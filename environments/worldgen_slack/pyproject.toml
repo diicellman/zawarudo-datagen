@@ -1,0 +1,46 @@
+[project]
+name = "worldgen-slack"
+version = "0.2.0"
+description = "Prime-native Slack QA/world synthetic data generator."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic==2.13.4",
+    "verifiers==0.3.0",
+]
+
+[project.scripts]
+worldgen-slack = "worldgen_slack.generate:main"
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.2",
+    "pytest-asyncio==1.2.0",
+    "ruff==0.14.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["worldgen_slack"]
+include = [
+    "worldgen_slack/**/*.json",
+    "worldgen_slack/**/*.md",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"worldgen_slack_generation.py" = "worldgen_slack_generation.py"
+"worldgen_slack_generated.py" = "worldgen_slack_generated.py"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+
+[tool.verifiers.eval]
+num_examples = 3
+rollouts_per_example = 1
