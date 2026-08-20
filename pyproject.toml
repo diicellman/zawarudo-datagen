@@ -1,0 +1,27 @@
+[project]
+name = "zawarudo-datagen"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "diicell", email = "diicellman@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "verifiers==0.3.0",
+    "worldgen-slack",
+]
+
+[project.scripts]
+zawarudo-datagen = "zawarudo_datagen:main"
+worldgen-slack = "worldgen_slack.generate:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+worldgen-slack = { workspace = true }
+
+[tool.uv.workspace]
+members = ["environments/worldgen_slack"]
