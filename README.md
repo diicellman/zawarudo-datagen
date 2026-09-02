@@ -1,21 +1,25 @@
 # Zawarudo Data Generation
 
-Prime-native synthetic data generation for read-only Slack question-answering worlds. The generator
-creates a QA contract, writes and validates one `world.py`, probes it with a blind solver, filters it
-with an empirical agentic judge, and exports accepted snapshots as a normal Verifiers taskset.
+Prime-native synthetic data generation for read-only Slack question-answering worlds.
+The fixed protocol is:
 
-Implementation details and trust boundaries are documented in
-[`environments/worldgen_slack/README.md`](environments/worldgen_slack/README.md).
+```text
+synthesize → build → validate → solve → judge
+```
 
-## Prerequisites
+## Ownership
 
-- Python 3.12 or newer
-- [`uv`](https://docs.astral.sh/uv/)
-- Prime CLI access and a Prime account with Inference and Sandbox access
+- **Env owns sequence.** `SlackDataGenerationEnv` contains the five explicit stages and short circuits.
+- **Slack owns meaning.** `slack/models.py`, `api.py`, `tools.py`, and `validate.py` define data, behavior, native actions, and hard gates.
+- **Verifiers owns execution.** Native agents, retries, traces, toolsets, runtimes, rewards, and metrics drive every episode.
+- **Generator owns persistence.** `generate.py` applies deduplication and quality policy; `dataset.py` commits and audits releases.
+- **Janitor owns observation.** It opens a completed release without affecting canonical artifacts.
+
+No workflow engine, registry, plugin layer, or project-owned MCP server is used.
 
 ## Setup
 
-From the repository root:
+Requirements: Python 3.12+, `uv`, and Prime Inference/Sandbox access.
 
 ```bash
 prime lab setup
@@ -24,117 +28,104 @@ prime login
 prime lab doctor
 ```
 
-Confirm that the local command and plugins resolve:
+Do not put credentials in TOML files or forward them into model sandboxes.
+
+## Generate
 
 ```bash
-uv run worldgen-slack --help
-uv run eval worldgen-slack-generated --dry-run True --no-push --plain
+uv run --frozen worldgen-slack generate --config configs/generation.toml
 ```
 
-Prime credentials stay in the Prime CLI credential store. Do not add API keys to TOML files or
-forward them into model sandboxes.
+The config targets accepted worlds, not attempted seeds. Optional CLI overrides are
+`--target-accepted`, `--max-attempts`, `--concurrency`, `--run-id`, and `--output`. The generator
+keeps a fixed worker pool active until the accepted target or exact attempt cap is reached, then
+drains work already in flight.
 
-## Configure generation
+Whole-episode retries are zero. Only the world judge has one narrowly scoped native retry for
+operational failures. Expected synthesis, deterministic, semantic, and quality rejections return
+normally and are recorded with exact taxonomy. Provider, runtime, tunnel, and trusted-code failures
+remain native failed episodes. Progress is fsynced to `progress.jsonl` and printed at least every ten
+seconds.
 
-The checked-in configuration is [`configs/generation.toml`](configs/generation.toml). Its main
-settings are:
+Resume with the same command and immutable run configuration. Recorded seeds are skipped.
+Configuration, source, provenance, path, or hash mismatches fail loudly.
 
-- `run_id`: internal manifest and attempt-ID namespace;
-- `count`: number of seed tasks in the run;
-- `concurrency`: items generated at the same time;
-- `output`: release directory used when `--output` is absent;
-- `max_item_retries`: whole-item operational retries;
-- role models, turn limits, immutable Prime image, and RLM revision;
-- quality weights, criterion floors, acceptance threshold, and accepted semantic statuses.
+## Release layout
 
-The CLI can override `count` and `output`. Change other values in a copied TOML configuration.
-
-## Generate data
-
-Run a one-item smoke:
-
-```bash
-uv run worldgen-slack generate \
-  --config configs/generation.toml \
-  --count 1 \
-  --output runs/prime-smoke
-```
-
-Run ten seeds into the default release location:
-
-```bash
-uv run worldgen-slack generate \
-  --config configs/generation.toml \
-  --count 10 \
-  --output data/slack-v0
-```
-
-To resume, run the exact same command with the same source, configuration, count, run ID, and output
-path. Completed terminal seeds are skipped. A source or provenance mismatch fails instead of mixing
-releases.
-
-Inspect the result:
-
-```bash
-cat data/slack-v0/summary.json
-cat data/slack-v0/attempts.jsonl
-find data/slack-v0/worlds -maxdepth 2 -type f | sort
-```
-
-## Output names
-
-`runs/` and `data/` have no special naming behavior. The release root is exactly the CLI `--output`
-path, or the TOML `output` value when the CLI flag is absent. Names such as `prime-smoke` are chosen
-by the caller.
-
-`run_id` does not name the directory. It appears in manifest and attempt IDs such as:
+The current generator contract is `worldgen-slack.dataset.v3` with release table schema 2. Older,
+append-incompatible generator releases are rejected rather than silently mixed.
 
 ```text
-slack-generator-v0--seed-00000003--attempt-0001
+manifest.json                 # Janitor table discovery
+run_manifest.json             # immutable generator provenance
+attempts.jsonl                # one stable scalar row per terminal attempt
+artifacts.jsonl               # one path and SHA-256 row per artifact
+dataset.jsonl                 # accepted private catalog
+public_tasks.jsonl            # solver-safe snapshot rows
+private_oracles.jsonl         # host-only answer and gold references
+interfaces/slack.readonly.v1/ # action contract, derived schemas, builder guide
+worlds/<instance_id>/         # accepted source, snapshot, validation, traces, verdict
+rejected/<attempt_id>/        # optional, always separate
+summary.json
+qualification_report.json       # independently gated qualification result
+progress.jsonl                  # durable stage, branch, retry, and heartbeat events
 ```
 
-Accepted world directories use a host-owned identity:
+Accepted commits are insert-only and transactional. Public rows never contain answers, claims,
+evidence requirements, or gold calls. Generated evaluation hashes and loads `snapshot.json`; it
+never imports or executes `world.py`.
 
-```text
-<sanitized-task-slug>--<first-12-characters-of-contract-hash>
-```
-
-A release contains `run_manifest.json`, `summary.json`, all-attempt and public/private JSONL files,
-the fixed interface assets, and `worlds/<instance_id>/` directories with source, snapshots,
-validation, verdicts, manifests, and four role traces.
-
-Local `runs/`, `data/`, and `references/` trees are ignored by Git. The `.log` and `.pid` files used
-for long local runs are operator conveniences, not release artifacts.
-
-## Evaluate generated tasks
-
-Evaluate three accepted snapshots with Prime Inference and Prime VMs:
+Inspect a release with Janitor:
 
 ```bash
-uv run eval @ configs/eval-generated-prime.toml \
-  --env.taskset.release-dir data/slack-v0 \
-  -n 3 -r 1 -c 2 \
-  --no-push --rich False --plain
+(cd janitor && cargo run -- release ../data/slack-qualification-v1)
 ```
 
-Validate configuration without running models:
+Janitor registers the manifest-declared `attempts` and `artifacts` JSONL files as read-only DuckDB
+views. Deleting viewer state cannot change the release.
+
+## Rewards and acceptance
+
+These are separate:
+
+- deterministic validation is a builder metric and a hard gate;
+- a narrow host-side semantic judge scores solver claims and accepts equivalent paraphrases;
+- a world-only agentic judge uses empirical Slack reads to score six weighted quality criteria and
+  the hard gates `task_unambiguous` and `world_supports_task`;
+- exact/date/list matching remains diagnostic and cannot override semantic correctness;
+- deterministic or world hard-gate failure zeros final world quality while retaining raw criteria.
+
+The authoritative named rewards are `semantic_correctness` and `world_quality`. Release acceptance
+also requires the configured solver threshold, world threshold, every per-criterion floor,
+deduplication, and a solved semantic status. Challenging and rejected rows never count toward the
+accepted target.
+
+## Security boundary
+
+Generated `world.py` runs only in fresh Prime VMs. Every model and candidate runtime uses an
+immutable image, `vm=true`, `allow=[]`, and `block=["*"]`. Public feedback is non-authoritative.
+The host downloads bounded snapshots, rebuilds strict Pydantic models, and reruns hard gates.
+Solvers and judges receive validated snapshots through a thin native `vf.Toolset`; they never
+execute generated source. Private oracle data is supplied only to the judge and host-side release.
+
+## Evaluate accepted snapshots
 
 ```bash
-uv run eval @ configs/eval-generated-prime.toml \
-  --env.taskset.release-dir data/slack-v0 \
-  --dry-run True --no-push --plain
+uv run eval @ configs/eval-generated-prime.toml --env.taskset.release-dir data/slack-qualification-v1 -n 3 -r 1 -c 2 --no-push --rich False --plain
 ```
 
-`worldgen-slack-generated` evaluates already-built snapshots and never executes `world.py`.
-`worldgen-slack-generation` can be driven by `uv run eval` for timing and trace inspection, but the
-standard eval runner does not call the standalone atomic dataset-commit callback. Use
-`worldgen-slack generate` to create a release.
+Use `--dry-run True` for configuration-only validation.
 
-## Development checks
+## Checks
 
 ```bash
-uv run --project environments/worldgen_slack pytest -q environments/worldgen_slack/tests
-uv run --project environments/worldgen_slack ruff check environments/worldgen_slack
-uv run --project environments/worldgen_slack ruff format --check environments/worldgen_slack
+uv run pytest -q
+uv run --project environments/worldgen_slack ruff check   environments/worldgen_slack/worldgen_slack environments/worldgen_slack/tests
+uv run --project environments/worldgen_slack ruff format --check   environments/worldgen_slack/worldgen_slack environments/worldgen_slack/tests
 uv lock --check
+(cd janitor && cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings)
+(cd janitor && cargo test --all-targets --all-features)
 ```
+
+The live Prime test is skipped unless `WORLDGEN_SLACK_EXTERNAL_SMOKE=1`. It also requires Prime
+Inference, Sandbox provisioning, `z-ai/glm-5.2`, tunneling, and access to the pinned RLM revision.

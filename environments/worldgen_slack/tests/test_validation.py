@@ -1,182 +1,161 @@
 from __future__ import annotations
 
-import json
+from pathlib import Path
+import os
+import subprocess
+import sys
 
 import pytest
-from pydantic import ValidationError
+import verifiers.v1 as vf
 
-from conftest import deep_world_payload, make_world
-from worldgen_slack.contracts import (
-    FailureOwner,
-    JudgeVerdict,
-    QualityFilterConfig,
-    decide_persistence,
-    normalized_quality_score,
-    parse_synthesized_item,
-    preflight_synthesized_item,
-)
-from worldgen_slack.slack.models import SlackWorld
-from worldgen_slack.slack.validation import (
+from worldgen_slack.contracts import parse_synthesized_item, preflight_synthesized_item
+from worldgen_slack.env import SlackDataGenerationConfig
+from worldgen_slack.slack.validate import (
+    check_candidate,
+    evaluate_candidate_in_runtime,
     static_source_errors,
     validate_compiled_snapshots,
     validate_world,
 )
 
+from conftest import make_world
 
-def test_valid_world_recovers_required_evidence_through_gold_calls(world, contract) -> None:
+
+def test_evidence_is_reachable_only_through_declared_message_rows(world, contract) -> None:
     report = validate_world(world, contract)
     assert report["ok"]
-    assert len(report["gold_call_log"]) == 2
-    assert all(item["ok"] for item in report["evidence"])
+    assert {row["output"][0]["message_id"] for row in report["gold_call_log"] if row["output"]} >= {
+        "newer",
+        "root",
+    }
+
+    broken = contract.model_copy(
+        update={
+            "gold_calls": [
+                contract.gold_calls[0].model_copy(update={"arguments": {"query": "unrelated rehearsal"}})
+            ]
+        }
+    )
+    failed = validate_world(world, broken)
+    assert not failed["ok"]
+    assert any(check["name"] == "gold_replay" and not check["ok"] for check in failed["checks"])
 
 
-def test_archived_public_evidence_is_not_actor_visible(world, contract) -> None:
-    payload = deep_world_payload(world)
-    payload["conversations"][0]["is_archived"] = True
-    report = validate_world(SlackWorld.model_validate(payload), contract)
-    evidence = next(item for item in report["checks"] if item["name"] == "required_evidence")
-    assert not evidence["ok"]
-    assert "invisible" in evidence["detail"]
+def test_source_policy_rejects_escape_and_nonexact_build_signatures() -> None:
+    invalid_sources = [
+        "import os\ndef build(seed, contract): return None\n",
+        "async def build(seed, contract): return None\n",
+        "def build(seed, contract=None): return None\n",
+        "def build(seed, contract, *args): return None\n",
+        "@staticmethod\ndef build(seed, contract): return None\n",
+        "def build(seed, contract):\n    return open('/etc/passwd')\n",
+    ]
+    assert all(static_source_errors(source) for source in invalid_sources)
+    assert not static_source_errors("def build(seed, contract):\n    return None\n")
 
 
-def test_source_policy_rejects_host_io_network_and_bad_signature() -> None:
-    source = "import os\n\ndef build(other, contract):\n    return open('/tmp/x')\n"
-    errors = static_source_errors(source)
-    assert any("IMPORT" in error for error in errors)
-    assert any("NAME" in error for error in errors)
-    assert any("build arguments" in error for error in errors)
+def test_generated_program_failure_is_a_bounded_candidate_rejection(
+    tmp_path: Path, contract, monkeypatch
+) -> None:
+    candidate = tmp_path / "world.py"
+    candidate.write_text("def build(seed, contract):\n    return None\n")
 
-    bypass = """from worldgen_slack.slack.models import SlackWorld, TaskContract
-importer = __builtins__["__import__"]
-os = importer("os")
-def build(seed, contract):
-    os.system("touch /tmp/outside-task")
-"""
-    bypass_errors = static_source_errors(bypass)
-    assert any("__builtins__" in error for error in bypass_errors)
-    assert any("system" in error for error in bypass_errors)
+    def generated_failure(*_args):
+        raise SystemExit("candidate tried to exit")
 
-    import_alias = """from random import _os as harmless
-from worldgen_slack.slack.models import SlackWorld, TaskContract
-def build(seed, contract):
-    harmless.execv("/bin/sh", ["sh", "-c", "touch /tmp/outside-task"])
-"""
-    alias_errors = static_source_errors(import_alias)
-    assert any("_os" in error for error in alias_errors)
-    assert any("execv" in error for error in alias_errors)
+    monkeypatch.setattr(
+        "worldgen_slack.slack.validate._load_build",
+        lambda *_args: generated_failure,
+    )
+    result = check_candidate(candidate, contract, [0])
+    assert not result["ok"]
+    assert result["snapshots"] == {}
+    assert all("SystemExit" in report["error"] for report in result["reports"])
 
 
-def test_compiled_snapshots_require_determinism_variation_and_evidence_stability(contract) -> None:
+def test_seed_family_requires_determinism_variation_and_answer_stability(contract) -> None:
     snapshots = {
         "0": make_world(0).model_dump(mode="json"),
         "101": make_world(101).model_dump(mode="json"),
         "202": make_world(202).model_dump(mode="json"),
         "repeat_0": make_world(0).model_dump(mode="json"),
     }
+    assert validate_compiled_snapshots(snapshots, contract, [0, 101, 202]).ok
+
+    changed = make_world(101).model_dump(mode="json")
+    next(message for message in changed["messages"] if message["id"] == "msg_fix")["text"] += " Later."
+    snapshots["101"] = changed
     report = validate_compiled_snapshots(snapshots, contract, [0, 101, 202])
-    assert report.ok
-    assert report.failure_owner == FailureOwner.NONE
-    assert len(report.hidden_snapshot_hashes) == 2
-    broken = json.loads(json.dumps(snapshots))
-    message = next(item for item in broken["101"]["messages"] if item["id"] == "msg_cause")
-    message["text"] += " changed"
-    report = validate_compiled_snapshots(broken, contract, [0, 101, 202])
     assert not report.ok
     assert any(check.name == "hidden_seed_answer_stability" and not check.ok for check in report.checks)
 
 
-def test_synthesized_parser_requires_exactly_one_strict_object(synthesized) -> None:
+@pytest.mark.asyncio
+async def test_candidate_execution_accepts_only_default_deny_prime_vm(contract) -> None:
+    with pytest.raises(TypeError, match="PrimeConfig"):
+        await evaluate_candidate_in_runtime(b"", contract, vf.SubprocessConfig())
+    with pytest.raises(ValueError, match="framework-only egress"):
+        await evaluate_candidate_in_runtime(
+            b"",
+            contract,
+            vf.PrimeConfig(vm=True, allow=["*"], block=[]),
+        )
+
+    config = SlackDataGenerationConfig(taskset=vf.TasksetConfig(id="worldgen-slack-generation"))
+    values = config.model_dump(mode="python")
+    values["solver"]["runtime"] = vf.SubprocessConfig()
+    with pytest.raises(TypeError, match="solver runtime must be PrimeConfig"):
+        SlackDataGenerationConfig.model_validate(values)
+
+
+def test_synthesized_json_and_preflight_are_strict(synthesized) -> None:
     parsed = parse_synthesized_item(synthesized.model_dump_json())
-    assert parsed == synthesized
-    with pytest.raises(ValueError, match="exactly one JSON object"):
-        parse_synthesized_item("```json\n{}\n```")
+    preflight_synthesized_item(parsed)
+    fenced = parse_synthesized_item(f"prefix ```json\n{synthesized.model_dump_json()}\n``` suffix")
+    assert fenced == synthesized
     with pytest.raises(ValueError, match="strict JSON"):
-        parse_synthesized_item('{"scenario": NaN}')
-
-
-def test_preflight_rejects_self_rooted_and_contradictory_evidence(synthesized) -> None:
-    payload = synthesized.model_dump(mode="json")
-    payload["task"]["required_evidence"][0]["thread_root_id"] = "msg_cause"
-    with pytest.raises(ValueError, match="own thread root"):
-        preflight_synthesized_item(type(synthesized).model_validate(payload))
-    payload = synthesized.model_dump(mode="json")
-    payload["task"]["required_evidence"][1]["message_id"] = "msg_cause"
-    payload["task"]["required_evidence"][1]["conversation_id"] = "dm_agent_alice"
-    payload["task"]["min_distinct_evidence_messages"] = 1
-    with pytest.raises(ValueError, match="contradictory"):
-        preflight_synthesized_item(type(synthesized).model_validate(payload))
-
-
-def _quality() -> QualityFilterConfig:
-    return QualityFilterConfig(
-        min_accept_score=0.75,
-        accepted_statuses={"solved"},
-        weights={
-            "scenario_alignment": 1,
-            "world_coherence": 1,
-            "professional_realism": 1,
-            "discoverability": 1,
-            "shortcut_free": 1,
-        },
-        minimum_scores={
-            "scenario_alignment": 3,
-            "world_coherence": 3,
-            "professional_realism": 3,
-            "discoverability": 3,
-            "shortcut_free": 3,
-        },
+        parse_synthesized_item('{"scenario": null, "scenario": null}')
+    with pytest.raises(ValueError, match="strict JSON"):
+        parse_synthesized_item('{"value": NaN}')
+    with pytest.raises(ValueError, match="exceeds 65536 bytes"):
+        parse_synthesized_item("x" * 65_537 + synthesized.model_dump_json())
+    with pytest.raises(ValueError):
+        parse_synthesized_item("{} " + synthesized.model_dump_json())
+    invalid = parsed.model_copy(
+        update={"task": parsed.task.model_copy(update={"question": "Post the answer?"})}
     )
+    with pytest.raises(ValueError, match="write action"):
+        preflight_synthesized_item(invalid)
 
 
-def _verdict(**updates) -> JudgeVerdict:
-    values = {
-        "solver_correct": True,
-        "task_unambiguous": True,
-        "world_supports_task": True,
-        "scenario_alignment": 4,
-        "world_coherence": 4,
-        "professional_realism": 4,
-        "discoverability": 4,
-        "shortcut_free": 4,
-        "failure_owner": FailureOwner.NONE,
-        "reason": "Verified.",
-    }
-    values.update(updates)
-    return JudgeVerdict.model_validate(values)
-
-
-def test_weighted_quality_and_inclusive_threshold() -> None:
-    verdict = _verdict()
-    assert normalized_quality_score(verdict, _quality().weights) == 0.75
-    decision = decide_persistence("solved", verdict, _quality())
-    assert decision.write_to_dataset
-
-
-def test_criterion_floor_beats_high_average_and_status_policy() -> None:
-    config = _quality()
-    verdict = _verdict(
-        scenario_alignment=2, world_coherence=5, professional_realism=5, discoverability=5, shortcut_free=5
+def test_fixed_checker_projection_imports_without_unprojected_tool_modules(tmp_path) -> None:
+    package = Path(__file__).resolve().parents[1] / "worldgen_slack"
+    fixed = tmp_path / "fixed" / "worldgen_slack"
+    (fixed / "slack").mkdir(parents=True)
+    for relative in (
+        "__init__.py",
+        "contracts.py",
+        "slack/__init__.py",
+        "slack/models.py",
+        "slack/api.py",
+        "slack/validate.py",
+    ):
+        target = fixed / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((package / relative).read_bytes())
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import worldgen_slack.slack.validate as value; "
+                "assert value.__file__.startswith(%r)" % str(tmp_path)
+            ),
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path / "fixed")},
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
-    decision = decide_persistence("solved", verdict, config)
-    assert not decision.write_to_dataset
-    assert decision.criterion_failures == ["scenario_alignment"]
-    challenging = _verdict(solver_correct=False, failure_owner=FailureOwner.SOLVER)
-    assert not decide_persistence("challenging", challenging, config).write_to_dataset
-    config.accepted_statuses.add("challenging")
-    assert decide_persistence("challenging", challenging, config).write_to_dataset
-    infrastructure = _verdict(failure_owner=FailureOwner.INFRASTRUCTURE)
-    assert not decide_persistence("solved", infrastructure, config).write_to_dataset
-
-
-def test_invalid_quality_configuration_fails_at_startup() -> None:
-    with pytest.raises(ValidationError, match="every quality criterion"):
-        QualityFilterConfig(
-            weights={"scenario_alignment": 1},
-            minimum_scores={"scenario_alignment": 3},
-        )
-    with pytest.raises(ValidationError, match="cannot be empty"):
-        QualityFilterConfig(
-            accepted_statuses=set(),
-            weights=_quality().weights,
-            minimum_scores=_quality().minimum_scores,
-        )
+    assert completed.returncode == 0, completed.stderr

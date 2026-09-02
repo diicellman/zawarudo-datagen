@@ -1,88 +1,129 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import tomllib
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Literal, Self
 
 import verifiers.v1 as vf
+from pydantic import Field, model_validator
 
-from ..contracts import (
-    INTERFACE_ID,
-    JudgeVerdict,
-    ScenarioSpec,
-    ValidationReport,
-    redact_secrets,
-)
-from ..slack.models import SlackWorld, TaskContract
-from ..slack.toolset import SlackState, SlackToolset, SlackToolsetConfig
-from .solver import SolverSummary
+from ..contracts import ValidationReport, WorldJudgeVerdict, redact_secrets
+from ..slack.models import INTERFACE_ID, QUALITY_CRITERIA, ScenarioSpec, SlackWorld, StrictModel, TaskContract
+from ..slack.tools import SlackState, SlackToolset, SlackToolsetConfig
 
-SOLVER_TRACE_FILE = "/tmp/worldgen_solver_trace.json"
-JUDGE_CONTEXT_FILE = "/tmp/worldgen_judge_context.json"
-VERDICT_FILE = "/tmp/worldgen_judge_verdict.json"
+BUILDER_TRACE_FILE = "/tmp/worldgen_builder_trace.json"
+WORLD_SOURCE_FILE = "/tmp/worldgen_world.py"
+JUDGE_CONTEXT_FILE = "/tmp/worldgen_world_judge_context.json"
+VERDICT_FILE = "/tmp/worldgen_world_judge_verdict.json"
+_RUBRIC_PATH = Path(__file__).resolve().parents[1] / "slack" / "world_rubric.toml"
+_CHOICE_SCORE = {
+    "fails": 0.0,
+    "weak": 0.25,
+    "adequate": 0.5,
+    "strong": 0.75,
+    "exceptional": 1.0,
+}
 
-JUDGE_PROMPT = f"""Audit one generated Slack QA item empirically. The complete solver trace is at
-`{SOLVER_TRACE_FILE}` and the private audit context is at `{JUDGE_CONTEXT_FILE}`. Inspect those
-files selectively. Use the fixed Slack actions to verify the evidence and current world yourself.
-Do not trust the solver, builder metadata, or recorded validation without checking.
-
-Score each quality criterion with this common scale: 1 clearly fails; 2 materially weak;
-3 acceptable but limited; 4 strong; 5 exceptional.
-
-- scenario_alignment: 1 contradicts the scenario; 2 has major mismatches; 3 broadly fits;
-  4 strongly realizes the organization and workflow; 5 is unusually specific and complete.
-- world_coherence: 1 is contradictory/broken; 2 has material timeline or relationship problems;
-  3 is internally usable; 4 is consistent and well connected; 5 is exceptionally coherent.
-- professional_realism: 1 is implausible; 2 is artificial; 3 is credible enough; 4 resembles a
-  real workplace; 5 has exceptional professional detail without noise.
-- discoverability: 1 cannot be found; 2 needs guessing or hidden knowledge; 3 is reachable with
-  some friction; 4 has a clear evidence path; 5 supports robust discovery through several cues.
-- shortcut_free: 1 exposes an answer cache; 2 has an obvious shortcut; 3 has minor leakage;
-  4 requires genuine Slack retrieval; 5 is robust against shortcuts and prompt artifacts.
-
-Set `task_unambiguous` false when more than one materially different answer fits the question.
-Set `world_supports_task` false when actor-visible Slack evidence cannot establish the answer.
-Use failure ownership carefully: ambiguous contracts belong to synthesizer; missing or incoherent
-world evidence belongs to builder; a capable world with an incorrect answer belongs to solver;
-fixed action defects belong to interface. File/tool/runtime failures are infrastructure failures.
-
-Write exactly one JSON object matching the required schema to `{VERDICT_FILE}`. The chat reply is
-not used as the verdict.
+WORLD_JUDGE_PROMPT = f"""Grade only the generated Slack world and builder work.
+Read the builder trace at `{BUILDER_TRACE_FILE}`, generated source at `{WORLD_SOURCE_FILE}`, and
+rubric/context at `{JUDGE_CONTEXT_FILE}`. Empirically inspect the validated Slack world with at least
+one Slack action. Do not trust supplied validation summaries as a substitute for inspection.
+Write exactly one verdict JSON matching `verdict_schema` to `{VERDICT_FILE}`. The chat reply is not
+the verdict. Do not assess or infer anything about a solver; no solver artifact is available.
 """
 
 
-class JudgeData(vf.TaskData):
+class RubricCriterion(StrictModel):
+    name: str
+    description: str
+    weight: float = Field(ge=0.0)
+    choices: list[str]
+
+
+class WorldRubric(StrictModel):
+    version: Literal[1]
+    criteria: list[RubricCriterion]
+
+    @model_validator(mode="after")
+    def exact_contract(self) -> Self:
+        names = [item.name for item in self.criteria]
+        expected = ["task_unambiguous", "world_supports_task", *QUALITY_CRITERIA]
+        if names != expected:
+            raise ValueError(f"world rubric criteria must be exactly {expected}")
+        for criterion in self.criteria[:2]:
+            if criterion.weight != 0.0 or criterion.choices != ["no", "yes"]:
+                raise ValueError("world hard-gate criteria require zero weight and no/yes choices")
+        for criterion in self.criteria[2:]:
+            if criterion.weight <= 0 or criterion.choices != list(_CHOICE_SCORE):
+                raise ValueError("quality criteria require positive weight and ordered quality choices")
+        return self
+
+
+@lru_cache(maxsize=1)
+def load_world_rubric() -> WorldRubric:
+    return WorldRubric.model_validate(tomllib.loads(_RUBRIC_PATH.read_text(encoding="utf-8")))
+
+
+def world_reward_scores(
+    validation_ok: bool,
+    verdict: WorldJudgeVerdict,
+    rubric: WorldRubric | None = None,
+) -> dict[str, Any]:
+    rubric = rubric or load_world_rubric()
+    weights = {item.name: item.weight for item in rubric.criteria[2:]}
+    criteria = {name: _CHOICE_SCORE[getattr(verdict, name)] for name in QUALITY_CRITERIA}
+    raw = sum(criteria[name] * weights[name] for name in QUALITY_CRITERIA) / sum(weights.values())
+    hard_gates = {
+        "task_unambiguous": verdict.task_unambiguous,
+        "world_supports_task": verdict.world_supports_task,
+    }
+    hard_gate = validation_ok and all(hard_gates.values())
+    return {
+        "deterministic_validation": float(validation_ok),
+        "hard_gates": hard_gates,
+        "criteria": criteria,
+        "world_quality_raw": raw,
+        "world_quality": raw if hard_gate else 0.0,
+    }
+
+
+class WorldJudgeData(vf.TaskData):
     instance_id: str
     question: str
     interface_id: str = INTERFACE_ID
 
 
-class JudgeConfig(vf.TaskConfig):
+class WorldJudgeConfig(vf.TaskConfig):
     tools: SlackToolsetConfig = SlackToolsetConfig()
-    solver_trace: dict[str, Any]
+    builder_trace: dict[str, Any]
+    source: str
     judge_context: dict[str, Any]
 
 
-class JudgeTask(vf.Task[JudgeData, SlackState, JudgeConfig]):
+class WorldJudgeTask(vf.Task[WorldJudgeData, SlackState, WorldJudgeConfig]):
     NEEDS_CONTAINER = True
 
     @classmethod
-    def toolsets(cls, config: JudgeConfig) -> list[vf.Toolset]:
+    def toolsets(cls, config: WorldJudgeConfig) -> list[vf.Toolset]:
         return [SlackToolset(config.tools)]
 
     async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
-        paths = [VERDICT_FILE, SOLVER_TRACE_FILE, JUDGE_CONTEXT_FILE]
+        paths = [VERDICT_FILE, BUILDER_TRACE_FILE, WORLD_SOURCE_FILE, JUDGE_CONTEXT_FILE]
         removed = await runtime.run(["rm", "-f", *paths], {})
         if removed.exit_code:
-            raise RuntimeError(f"could not clear judge protocol files: {removed.stderr[-500:]}")
+            raise RuntimeError(f"could not clear world-judge protocol files: {removed.stderr[-500:]}")
         await runtime.write(
-            SOLVER_TRACE_FILE,
+            BUILDER_TRACE_FILE,
             json.dumps(
-                self.config.solver_trace,
+                self.config.builder_trace,
                 ensure_ascii=False,
                 allow_nan=False,
                 sort_keys=True,
             ).encode(),
         )
+        await runtime.write(WORLD_SOURCE_FILE, self.config.source.encode())
         await runtime.write(
             JUDGE_CONTEXT_FILE,
             json.dumps(
@@ -96,64 +137,87 @@ class JudgeTask(vf.Task[JudgeData, SlackState, JudgeConfig]):
     async def finalize(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         try:
             raw = await runtime.read(VERDICT_FILE, max_bytes=64_000)
-        except Exception as exc:
-            raise ValueError(f"judge wrote no bounded verdict file at {VERDICT_FILE}") from exc
-        verdict = JudgeVerdict.model_validate_json(raw)
-        if not trace.state.completed_calls:
-            raise ValueError("judge completed no empirically recorded Slack action")
-        payload = verdict.model_dump(mode="json")
-        trace.info["judge_tool_calls"] = trace.state.completed_calls
-        trace.info["judge_verdict"] = payload
+        except vf.SandboxError as exc:
+            raise ValueError(f"world judge wrote no bounded verdict file at {VERDICT_FILE}") from exc
+        verdict = WorldJudgeVerdict.model_validate_json(raw)
+        if not isinstance(trace.state, SlackState):
+            raise TypeError("world judge trace requires SlackState")
+        if not trace.state.completed_actions:
+            raise ValueError("world judge completed no Slack action")
+        trace.info["completed_actions"] = [
+            action.model_dump(mode="json") for action in trace.state.completed_actions
+        ]
+        trace.info["world_verdict"] = verdict.model_dump(mode="json")
 
 
-def make_judge_task(
+def _builder_trace_context(trace: vf.Trace) -> dict[str, Any]:
+    record = trace.to_record()
+    info = record.get("info") if isinstance(record.get("info"), dict) else {}
+    return redact_secrets(
+        {
+            "version": record.get("version"),
+            "id": record.get("id"),
+            "agent": record.get("agent"),
+            "nodes": record.get("nodes", []),
+            "calls": record.get("calls", []),
+            "errors": record.get("errors", []),
+            "timing": record.get("timing"),
+            "stop_condition": record.get("stop_condition"),
+            "info": {key: info[key] for key in ("public_checks", "builder_metadata") if key in info},
+        }
+    )
+
+
+def make_world_judge_task(
     *,
+    generation_seed: int,
     instance_id: str,
     scenario: ScenarioSpec,
     contract: TaskContract,
     world: SlackWorld,
     validation: ValidationReport,
-    solver_trace: vf.Trace,
-    solver_summary: SolverSummary,
-    builder_metadata: dict[str, Any],
-) -> JudgeTask:
+    builder_trace: vf.Trace,
+    source: bytes,
+) -> WorldJudgeTask:
+    rubric = load_world_rubric()
     context = {
         "scenario": scenario.model_dump(mode="json"),
-        "question": contract.question,
-        "canonical_answer": contract.answer.canonical_answer,
-        "required_claims": contract.answer.required_claims,
-        "forbidden_claims": contract.answer.forbidden_claims,
-        "required_evidence": [item.model_dump(mode="json") for item in contract.required_evidence],
+        "task_contract": contract.model_dump(mode="json"),
         "deterministic_validation": validation.model_dump(
             mode="json",
-            exclude={"public_snapshot"},
+            exclude={"public_snapshot", "gold_call_log"},
         ),
-        "gold_call_log": validation.gold_call_log,
-        "builder_artifact": builder_metadata,
-        "solver_summary": solver_summary.model_dump(mode="json"),
-        "verdict_schema": JudgeVerdict.model_json_schema(),
+        "rubric": rubric.model_dump(mode="json"),
+        "verdict_schema": WorldJudgeVerdict.model_json_schema(),
     }
-    data = JudgeData(
-        idx=solver_trace.task.data.idx,
+    data = WorldJudgeData(
+        idx=generation_seed,
         name=instance_id,
-        prompt=JUDGE_PROMPT,
+        prompt=WORLD_JUDGE_PROMPT,
         network_allow=[],
         network_block=["*"],
         instance_id=instance_id,
         question=contract.question,
     )
-    config = JudgeConfig(
-        tools=SlackToolsetConfig.from_world(world, contract.actor_id),
-        solver_trace=redact_secrets(solver_trace.to_record()),
-        judge_context=context,
+    return WorldJudgeTask(
+        data,
+        WorldJudgeConfig(
+            tools=SlackToolsetConfig.from_world(world, contract.actor_id),
+            builder_trace=_builder_trace_context(builder_trace),
+            source=source.decode("utf-8"),
+            judge_context=context,
+        ),
     )
-    return JudgeTask(data, config)
 
 
 __all__ = [
+    "BUILDER_TRACE_FILE",
     "JUDGE_CONTEXT_FILE",
-    "SOLVER_TRACE_FILE",
     "VERDICT_FILE",
-    "JudgeTask",
-    "make_judge_task",
+    "WORLD_SOURCE_FILE",
+    "WorldJudgeConfig",
+    "WorldJudgeTask",
+    "load_world_rubric",
+    "make_world_judge_task",
+    "world_reward_scores",
 ]

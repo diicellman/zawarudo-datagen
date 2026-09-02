@@ -6,6 +6,15 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+INTERFACE_ID = "slack.readonly.v1"
+QUALITY_CRITERIA = (
+    "scenario_alignment",
+    "world_coherence",
+    "professional_realism",
+    "discoverability",
+    "shortcut_free",
+    "evidence_composition",
+)
 SAFE_IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
 _SAFE_IDENTIFIER = re.compile(SAFE_IDENTIFIER_PATTERN)
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -189,6 +198,17 @@ class SlackWorld(StrictModel):
         raise ValueError(f"actor {actor_id!r} does not exist in the Slack world")
 
 
+class ScenarioSpec(StrictModel):
+    organization: NonEmptyText
+    workflow: NonEmptyText
+    description: NonEmptyText
+
+    @field_validator("organization", "workflow", "description")
+    @classmethod
+    def nonblank(cls, value: str, info: Any) -> str:
+        return _nonblank(value, info.field_name)
+
+
 class AnswerSpec(StrictModel):
     kind: Literal["exact_string", "date", "entity", "list", "fact_summary"]
     canonical_answer: NonEmptyText
@@ -323,7 +343,14 @@ class TaskContract(StrictModel):
         return self
 
 
+class SynthesizedItem(StrictModel):
+    scenario: ScenarioSpec
+    task: TaskContract
+
+
 __all__ = [
+    "INTERFACE_ID",
+    "QUALITY_CRITERIA",
     "SAFE_IDENTIFIER_PATTERN",
     "TIMESTAMP_FORMAT",
     "AnswerSpec",
@@ -332,8 +359,10 @@ __all__ = [
     "GoldCall",
     "Message",
     "Reaction",
+    "ScenarioSpec",
     "SlackWorld",
     "StrictModel",
+    "SynthesizedItem",
     "TaskContract",
     "User",
     "is_safe_identifier",

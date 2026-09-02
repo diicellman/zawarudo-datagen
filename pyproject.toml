@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "verifiers==0.3.0",
+    "verifiers==0.3.1",
     "worldgen-slack",
 ]
 
@@ -25,3 +25,8 @@ worldgen-slack = { workspace = true }
 
 [tool.uv.workspace]
 members = ["environments/worldgen_slack"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["environments/worldgen_slack"]
+testpaths = ["environments/worldgen_slack/tests"]

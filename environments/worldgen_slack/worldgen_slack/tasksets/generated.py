@@ -9,10 +9,9 @@ import verifiers.v1 as vf
 from pydantic import Field
 
 from ..agents.solver import SolverConfig, SolverTask
-from ..contracts import INTERFACE_ID
 from ..dataset import validate_release_integrity
-from ..slack.models import SlackWorld, TaskContract, validate_safe_identifier
-from ..slack.validation import validate_world
+from ..slack.models import INTERFACE_ID, SlackWorld, TaskContract, validate_safe_identifier
+from ..slack.validate import validate_world
 
 _PUBLIC_FIELDS = {"instance_id", "scenario", "question", "snapshot_ref", "interface_id"}
 _PRIVATE_FIELDS = {
@@ -97,7 +96,7 @@ def _canonical_contract_hash(contract: TaskContract) -> str:
 
 
 class GeneratedSlackTasksetConfig(vf.TasksetConfig):
-    release_dir: Path = Path("data/slack-v0")
+    release_dir: Path = Path("data/slack-qualification-v1")
     task: SolverConfig = Field(default_factory=SolverConfig)
 
 
@@ -179,7 +178,7 @@ class GeneratedSlackTaskset(vf.Taskset[SolverTask, GeneratedSlackTasksetConfig])
                     instance_id=instance_id,
                     contract=contract,
                     world=world,
-                    include_oracle=True,
+                    answer_judge=self.config.task.answer_judge,
                     idx=index,
                 )
             )

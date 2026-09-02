@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic==2.13.4",
-    "verifiers==0.3.0",
+    "verifiers==0.3.1",
 ]
 
 [project.scripts]
@@ -28,6 +28,7 @@ packages = ["worldgen_slack"]
 include = [
     "worldgen_slack/**/*.json",
     "worldgen_slack/**/*.md",
+    "worldgen_slack/**/*.toml",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]
@@ -37,6 +38,7 @@ include = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 110

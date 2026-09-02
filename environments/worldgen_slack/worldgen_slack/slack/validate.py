@@ -12,12 +12,12 @@ import shlex
 import sys
 import unicodedata
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import verifiers.v1 as vf
 
 from ..contracts import CheckResult, FailureOwner, ValidationReport
-from .api import SlackAPI
+from .api import SlackAPI, SlackNotFoundError
 from .models import SlackWorld, TaskContract
 
 SAFE_IMPORT_ROOTS = {
@@ -246,43 +246,38 @@ def static_source_errors(source: str) -> list[str]:
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "build"
     ]
-    if len(definitions) != 1:
-        errors.append("CONTRACT: define exactly one top-level build()")
-    elif [argument.arg for argument in definitions[0].args.args] != ["seed", "contract"]:
-        errors.append("CONTRACT: build arguments must be exactly (seed, contract)")
+    if len(definitions) != 1 or not isinstance(definitions[0], ast.FunctionDef):
+        errors.append("CONTRACT: define exactly one synchronous top-level build()")
+    else:
+        definition = definitions[0]
+        arguments = definition.args
+        exact_arguments = (
+            not arguments.posonlyargs
+            and [argument.arg for argument in arguments.args] == ["seed", "contract"]
+            and arguments.vararg is None
+            and not arguments.kwonlyargs
+            and arguments.kwarg is None
+            and not arguments.defaults
+            and not arguments.kw_defaults
+            and not definition.decorator_list
+        )
+        if not exact_arguments:
+            errors.append("CONTRACT: build signature must be exactly build(seed, contract)")
     return sorted(set(errors))
 
 
-def _visible_conversation(world: SlackWorld, actor_id: str, conversation_id: str) -> bool:
-    conversation = next((item for item in world.conversations if item.id == conversation_id), None)
-    if conversation is None or conversation.is_archived:
-        return False
-    return conversation.kind == "public_channel" or actor_id in conversation.member_ids
-
-
-def _claim_coverage(claim: str, corpus: str) -> float:
-    stop = {
-        "a",
-        "an",
-        "and",
-        "as",
-        "at",
-        "by",
-        "for",
-        "from",
-        "in",
-        "is",
-        "of",
-        "on",
-        "the",
-        "to",
-        "was",
-    }
-    tokens = {token for token in normalize_text(claim).split() if token not in stop}
-    if not tokens:
-        return 0.0
-    haystack = set(normalize_text(corpus).split())
-    return len(tokens & haystack) / len(tokens)
+def _message_ids(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        found = {item for key, item in value.items() if key == "message_id" and isinstance(item, str)}
+        for item in value.values():
+            found.update(_message_ids(item))
+        return found
+    if isinstance(value, list):
+        found: set[str] = set()
+        for item in value:
+            found.update(_message_ids(item))
+        return found
+    return set()
 
 
 def _dispatch_gold(api: SlackAPI, tool: str, arguments: dict[str, Any]) -> Any:
@@ -323,15 +318,15 @@ def validate_world(world: SlackWorld, contract: TaskContract) -> dict[str, Any]:
         size_problems.append(f"canonical snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes")
     checks.append(_check("world_size_and_bounds", size_problems))
 
-    actor_problems = []
+    actor_problems: list[str] = []
+    api: SlackAPI | None = None
     try:
-        world.require_actor(contract.actor_id)
+        api = SlackAPI(world, contract.actor_id)
     except ValueError as exc:
         actor_problems.append(str(exc))
     checks.append(_check("actor_visibility", actor_problems))
 
     messages = {message.id: message for message in world.messages}
-    evidence_texts: list[str] = []
     evidence_results: list[dict[str, Any]] = []
     evidence_problems: list[str] = []
     for requirement in contract.required_evidence:
@@ -357,10 +352,8 @@ def validate_world(world: SlackWorld, contract: TaskContract) -> dict[str, Any]:
                 problems.append(f"missing terms {missing}")
             if message.deleted:
                 problems.append("message is deleted")
-            if not _visible_conversation(world, contract.actor_id, message.conversation_id):
+            if api is None or not api.is_conversation_visible(message.conversation_id):
                 problems.append("message is invisible to actor")
-            if not problems:
-                evidence_texts.append(message.text)
         evidence_results.append(
             {
                 "evidence_id": requirement.evidence_id,
@@ -373,12 +366,11 @@ def validate_world(world: SlackWorld, contract: TaskContract) -> dict[str, Any]:
 
     gold_outputs: list[dict[str, Any]] = []
     gold_problems: list[str] = []
-    if not actor_problems:
-        api = SlackAPI(world=world, actor_id=contract.actor_id)
+    if api is not None:
         for number, call in enumerate(contract.gold_calls, 1):
             try:
                 output = _dispatch_gold(api, call.tool, call.arguments)
-            except Exception as exc:  # Candidate-owned deterministic tool failure.
+            except (SlackNotFoundError, TypeError, ValueError) as exc:
                 gold_problems.append(f"call {number}: {type(exc).__name__}: {exc}")
                 break
             gold_outputs.append(
@@ -389,23 +381,18 @@ def validate_world(world: SlackWorld, contract: TaskContract) -> dict[str, Any]:
                     "output": output,
                 }
             )
-    exposed = normalize_text(json.dumps([item["output"] for item in gold_outputs], sort_keys=True))
-    missing_evidence = []
-    for requirement in contract.required_evidence:
-        by_id = normalize_text(requirement.message_id) in exposed
-        by_terms = all(normalize_text(term) in exposed for term in requirement.required_terms)
-        if not (by_id or by_terms):
-            missing_evidence.append(requirement.evidence_id)
+    exposed_ids = _message_ids([item["output"] for item in gold_outputs])
+    missing_evidence = [
+        requirement.evidence_id
+        for requirement in contract.required_evidence
+        if requirement.message_id not in exposed_ids
+    ]
     if missing_evidence:
         gold_problems.append(f"gold path did not expose evidence {missing_evidence}")
     if len(json.dumps(gold_outputs, default=str).encode()) > MAX_SNAPSHOT_BYTES:
         gold_problems.append("gold call log exceeds the output bound")
     checks.append(_check("gold_replay", gold_problems))
 
-    evidence_corpus = "\n".join(evidence_texts)
-    claim_coverage = {
-        claim: _claim_coverage(claim, evidence_corpus) for claim in contract.answer.required_claims
-    }
     public_strings = [
         *(user.name for user in world.users),
         *(user.display_name or "" for user in world.users),
@@ -441,7 +428,6 @@ def validate_world(world: SlackWorld, contract: TaskContract) -> dict[str, Any]:
         "counts": counts,
         "snapshot_bytes": snapshot_size,
         "evidence": evidence_results,
-        "claim_coverage": claim_coverage,
         "gold_call_log": gold_outputs,
     }
 
@@ -609,13 +595,13 @@ def validate_compiled_snapshots(
     )
 
 
-_RUNNER_SOURCE = """# /// script
+CHECKER_RUNNER_SOURCE = """# /// script
 # requires-python = ">=3.11"
-# dependencies = ["pydantic==2.13.4", "verifiers==0.3.0"]
+# dependencies = ["pydantic==2.13.4", "verifiers==0.3.1"]
 # ///
 import sys
 sys.path.insert(0, "/task/fixed")
-from worldgen_slack.slack.validation import main
+from worldgen_slack.slack.validate import main
 raise SystemExit(main())
 """
 
@@ -641,6 +627,7 @@ async def evaluate_candidate_in_runtime(
     *,
     seeds: tuple[int, ...] = (0, 101, 202),
     timeout_seconds: float = 90.0,
+    on_seed_complete: Callable[[int, bool], None] | None = None,
 ) -> ValidationReport:
     from verifiers.v1.runtimes import provision_runtime
 
@@ -678,16 +665,13 @@ async def evaluate_candidate_in_runtime(
                 "slack", "models.py"
             ).read_bytes(),
             "/task/fixed/worldgen_slack/slack/api.py": package_dir.joinpath("slack", "api.py").read_bytes(),
-            "/task/fixed/worldgen_slack/slack/toolset.py": package_dir.joinpath(
-                "slack", "toolset.py"
-            ).read_bytes(),
-            "/task/fixed/worldgen_slack/slack/validation.py": Path(__file__).read_bytes(),
+            "/task/fixed/worldgen_slack/slack/validate.py": Path(__file__).read_bytes(),
             "/task/candidate/world.py": source,
             "/task/contract.json": contract.model_dump_json(indent=2).encode(),
         }
         for path, content in fixed_files.items():
             await runtime.write(path, content)
-        program = await runtime.prepare_uv_script(_RUNNER_SOURCE)
+        program = await runtime.prepare_uv_script(CHECKER_RUNNER_SOURCE)
         await runtime.prepare_execution([])
         probe = await runtime.run(
             [
@@ -698,76 +682,63 @@ async def evaluate_candidate_in_runtime(
             {},
         )
         if probe.exit_code == 0:
-            return _failed_report(
-                FailureOwner.INFRASTRUCTURE,
-                "network_policy",
-                "candidate runtime allowed external network",
-                runtime_info,
-            )
-        argv = [
-            *program,
-            "check-candidate",
-            "--candidate",
-            "/task/candidate/world.py",
-            "--contract",
-            "/task/contract.json",
-            "--output",
-            "/task/result.json",
-            "--seeds",
-            *(str(seed) for seed in seeds),
-        ]
-        wrapper = (
-            "#!/bin/sh\n"
-            "ulimit -f 8192\n"
-            + "PYTHONPATH=/task/fixed "
-            + shlex.join(argv)
-            + " > /task/candidate.stdout 2> /task/candidate.stderr\n"
-            "status=$?\n"
-            "tail -c 2000 /task/candidate.stdout 2>/dev/null || true\n"
-            "tail -c 2000 /task/candidate.stderr >&2 2>/dev/null || true\n"
-            "exit $status\n"
-        )
-        await runtime.write("/task/run-candidate", wrapper.encode())
+            raise RuntimeError("candidate runtime allowed external network")
+        snapshots: dict[str, Any] = {}
+        current_seed: int | None = None
         try:
             async with asyncio.timeout(timeout_seconds):
-                process = await runtime.run(["/bin/sh", "/task/run-candidate"], {})
+                for current_seed in seeds:
+                    output_path = f"/task/result-{current_seed}.json"
+                    argv = [
+                        *program,
+                        "check-candidate",
+                        "--candidate",
+                        "/task/candidate/world.py",
+                        "--contract",
+                        "/task/contract.json",
+                        "--output",
+                        output_path,
+                        "--seeds",
+                        str(current_seed),
+                    ]
+                    wrapper = (
+                        "#!/bin/sh\n"
+                        "ulimit -f 8192\n"
+                        + "PYTHONPATH=/task/fixed "
+                        + shlex.join(argv)
+                        + " > /task/candidate.stdout 2> /task/candidate.stderr\n"
+                        "status=$?\n"
+                        "tail -c 2000 /task/candidate.stdout 2>/dev/null || true\n"
+                        "tail -c 2000 /task/candidate.stderr >&2 2>/dev/null || true\n"
+                        "exit $status\n"
+                    )
+                    await runtime.write("/task/run-candidate", wrapper.encode())
+                    process = await runtime.run(["/bin/sh", "/task/run-candidate"], {})
+                    if process.exit_code not in (0, 2):
+                        detail = (process.stderr or process.stdout)[
+                            -2_000:
+                        ] or "fixed candidate runner failed"
+                        if not await runtime.alive():
+                            raise vf.SandboxError("candidate runtime stopped during execution")
+                        raise RuntimeError(detail)
+                    raw = await runtime.read(output_path, max_bytes=MAX_RESULT_BYTES)
+                    try:
+                        result = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("fixed candidate runner returned invalid JSON") from exc
+                    seed_snapshots = result.get("snapshots")
+                    if not isinstance(seed_snapshots, dict):
+                        raise RuntimeError("fixed candidate runner produced no snapshot map")
+                    snapshots.update(seed_snapshots)
+                    if on_seed_complete is not None:
+                        on_seed_complete(current_seed, process.exit_code == 0)
         except TimeoutError:
+            if current_seed is not None and on_seed_complete is not None:
+                on_seed_complete(current_seed, False)
             return _failed_report(
                 FailureOwner.BUILDER,
                 "candidate_timeout",
                 "candidate validation timed out",
-                runtime_info,
-            )
-        if process.exit_code not in (0, 2):
-            if not await runtime.alive():
-                return _failed_report(
-                    FailureOwner.INFRASTRUCTURE,
-                    "candidate_runtime",
-                    "candidate runtime stopped during execution",
-                    runtime_info,
-                )
-            return _failed_report(
-                FailureOwner.INFRASTRUCTURE,
-                "candidate_execution",
-                (process.stderr or process.stdout)[-2_000:] or "fixed candidate runner failed",
-                runtime_info,
-            )
-        raw = await runtime.read("/task/result.json", max_bytes=MAX_RESULT_BYTES)
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            return _failed_report(
-                FailureOwner.INFRASTRUCTURE,
-                "candidate_result",
-                f"fixed candidate runner returned invalid JSON: {exc}",
-                runtime_info,
-            )
-        snapshots = result.get("snapshots")
-        if not isinstance(snapshots, dict):
-            return _failed_report(
-                FailureOwner.BUILDER,
-                "candidate_result",
-                "candidate produced no snapshot map",
                 runtime_info,
             )
         return validate_compiled_snapshots(
@@ -798,6 +769,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
+    "CHECKER_RUNNER_SOURCE",
     "MAX_SOURCE_BYTES",
     "canonical_world_hash",
     "evaluate_candidate_in_runtime",

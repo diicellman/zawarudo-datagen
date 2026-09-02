@@ -19,30 +19,62 @@ from typing import Any
 import verifiers.v1 as vf
 
 from .contracts import (
-    INTERFACE_ID,
+    FailedStage,
+    FailureKind,
     FailureOwner,
     GenerationResult,
     ItemStatus,
-    JudgeVerdict,
-    QualityFilterConfig,
-    ScenarioSpec,
-    SynthesizedItem,
+    ReleaseAcceptanceConfig,
     ValidationReport,
-    synthesized_signature,
-    synthesized_signature_text,
-    token_jaccard,
+    WorldJudgeVerdict,
+    item_identity,
+    normalize_signature_text,
     redact_secrets,
 )
-from .slack.models import SlackWorld, TaskContract
-from .slack.validation import canonical_world_hash
+from .slack.models import (
+    INTERFACE_ID,
+    QUALITY_CRITERIA,
+    ScenarioSpec,
+    SlackWorld,
+    SynthesizedItem,
+    TaskContract,
+)
+from .slack.validate import canonical_world_hash
 
-GENERATOR_SCHEMA_VERSION = "worldgen-slack.dataset.v1"
+GENERATOR_SCHEMA_VERSION = "worldgen-slack.dataset.v3"
+RELEASE_TABLE_SCHEMA_VERSION = 2
+
+
+def synthesized_signature_text(item: SynthesizedItem) -> str:
+    fields = [
+        item.scenario.organization,
+        item.scenario.workflow,
+        item.task.question,
+        *item.task.answer.required_claims,
+    ]
+    return " | ".join(normalize_signature_text(value) for value in fields)
+
+
+def synthesized_signature(item: SynthesizedItem) -> str:
+    return hashlib.sha256(synthesized_signature_text(item).encode()).hexdigest()
+
+
+def token_jaccard(left: str, right: str) -> float:
+    left_tokens = set(normalize_signature_text(left).split())
+    right_tokens = set(normalize_signature_text(right).split())
+    if not left_tokens and not right_tokens:
+        return 1.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
 def _generator_source_hash() -> str:
     package = Path(__file__).resolve().parent
     base = package.parent
-    files = [path for path in package.rglob("*") if path.is_file() and path.suffix in {".py", ".json", ".md"}]
+    files = [
+        path
+        for path in package.rglob("*")
+        if path.is_file() and path.suffix in {".py", ".json", ".md", ".toml"}
+    ]
     files.extend(
         path
         for path in (base / "worldgen_slack_generation.py", base / "worldgen_slack_generated.py")
@@ -71,7 +103,67 @@ JSONL_FILES = (
     "public_tasks.jsonl",
     "private_oracles.jsonl",
     "attempts.jsonl",
+    "artifacts.jsonl",
 )
+ROLE_NAMES = ("synthesizer", "builder", "solver", "judge")
+ATTEMPT_VIEWER_FIELDS = {
+    "schema_version",
+    "run_id",
+    "attempt_id",
+    "created_at",
+    "instance_id",
+    "generation_seed",
+    "status",
+    "item_status",
+    "failure_owner",
+    "failed_stage",
+    "failure_kind",
+    "synthesis_ok",
+    "validation_ok",
+    "solver_score",
+    "builder_score",
+    "builder_raw_score",
+    "task_unambiguous",
+    "world_supports_task",
+    "world_criteria",
+    "synthesizer_tokens",
+    "builder_tokens",
+    "solver_tokens",
+    "judge_tokens",
+    "synthesizer_duration_ms",
+    "builder_duration_ms",
+    "solver_duration_ms",
+    "judge_duration_ms",
+    "synthesizer_cost",
+    "builder_cost",
+    "solver_cost",
+    "judge_cost",
+    "solver_judge_tokens",
+    "solver_judge_cost",
+    "solver_judge_model",
+    "world_judge_completed_action_count",
+    "world_judge_retry_count",
+    "whole_episode_retry_count",
+    "scenario_path",
+    "contract_path",
+    "source_path",
+    "snapshot_path",
+    "validation_path",
+    "solver_trace_path",
+    "world_judge_trace_path",
+    "solver_verdict_path",
+    "world_verdict_path",
+    "progress_path",
+}
+ARTIFACT_VIEWER_FIELDS = {
+    "schema_version",
+    "run_id",
+    "attempt_id",
+    "instance_id",
+    "path",
+    "sha256",
+    "size_bytes",
+}
 CATALOG_FIELDS = {
     "instance_id",
     "domain",
@@ -80,13 +172,18 @@ CATALOG_FIELDS = {
     "answer",
     "required_claims",
     "status",
-    "quality_score",
-    "judge_scores",
+    "solver_score",
+    "builder_score",
+    "builder_raw_score",
+    "world_criteria",
+    "world_hard_gates",
     "world_ref",
     "snapshot_ref",
     "oracle_ref",
     "solver_trace_ref",
-    "judge_ref",
+    "world_judge_trace_ref",
+    "solver_verdict_ref",
+    "world_verdict_ref",
     "interface_id",
     "interface_ref",
     "world_hash",
@@ -293,7 +390,7 @@ def validate_release_integrity(
     require_tasks: bool = False,
 ) -> None:
     release = Path(root).expanduser().resolve()
-    for name in (*JSONL_FILES, "setup_failures.jsonl", "run_manifest.json"):
+    for name in (*JSONL_FILES, "progress.jsonl", "manifest.json", "run_manifest.json"):
         path = release / name
         if path.exists() or path.is_symlink():
             _reject_symlink(path, name)
@@ -304,6 +401,21 @@ def validate_release_integrity(
     public_rows = _read_jsonl(release / "public_tasks.jsonl")
     private_rows = _read_jsonl(release / "private_oracles.jsonl")
     attempt_rows = _read_jsonl(release / "attempts.jsonl")
+    artifact_rows = _read_jsonl(release / "artifacts.jsonl")
+    viewer_manifest_path = release / "manifest.json"
+    if not viewer_manifest_path.is_file():
+        raise ValueError("release has no viewer manifest.json")
+    viewer_manifest = _read_json(viewer_manifest_path)
+    expected_viewer_manifest = {
+        "schema_version": RELEASE_TABLE_SCHEMA_VERSION,
+        "tables": {
+            "attempts": {"path": "attempts.jsonl", "format": "jsonl"},
+            "artifacts": {"path": "artifacts.jsonl", "format": "jsonl"},
+            "progress": {"path": "progress.jsonl", "format": "jsonl"},
+        },
+    }
+    if viewer_manifest != expected_viewer_manifest:
+        raise ValueError("viewer manifest contract mismatch")
     run_manifest_path = release / "run_manifest.json"
     if not run_manifest_path.is_file():
         raise ValueError("release has no immutable run_manifest.json")
@@ -313,7 +425,7 @@ def validate_release_integrity(
         raise ValueError("run manifest has an unsafe run_id")
     if expected_run_id is not None and manifest_run_id != expected_run_id:
         raise ValueError("run manifest belongs to another run")
-    if run_manifest.get("schema_version") != 1:
+    if run_manifest.get("schema_version") != 2:
         raise ValueError("run manifest schema mismatch")
     if run_manifest.get("interface_id") != INTERFACE_ID:
         raise ValueError("run manifest interface mismatch")
@@ -323,6 +435,14 @@ def validate_release_integrity(
         "generator_source_hash"
     ].startswith("sha256:"):
         raise ValueError("run manifest has no generator source hash")
+    if run_manifest.get("progress_path") != "progress.jsonl":
+        raise ValueError("run manifest has an invalid progress path")
+    if not isinstance(run_manifest.get("acceptance"), dict):
+        raise ValueError("run manifest has no acceptance policy")
+    ReleaseAcceptanceConfig.model_validate(run_manifest["acceptance"])
+    for field in ("target_accepted", "max_attempts", "concurrency"):
+        if isinstance(run_manifest.get(field), bool) or not isinstance(run_manifest.get(field), int):
+            raise ValueError(f"run manifest has invalid {field}")
     catalog = _row_index(catalog_rows, "catalog")
     public = _row_index(public_rows, "public")
     private = _row_index(private_rows, "private")
@@ -344,6 +464,42 @@ def validate_release_integrity(
         attempt_ids.add(attempt_id)
         if row.get("run_id") != manifest_run_id:
             raise ValueError(f"attempt {attempt_id!r} belongs to another run")
+        if not ATTEMPT_VIEWER_FIELDS <= set(row):
+            missing = sorted(ATTEMPT_VIEWER_FIELDS - set(row))
+            raise ValueError(f"attempt {attempt_id!r} is missing viewer fields: {missing}")
+        if row.get("schema_version") != RELEASE_TABLE_SCHEMA_VERSION:
+            raise ValueError(f"attempt {attempt_id!r} has an unsupported schema version")
+        created_at = row.get("created_at")
+        try:
+            timestamp = datetime.fromisoformat(created_at)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"attempt {attempt_id!r} has an invalid UTC timestamp") from exc
+        if timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(timestamp):
+            raise ValueError(f"attempt {attempt_id!r} timestamp is not UTC")
+        for role in ROLE_NAMES:
+            for suffix in ("tokens", "duration_ms"):
+                field = f"{role}_{suffix}"
+                value = row.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"attempt {attempt_id!r} has invalid {field}")
+            cost = row.get(f"{role}_cost")
+            if cost is not None and (
+                isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0
+            ):
+                raise ValueError(f"attempt {attempt_id!r} has invalid {role}_cost")
+        for field in ("solver_score", "builder_score", "builder_raw_score"):
+            value = row.get(field)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1
+            ):
+                raise ValueError(f"attempt {attempt_id!r} has invalid {field}")
+        criteria = row.get("world_criteria")
+        if criteria is not None and (
+            not isinstance(criteria, dict) or set(criteria) != set(QUALITY_CRITERIA)
+        ):
+            raise ValueError(f"attempt {attempt_id!r} has invalid world criteria")
+        if row.get("progress_path") != "progress.jsonl":
+            raise ValueError(f"attempt {attempt_id!r} has an invalid progress path")
         instance_id = row.get("instance_id")
         if instance_id is not None and (
             not isinstance(instance_id, str) or not _SAFE_COMPONENT.fullmatch(instance_id)
@@ -352,23 +508,15 @@ def validate_release_integrity(
         written = row.get("written_to_dataset")
         if not isinstance(written, bool):
             raise ValueError(f"attempt {attempt_id!r} has no boolean persistence decision")
-        retry_discarded = row.get("retry_discarded")
-        if not isinstance(retry_discarded, bool):
-            raise ValueError(f"attempt {attempt_id!r} has no retry_discarded flag")
+        expected_status = "accepted" if written else "rejected"
+        if row.get("status") != expected_status:
+            raise ValueError(f"attempt {attempt_id!r} status disagrees with persistence")
         generation_seed = row.get("generation_seed")
         if isinstance(generation_seed, bool) or not isinstance(generation_seed, int) or generation_seed < 0:
             raise ValueError(f"attempt {attempt_id!r} has an invalid generation seed")
-        if retry_discarded:
-            if (
-                written
-                or row.get("failure_owner") != "infrastructure"
-                or row.get("item_status") != ItemStatus.INFRASTRUCTURE_ERROR.value
-            ):
-                raise ValueError(f"retry-discarded attempt {attempt_id!r} is not infrastructure-owned")
-        elif generation_seed in terminal_seeds:
+        if generation_seed in terminal_seeds:
             raise ValueError(f"generation seed {generation_seed} has multiple terminal attempts")
-        else:
-            terminal_seeds.add(generation_seed)
+        terminal_seeds.add(generation_seed)
         artifact_ref = row.get("artifact_ref")
         if written:
             if not isinstance(instance_id, str) or instance_id not in catalog:
@@ -384,33 +532,65 @@ def validate_release_integrity(
             retained_rejected.add(attempt_id)
         if artifact_ref is not None and not _inside(release, artifact_ref).is_dir():
             raise ValueError(f"attempt {attempt_id!r} has a dangling artifact_ref")
-        trace_refs = row.get("trace_refs")
-        if not isinstance(trace_refs, dict):
-            raise ValueError(f"attempt {attempt_id!r} has invalid trace_refs")
-        for references in trace_refs.values():
-            if not isinstance(references, list) or not all(
-                isinstance(reference, str) for reference in references
-            ):
-                raise ValueError(f"attempt {attempt_id!r} has invalid trace references")
-            for reference in references:
-                target = _inside(release, reference)
-                if not target.is_file():
-                    raise ValueError(f"attempt {attempt_id!r} has a dangling trace reference")
-                if written and not reference.startswith(f"worlds/{instance_id}/"):
-                    raise ValueError(f"attempt {attempt_id!r} has a cross-world trace reference")
-                if (
-                    not written
-                    and artifact_ref is not None
-                    and not reference.startswith(f"rejected/{attempt_id}/")
-                ):
-                    raise ValueError(f"attempt {attempt_id!r} has a cross-attempt trace reference")
+        for field in (
+            "scenario_path",
+            "contract_path",
+            "source_path",
+            "snapshot_path",
+            "validation_path",
+            "solver_trace_path",
+            "world_judge_trace_path",
+            "solver_verdict_path",
+            "world_verdict_path",
+        ):
+            reference = row.get(field)
+            if reference is None:
+                continue
+            target = _inside(release, reference)
+            if not target.is_file():
+                raise ValueError(f"attempt {attempt_id!r} has a dangling {field}")
+            if artifact_ref is None or not reference.startswith(f"{artifact_ref}/"):
+                raise ValueError(f"attempt {attempt_id!r} has a cross-attempt {field}")
     if set(accepted_attempts) != set(catalog) or any(count != 1 for count in accepted_attempts.values()):
         raise ValueError("accepted dataset rows must have exactly one accepted attempt")
+
+    attempts_by_id = {row["attempt_id"]: row for row in attempt_rows}
+    artifact_paths: set[str] = set()
+    for number, row in enumerate(artifact_rows, 1):
+        if set(row) != ARTIFACT_VIEWER_FIELDS:
+            raise ValueError(f"artifact row {number} has unexpected fields")
+        if row.get("schema_version") != RELEASE_TABLE_SCHEMA_VERSION:
+            raise ValueError(f"artifact row {number} has an unsupported schema version")
+        if row.get("run_id") != manifest_run_id:
+            raise ValueError(f"artifact row {number} belongs to another run")
+        attempt = attempts_by_id.get(row.get("attempt_id"))
+        if attempt is None or row.get("instance_id") != attempt.get("instance_id"):
+            raise ValueError(f"artifact row {number} has no matching attempt")
+        reference = row.get("path")
+        target = _inside(release, reference)
+        if reference in artifact_paths:
+            raise ValueError("artifacts.jsonl has duplicate paths")
+        artifact_paths.add(reference)
+        if not target.is_file() or target.is_symlink():
+            raise ValueError(f"artifact row {number} has a dangling or symlinked path")
+        digest = row.get("sha256")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError(f"artifact row {number} has an invalid SHA-256 hash")
+        if digest != hashlib.sha256(target.read_bytes()).hexdigest():
+            raise ValueError(f"artifact hash mismatch: {reference}")
+        if row.get("size_bytes") != target.stat().st_size:
+            raise ValueError(f"artifact size mismatch: {reference}")
 
     interface_root = release / "interfaces" / INTERFACE_ID
     _reject_symlink(interface_root, "interface version directory")
     interface_hashes = {}
-    for name in ("interface.json", "models.schema.json", "behavior.md"):
+    for name in (
+        "interface.json",
+        "slack_world.schema.json",
+        "task_contract.schema.json",
+        "builder_guide.md",
+        "world_rubric.toml",
+    ):
         path = interface_root / name
         _reject_symlink(path, f"interface file {name}")
         if not path.is_file():
@@ -434,7 +614,9 @@ def validate_release_integrity(
             "snapshot_ref": f"{base}/snapshot.json",
             "oracle_ref": f"{base}/task_contract.json",
             "solver_trace_ref": f"{base}/solver_trace.json",
-            "judge_ref": f"{base}/judge_verdict.json",
+            "world_judge_trace_ref": f"{base}/judge_trace.json",
+            "solver_verdict_ref": f"{base}/solver_verdict.json",
+            "world_verdict_ref": f"{base}/world_verdict.json",
             "interface_ref": f"interfaces/{INTERFACE_ID}/interface.json",
         }
         for key, reference in expected_catalog_refs.items():
@@ -468,7 +650,8 @@ def validate_release_integrity(
             "builder_trace.json",
             "solver_trace.json",
             "judge_trace.json",
-            "judge_verdict.json",
+            "solver_verdict.json",
+            "world_verdict.json",
             "manifest.json",
             "public_checks.json",
         }
@@ -479,7 +662,7 @@ def validate_release_integrity(
             )
         manifest_path = world_dir / "manifest.json"
         manifest = _read_json(manifest_path)
-        if manifest.get("schema_version") != 1:
+        if manifest.get("schema_version") != 2:
             raise ValueError(f"manifest schema mismatch for {instance_id}")
         artifact_hashes = manifest.get("artifact_hashes")
         expected_artifacts = required_files - {"manifest.json"}
@@ -500,10 +683,20 @@ def validate_release_integrity(
         if len(matching_attempts) != 1:
             raise ValueError(f"manifest attempt mismatch for {instance_id}")
         matching_attempt = matching_attempts[0]
-        if manifest.get("runtime_records") != matching_attempt.get("runtime_records"):
-            raise ValueError(f"manifest runtime records mismatch for {instance_id}")
-        if manifest.get("builder") != matching_attempt.get("builder"):
-            raise ValueError(f"manifest builder metadata mismatch for {instance_id}")
+        expected_attempt_paths = {
+            "scenario_path": f"{base}/scenario.json",
+            "contract_path": f"{base}/task_contract.json",
+            "source_path": f"{base}/world.py",
+            "snapshot_path": f"{base}/snapshot.json",
+            "validation_path": f"{base}/validation.json",
+            "solver_trace_path": f"{base}/solver_trace.json",
+            "world_judge_trace_path": f"{base}/judge_trace.json",
+            "solver_verdict_path": f"{base}/solver_verdict.json",
+            "world_verdict_path": f"{base}/world_verdict.json",
+        }
+        for field, reference in expected_attempt_paths.items():
+            if matching_attempt.get(field) != reference:
+                raise ValueError(f"attempt {field} mismatch for {instance_id}")
         if manifest.get("generation_seed") != matching_attempt.get("generation_seed"):
             raise ValueError(f"manifest generation seed mismatch for {instance_id}")
         if manifest.get("run_id") != manifest_run_id:
@@ -518,11 +711,14 @@ def validate_release_integrity(
             "pydantic_version",
             "prime_image",
             "rlm_revision",
+            "world_rubric_hash",
         ):
             if manifest.get(key) != run_manifest.get(key):
                 raise ValueError(f"manifest {key} mismatch for {instance_id}")
         if manifest.get("interface_hashes") != interface_hashes:
             raise ValueError(f"manifest interface hashes mismatch for {instance_id}")
+        if manifest.get("acceptance") != run_manifest.get("acceptance"):
+            raise ValueError(f"manifest acceptance policy mismatch for {instance_id}")
         world_path = _inside(release, expected_catalog_refs["world_ref"])
         snapshot_path = _inside(release, expected_catalog_refs["snapshot_ref"])
         contract_path = _inside(release, expected_catalog_refs["oracle_ref"])
@@ -545,40 +741,130 @@ def validate_release_integrity(
         if gold.get("calls") != expected_calls or not isinstance(gold.get("call_log"), list):
             raise ValueError(f"gold artifact mismatch for {instance_id}")
         validation_data = _read_json(world_dir / "validation.json")
-        if matching_attempt.get("validation") != validation_data:
-            raise ValueError(f"attempt validation mismatch for {instance_id}")
         validation = ValidationReport.model_validate_json(
             json.dumps({**validation_data, "public_snapshot": world.model_dump(mode="json")})
         )
         if not validation.ok or validation.gold_call_log != gold["call_log"]:
             raise ValueError(f"validation/gold mismatch for {instance_id}")
-        verdict_data = _read_json(world_dir / "judge_verdict.json")
-        verdict = JudgeVerdict.model_validate_json(json.dumps(verdict_data))
-        if matching_attempt.get("verdict") != verdict_data:
-            raise ValueError(f"attempt verdict mismatch for {instance_id}")
-        if matching_attempt.get("judge_scores") != verdict.scores:
-            raise ValueError(f"attempt judge scores mismatch for {instance_id}")
-        if catalog_row.get("judge_scores") != verdict.scores:
-            raise ValueError(f"catalog judge scores mismatch for {instance_id}")
+        from .agents.judge import world_reward_scores
+        from .agents.solver import SolverAnswerVerdict, solver_verdict_scores
+
+        world_verdict = WorldJudgeVerdict.model_validate_json(
+            json.dumps(_read_json(world_dir / "world_verdict.json"))
+        )
+        solver_verdict = SolverAnswerVerdict.model_validate(_read_json(world_dir / "solver_verdict.json"))
+        solver_scores = solver_verdict_scores(solver_verdict, contract.answer)
+        world_scores = world_reward_scores(True, world_verdict)
+        if matching_attempt.get("solver_score") != solver_scores["semantic_correctness"]:
+            raise ValueError(f"attempt solver score mismatch for {instance_id}")
+        if matching_attempt.get("builder_score") != world_scores["world_quality"]:
+            raise ValueError(f"attempt builder score mismatch for {instance_id}")
+        if matching_attempt.get("builder_raw_score") != world_scores["world_quality_raw"]:
+            raise ValueError(f"attempt raw builder score mismatch for {instance_id}")
+        if matching_attempt.get("world_criteria") != world_scores["criteria"]:
+            raise ValueError(f"attempt world criteria mismatch for {instance_id}")
+        expected_hard = world_scores["hard_gates"]
+        if catalog_row.get("world_hard_gates") != expected_hard:
+            raise ValueError(f"catalog world hard gates mismatch for {instance_id}")
+        for key in ("solver_score", "builder_score", "builder_raw_score", "world_criteria"):
+            if catalog_row.get(key) != matching_attempt.get(key):
+                raise ValueError(f"{key} mismatch for {instance_id}")
         if catalog_row.get("status") != matching_attempt.get("semantic_status"):
             raise ValueError(f"semantic status mismatch for {instance_id}")
-        if catalog_row.get("quality_score") != matching_attempt.get("quality_score"):
-            raise ValueError(f"quality score mismatch for {instance_id}")
         public_checks = _read_json_value(world_dir / "public_checks.json")
         if not isinstance(public_checks, list):
             raise ValueError(f"invalid public checks for {instance_id}")
-        trace_ids = matching_attempt.get("trace_ids")
-        if not isinstance(trace_ids, dict):
-            raise ValueError(f"accepted attempt has invalid trace IDs for {instance_id}")
+        trace_records: dict[str, dict[str, Any]] = {}
         for role in ("synthesizer", "builder", "solver", "judge"):
             trace_record = _read_json(world_dir / f"{role}_trace.json")
-            ids = trace_ids.get(role)
+            trace_records[role] = trace_record
+            agent = trace_record.get("agent")
             if (
                 not isinstance(trace_record.get("id"), str)
-                or not isinstance(ids, list)
-                or trace_record["id"] not in ids
+                or not isinstance(agent, dict)
+                or agent.get("name") != role
             ):
                 raise ValueError(f"{role} trace identity mismatch for {instance_id}")
+
+        solver_trace = trace_records["solver"]
+        solver_rewards = solver_trace.get("rewards")
+        solver_info = solver_trace.get("info")
+        if not isinstance(solver_rewards, dict) or not isinstance(solver_info, dict):
+            raise ValueError(f"solver trace reward data missing for {instance_id}")
+        semantic_reward = solver_rewards.get("semantic_correctness")
+        if (
+            not isinstance(semantic_reward, dict)
+            or semantic_reward.get("score") != solver_scores["semantic_correctness"]
+            or semantic_reward.get("weight") != 1.0
+        ):
+            raise ValueError(f"solver named reward mismatch for {instance_id}")
+        if solver_info.get("solver_semantic_verdict") != solver_verdict.model_dump(mode="json"):
+            raise ValueError(f"solver trace verdict mismatch for {instance_id}")
+        for reward_name in (
+            "required_claim_coverage",
+            "contradiction_free",
+            "forbidden_claim_count",
+        ):
+            reward = solver_rewards.get(reward_name)
+            if (
+                not isinstance(reward, dict)
+                or reward.get("score") != solver_scores[reward_name]
+                or reward.get("weight") != 0.0
+            ):
+                raise ValueError(f"solver diagnostic reward {reward_name!r} mismatch for {instance_id}")
+        semantic_details = solver_info.get("solver_semantic_scores")
+        if (
+            not isinstance(semantic_details, dict)
+            or semantic_details.get("semantic_correctness") != solver_scores["semantic_correctness"]
+        ):
+            raise ValueError(f"solver trace score details mismatch for {instance_id}")
+
+        builder_trace = trace_records["builder"]
+        builder_rewards = builder_trace.get("rewards")
+        builder_info = builder_trace.get("info")
+        if not isinstance(builder_rewards, dict) or not isinstance(builder_info, dict):
+            raise ValueError(f"builder trace reward data missing for {instance_id}")
+        world_reward = builder_rewards.get("world_quality")
+        raw_reward = builder_rewards.get("world_quality_raw")
+        if (
+            not isinstance(world_reward, dict)
+            or world_reward.get("score") != world_scores["world_quality"]
+            or world_reward.get("weight") != 1.0
+            or not isinstance(raw_reward, dict)
+            or raw_reward.get("score") != world_scores["world_quality_raw"]
+            or raw_reward.get("weight") != 0.0
+            or builder_info.get("world_reward") != world_scores
+        ):
+            raise ValueError(f"builder named reward mismatch for {instance_id}")
+        expected_builder_diagnostics = {
+            "deterministic_validation": world_scores["deterministic_validation"],
+            "task_unambiguous": float(world_scores["hard_gates"]["task_unambiguous"]),
+            "world_supports_task": float(world_scores["hard_gates"]["world_supports_task"]),
+            **world_scores["criteria"],
+        }
+        for reward_name, expected_score in expected_builder_diagnostics.items():
+            reward = builder_rewards.get(reward_name)
+            if (
+                not isinstance(reward, dict)
+                or reward.get("score") != expected_score
+                or reward.get("weight") != 0.0
+            ):
+                raise ValueError(f"builder diagnostic reward {reward_name!r} mismatch for {instance_id}")
+
+        judge_info = trace_records["judge"].get("info")
+        if not isinstance(judge_info, dict) or judge_info.get("world_verdict") != world_verdict.model_dump(
+            mode="json"
+        ):
+            raise ValueError(f"world judge trace verdict mismatch for {instance_id}")
+        completed_actions = judge_info.get("completed_actions")
+        if not isinstance(completed_actions, list) or not completed_actions:
+            raise ValueError(f"world judge trace has no empirical Slack actions for {instance_id}")
+        from .slack.tools import SlackActionRecord
+
+        for action in completed_actions:
+            SlackActionRecord.model_validate(action)
+        if matching_attempt.get("world_judge_completed_action_count") != len(completed_actions):
+            raise ValueError(f"world judge action count mismatch for {instance_id}")
         expected_hashes = {
             "world_hash": _sha256(world_path.read_bytes()),
             "snapshot_hash": _sha256(snapshot_path.read_bytes()),
@@ -665,6 +951,16 @@ def validate_release_integrity(
             if hashes[name] != _sha256(path.read_bytes()):
                 raise ValueError(f"rejected artifact {attempt_id!r} hash mismatch: {name}")
 
+    expected_artifact_paths = {
+        path.relative_to(release).as_posix()
+        for root_name in ("worlds", "rejected")
+        for path in (release / root_name).rglob("*")
+        if path.is_file()
+    }
+    if artifact_paths != expected_artifact_paths:
+        difference = sorted(artifact_paths ^ expected_artifact_paths)
+        raise ValueError(f"artifacts.jsonl and canonical files differ: {difference}")
+
 
 class DatasetWriter:
     def __init__(
@@ -672,16 +968,28 @@ class DatasetWriter:
         output: str | Path,
         *,
         run_id: str,
-        quality_filter: QualityFilterConfig,
+        acceptance: ReleaseAcceptanceConfig,
         prime_image: str,
         rlm_revision: str,
         environment_config: Mapping[str, Any],
+        target_accepted: int,
+        max_attempts: int,
+        concurrency: int,
+        progress_path: str = "progress.jsonl",
     ) -> None:
         if not _SAFE_COMPONENT.fullmatch(run_id):
             raise ValueError(f"unsafe run_id: {run_id!r}")
+        if target_accepted < 1 or max_attempts < target_accepted or concurrency < 1:
+            raise ValueError("invalid target, attempt guard, or concurrency")
+        if progress_path != "progress.jsonl":
+            raise ValueError("progress path must be the canonical progress.jsonl")
         self.root = Path(output).expanduser().resolve()
         self.run_id = run_id
-        self.quality_filter = quality_filter
+        self.acceptance = acceptance
+        self.target_accepted = target_accepted
+        self.max_attempts = max_attempts
+        self.concurrency = concurrency
+        self.progress_path = progress_path
         self.prime_image = prime_image
         self.rlm_revision = rlm_revision
         raw_environment_config = _jsonable(environment_config)
@@ -692,16 +1000,36 @@ class DatasetWriter:
         self.verifiers_version = version("verifiers")
         self.pydantic_version = version("pydantic")
         self._lock = threading.RLock()
+        self.process_started_at = datetime.now(UTC)
         self.root.mkdir(parents=True, exist_ok=True)
+        previous_summary_path = self.root / "summary.json"
+        previous_summary = (
+            _read_json(previous_summary_path)
+            if previous_summary_path.is_file() and not previous_summary_path.is_symlink()
+            else {}
+        )
+        previous_active = previous_summary.get("active_wall_time_seconds", 0.0)
+        self.prior_active_seconds = (
+            float(previous_active)
+            if isinstance(previous_active, (int, float)) and not isinstance(previous_active, bool)
+            else 0.0
+        )
+        existing_manifest = self.root / "run_manifest.json"
+        _reject_symlink(existing_manifest, "run manifest")
+        if existing_manifest.is_file() and (
+            _read_json(existing_manifest).get("generator_schema_version") != GENERATOR_SCHEMA_VERSION
+        ):
+            raise ValueError("release uses an incompatible dataset schema; create a new v3 output directory")
         worlds = self.root / "worlds"
         _reject_symlink(worlds, "worlds directory")
         worlds.mkdir(exist_ok=True)
-        for name in (*JSONL_FILES, "setup_failures.jsonl"):
+        for name in (*JSONL_FILES, self.progress_path):
             path = self.root / name
             _reject_symlink(path, name)
             path.touch(exist_ok=True)
         self._recover_transactions()
         self.interface_hashes = self._install_interface()
+        self._install_viewer_manifest()
         self._install_run_manifest()
         self._validate_resume()
         self._load_signature_index()
@@ -716,8 +1044,16 @@ class DatasetWriter:
         return {
             int(row["generation_seed"])
             for row in _read_jsonl(self.attempts_path)
-            if isinstance(row.get("generation_seed"), int) and row.get("retry_discarded") is not True
+            if isinstance(row.get("generation_seed"), int)
         }
+
+    @property
+    def attempted_count(self) -> int:
+        return len(_read_jsonl(self.attempts_path))
+
+    @property
+    def accepted_count(self) -> int:
+        return sum(bool(row.get("written_to_dataset")) for row in _read_jsonl(self.attempts_path))
 
     @property
     def transaction_root(self) -> Path:
@@ -771,28 +1107,52 @@ class DatasetWriter:
         _reject_symlink(interfaces, "interfaces directory")
         _reject_symlink(destination, "interface version directory")
         destination.mkdir(parents=True, exist_ok=True)
+        artifacts = {
+            "interface.json": (source / "interface.json").read_bytes(),
+            "slack_world.schema.json": _dumps(SlackWorld.model_json_schema(), pretty=True),
+            "task_contract.schema.json": _dumps(TaskContract.model_json_schema(), pretty=True),
+            "builder_guide.md": (source / "builder_guide.md").read_bytes(),
+            "world_rubric.toml": (source / "world_rubric.toml").read_bytes(),
+        }
         hashes: dict[str, str] = {}
-        for source_name, target_name in (
-            ("interface.json", "interface.json"),
-            ("models.schema.json", "models.schema.json"),
-            ("behavior.md", "behavior.md"),
-        ):
-            data = (source / source_name).read_bytes()
-            target = destination / target_name
-            _reject_symlink(target, f"interface file {target_name}")
-            if target.exists() and target.read_bytes() != data:
+        for name, data in artifacts.items():
+            target = destination / name
+            _reject_symlink(target, f"interface file {name}")
+            content = data if isinstance(data, bytes) else data.encode()
+            if target.exists() and target.read_bytes() != content:
                 raise ValueError(f"existing interface artifact differs: {target}")
             if not target.exists():
-                _atomic_write(target, data)
-            hashes[target_name] = _sha256(data)
+                _atomic_write(target, content)
+            hashes[name] = _sha256(content)
         return hashes
 
-    def _install_run_manifest(self) -> None:
+    def _install_viewer_manifest(self) -> None:
         manifest = {
-            "schema_version": 1,
+            "schema_version": RELEASE_TABLE_SCHEMA_VERSION,
+            "tables": {
+                "attempts": {"path": "attempts.jsonl", "format": "jsonl"},
+                "artifacts": {"path": "artifacts.jsonl", "format": "jsonl"},
+                "progress": {"path": "progress.jsonl", "format": "jsonl"},
+            },
+        }
+        path = self.root / "manifest.json"
+        _reject_symlink(path, "viewer manifest")
+        if path.exists() and _read_json(path) != manifest:
+            raise ValueError("release manifest differs from the supported viewer contract")
+        if not path.exists():
+            _atomic_write(path, _dumps(manifest, pretty=True))
+
+    def _install_run_manifest(self) -> None:
+        path = self.root / "run_manifest.json"
+        _reject_symlink(path, "run manifest")
+        existing = _read_json(path) if path.exists() else None
+        created_at = existing.get("created_at") if existing is not None else datetime.now(UTC).isoformat()
+        manifest = {
+            "schema_version": 2,
             "generator_schema_version": GENERATOR_SCHEMA_VERSION,
             "interface_id": INTERFACE_ID,
             "run_id": self.run_id,
+            "created_at": created_at,
             "worldgen_version": self.worldgen_version,
             "verifiers_version": self.verifiers_version,
             "pydantic_version": self.pydantic_version,
@@ -800,20 +1160,25 @@ class DatasetWriter:
             "prime_image": self.prime_image,
             "rlm_revision": self.rlm_revision,
             "interface_hashes": self.interface_hashes,
+            "world_rubric_hash": self.interface_hashes["world_rubric.toml"],
             "environment_config_hash": self.environment_config_hash,
             "environment_config": self.environment_config,
+            "acceptance": self.acceptance.model_dump(mode="json"),
+            "target_accepted": self.target_accepted,
+            "max_attempts": self.max_attempts,
+            "concurrency": self.concurrency,
+            "progress_path": self.progress_path,
         }
-        path = self.root / "run_manifest.json"
-        _reject_symlink(path, "run manifest")
-        if path.exists():
-            if _read_json(path) != _jsonable(manifest):
+        if existing is not None:
+            if existing != _jsonable(manifest):
                 raise ValueError("output directory belongs to a different immutable run config")
-            return
-        has_existing_attempts = bool(_read_jsonl(self.root / "attempts.jsonl"))
-        has_existing_worlds = any((self.root / "worlds").iterdir())
-        if has_existing_attempts or has_existing_worlds:
-            raise ValueError("existing output has no immutable run_manifest.json")
-        _atomic_write(path, _dumps(manifest, pretty=True))
+        else:
+            has_existing_attempts = bool(_read_jsonl(self.root / "attempts.jsonl"))
+            has_existing_worlds = any((self.root / "worlds").iterdir())
+            if has_existing_attempts or has_existing_worlds:
+                raise ValueError("existing output has no immutable run_manifest.json")
+            _atomic_write(path, _dumps(manifest, pretty=True))
+        self.run_started_at = datetime.fromisoformat(str(created_at))
 
     def _validate_resume(self) -> None:
         validate_release_integrity(self.root, expected_run_id=self.run_id)
@@ -823,6 +1188,8 @@ class DatasetWriter:
         self._signature_seeds: dict[str, int] = {}
         self._committed_signatures: set[str] = set()
         for row in _read_jsonl(self.attempts_path):
+            if row.get("item_status") == ItemStatus.DUPLICATE.value:
+                continue
             signature = row.get("signature")
             text = row.get("signature_text")
             seed = row.get("generation_seed")
@@ -871,27 +1238,9 @@ class DatasetWriter:
             self._signature_seeds[signature] = generation_seed
         return True, signature, text, None
 
-    def recent_summaries(self, limit: int = 10) -> list[dict[str, object]]:
-        rows = _read_jsonl(self.root / "dataset.jsonl")[-limit:]
-        output: list[dict[str, object]] = []
-        for row in rows:
-            scenario_path = self.root / "worlds" / row["instance_id"] / "scenario.json"
-            scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
-            output.append(
-                {
-                    "organization": scenario["organization"],
-                    "workflow": scenario["workflow"],
-                    "question": row["question"],
-                    "required_claims": row.get("required_claims", []),
-                }
-            )
-        return output
-
     @staticmethod
     def identity(item: SynthesizedItem) -> tuple[str, str]:
-        contract_hash = hashlib.sha256(_canonical_bytes(item.task)).hexdigest()
-        source = item.task.task_slug or f"{item.scenario.organization}-{item.scenario.workflow}"
-        instance_id = f"{_safe_slug(source)}--{contract_hash[:12]}"
+        instance_id, contract_hash = item_identity(item)
         if not _SAFE_COMPONENT.fullmatch(instance_id):
             raise ValueError(f"unsafe generated instance ID: {instance_id!r}")
         return instance_id, contract_hash
@@ -912,33 +1261,138 @@ class DatasetWriter:
             output.append(record)
         return output
 
-    def write_setup_failure(
+    @staticmethod
+    def _role_stats(traces: Sequence[vf.Trace], role: str) -> dict[str, Any]:
+        selected = [trace for trace in traces if trace.agent and trace.agent.name == role]
+        discarded = [
+            record
+            for trace in selected
+            for record in trace.info.get("discarded_attempt_usage", [])
+            if isinstance(record, dict)
+        ]
+        usages = [usage for trace in selected if (usage := getattr(trace, "usage", None))]
+        usages.extend(
+            vf.Usage.model_validate(record["usage"])
+            for record in discarded
+            if isinstance(record.get("usage"), dict)
+        )
+        usage = vf.Usage.aggregate(usages)
+        auxiliary_values = [item for trace in selected for item in getattr(trace, "extra_usage", [])]
+        auxiliary_values.extend(
+            vf.Usage.model_validate(item)
+            for record in discarded
+            for item in record.get("extra_usage", [])
+            if isinstance(item, dict)
+        )
+        auxiliary = vf.Usage.aggregate(auxiliary_values)
+        seconds = 0.0
+        for trace in selected:
+            timing = getattr(trace, "timing", None)
+            if timing is None:
+                continue
+            seconds += sum(
+                float(getattr(getattr(timing, name, None), "duration", 0.0))
+                for name in ("boot", "setup", "agent", "finalize", "scoring")
+            )
+        seconds += sum(
+            float(record.get("duration_ms", 0)) / 1_000
+            for record in discarded
+            if isinstance(record.get("duration_ms"), (int, float))
+        )
+        models = {trace.agent.config.model for trace in selected if trace.agent and trace.agent.config.model}
+        models.update(record["model"] for record in discarded if isinstance(record.get("model"), str))
+        return {
+            "tokens": int(usage.total_tokens or 0)
+            if usage is not None
+            else sum(int(getattr(trace, "num_total_tokens", 0)) for trace in selected),
+            "input_tokens": usage.input_tokens if usage is not None else None,
+            "output_tokens": usage.completion_tokens if usage is not None else None,
+            "cached_input_tokens": usage.cached_input_tokens if usage is not None else None,
+            "reasoning_tokens": usage.reasoning_tokens if usage is not None else None,
+            "cost": usage.cost if usage is not None else None,
+            "auxiliary_tokens": int(auxiliary.total_tokens or 0) if auxiliary is not None else 0,
+            "auxiliary_cost": auxiliary.cost if auxiliary is not None else None,
+            "duration_ms": int(round(seconds * 1_000)),
+            "model": next(iter(models)) if len(models) == 1 else None,
+            "retry_count": sum(
+                int(trace.info.get("retry_count", 0))
+                for trace in selected
+                if isinstance(trace.info.get("retry_count", 0), int)
+            ),
+        }
+
+    def _artifact_rows(
+        self,
+        *,
+        attempt_id: str,
+        instance_id: str | None,
+        artifact_ref: str | None,
+    ) -> list[dict[str, Any]]:
+        if artifact_ref is None:
+            return []
+        directory = _inside(self.root, artifact_ref)
+        rows = []
+        for path in sorted(directory.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(self.root).as_posix()
+            rows.append(
+                {
+                    "schema_version": RELEASE_TABLE_SCHEMA_VERSION,
+                    "run_id": self.run_id,
+                    "attempt_id": attempt_id,
+                    "instance_id": instance_id,
+                    "path": relative,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "size_bytes": path.stat().st_size,
+                }
+            )
+        return rows
+
+    def write_failed_episode(
         self,
         *,
         generation_seed: int,
         episode: vf.Episode,
         reason: str,
+        failed_stage: FailedStage,
+        failure_kind: FailureKind,
+        failure_owner: FailureOwner,
         traces: Sequence[vf.Trace] = (),
     ) -> dict[str, Any]:
         diagnostic_traces = list(traces) or list(episode.traces)
         errors = [*episode.errors]
         for trace in diagnostic_traces:
             errors.extend(trace.errors)
-        row = redact_secrets(
-            {
-                "run_id": self.run_id,
-                "created_at": datetime.now(UTC).isoformat(),
-                "generation_seed": generation_seed,
-                "reason": reason,
-                "episode_id": episode.id,
-                "errors": [{"type": error.type, "message": error.message} for error in errors],
-                "trace_ids": [trace.id for trace in diagnostic_traces],
-                "runtime_records": self._runtime_records(diagnostic_traces),
-            }
+        status = (
+            ItemStatus.INFRASTRUCTURE_ERROR
+            if failure_owner == FailureOwner.INFRASTRUCTURE
+            else ItemStatus.PROTOCOL_ERROR
         )
-        with self._lock:
-            _append_jsonl(self.root / "setup_failures.jsonl", row)
-        return row
+        result = GenerationResult(
+            generation_seed=generation_seed,
+            status=status,
+            failure_owner=failure_owner,
+            failed_stage=failed_stage,
+            failure_kind=failure_kind,
+            reason=str(redact_secrets(reason))[:4_000],
+        )
+        return self.write_attempt(
+            result,
+            signature_text=None,
+            source=None,
+            traces=diagnostic_traces,
+            builder_metadata={
+                "episode_id": episode.id,
+                "episode_errors": [
+                    {
+                        "type": error.type,
+                        "message": str(redact_secrets(error.message))[:1_000],
+                    }
+                    for error in errors[:20]
+                ],
+            },
+        )
 
     def write_attempt(
         self,
@@ -949,14 +1403,18 @@ class DatasetWriter:
         traces: Sequence[vf.Trace],
         public_checks: Sequence[Mapping[str, Any]] = (),
         builder_metadata: Mapping[str, Any] | None = None,
-        retry_discarded: bool = False,
     ) -> dict[str, Any]:
+        result = GenerationResult.model_validate_json(result.model_dump_json())
+        if result.synthesized is not None and result.signature != synthesized_signature(result.synthesized):
+            raise ValueError("persisted signature does not match the synthesized item")
         with self._lock:
             attempt_id = self._next_attempt_id(result.generation_seed)
             trace_ids: dict[str, list[str]] = {}
             for trace in traces:
                 role = trace.agent.name if trace.agent and trace.agent.name else "unknown"
                 trace_ids.setdefault(role, []).append(trace.id)
+            if result.trace_ids and result.trace_ids != trace_ids:
+                raise ValueError("generation result trace IDs do not match persisted traces")
             result = result.model_copy(update={"trace_ids": trace_ids})
             sizes = {self.root / name: (self.root / name).stat().st_size for name in JSONL_FILES}
             world_path = self.root / "worlds" / result.instance_id if result.instance_id is not None else None
@@ -998,7 +1456,7 @@ class DatasetWriter:
                         reference = f"{artifact_ref}/{role}_trace.json"
                         if (self.root / reference).is_file():
                             trace_refs[role] = [reference]
-                elif self.quality_filter.retain_rejected_artifacts:
+                elif self.acceptance.retain_rejected_artifacts:
                     artifact_ref, trace_refs = self._write_rejected(
                         attempt_id,
                         result,
@@ -1008,58 +1466,142 @@ class DatasetWriter:
                         builder_metadata=builder_metadata or {},
                     )
 
-                attempt_reason = result.reason
-                if result.failure_owner == FailureOwner.INFRASTRUCTURE and attempt_reason:
-                    attempt_reason = str(redact_secrets(attempt_reason))[:4_000]
-                safe_builder = dict(builder_metadata or {})
-                episode_errors = safe_builder.get("episode_errors")
-                if isinstance(episode_errors, list):
-                    safe_builder["episode_errors"] = [
-                        {
-                            "type": str(item.get("type", ""))[:128],
-                            "message": str(redact_secrets(item.get("message", "")))[:1_000],
-                        }
-                        for item in episode_errors[:20]
-                        if isinstance(item, dict)
-                    ]
-                safe_solver = result.solver.model_dump(mode="json") if result.solver else None
-                if safe_solver is not None:
-                    safe_solver["visible_errors"] = [
-                        str(redact_secrets(value))[:1_000]
-                        for value in safe_solver.get("visible_errors", [])[:20]
-                    ]
+                attempt_reason = str(redact_secrets(result.reason))[:4_000] if result.reason else None
+                role_stats = {role: self._role_stats(traces, role) for role in ROLE_NAMES}
+                synthesis_ok = result.synthesized is not None or any(
+                    trace.agent
+                    and trace.agent.name == "synthesizer"
+                    and isinstance(trace.info.get("synthesized_item"), dict)
+                    for trace in traces
+                )
+                validation_ok = (
+                    result.validation.ok
+                    if result.validation is not None
+                    else any(
+                        trace.agent
+                        and trace.agent.name == "builder"
+                        and isinstance(trace.info.get("worldgen_validation"), dict)
+                        and trace.info["worldgen_validation"].get("ok") is True
+                        for trace in traces
+                    )
+                )
+                accepted_base = artifact_ref if written else None
                 row = {
+                    "schema_version": RELEASE_TABLE_SCHEMA_VERSION,
                     "attempt_id": attempt_id,
                     "run_id": self.run_id,
                     "created_at": datetime.now(UTC).isoformat(),
                     "generation_seed": result.generation_seed,
                     "instance_id": result.instance_id,
+                    "status": "accepted" if written else "rejected",
                     "item_status": result.status.value,
                     "failure_owner": result.failure_owner.value,
+                    "failed_stage": result.failed_stage.value if result.failed_stage else None,
+                    "failure_kind": result.failure_kind.value if result.failure_kind else None,
+                    "synthesis_ok": synthesis_ok,
+                    "validation_ok": validation_ok,
+                    "solver_score": result.solver_score,
+                    "solver_metrics": result.solver_metrics,
+                    "builder_score": result.builder_score,
+                    "builder_raw_score": result.builder_raw_score,
+                    "task_unambiguous": (
+                        result.world_hard_gates["task_unambiguous"] if result.world_hard_gates else None
+                    ),
+                    "world_supports_task": (
+                        result.world_hard_gates["world_supports_task"] if result.world_hard_gates else None
+                    ),
+                    "world_criteria": result.world_criteria,
+                    "scenario_path": f"{accepted_base}/scenario.json" if accepted_base else None,
+                    "contract_path": f"{accepted_base}/task_contract.json" if accepted_base else None,
+                    "source_path": (
+                        f"{artifact_ref}/world.py"
+                        if artifact_ref and (self.root / artifact_ref / "world.py").is_file()
+                        else None
+                    ),
+                    "snapshot_path": (
+                        f"{artifact_ref}/snapshot.json"
+                        if artifact_ref and (self.root / artifact_ref / "snapshot.json").is_file()
+                        else None
+                    ),
+                    "validation_path": f"{accepted_base}/validation.json" if accepted_base else None,
+                    "solver_trace_path": (
+                        trace_refs.get("solver", [None])[-1] if trace_refs.get("solver") else None
+                    ),
+                    "world_judge_trace_path": (
+                        trace_refs.get("judge", [None])[-1] if trace_refs.get("judge") else None
+                    ),
+                    "solver_verdict_path": (
+                        f"{accepted_base}/solver_verdict.json" if accepted_base else None
+                    ),
+                    "world_verdict_path": (f"{accepted_base}/world_verdict.json" if accepted_base else None),
+                    "progress_path": self.progress_path,
                     "reason": attempt_reason,
                     "signature": result.signature,
                     "signature_text": signature_text,
                     "semantic_status": result.decision.status if result.decision else None,
-                    "judge_scores": result.verdict.scores if result.verdict else None,
-                    "quality_score": result.decision.quality_score if result.decision else None,
-                    "criterion_failures": (result.decision.criterion_failures if result.decision else []),
-                    "rejection_reason": (result.decision.rejection_reason if result.decision else None),
-                    "written_to_dataset": written,
-                    "retry_discarded": retry_discarded,
-                    "artifact_ref": artifact_ref,
-                    "trace_ids": trace_ids,
-                    "trace_refs": trace_refs,
-                    "runtime_records": self._runtime_records(traces),
-                    "candidate_runtime": (result.validation.runtime if result.validation else None),
-                    "builder": safe_builder,
-                    "solver": safe_solver,
-                    "verdict": (result.verdict.model_dump(mode="json") if result.verdict else None),
-                    "validation": (
-                        result.validation.model_dump(mode="json", exclude={"public_snapshot"})
-                        if result.validation
+                    "criterion_failures": result.decision.criterion_failures if result.decision else [],
+                    "rejection_reason": (
+                        result.decision.rejection_reason
+                        if result.decision
+                        else result.failure_kind.value
+                        if result.failure_kind
                         else None
                     ),
+                    "written_to_dataset": written,
+                    "artifact_ref": artifact_ref,
+                    "builder_turns": int((builder_metadata or {}).get("turns", 0)),
+                    "solver_completed_action_count": (
+                        len(result.solver.completed_actions) if result.solver else 0
+                    ),
+                    "world_judge_retry_count": role_stats["judge"]["retry_count"],
+                    "whole_episode_retry_count": 0,
+                    "retry_counts": {role: role_stats[role]["retry_count"] for role in ROLE_NAMES},
+                    "models": {role: role_stats[role]["model"] for role in ROLE_NAMES},
+                    "role_outcomes": {
+                        role: {
+                            "present": any(trace.agent and trace.agent.name == role for trace in traces),
+                            "ok": any(
+                                trace.agent and trace.agent.name == role and trace.ok for trace in traces
+                            ),
+                        }
+                        for role in ROLE_NAMES
+                    },
+                    "usage_by_role": role_stats,
+                    "solver_judge_tokens": role_stats["solver"]["auxiliary_tokens"],
+                    "solver_judge_cost": role_stats["solver"]["auxiliary_cost"],
+                    "solver_judge_model": next(
+                        (
+                            trace.info.get("solver_answer_judge_model")
+                            for trace in traces
+                            if trace.agent
+                            and trace.agent.name == "solver"
+                            and isinstance(trace.info.get("solver_answer_judge_model"), str)
+                        ),
+                        None,
+                    ),
+                    "world_judge_completed_action_count": next(
+                        (
+                            len(trace.info.get("completed_actions", []))
+                            for trace in traces
+                            if trace.agent
+                            and trace.agent.name == "judge"
+                            and isinstance(trace.info.get("completed_actions"), list)
+                        ),
+                        0,
+                    ),
                 }
+                for role in ROLE_NAMES:
+                    row[f"{role}_tokens"] = role_stats[role]["tokens"]
+                    row[f"{role}_duration_ms"] = role_stats[role]["duration_ms"]
+                    row[f"{role}_cost"] = role_stats[role]["cost"]
+                artifact_rows = self._artifact_rows(
+                    attempt_id=attempt_id,
+                    instance_id=result.instance_id,
+                    artifact_ref=artifact_ref,
+                )
+                for artifact_row in artifact_rows:
+                    _append_jsonl(self.root / "artifacts.jsonl", artifact_row)
+
                 _append_jsonl(self.attempts_path, row)
                 validate_release_integrity(self.root, expected_run_id=self.run_id)
                 self.write_summary()
@@ -1099,7 +1641,8 @@ class DatasetWriter:
                 result.validation,
                 result.validation and result.validation.public_snapshot,
                 result.solver,
-                result.verdict,
+                result.solver.semantic_verdict if result.solver else None,
+                result.world_verdict,
                 result.decision,
                 source,
             )
@@ -1107,7 +1650,7 @@ class DatasetWriter:
             raise ValueError("accepted item is missing required artifacts")
         item = result.synthesized
         validation = result.validation
-        verdict = result.verdict
+        verdict = result.world_verdict
         decision = result.decision
         instance_id = result.instance_id
         assert item is not None and validation is not None and verdict is not None and decision is not None
@@ -1131,7 +1674,7 @@ class DatasetWriter:
             raise ValueError(f"accepted item is missing role traces: {missing_traces}")
         runtime_records = self._runtime_records(traces)
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "generator_schema_version": GENERATOR_SCHEMA_VERSION,
             "generator_source_hash": self.generator_source_hash,
             "worldgen_version": self.worldgen_version,
@@ -1143,8 +1686,16 @@ class DatasetWriter:
             "generation_seed": result.generation_seed,
             "interface_id": INTERFACE_ID,
             "interface_hashes": self.interface_hashes,
+            "world_rubric_hash": self.interface_hashes["world_rubric.toml"],
+            "acceptance": self.acceptance.model_dump(mode="json"),
             "prime_image": self.prime_image,
             "rlm_revision": self.rlm_revision,
+            "solver_score": result.solver_score,
+            "solver_metrics": result.solver_metrics,
+            "builder_score": result.builder_score,
+            "builder_raw_score": result.builder_raw_score,
+            "world_criteria": result.world_criteria,
+            "world_hard_gates": result.world_hard_gates,
             "world_hash": _sha256(source_bytes),
             "snapshot_hash": _sha256(snapshot_bytes),
             "canonical_snapshot_hash": "sha256:" + canonical_world_hash(validation.public_snapshot),
@@ -1178,7 +1729,8 @@ class DatasetWriter:
                     validation.model_dump(mode="json", exclude={"public_snapshot"}),
                     pretty=True,
                 ),
-                "judge_verdict.json": _dumps(verdict, pretty=True),
+                "solver_verdict.json": _dumps(result.solver.semantic_verdict, pretty=True),
+                "world_verdict.json": _dumps(verdict, pretty=True),
                 "public_checks.json": _dumps(list(public_checks), pretty=True),
             }
             for role, role_traces in trace_by_role.items():
@@ -1209,18 +1761,24 @@ class DatasetWriter:
             "answer": item.task.answer.canonical_answer,
             "required_claims": item.task.answer.required_claims,
             "status": decision.status,
-            "quality_score": decision.quality_score,
-            "judge_scores": verdict.scores,
+            "solver_score": result.solver_score,
+            "builder_score": result.builder_score,
+            "builder_raw_score": result.builder_raw_score,
+            "world_criteria": result.world_criteria,
+            "world_hard_gates": result.world_hard_gates,
             "world_ref": f"{base}/world.py",
             "snapshot_ref": f"{base}/snapshot.json",
             "oracle_ref": f"{base}/task_contract.json",
             "solver_trace_ref": f"{base}/solver_trace.json",
-            "judge_ref": f"{base}/judge_verdict.json",
+            "world_judge_trace_ref": f"{base}/judge_trace.json",
+            "solver_verdict_ref": f"{base}/solver_verdict.json",
+            "world_verdict_ref": f"{base}/world_verdict.json",
             "interface_id": INTERFACE_ID,
             "interface_ref": f"interfaces/{INTERFACE_ID}/interface.json",
             "world_hash": manifest["world_hash"],
             "contract_hash": manifest["contract_hash"],
         }
+
         public = {
             "instance_id": instance_id,
             "scenario": item.scenario.description,
@@ -1297,75 +1855,317 @@ class DatasetWriter:
             raise
         return base, trace_refs
 
-    def write_summary(self) -> dict[str, Any]:
+    def write_summary(
+        self,
+        *,
+        exit_reason: str | None = None,
+        release_integrity_ok: bool | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             attempts = _read_jsonl(self.attempts_path)
-            final_attempts = [row for row in attempts if row.get("retry_discarded") is not True]
-            scores = [
-                float(row["quality_score"])
-                for row in attempts
-                if isinstance(row.get("quality_score"), (int, float))
-            ]
-            statuses = Counter(str(row.get("item_status")) for row in final_attempts)
-            owners = Counter(str(row.get("failure_owner")) for row in final_attempts)
+            written = [row for row in attempts if row.get("written_to_dataset")]
+            statuses = Counter(str(row.get("item_status")) for row in attempts)
+            owners = Counter(str(row.get("failure_owner")) for row in attempts)
+            stages = Counter(str(row.get("failed_stage")) for row in attempts if row.get("failed_stage"))
+            kinds = Counter(str(row.get("failure_kind")) for row in attempts if row.get("failure_kind"))
             semantic = Counter(
-                str(row.get("semantic_status")) for row in final_attempts if row.get("semantic_status")
+                str(row.get("semantic_status")) for row in attempts if row.get("semantic_status")
             )
             floor_counts: Counter[str] = Counter()
             for row in attempts:
                 floor_counts.update(row.get("criterion_failures") or [])
-            written = [row for row in attempts if row.get("written_to_dataset")]
-            before_quality = [
-                row for row in attempts if row.get("semantic_status") in self.quality_filter.accepted_statuses
-            ]
-            builder_rows = [row.get("builder") or {} for row in attempts]
-            solver_rows = [row.get("solver") or {} for row in attempts]
-            sandbox_ids = {
-                record.get("id")
+
+            role_usage: dict[str, Any] = {}
+            reported_costs: list[float] = []
+            for role in ROLE_NAMES:
+                durations = [
+                    float(row[f"{role}_duration_ms"])
+                    for row in attempts
+                    if isinstance(row.get(f"{role}_duration_ms"), (int, float))
+                    and row[f"{role}_duration_ms"] > 0
+                ]
+                costs = [
+                    float(row[f"{role}_cost"])
+                    for row in attempts
+                    if isinstance(row.get(f"{role}_cost"), (int, float))
+                ]
+                reported_costs.extend(costs)
+                role_usage[role] = {
+                    "tokens": sum(int(row.get(f"{role}_tokens", 0)) for row in attempts),
+                    "cost": sum(costs) if costs else None,
+                    "duration_ms": _distribution(durations),
+                    "models": sorted(
+                        {
+                            model
+                            for row in attempts
+                            if isinstance((model := (row.get("models") or {}).get(role)), str)
+                        }
+                    ),
+                    "retries": sum(int((row.get("retry_counts") or {}).get(role, 0)) for row in attempts),
+                }
+            role_yield: dict[str, Any] = {}
+            for role in ROLE_NAMES:
+                started = sum(
+                    bool((row.get("role_outcomes") or {}).get(role, {}).get("present")) for row in attempts
+                )
+                succeeded = sum(
+                    bool((row.get("role_outcomes") or {}).get(role, {}).get("ok")) for row in attempts
+                )
+                role_yield[role] = {
+                    "started": started,
+                    "succeeded": succeeded,
+                    "yield": succeeded / started if started else None,
+                }
+
+            solver_judge_costs = [
+                float(row["solver_judge_cost"])
                 for row in attempts
-                for record in [*(row.get("runtime_records") or []), row.get("candidate_runtime") or {}]
-                if isinstance(record, dict) and record.get("id")
+                if isinstance(row.get("solver_judge_cost"), (int, float))
+            ]
+            reported_costs.extend(solver_judge_costs)
+            solver_judge = {
+                "tokens": sum(int(row.get("solver_judge_tokens", 0)) for row in attempts),
+                "cost": sum(solver_judge_costs) if solver_judge_costs else None,
+                "models": sorted(
+                    {
+                        row["solver_judge_model"]
+                        for row in attempts
+                        if isinstance(row.get("solver_judge_model"), str)
+                    }
+                ),
             }
+
+            progress = _read_jsonl(self.root / self.progress_path)
+            progress_times: list[datetime] = []
+            for event in progress:
+                timestamp = event.get("timestamp_utc")
+                if not isinstance(timestamp, str):
+                    raise ValueError("progress event has an invalid timestamp_utc")
+                try:
+                    progress_times.append(datetime.fromisoformat(timestamp.replace("Z", "+00:00")))
+                except ValueError as exc:
+                    raise ValueError("progress event has an invalid timestamp_utc") from exc
+            progress_gaps = [
+                (right - left).total_seconds()
+                for left, right in zip(progress_times, progress_times[1:], strict=False)
+            ]
+            max_progress_gap = max(progress_gaps, default=0.0) if progress_times else None
+            overlap_by_seed: dict[int, bool] = {}
+            for row in written:
+                seed = row.get("generation_seed")
+                if not isinstance(seed, int):
+                    continue
+                role_events = {
+                    (event.get("stage"), event.get("event")): event.get("timestamp_utc")
+                    for event in progress
+                    if event.get("seed") == seed
+                    and event.get("stage") in {"solver", "world_judge"}
+                    and event.get("event") in {"started", "finished"}
+                }
+                try:
+                    solver_start = datetime.fromisoformat(
+                        str(role_events[("solver", "started")]).replace("Z", "+00:00")
+                    )
+                    solver_end = datetime.fromisoformat(
+                        str(role_events[("solver", "finished")]).replace("Z", "+00:00")
+                    )
+                    judge_start = datetime.fromisoformat(
+                        str(role_events[("world_judge", "started")]).replace("Z", "+00:00")
+                    )
+                    judge_end = datetime.fromisoformat(
+                        str(role_events[("world_judge", "finished")]).replace("Z", "+00:00")
+                    )
+                    overlap_by_seed[seed] = max(solver_start, judge_start) <= min(solver_end, judge_end)
+                except (KeyError, ValueError):
+                    overlap_by_seed[seed] = False
+            stage_values: dict[str, list[float]] = {}
+            for event in progress:
+                duration = event.get("duration_ms")
+                if event.get("event") == "finished" and isinstance(duration, (int, float)):
+                    stage_values.setdefault(str(event.get("stage")), []).append(float(duration))
+            criterion_distributions = {
+                criterion: _distribution(
+                    [
+                        float(row["world_criteria"][criterion])
+                        for row in attempts
+                        if isinstance(row.get("world_criteria"), dict)
+                    ]
+                )
+                for criterion in QUALITY_CRITERIA
+            }
+            solver_scores = [
+                float(row["solver_score"])
+                for row in attempts
+                if isinstance(row.get("solver_score"), (int, float))
+            ]
+            builder_scores = [
+                float(row["builder_score"])
+                for row in attempts
+                if isinstance(row.get("builder_score"), (int, float))
+            ]
+            total_cost = sum(reported_costs) if reported_costs else None
+            now = datetime.now(UTC)
+            elapsed = max(0.0, (now - self.run_started_at).total_seconds())
+            active_elapsed = self.prior_active_seconds + max(
+                0.0, (now - self.process_started_at).total_seconds()
+            )
             summary = {
                 "run_id": self.run_id,
                 "output": str(self.root),
-                "attempted": len(final_attempts),
-                "attempt_records": len(attempts),
-                "retry_discarded_attempts": len(attempts) - len(final_attempts),
-                "judge_complete_attempts": len(scores),
+                "target_accepted": self.target_accepted,
+                "actual_accepted": len(written),
                 "written_to_dataset": len(written),
-                "semantic_status_counts": dict(sorted(semantic.items())),
+                "attempted": len(attempts),
+                "qualification_passed": False,
+                "exit_reason": exit_reason,
+                "attempt_cap_exhausted": (
+                    len(attempts) >= self.max_attempts and len(written) < self.target_accepted
+                ),
+                "max_attempts": self.max_attempts,
+                "concurrency": self.concurrency,
+                "wall_time_seconds": elapsed,
+                "active_wall_time_seconds": active_elapsed,
+                "accepted_worlds_per_hour": (
+                    len(written) / (active_elapsed / 3_600) if active_elapsed > 0 else None
+                ),
+                "attempts_per_accepted_world": len(attempts) / len(written) if written else None,
                 "item_status_counts": dict(sorted(statuses.items())),
+                "semantic_status_counts": dict(sorted(semantic.items())),
                 "failure_owner_counts": dict(sorted(owners.items())),
-                "hard_gate_rejected": statuses[ItemStatus.HARD_GATE_REJECTED.value],
-                "quality_threshold_rejected": statuses[ItemStatus.QUALITY_THRESHOLD_REJECTED.value],
-                "criterion_floor_rejected": statuses[ItemStatus.CRITERION_FLOOR_REJECTED.value],
+                "rejections_by_stage": dict(sorted(stages.items())),
+                "failure_kind_counts": dict(sorted(kinds.items())),
                 "criterion_floor_counts": dict(sorted(floor_counts.items())),
                 "duplicate_contracts_rejected": statuses[ItemStatus.DUPLICATE.value],
-                "synthesizer_failures": statuses[ItemStatus.SYNTHESIZER_FAILURE.value],
-                "builder_failures": statuses[ItemStatus.BUILDER_FAILURE.value],
-                "judge_protocol_failures": statuses[ItemStatus.JUDGE_PROTOCOL_FAILURE.value],
-                "infrastructure_errors": statuses[ItemStatus.INFRASTRUCTURE_ERROR.value],
-                "quality_score_distribution": _distribution(scores),
-                "quality_filter": self.quality_filter.model_dump(mode="json"),
-                "acceptance_rate_before_quality_filter": (
-                    len(before_quality) / len(scores) if scores else 0.0
+                "synthesis_yield": (
+                    sum(row.get("synthesis_ok") is True for row in attempts) / len(attempts)
+                    if attempts
+                    else None
                 ),
-                "acceptance_rate_after_quality_filter": (len(written) / len(scores) if scores else 0.0),
-                "written_by_semantic_status": dict(
-                    Counter(str(row.get("semantic_status")) for row in written)
+                "validation_yield": (
+                    sum(row.get("validation_ok") is True for row in attempts)
+                    / sum(row.get("synthesis_ok") is True for row in attempts)
+                    if any(row.get("synthesis_ok") is True for row in attempts)
+                    else None
                 ),
-                "average_builder_turns": _mean_values(builder_rows, "turns"),
-                "average_builder_tokens": _mean_values(builder_rows, "tokens"),
-                "average_builder_wall_seconds": _mean_values(builder_rows, "wall_seconds"),
-                "average_solver_tool_calls": _mean_values(solver_rows, "tool_call_count"),
-                "prime_sandbox_provisioning_count": len(sandbox_ids),
-                "prime_sandbox_ids": sorted(sandbox_ids),
+                "solver_score_distribution": _distribution(solver_scores),
+                "builder_score_distribution": _distribution(builder_scores),
+                "world_criterion_distributions": criterion_distributions,
+                "role_usage": role_usage,
+                "role_yield": role_yield,
+                "solver_answer_judge_usage": solver_judge,
+                "total_reported_cost": total_cost,
+                "cost_per_accepted_world": total_cost / len(written)
+                if total_cost is not None and written
+                else None,
+                "stage_duration_ms": {
+                    stage: _distribution(values) for stage, values in sorted(stage_values.items())
+                },
+                "max_progress_gap_seconds": max_progress_gap,
+                "solver_world_judge_overlap": {
+                    str(seed): value for seed, value in sorted(overlap_by_seed.items())
+                },
+                "release_integrity_ok": release_integrity_ok,
+                "retry_counts": {
+                    "whole_episode": sum(int(row.get("whole_episode_retry_count", 0)) for row in attempts),
+                    "world_judge": sum(int(row.get("world_judge_retry_count", 0)) for row in attempts),
+                },
+                "acceptance": self.acceptance.model_dump(mode="json"),
                 "prime_image": self.prime_image,
                 "rlm_revision": self.rlm_revision,
                 "interface_hashes": self.interface_hashes,
+                "progress_path": self.progress_path,
             }
+            accepted_signatures = [row.get("signature") for row in written]
+            end_conditions = {
+                "accepted_target_reached": len(written) >= self.target_accepted,
+                "attempt_cap_respected": len(attempts) <= self.max_attempts,
+                "accepted_rows_are_solved": all(row.get("semantic_status") == "solved" for row in written),
+                "solver_threshold_met": all(
+                    isinstance(row.get("solver_score"), (int, float))
+                    and row["solver_score"] >= self.acceptance.min_solver_score
+                    for row in written
+                ),
+                "builder_threshold_met": all(
+                    isinstance(row.get("builder_score"), (int, float))
+                    and row["builder_score"] >= self.acceptance.min_world_score
+                    for row in written
+                ),
+                "world_hard_gates_met": all(
+                    row.get("task_unambiguous") is True and row.get("world_supports_task") is True
+                    for row in written
+                ),
+                "criterion_floors_met": all(
+                    isinstance(row.get("world_criteria"), dict)
+                    and all(
+                        row["world_criteria"].get(name, -1) >= floor
+                        for name, floor in self.acceptance.minimum_world_scores.items()
+                    )
+                    for row in written
+                ),
+                "accepted_signatures_unique": (
+                    len(accepted_signatures) == len(set(accepted_signatures)) and all(accepted_signatures)
+                ),
+                "whole_episode_retries_zero": all(
+                    row.get("whole_episode_retry_count") == 0 for row in attempts
+                ),
+                "structured_solver_verdicts_present": all(
+                    isinstance(row.get("solver_verdict_path"), str) for row in written
+                ),
+                "empirical_world_judge_actions_present": all(
+                    isinstance(row.get("world_verdict_path"), str)
+                    and row.get("world_judge_completed_action_count", 0) > 0
+                    for row in written
+                ),
+                "solver_world_judge_overlapped": (
+                    len(overlap_by_seed) == len(written) and all(overlap_by_seed.values())
+                ),
+                "active_wall_time_at_most_20_minutes": active_elapsed <= 1_200,
+                "progress_heartbeat_within_interval": (
+                    bool(progress_times) and max_progress_gap is not None and max_progress_gap <= 10.0
+                ),
+                "release_integrity_passed": release_integrity_ok is True,
+            }
+            summary["qualification_passed"] = all(end_conditions.values())
             _atomic_write(self.root / "summary.json", _dumps(summary, pretty=True))
+            report = {
+                "schema_version": 1,
+                "run_id": self.run_id,
+                "generated_at": datetime.now(UTC).isoformat(),
+                "passed": all(end_conditions.values()),
+                "target_accepted": self.target_accepted,
+                "actual_accepted": len(written),
+                "attempted": len(attempts),
+                "max_attempts": self.max_attempts,
+                "exit_reason": exit_reason,
+                "end_conditions": end_conditions,
+                "solver_score_distribution": summary["solver_score_distribution"],
+                "builder_score_distribution": summary["builder_score_distribution"],
+                "world_criterion_distributions": summary["world_criterion_distributions"],
+                "role_usage": role_usage,
+                "role_yield": role_yield,
+                "solver_answer_judge_usage": solver_judge,
+                "rejections_by_stage": summary["rejections_by_stage"],
+                "failure_kind_counts": summary["failure_kind_counts"],
+                "synthesis_yield": summary["synthesis_yield"],
+                "validation_yield": summary["validation_yield"],
+                "duplicate_contracts_rejected": summary["duplicate_contracts_rejected"],
+                "attempts_per_accepted_world": summary["attempts_per_accepted_world"],
+                "accepted_worlds_per_hour": summary["accepted_worlds_per_hour"],
+                "concurrency": self.concurrency,
+                "stage_duration_ms": summary["stage_duration_ms"],
+                "retry_counts": summary["retry_counts"],
+                "max_progress_gap_seconds": max_progress_gap,
+                "solver_world_judge_overlap": summary["solver_world_judge_overlap"],
+                "total_reported_cost": total_cost,
+                "cost_per_accepted_world": summary["cost_per_accepted_world"],
+                "wall_time_seconds": elapsed,
+                "active_wall_time_seconds": active_elapsed,
+                "acceptance": self.acceptance.model_dump(mode="json"),
+                "generator_source_hash": self.generator_source_hash,
+                "interface_hashes": self.interface_hashes,
+                "world_rubric_hash": self.interface_hashes["world_rubric.toml"],
+            }
+            _atomic_write(self.root / "qualification_report.json", _dumps(report, pretty=True))
             return summary
 
 
@@ -1392,7 +2192,13 @@ def _distribution(values: Sequence[float]) -> dict[str, float | None]:
         "median": _percentile(values, 0.5),
         "p10": _percentile(values, 0.1),
         "p90": _percentile(values, 0.9),
+        "p95": _percentile(values, 0.95),
     }
 
 
-__all__ = ["DatasetWriter"]
+__all__ = [
+    "DatasetWriter",
+    "synthesized_signature",
+    "synthesized_signature_text",
+    "validate_release_integrity",
+]

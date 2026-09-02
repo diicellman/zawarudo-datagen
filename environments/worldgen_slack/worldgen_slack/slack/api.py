@@ -7,7 +7,6 @@ from .models import Message, SlackWorld, validate_safe_identifier
 MAX_SEARCH_RESULTS = 10
 MAX_HISTORY_RESULTS = 50
 MAX_THREAD_RESULTS = 50
-TOOL_PREFIX = "slack"
 
 
 class SlackNotFoundError(LookupError):

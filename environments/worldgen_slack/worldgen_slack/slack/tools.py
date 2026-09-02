@@ -1,20 +1,46 @@
-from typing import Annotated, Any, Literal
+import json
+from typing import Annotated, Any, Literal, Self
 
 import verifiers.v1 as vf
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from .api import MAX_HISTORY_RESULTS, MAX_SEARCH_RESULTS, SlackAPI
-from .models import SlackWorld, validate_safe_identifier
+from .models import SAFE_IDENTIFIER_PATTERN, SlackWorld, validate_safe_identifier
 
 TOOL_PREFIX = "slack"
 SearchLimit = Annotated[int, Field(ge=1, le=MAX_SEARCH_RESULTS)]
 HistoryLimit = Annotated[int, Field(ge=1, le=MAX_HISTORY_RESULTS)]
+SearchQuery = Annotated[str, Field(min_length=1, max_length=512)]
+SlackIdentifier = Annotated[str, Field(min_length=1, max_length=128, pattern=SAFE_IDENTIFIER_PATTERN)]
+SlackAction = Literal[
+    "list_conversations",
+    "search_messages",
+    "get_conversation_history",
+    "get_thread",
+    "get_user",
+]
+
+
+class SlackActionRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    action: SlackAction
+    arguments: dict[str, JsonValue]
+
+    @model_validator(mode="after")
+    def bounded_arguments(self) -> Self:
+        if len(json.dumps(self.arguments, ensure_ascii=False, sort_keys=True).encode()) > 4_096:
+            raise ValueError("Slack action arguments exceed 4096 bytes")
+        return self
+
+
+class SlackState(vf.State):
+    completed_actions: list[SlackActionRecord] = Field(default_factory=list, max_length=128)
 
 
 class SlackToolsetConfig(vf.ToolsetConfig):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    colocated: Literal[False] = False
     snapshot_json: str = Field(default="", repr=False)
     actor_id: str = Field(default="", max_length=128)
 
@@ -23,8 +49,7 @@ class SlackToolsetConfig(vf.ToolsetConfig):
     def valid_snapshot(cls, value: str) -> str:
         if not value:
             return value
-        world = SlackWorld.model_validate_json(value)
-        return world.model_dump_json()
+        return SlackWorld.model_validate_json(value).model_dump_json()
 
     @field_validator("actor_id")
     @classmethod
@@ -32,9 +57,7 @@ class SlackToolsetConfig(vf.ToolsetConfig):
         return validate_safe_identifier(value, "actor_id") if value else value
 
     @model_validator(mode="after")
-    def valid_pair(self):
-        if self.colocated or self.runtime.type != "subprocess":
-            raise ValueError("Slack Toolset must use the trusted host-local server")
+    def valid_pair(self) -> Self:
         if bool(self.snapshot_json) != bool(self.actor_id):
             raise ValueError("snapshot_json and actor_id must be configured together")
         if self.snapshot_json:
@@ -42,13 +65,9 @@ class SlackToolsetConfig(vf.ToolsetConfig):
         return self
 
     @classmethod
-    def from_world(cls, world: SlackWorld, actor_id: str, **kwargs: Any):
+    def from_world(cls, world: SlackWorld, actor_id: str, **kwargs: Any) -> Self:
         validated = SlackWorld.model_validate(world)
         return cls(snapshot_json=validated.model_dump_json(), actor_id=actor_id, **kwargs)
-
-
-class SlackState(vf.State):
-    completed_calls: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SlackToolset(vf.Toolset[SlackToolsetConfig, SlackState]):
@@ -61,8 +80,10 @@ class SlackToolset(vf.Toolset[SlackToolsetConfig, SlackState]):
     async def setup(self) -> None:
         if not self.config.snapshot_json or not self.config.actor_id:
             raise ValueError("SlackToolset requires a snapshot_json and actor_id")
-        world = SlackWorld.model_validate_json(self.config.snapshot_json)
-        self._api = SlackAPI(world, self.config.actor_id)
+        self._api = SlackAPI(
+            SlackWorld.model_validate_json(self.config.snapshot_json),
+            self.config.actor_id,
+        )
 
     @property
     def api(self) -> SlackAPI:
@@ -70,8 +91,10 @@ class SlackToolset(vf.Toolset[SlackToolsetConfig, SlackState]):
             raise RuntimeError("SlackToolset.setup() has not completed")
         return self._api
 
-    def _record(self, name: str, arguments: dict[str, Any]) -> None:
-        self.state.completed_calls.append({"tool": f"slack_{name}", "arguments": arguments})
+    def _record(self, action: SlackAction, arguments: dict[str, JsonValue]) -> None:
+        if len(self.state.completed_actions) >= 128:
+            raise ValueError("Slack action history exceeds 128 successful calls")
+        self.state.completed_actions.append(SlackActionRecord(action=action, arguments=arguments))
 
     @vf.tool
     async def list_conversations(self) -> list[dict[str, Any]]:
@@ -82,18 +105,20 @@ class SlackToolset(vf.Toolset[SlackToolsetConfig, SlackState]):
 
     @vf.tool
     async def search_messages(
-        self, query: str, limit: SearchLimit = MAX_SEARCH_RESULTS
+        self, query: SearchQuery, limit: SearchLimit = MAX_SEARCH_RESULTS
     ) -> list[dict[str, str | None]]:
-        """Search visible messages. Exact phrases rank above token overlap."""
+        """Search visible undeleted messages; exact phrases rank before token overlap."""
         result = self.api.search_messages(query, limit)
         self._record("search_messages", {"query": query, "limit": limit})
         return result
 
     @vf.tool
     async def get_conversation_history(
-        self, conversation_id: str, limit: HistoryLimit = MAX_HISTORY_RESULTS
+        self,
+        conversation_id: SlackIdentifier,
+        limit: HistoryLimit = MAX_HISTORY_RESULTS,
     ) -> list[dict[str, str | None]]:
-        """Get root messages in one visible conversation, newest first."""
+        """Read visible root messages newest first; absent or invisible IDs fail."""
         result = self.api.get_conversation_history(conversation_id, limit)
         self._record(
             "get_conversation_history",
@@ -102,24 +127,37 @@ class SlackToolset(vf.Toolset[SlackToolsetConfig, SlackState]):
         return result
 
     @vf.tool
-    async def get_thread(self, conversation_id: str, root_message_id: str) -> list[dict[str, str | None]]:
-        """Get a visible thread root and its replies in chronological order."""
+    async def get_thread(
+        self,
+        conversation_id: SlackIdentifier,
+        root_message_id: SlackIdentifier,
+    ) -> list[dict[str, str | None]]:
+        """Read a visible root and its replies oldest first; absent or invisible IDs fail."""
         result = self.api.get_thread(conversation_id, root_message_id)
         self._record(
             "get_thread",
-            {"conversation_id": conversation_id, "root_message_id": root_message_id},
+            {
+                "conversation_id": conversation_id,
+                "root_message_id": root_message_id,
+            },
         )
         return result
 
     @vf.tool
-    async def get_user(self, user_id: str) -> dict[str, Any]:
-        """Look up one user in the workspace directory."""
+    async def get_user(self, user_id: SlackIdentifier) -> dict[str, Any]:
+        """Read one workspace directory entry; unknown user IDs fail."""
         result = self.api.get_user(user_id)
         self._record("get_user", {"user_id": user_id})
         return result
 
 
-__all__ = ["TOOL_PREFIX", "SlackState", "SlackToolset", "SlackToolsetConfig"]
+__all__ = [
+    "TOOL_PREFIX",
+    "SlackActionRecord",
+    "SlackState",
+    "SlackToolset",
+    "SlackToolsetConfig",
+]
 
 
 if __name__ == "__main__":

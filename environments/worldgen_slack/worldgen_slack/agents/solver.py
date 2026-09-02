@@ -1,18 +1,128 @@
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
-from collections import Counter
 from datetime import datetime
+from statistics import fmean
+from typing import Literal, Self
 
 import verifiers.v1 as vf
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 
-from ..contracts import INTERFACE_ID, SolverSummary, redact_secrets
-from ..slack.models import AnswerSpec, SlackWorld, TaskContract
-from ..slack.toolset import SlackState, SlackToolset, SlackToolsetConfig
+from ..contracts import SolverSummary, redact_secrets
+from ..slack.models import INTERFACE_ID, AnswerSpec, NonEmptyText, SlackWorld, StrictModel, TaskContract
+from ..slack.tools import SlackState, SlackToolset, SlackToolsetConfig
 
-FINAL_TAG = "final_answer"
+CLAIM_SCORE = {"missing": 0.0, "contradicted": 0.0, "partial": 0.5, "supported": 1.0}
+
+
+class RequiredClaimVerdict(StrictModel):
+    claim_index: int = Field(ge=0)
+    grade: Literal["missing", "contradicted", "partial", "supported"]
+    reason: NonEmptyText
+
+    @field_validator("reason")
+    @classmethod
+    def nonblank_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("claim verdict reason must not be blank")
+        return value
+
+
+class SolverAnswerVerdict(StrictModel):
+    required_claims: list[RequiredClaimVerdict]
+    forbidden_claim_indexes: list[int] = Field(default_factory=list)
+    material_contradiction: bool
+    reason: NonEmptyText
+
+    @field_validator("reason")
+    @classmethod
+    def nonblank_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("solver verdict reason must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def unique_indexes(self) -> Self:
+        required = [item.claim_index for item in self.required_claims]
+        if len(required) != len(set(required)):
+            raise ValueError("required claim verdict indexes must be unique")
+        if len(self.forbidden_claim_indexes) != len(set(self.forbidden_claim_indexes)):
+            raise ValueError("forbidden claim indexes must be unique")
+        if any(index < 0 for index in self.forbidden_claim_indexes):
+            raise ValueError("forbidden claim indexes must be non-negative")
+        return self
+
+    def validate_against(self, answer: AnswerSpec) -> Self:
+        required = {item.claim_index for item in self.required_claims}
+        expected_required = set(range(len(answer.required_claims)))
+        if required != expected_required:
+            raise ValueError(
+                "required claim verdict indexes must appear exactly once: "
+                f"expected {sorted(expected_required)}, got {sorted(required)}"
+            )
+        unknown_forbidden = set(self.forbidden_claim_indexes) - set(range(len(answer.forbidden_claims)))
+        if unknown_forbidden:
+            raise ValueError(f"unknown forbidden claim indexes: {sorted(unknown_forbidden)}")
+        return self
+
+
+class SlackAnswerJudge(vf.Judge[SolverAnswerVerdict]):
+    schema = SolverAnswerVerdict
+
+    def build_messages(
+        self,
+        *,
+        question: str,
+        canonical_answer: str,
+        required_claims: list[str],
+        forbidden_claims: list[str],
+        response: str,
+    ) -> vf.Messages:
+        payload = {
+            "question": question,
+            "canonical_answer": canonical_answer,
+            "required_claims": [
+                {"claim_index": index, "claim": claim} for index, claim in enumerate(required_claims)
+            ],
+            "forbidden_claims": [
+                {"claim_index": index, "claim": claim} for index, claim in enumerate(forbidden_claims)
+            ],
+            "solver_response": response,
+        }
+        return [
+            vf.SystemMessage(
+                content=(
+                    "Grade only the solver response against the supplied private answer oracle. "
+                    "Treat semantically equivalent paraphrases as supported. Grade every required "
+                    "claim exactly once using its zero-based claim_index. Use contradicted when the "
+                    "response materially conflicts with a required claim. List every forbidden claim "
+                    "asserted by the response. Set material_contradiction only for a material conflict "
+                    "with the oracle. Do not infer missing entries."
+                )
+            ),
+            vf.UserMessage(content=json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+        ]
+
+
+def solver_verdict_scores(
+    verdict: SolverAnswerVerdict,
+    answer: AnswerSpec,
+) -> dict[str, float]:
+    verdict.validate_against(answer)
+    coverage = fmean(CLAIM_SCORE[item.grade] for item in verdict.required_claims)
+    contradiction_free = (
+        not verdict.material_contradiction
+        and not verdict.forbidden_claim_indexes
+        and all(item.grade != "contradicted" for item in verdict.required_claims)
+    )
+    return {
+        "semantic_correctness": coverage if contradiction_free else 0.0,
+        "required_claim_coverage": coverage,
+        "contradiction_free": float(contradiction_free),
+        "forbidden_claim_count": float(len(verdict.forbidden_claim_indexes)),
+    }
 
 
 class SolverData(vf.TaskData):
@@ -23,7 +133,11 @@ class SolverData(vf.TaskData):
 
 class SolverConfig(vf.TaskConfig):
     tools: SlackToolsetConfig = SlackToolsetConfig()
-    oracle: TaskContract | None = Field(default=None, exclude=True, repr=False)
+    oracle: AnswerSpec | None = Field(default=None, exclude=True, repr=False)
+    answer_judge: vf.JudgeConfig = vf.JudgeConfig(
+        model="openai/gpt-5.6-luna",
+        sampling=vf.Sampling(temperature=0.0, max_tokens=2_000),
+    )
 
 
 class SolverTask(vf.Task[SolverData, SlackState, SolverConfig]):
@@ -38,17 +152,13 @@ class SolverTask(vf.Task[SolverData, SlackState, SolverConfig]):
         instance_id: str,
         contract: TaskContract,
         world: SlackWorld,
-        include_oracle: bool = False,
+        answer_judge: vf.JudgeConfig | None = None,
         idx: int | None = None,
     ) -> "SolverTask":
-        prompt = (
-            f"{contract.question}\n\nUse only the fixed read-only Slack actions. "
-            f"Reply naturally inside <{FINAL_TAG}>...</{FINAL_TAG}> when done."
-        )
         data = SolverData(
             idx=idx,
             name=instance_id,
-            prompt=prompt,
+            prompt=contract.question,
             network_allow=[],
             network_block=["*"],
             instance_id=instance_id,
@@ -56,54 +166,70 @@ class SolverTask(vf.Task[SolverData, SlackState, SolverConfig]):
         )
         config = SolverConfig(
             tools=SlackToolsetConfig.from_world(world, contract.actor_id),
-            oracle=contract.model_copy(deep=True) if include_oracle else None,
+            oracle=contract.answer.model_copy(deep=True),
+            answer_judge=answer_judge or SolverConfig().answer_judge,
         )
         return cls(data, config)
 
     @vf.metric
-    async def final_answer_present(self, trace: vf.Trace) -> float:
-        answer = extract_final_answer(trace.last_reply)
-        return float(bool(answer))
+    async def answer_present(self, trace: vf.Trace) -> float:
+        return float(bool(trace.last_reply.strip()))
 
     @vf.metric
-    async def tool_call_count(self, trace: vf.Trace) -> float:
-        return float(len(trace.state.completed_calls))
+    async def completed_action_count(self, trace: vf.Trace) -> float:
+        return float(len(require_slack_state(trace).completed_actions))
 
-    @vf.reward
-    async def answer_correct(self, trace: vf.Trace) -> float:
-        answer = extract_final_answer(trace.last_reply)
+    @vf.metric
+    async def exact_answer_diagnostic(self, trace: vf.Trace) -> float:
         oracle = self.config.oracle
-        if answer is None or oracle is None or not trace.state.completed_calls:
+        if oracle is None or oracle.kind == "fact_summary":
             return 0.0
-        return float(score_supported_answer(answer, oracle.answer))
+        return float(score_exact_answer(trace.last_reply.strip(), oracle))
 
-    @vf.metric
-    async def exact_answer(self, trace: vf.Trace) -> float:
-        answer = extract_final_answer(trace.last_reply)
-        oracle = self.config.oracle
-        if answer is None or oracle is None or oracle.answer.kind == "fact_summary":
-            return 0.0
-        return float(score_exact_answer(answer, oracle.answer))
-
-    @vf.metric
-    async def required_claim_coverage(self, trace: vf.Trace) -> float:
-        answer = extract_final_answer(trace.last_reply) or ""
+    @vf.reward(weight=1.0)
+    async def semantic_correctness(self, trace: vf.Trace) -> float:
         oracle = self.config.oracle
         if oracle is None:
-            return 0.0
-        claims = oracle.answer.required_claims
-        return sum(_claim_coverage(claim, answer) for claim in claims) / len(claims)
+            raise ValueError("solver semantic reward requires a private answer oracle")
+        response = trace.last_reply.strip()
+        trace.info["solver_answer_judge_model"] = self.config.answer_judge.model
+        if not response:
+            scores = {
+                "semantic_correctness": 0.0,
+                "required_claim_coverage": 0.0,
+                "contradiction_free": 1.0,
+                "forbidden_claim_count": 0.0,
+            }
+            trace.info["solver_semantic_verdict"] = None
+        else:
+            judged = await SlackAnswerJudge(self.config.answer_judge).evaluate(
+                trace=trace,
+                question=self.data.question,
+                canonical_answer=oracle.canonical_answer,
+                required_claims=oracle.required_claims,
+                forbidden_claims=oracle.forbidden_claims,
+                response=response,
+            )
+            verdict = judged.parsed
+            if verdict is None:
+                raise ValueError("solver answer judge returned no parsed verdict")
+            scores = solver_verdict_scores(verdict, oracle)
+            trace.info["solver_semantic_verdict"] = verdict.model_dump(mode="json")
+        trace.info["solver_semantic_scores"] = scores
+        for name in (
+            "required_claim_coverage",
+            "contradiction_free",
+            "forbidden_claim_count",
+        ):
+            trace.record_metric(name, scores[name])
+            trace.record_reward(name, scores[name], 0.0)
+        return scores["semantic_correctness"]
 
 
-def extract_final_answer(text: str) -> str | None:
-    matches = re.findall(
-        rf"<{FINAL_TAG}>\s*(.*?)\s*</{FINAL_TAG}>",
-        text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    if len(matches) != 1 or not matches[0].strip():
-        return None
-    return matches[0].strip()
+def require_slack_state(trace: vf.Trace) -> SlackState:
+    if not isinstance(trace.state, SlackState):
+        raise TypeError("Slack solver trace requires SlackState")
+    return trace.state
 
 
 def normalize_answer(value: str) -> str:
@@ -117,7 +243,7 @@ def _dates(value: str) -> set[str]:
         r"(?:January|February|March|April|May|June|July|August|September|October|"
         r"November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
     )
-    candidates = [value.strip()]
+    candidates: list[str] = []
     for pattern in (
         r"\b\d{4}[-/]\d{2}[-/]\d{2}\b",
         rf"\b{month}\s+\d{{1,2}},?\s+\d{{4}}\b",
@@ -126,15 +252,8 @@ def _dates(value: str) -> set[str]:
         candidates.extend(match.group(0) for match in re.finditer(pattern, value, re.IGNORECASE))
     parsed: set[str] = set()
     for candidate in candidates:
-        rendered = re.sub(r"[,]", "", candidate)
-        for fmt in (
-            "%Y-%m-%d",
-            "%Y/%m/%d",
-            "%B %d %Y",
-            "%b %d %Y",
-            "%d %B %Y",
-            "%d %b %Y",
-        ):
+        rendered = candidate.replace(",", "")
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%B %d %Y", "%b %d %Y", "%d %B %Y", "%d %b %Y"):
             try:
                 parsed.add(datetime.strptime(rendered, fmt).date().isoformat())
                 break
@@ -143,275 +262,52 @@ def _dates(value: str) -> set[str]:
     return parsed
 
 
-def _date(value: str) -> str | None:
-    parsed = _dates(value)
-    return next(iter(parsed)) if len(parsed) == 1 else None
-
-
 def _list_items(value: str) -> list[str]:
-    pieces = re.split(r"[,;\n]|\s+and\s+", value)
-    output: list[str] = []
-    for piece in pieces:
-        unbulleted = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", piece)
-        normalized = normalize_answer(unbulleted)
-        if normalized:
-            output.append(normalized)
-    return output
+    return [
+        item
+        for piece in re.split(r"[,;\n]|\s+and\s+", value)
+        if (item := normalize_answer(re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", piece)))
+    ]
 
 
 def score_exact_answer(value: str, spec: AnswerSpec) -> bool:
-    if spec.kind == "fact_summary":
+    if not value or spec.kind == "fact_summary":
         return False
     if spec.kind == "date":
-        return _date(value) is not None and _date(value) == _date(spec.canonical_answer)
+        return len(_dates(value)) == 1 and _dates(value) == _dates(spec.canonical_answer)
     if spec.kind == "list":
-        actual, expected = _list_items(value), _list_items(spec.canonical_answer)
+        actual = _list_items(value)
+        expected = _list_items(spec.canonical_answer)
         return actual == expected if spec.list_order_matters else sorted(actual) == sorted(expected)
     return normalize_answer(value) == normalize_answer(spec.canonical_answer)
 
 
-_STOPWORDS = frozenset(
-    {
-        "a",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "been",
-        "being",
-        "by",
-        "for",
-        "from",
-        "i",
-        "in",
-        "is",
-        "it",
-        "its",
-        "of",
-        "on",
-        "or",
-        "that",
-        "the",
-        "this",
-        "to",
-        "was",
-        "were",
-        "with",
-    }
-)
-_NEGATIONS = frozenset({"neither", "never", "no", "nor", "not", "without"})
-_CONTRASTS = frozenset({"although", "but", "however", "yet"})
-_TOKEN_PATTERN = re.compile(r"\d+(?:[.,]\d+)?%?|[a-z0-9_]+|[.!?;]")
-_TOKEN_ALIASES = {
-    "because": "caus",
-    "expiration": "expir",
-}
-
-
-def _stem_token(token: str) -> str:
-    if token in _TOKEN_ALIASES:
-        return _TOKEN_ALIASES[token]
-    if re.fullmatch(r"\d+(?:[.,]\d+)?%?", token):
-        return token
-    if len(token) > 5 and token.endswith("ing"):
-        return token[:-3]
-    if len(token) > 4 and token.endswith("ed"):
-        return token[:-2]
-    if len(token) > 4 and token.endswith("s"):
-        return token[:-1]
-    if len(token) > 4 and token.endswith("e"):
-        return token[:-1]
-    return token
-
-
-def _is_effective_negation(tokens: list[str], index: int) -> bool:
-    token = tokens[index]
-    return token in _NEGATIONS and not (
-        token == "not" and index + 1 < len(tokens) and tokens[index + 1] == "only"
-    )
-
-
-def _strong_denial_indexes(tokens: list[str]) -> set[int]:
-    denied: set[int] = set()
-    segment: list[int] = []
-
-    def finish() -> None:
-        if not segment:
-            return
-        words = [tokens[index] for index in segment]
-        strong_denial = False
-        for offset, word in enumerate(words):
-            before = words[max(0, offset - 2) : offset]
-            after = words[offset + 1 : offset + 5]
-            if word in {"false", "incorrect", "untrue"} and (
-                "that" in after or any(item in {"is", "was"} for item in before)
-            ):
-                strong_denial = True
-            if word == "no" and "evidence" in after:
-                evidence = offset + 1 + after.index("evidence")
-                if "that" in words[evidence + 1 : evidence + 5]:
-                    strong_denial = True
-            if word in {"deny", "denied", "denies"} and "that" in after:
-                strong_denial = True
-            if word == "not" and any(item in {"case", "true"} for item in after) and "that" in after:
-                strong_denial = True
-        if strong_denial:
-            denied.update(segment)
-
-    for index, token in enumerate(tokens):
-        if token in {".", "!", "?", ";"} or token in _CONTRASTS:
-            finish()
-            segment = []
-        else:
-            segment.append(index)
-    finish()
-    return denied
-
-
-def _content_sequence(value: str) -> list[tuple[str, bool]]:
-    normalized = unicodedata.normalize("NFKC", value).casefold().replace("’", "'")
-    normalized = re.sub(r"n['’]t\b", " not", normalized)
-    normalized = re.sub(r"\bcannot\b", "can not", normalized)
-    normalized = normalized.replace("-", " ").replace("/", " ")
-    tokens = _TOKEN_PATTERN.findall(normalized)
-    strong_denials = _strong_denial_indexes(tokens)
-    output: list[tuple[str, bool]] = []
-    boundary = -1
-    contrast = -1
-    for index, token in enumerate(tokens):
-        if token in {".", "!", "?", ";"}:
-            boundary = index
-            continue
-        if token in _CONTRASTS:
-            contrast = index
-            continue
-        if token in _STOPWORDS or token in _NEGATIONS:
-            continue
-        start = max(boundary, contrast, index - 4) + 1
-        negated = index in strong_denials or any(
-            _is_effective_negation(tokens, position) for position in range(start, index)
-        )
-        if len(token) > 1 or token.isdigit():
-            output.append((_stem_token(token), negated))
-    return output
-
-
-def _supports_ordered_relations(
-    available: list[tuple[str, bool]],
-    expected: list[tuple[str, bool]],
-    *,
-    max_extra: int = 4,
-) -> bool:
-    pairs = list(zip(expected, expected[1:], strict=False))
-    if not pairs:
-        return True
-    matches = 0
-    for left, right in pairs:
-        if any(
-            item == left and right in available[index + 1 : index + max_extra + 2]
-            for index, item in enumerate(available)
-        ):
-            matches += 1
-    return matches * 5 >= len(pairs) * 4
-
-
-def _supports_claim(value: str, claim: str) -> bool:
-    expected = _content_sequence(claim)
-    available = _content_sequence(value)
-    required = Counter(expected)
-    return (
-        bool(required) and required <= Counter(available) and _supports_ordered_relations(available, expected)
-    )
-
-
-def _contains_near_sequence(
-    value: list[tuple[str, bool]],
-    expected: list[tuple[str, bool]],
-    *,
-    max_extra: int = 2,
-) -> bool:
-    if not expected:
-        return False
-    for start, item in enumerate(value):
-        if item != expected[0]:
-            continue
-        cursor = start
-        for target in expected[1:]:
-            cursor += 1
-            while cursor < len(value) and value[cursor] != target:
-                cursor += 1
-            if cursor >= len(value) or cursor - start + 1 > len(expected) + max_extra:
-                break
-        else:
-            return True
-    return False
-
-
-def _matches_forbidden(value: str, claim: str) -> bool:
-    available = _content_sequence(value)
-    expected = _content_sequence(claim)
-    quantities = Counter(item for item in expected if re.fullmatch(r"\d+(?:[.,]\d+)?%?", item[0]))
-    if quantities and quantities <= Counter(available):
-        return True
-    return _contains_near_sequence(available, expected)
-
-
-def score_supported_answer(value: str, spec: AnswerSpec) -> bool:
-    if any(_matches_forbidden(value, forbidden) for forbidden in spec.forbidden_claims):
-        return False
-    if spec.kind == "date":
-        return _date(value) is not None and _date(value) == _date(spec.canonical_answer)
-    if spec.kind == "list":
-        return score_exact_answer(value, spec)
-    return _supports_claim(value, spec.canonical_answer)
-
-
-def _claim_coverage(claim: str, answer: str) -> float:
-    tokens = set(normalize_answer(claim).split())
-    if not tokens:
-        return 0.0
-    return len(tokens & set(normalize_answer(answer).split())) / len(tokens)
-
-
-def tool_names(trace: vf.Trace) -> list[str]:
-    calls: dict[str, str] = {}
-    results: set[str] = set()
-    for node in trace.nodes:
-        message = node.message.model_dump(mode="json", exclude_none=True)
-        for call in message.get("tool_calls", []):
-            name = call.get("name") or call.get("function", {}).get("name")
-            call_id = call.get("id")
-            if isinstance(call_id, str) and isinstance(name, str) and name.startswith("slack_"):
-                calls[call_id] = name
-        if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str):
-            results.add(message["tool_call_id"])
-    return [calls[call_id] for call_id in calls if call_id in results]
-
-
 def visible_errors(trace: vf.Trace) -> list[str]:
-    output = [str(redact_secrets(f"{error.type}: {error.message}"))[:1_000] for error in trace.errors[:20]]
-    for node in trace.nodes:
-        message = node.message.model_dump(mode="json", exclude_none=True)
-        if message.get("role") != "tool":
-            continue
-        content = str(message.get("content", ""))
-        normalized = content.lstrip().casefold()
-        if normalized.startswith(("error", '{"error"', "{'error'")):
-            output.append(str(redact_secrets(content))[:500])
-    return output
+    return [str(redact_secrets(f"{error.type}: {error.message}"))[:1_000] for error in trace.errors[:20]]
 
 
 def summarize_solver(trace: vf.Trace) -> SolverSummary:
-    answer = extract_final_answer(trace.last_reply) or ""
-    names = [call["tool"] for call in trace.state.completed_calls]
-    runtime_id = trace.agent.runtime.id if trace.agent and trace.agent.runtime else None
+    answer = trace.last_reply.strip()
+    state = require_slack_state(trace)
+    reward = trace.rewards.get("semantic_correctness")
+    if reward is None:
+        raise ValueError("solver trace is missing semantic_correctness reward")
+    scores = trace.info.get("solver_semantic_scores")
+    if not isinstance(scores, dict):
+        raise ValueError("solver trace is missing semantic score details")
+    runtime_id = trace.agent.runtime.id if trace.agent.runtime else None
     return SolverSummary(
         final_answer_present=bool(answer),
         final_answer=answer,
-        tool_call_count=len(names),
-        tool_names=names,
+        completed_actions=[item.model_dump(mode="json") for item in state.completed_actions],
+        semantic_score=reward.score,
+        metrics={
+            "required_claim_coverage": float(scores["required_claim_coverage"]),
+            "contradiction_free": float(scores["contradiction_free"]),
+            "forbidden_claim_count": float(scores["forbidden_claim_count"]),
+            "answer_present": float(bool(answer)),
+        },
+        semantic_verdict=trace.info.get("solver_semantic_verdict"),
         visible_errors=visible_errors(trace),
         trace_id=trace.id,
         runtime_id=runtime_id,
@@ -419,12 +315,14 @@ def summarize_solver(trace: vf.Trace) -> SolverSummary:
 
 
 __all__ = [
+    "CLAIM_SCORE",
+    "RequiredClaimVerdict",
+    "SlackAnswerJudge",
+    "SolverAnswerVerdict",
     "SolverConfig",
     "SolverData",
     "SolverTask",
-    "extract_final_answer",
     "score_exact_answer",
-    "score_supported_answer",
+    "solver_verdict_scores",
     "summarize_solver",
-    "tool_names",
 ]
