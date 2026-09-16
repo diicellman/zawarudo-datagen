@@ -244,5 +244,12 @@ __marimo__/
 /references/
 /opencode.json
 
+# Local research notes, historical datasets, and generated archives
+/local-docs/
+/janitor/
+/data_intermidiate/
+/*.zip
+/*.zip.sha256
+
 # macOS
 .DS_Store

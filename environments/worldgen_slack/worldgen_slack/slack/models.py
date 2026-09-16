@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-INTERFACE_ID = "slack.readonly.v1"
+INTERFACE_ID = "slack.readonly.v2"
 QUALITY_CRITERIA = (
     "scenario_alignment",
     "world_coherence",
@@ -198,21 +198,21 @@ class SlackWorld(StrictModel):
         raise ValueError(f"actor {actor_id!r} does not exist in the Slack world")
 
 
-class ScenarioSpec(StrictModel):
-    organization: NonEmptyText
-    workflow: NonEmptyText
-    description: NonEmptyText
-
-    @field_validator("organization", "workflow", "description")
-    @classmethod
-    def nonblank(cls, value: str, info: Any) -> str:
-        return _nonblank(value, info.field_name)
-
-
 class AnswerSpec(StrictModel):
     kind: Literal["exact_string", "date", "entity", "list", "fact_summary"]
-    canonical_answer: NonEmptyText
-    required_claims: Annotated[list[NonEmptyText], Field(min_length=1)]
+    canonical_answer: Annotated[
+        NonEmptyText,
+        Field(
+            description="Concrete standalone answer to every requested output, not a placeholder or method."
+        ),
+    ]
+    required_claims: Annotated[
+        list[NonEmptyText],
+        Field(
+            min_length=1,
+            description="Requested answer facts only; no proof steps, formatting rules, or prohibitions.",
+        ),
+    ]
     forbidden_claims: list[NonEmptyText] = Field(default_factory=list)
     list_order_matters: bool = False
 
@@ -241,130 +241,3 @@ class AnswerSpec(StrictModel):
         if self.kind != "list" and self.list_order_matters:
             raise ValueError("list_order_matters is only valid for list answers")
         return self
-
-
-class EvidenceRequirement(StrictModel):
-    evidence_id: SafeId
-    message_id: SafeId
-    conversation_id: SafeId
-    author_id: SafeId | None = None
-    thread_root_id: SafeId | None = None
-    required_terms: Annotated[list[NonEmptyText], Field(min_length=1)]
-    fact_description: NonEmptyText
-
-    @field_validator("required_terms")
-    @classmethod
-    def valid_terms(cls, values: list[str]) -> list[str]:
-        for value in values:
-            _nonblank(value, "required_terms")
-        return values
-
-    @field_validator("fact_description")
-    @classmethod
-    def valid_description(cls, value: str) -> str:
-        return _nonblank(value, "fact_description")
-
-
-_ALLOWED_GOLD_TOOLS = {
-    "slack_list_conversations": frozenset(),
-    "slack_search_messages": frozenset({"query", "limit"}),
-    "slack_get_conversation_history": frozenset({"conversation_id", "limit"}),
-    "slack_get_thread": frozenset({"conversation_id", "root_message_id"}),
-    "slack_get_user": frozenset({"user_id"}),
-}
-
-
-class GoldCall(StrictModel):
-    tool: Literal[
-        "slack_list_conversations",
-        "slack_search_messages",
-        "slack_get_conversation_history",
-        "slack_get_thread",
-        "slack_get_user",
-    ]
-    arguments: dict[str, Any]
-
-    @model_validator(mode="after")
-    def valid_arguments(self) -> Self:
-        expected = _ALLOWED_GOLD_TOOLS[self.tool]
-        actual = set(self.arguments)
-        required = expected - {"limit"}
-        if actual - expected:
-            raise ValueError(f"unsupported arguments for {self.tool}: {sorted(actual - expected)}")
-        if required - actual:
-            raise ValueError(f"missing arguments for {self.tool}: {sorted(required - actual)}")
-        for name, value in self.arguments.items():
-            if name in {"conversation_id", "root_message_id", "user_id"}:
-                if not isinstance(value, str):
-                    raise ValueError(f"{name} must be a string")
-                validate_safe_identifier(value, name)
-            elif name == "query":
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError("query must be a nonblank string")
-            elif name == "limit":
-                maximum = 10 if self.tool == "slack_search_messages" else 50
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise ValueError("limit must be an integer")
-                if not 1 <= value <= maximum:
-                    raise ValueError(f"limit must be between 1 and {maximum}")
-        return self
-
-
-class TaskContract(StrictModel):
-    question: NonEmptyText
-    actor_id: SafeId
-    answer: AnswerSpec
-    required_evidence: Annotated[list[EvidenceRequirement], Field(min_length=1)]
-    gold_calls: Annotated[list[GoldCall], Field(min_length=1)]
-    task_slug: SafeId | None = None
-    min_distinct_evidence_messages: Annotated[int, Field(ge=1)] = 1
-    min_distinct_evidence_conversations: Annotated[int, Field(ge=1)] = 1
-
-    @field_validator("question")
-    @classmethod
-    def valid_question(cls, value: str) -> str:
-        value = _nonblank(value, "question")
-        normalized = re.sub(r"[\s_-]+", "", value.casefold())
-        if "requiredevidence" in normalized or "goldcalls" in normalized:
-            raise ValueError("question contains a private task-contract field name")
-        return value
-
-    @model_validator(mode="after")
-    def valid_evidence_spread(self) -> Self:
-        evidence_ids = [item.evidence_id for item in self.required_evidence]
-        if len(evidence_ids) != len(set(evidence_ids)):
-            raise ValueError("required_evidence contains duplicate evidence IDs")
-        message_count = len({item.message_id for item in self.required_evidence})
-        conversation_count = len({item.conversation_id for item in self.required_evidence})
-        if self.min_distinct_evidence_messages > message_count:
-            raise ValueError("min_distinct_evidence_messages exceeds specified evidence")
-        if self.min_distinct_evidence_conversations > conversation_count:
-            raise ValueError("min_distinct_evidence_conversations exceeds specified evidence")
-        return self
-
-
-class SynthesizedItem(StrictModel):
-    scenario: ScenarioSpec
-    task: TaskContract
-
-
-__all__ = [
-    "INTERFACE_ID",
-    "QUALITY_CRITERIA",
-    "SAFE_IDENTIFIER_PATTERN",
-    "TIMESTAMP_FORMAT",
-    "AnswerSpec",
-    "Conversation",
-    "EvidenceRequirement",
-    "GoldCall",
-    "Message",
-    "Reaction",
-    "ScenarioSpec",
-    "SlackWorld",
-    "StrictModel",
-    "SynthesizedItem",
-    "TaskContract",
-    "User",
-    "is_safe_identifier",
-    "validate_safe_identifier",
-]

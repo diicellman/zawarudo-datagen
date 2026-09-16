@@ -1,69 +1,37 @@
-# WorldGen Slack
+# Slack QA taskset
 
-A native `verifiers.v1` environment for generating read-only Slack QA worlds:
-
-```text
-synthesize → build → validate → solve → judge
-```
-
-`SlackDataGenerationEnv` owns only this sequence. Slack models/API/validation own semantics.
-Verifiers owns execution, native retries, traces, runtimes, scoring hooks, and the `vf.Toolset`
-transport. The standalone generator owns policy, resume, and atomic release writes. Janitor owns
-post-run viewing.
-
-## Run
-
-From the repository root:
+`worldgen-slack` loads related questions against one immutable Slack snapshot. Each task
+starts a fresh solver session with actor-scoped tools. A native `vf.Judge` call grades
+correctness and grounding in the solver's own observations. It does not launch a judge agent.
 
 ```bash
-uv run --frozen worldgen-slack generate --config configs/generation.toml
+uv run eval @ configs/eval-generated.toml -n 1 -r 2 --no-push --plain
 ```
 
-The CLI schedules a target number of accepted worlds with a fixed worker pool, an exact attempt cap,
-durable resume, deduplication, and transactional release writes. The environment uses native
-Verifiers execution and trace ownership. Whole-episode retries are zero; only the world judge has
-one narrowly scoped native operational retry. No custom retry state or trace-status mutation exists.
+Set `--env.taskset.task.release_dir` to select another generated release. Public rows and
+snapshot references are validated before execution; private answers stay host-side.
+The full-eval convention is 100 tasks, one rollout each.
 
-## Trust and correctness
+## Supported Slack subset: `slack.readonly.v2`
 
-All roles and generated-code checks use immutable Prime VMs with default-deny egress. The public
-builder check and private candidate check share `slack/validate.py`, but public feedback is never
-authoritative. The host accepts only bounded snapshots and reruns source, ontology, visibility,
-evidence, gold-call, determinism, variation, stability, size, and leakage gates.
+- `list_conversations(cursor?, limit?)`
+- `search_messages(query, conversation_id?, author_id?, after?, before?, cursor?, limit?)`
+- `get_conversation_history(conversation_id, cursor?, limit?)`
+- `get_thread(conversation_id, root_message_id, cursor?, limit?)`
+- `get_user(user_id)`
 
-The solver sees only its question, actor, validated snapshot, and the read-only Slack Toolset. Its
-natural last reply is scored by a host-side semantic claim judge with the private oracle. The
-world-only judge receives no solver response, trace, reward, or verdict; it must make an empirically
-recorded Slack call and write a fresh bounded rubric verdict. Exact/date/list matching is diagnostic
-only and cannot override the semantic reward.
+Pages contain `items` and `next_cursor`; directory lookup returns one record. Page size is
+1–100 (default 50). History returns roots newest first; threads return root and replies
+oldest first. Search uses deterministic phrase/token overlap ranking and exclusive UTC
+time bounds. It is a Slack-like lexical subset, not Slack's production search parser.
+Cursors belong to one actor, snapshot, and query.
 
-## Release
+Public channels are readable by all workspace users; private channels and DMs require
+membership. Archived conversations and deleted messages are excluded. The interface does
+not implement writes, attachments, Slack OAuth, or production MCP compatibility.
 
-Generator schema `worldgen-slack.dataset.v3` and release table schema 2 provide:
-
-- `manifest.json`, `attempts.jsonl`, and `artifacts.jsonl` for Janitor;
-- `run_manifest.json`, `summary.json`, `qualification_report.json`, and durable `progress.jsonl`;
-- `dataset.jsonl`, solver-safe `public_tasks.jsonl`, and host-only `private_oracles.jsonl`;
-- derived schemas plus `interface.json` and `builder_guide.md`;
-- accepted `worlds/<instance_id>/` and optional separate `rejected/<attempt_id>/` artifacts.
-
-Accepted writes use a transaction journal and atomic directory replacement. Resume validates paths,
-symlinks, hashes, identities, public/private correspondence, and immutable provenance. The generated
-taskset loads `snapshot.json` only and never executes `world.py`.
-
-```bash
-uv run eval @ configs/eval-generated-prime.toml --env.taskset.release-dir data/slack-qualification-v1 --dry-run True --no-push --plain
-
-(cd janitor && cargo run -- release ../data/slack-qualification-v1)
-```
-
-## Development
-
-```bash
-uv run --project environments/worldgen_slack pytest -q environments/worldgen_slack/tests
-uv run --project environments/worldgen_slack ruff check environments/worldgen_slack/worldgen_slack environments/worldgen_slack/tests
-uv run --project environments/worldgen_slack ruff format --check environments/worldgen_slack/worldgen_slack environments/worldgen_slack/tests
-```
-
-Set `WORLDGEN_SLACK_EXTERNAL_SMOKE=1` only when Prime Inference, Sandbox, tunneling, model, and pinned
-RLM access are available.
+Native subprocess tool servers hold the snapshot on the host. A small file reference
+avoids serializing thousands of messages into the tool-server environment variable.
+Recorded reads are serialized per server because the pinned Verifiers state endpoint
+replaces the whole state on each update. These constraints are covered by the runnable
+check in the generator.

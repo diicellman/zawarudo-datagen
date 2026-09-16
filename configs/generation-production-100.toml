@@ -1,94 +1,15 @@
-run_id = "slack-production-100-v1"
-default_model = "z-ai/glm-5.2"
-target_accepted = 100
-max_attempts = 250
-concurrency = 5
-seed_start = 0
-progress_interval_seconds = 8.0
-output = "data_intermidiate"
-near_duplicate_threshold = 0.92
-
-[client]
-type = "eval"
-
-[sampling]
-temperature = 0.2
-max_tokens = 16384
-
-[acceptance]
-min_solver_score = 1.0
-min_world_score = 0.80
-retain_rejected_artifacts = true
-
-[acceptance.minimum_world_scores]
-scenario_alignment = 0.75
-world_coherence = 0.75
-professional_realism = 0.50
-discoverability = 0.75
-shortcut_free = 0.75
-evidence_composition = 0.75
+sector = "IT"
+task_count = 100
+group_size = 10
+seed = 20260919
+output = "data/production-100"
+max_review_rounds = 5
+target_messages = 2000
+research_budget_usd = 690.0
 
 [env]
-max_concurrent_agents = 2
-max_builder_checks = 3
-hidden_seeds = [101, 202]
-public_seed = 0
-brief_schedule_seed = 0
-candidate_timeout_seconds = 90.0
-public_check_timeout_seconds = 45.0
-
-[env.taskset]
-id = "worldgen-slack-generation"
-
-[env.retries]
-max_retries = 0
-
-[env.synthesizer]
-model = "openai/gpt-5.6-luna"
-max_turns = 3
-sampling = { temperature = 0.0, max_tokens = 6000 }
-harness = { id = "null" }
-runtime = { type = "prime", vm = true, image = "python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a", workdir = "/task", allow = [], block = ["*"], cpu = 1, memory = 2, disk = 5, idle_timeout = 900, labels = ["worldgen-slack", "slack-production-100-v1"] }
-
-[env.builder]
-model = "openai/gpt-5.6-terra"
-max_turns = 18
-sampling = { temperature = 0.2, max_tokens = 16000 }
-harness = { id = "rlm", version = "83ef01f7a6c97328919387343bd30cf4edaac20d", builtin_skills = ["edit"] }
-runtime = { type = "prime", vm = true, image = "python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a", workdir = "/task", allow = [], block = ["*"], cpu = 2, memory = 4, disk = 8, idle_timeout = 900, labels = ["worldgen-slack", "slack-production-100-v1"] }
-
-[env.solver]
-model = "z-ai/glm-5.2"
-max_turns = 8
-sampling = { temperature = 0.1, max_tokens = 6000 }
-harness = { id = "null" }
-runtime = { type = "prime", vm = true, image = "python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a", workdir = "/task", allow = [], block = ["*"], cpu = 1, memory = 2, disk = 5, idle_timeout = 900, labels = ["worldgen-slack", "slack-production-100-v1"] }
-
-[env.solver_judge]
-model = "openai/gpt-5.6-luna"
-sampling = { temperature = 0.0, max_tokens = 2000 }
-
-[env.judge]
-model = "openai/gpt-5.6-sol"
-max_turns = 10
-sampling = { temperature = 0.0, max_tokens = 6000 }
-harness = { id = "rlm", version = "83ef01f7a6c97328919387343bd30cf4edaac20d", builtin_skills = [] }
-runtime = { type = "prime", vm = true, image = "python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a", workdir = "/task", allow = [], block = ["*"], cpu = 1, memory = 3, disk = 5, idle_timeout = 900, labels = ["worldgen-slack", "slack-production-100-v1"] }
-retries = { max_retries = 1, include = ["TaskError", "ProviderError", "SandboxError", "HarnessError", "InterceptionError", "TunnelError", "ToolsetError"] }
-
-[env.candidate_runtime]
-type = "prime"
-vm = true
-image = "python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a"
-workdir = "/task"
-allow = []
-block = ["*"]
-cpu = 2
-memory = 3
-disk = 8
-idle_timeout = 900
-labels = ["worldgen-slack", "slack-production-100-v1"]
+max_concurrent_agents = 8
 
 [env.timeout]
-episode = 3600
+episode = 86400
 finalize = 300

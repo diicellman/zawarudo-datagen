@@ -1,0 +1,12 @@
+sector = "IT"
+task_count = 10
+group_size = 5
+seed = 20260918
+output = "data/pilot"
+max_review_rounds = 5
+target_messages = 300
+research_budget_usd = 100.0
+
+[env.timeout]
+episode = 21600
+finalize = 300

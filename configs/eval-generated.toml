@@ -1,0 +1,9 @@
+model = "z-ai/glm-5.2"
+num_examples = 3
+rollouts_per_example = 1
+
+[env.taskset]
+id = "worldgen-slack"
+
+[env.taskset.task]
+release_dir = "data/milestone/release"
