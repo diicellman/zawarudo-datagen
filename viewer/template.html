@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Artifact observatory</title>
+<style>
+:root{color-scheme:light;--ink:#192b3a;--muted:#526779;--line:#d7e2e8;--paper:#fff;--accent:#006c70;--soft:#edf5f6}
+*{box-sizing:border-box}body{margin:0;background:#f3f6f8;color:var(--ink);font:15px/1.55 system-ui,sans-serif}
+header{background:#163747;color:white;padding:26px max(24px,calc((100vw - 1440px)/2))}h1{font-size:27px;margin:0}header p{max-width:950px;color:#d4e6ef;margin:6px 0}
+main{max-width:1488px;margin:auto;padding:24px}h2{font-size:19px;margin:0 0 14px}h3{font-size:16px;margin:12px 0 6px}p{margin:8px 0}
+.panel{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:18px;min-width:0}.toolbar{display:flex;gap:16px;flex-wrap:wrap;align-items:end}
+.field{display:flex;flex:1;min-width:190px;flex-direction:column;gap:5px}label,.eyebrow{font-size:12px;font-weight:700;letter-spacing:.04em}.eyebrow{text-transform:uppercase;color:var(--muted)}
+select,input[type=search]{width:100%;font:inherit;background:white;border:1px solid #9eafb9;border-radius:6px;padding:9px;color:var(--ink)}input[type=checkbox]{accent-color:var(--accent)}
+button{font:inherit;cursor:pointer;border:1px solid #89b9bc;background:var(--soft);color:#00595e;border-radius:6px;padding:5px 9px;margin:3px 5px 3px 0;text-align:left}button:hover{background:#d7ebed}
+:focus-visible{outline:3px solid #d18711;outline-offset:3px}a{color:var(--accent)}.grid{display:grid;grid-template-columns:minmax(300px, .9fr) minmax(400px,1.4fr);gap:20px}
+.muted{color:var(--muted);font-size:13px}.notice{padding:10px 12px;background:#fff4da;border-radius:6px}.question{font-size:20px;line-height:1.45;white-space:pre-wrap}.text{white-space:pre-wrap;overflow-wrap:anywhere}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 ui-monospace,monospace;background:#f4f7f9;padding:12px;border-radius:6px;max-height:400px;overflow:auto}
+details{margin:10px 0}summary{cursor:pointer;font-weight:650;padding:5px 0}.message{border:1px solid var(--line);border-radius:8px;padding:12px;margin:10px 0;background:white}.message.target{border:2px solid var(--accent);background:#f0fbfa}
+.message .meta{font-size:12px;color:var(--muted);overflow-wrap:anywhere}.badge{display:inline-block;border-radius:20px;padding:2px 9px;background:var(--soft);font-size:12px;margin:2px 5px 2px 0}.scroll{max-height:680px;overflow:auto;padding:2px 8px 2px 2px}
+.claim{border-top:1px solid var(--line);padding:10px 0}.diffrow{border-top:1px solid var(--line);padding-top:14px;margin-top:14px}.pair{display:grid;grid-template-columns:1fr 1fr;gap:14px}.added{color:#17663d}.removed{color:#9f3434}.changed{color:#855700}
+[hidden]{display:none!important}#thread{scroll-margin-top:18px}.empty{padding:20px 0;color:var(--muted)}.check{display:flex;gap:8px;align-items:center;padding:10px 0}.stats{margin:8px 0}
+@media(max-width:850px){.grid,.pair{grid-template-columns:1fr}main{padding:14px}.panel{padding:15px}header{padding:20px}.scroll{max-height:500px}}
+</style>
+</head>
+<body>
+<header><div class="eyebrow" style="color:#a5d6d8">Local artifact inspector</div><h1>Artifact observatory</h1><p>Explore generated worlds, task evidence, and revisions. This is an omniscient inspector, not a replay of solver access. Private channels and deleted messages remain visible.</p></header>
+<main>
+<section class="panel" aria-label="Artifact selection">
+<div class="toolbar"><label class="field">Run<select id="run"></select></label><label class="field">Attempt / artifact<select id="attempt"></select></label><label class="field">Task<select id="task"></select></label></div>
+<label class="check"><input id="hide" type="checkbox" checked> Hide private answers and review details</label>
+<p class="muted">Hiding answers is a display aid, not redaction. Workspace messages may reveal answers. All embedded data is available in this local file.</p>
+<div id="status" class="muted" role="status" aria-live="polite"></div>
+<details><summary>Artifact sources and run summary</summary><div id="sources"></div></details>
+</section>
+<div class="grid">
+<div>
+<section class="panel"><div class="eyebrow">Selected task</div><h2 id="question" class="question"></h2><div id="taskMeta" class="muted"></div><div id="privateTask"></div><div id="evidence"></div></section>
+<section class="panel"><h2>Catalog context</h2><div id="catalog"></div></section>
+<section class="panel"><h2>Review &amp; validation</h2><div id="review"></div></section>
+</div>
+<div>
+<section class="panel"><h2>Workspace explorer</h2><div class="toolbar"><label class="field">Channel<select id="channel"></select></label><label class="field">Search messages<input id="search" type="search" placeholder="Text, author, or message ID"></label></div><div id="workspaceStats" class="muted stats" role="status"></div><div id="messages" class="scroll"></div><details><summary>User directory</summary><div id="users"></div></details></section>
+<section class="panel" id="thread" tabindex="-1"><h2>Evidence &amp; full thread</h2><p class="muted">Select a message to inspect its root and all replies in this artifact, without the channel or search filters.</p><div id="threadContent"></div></section>
+</div>
+</div>
+<section class="panel"><h2>Compare selected artifacts</h2><p class="muted">This compares selected snapshots. It does not assume a causal edit history. Message IDs determine identity; deleted flags are metadata, not removals. “Before” defaults to the previous listed artifact.</p><div class="toolbar"><label class="field">Before<select id="before"></select></label><label class="field">After<select id="after"></select></label></div><div id="diffStats" class="stats" role="status"></div><div id="diff" class="scroll"></div></section>
+</main>
+<script id="viewer-data" type="application/json">__VIEWER_DATA__</script>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const list = value => Array.isArray(value) ? value : [];
+const fmt = value => typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (cls) node.className = cls;
+  return node;
+}
+function clear(id) { const node = $(id); node.replaceChildren(); return node; }
+function note(node, text) { node.append(el('p', text, 'muted')); }
+function raw(node, title, value) {
+  if (value === undefined || value === null) return;
+  const details = el('details'); details.append(el('summary', title), el('pre', fmt(value))); node.append(details);
+}
+function button(text, action) { const b = el('button', text); b.type = 'button'; b.onclick = action; return b; }
+function options(id, rows, selected) {
+  const node = clear(id);
+  for (const [value, label] of rows) { const o = el('option', label); o.value = value; node.append(o); }
+  if (selected !== undefined) node.value = String(selected);
+  node.disabled = !rows.length;
+}
+let data;
+try { data = JSON.parse($('viewer-data').textContent); }
+catch (error) { $('status').textContent = 'Cannot read embedded artifact data: ' + error.message; }
+const runs = list(data?.runs);
+let run, attempt, tasks = [], snapshot = {}, selectedTask;
+const hidden = () => $('hide').checked;
+const snap = artifact => artifact?.candidate?.snapshot || null;
+const attemptLabel = a => [a.id, a.phase].filter(Boolean).join(' · ');
+const byId = (items, id) => list(items).find(item => item.id === id);
+const userName = (s, id) => byId(s.users, id)?.name || id || 'Unknown author';
+const channelName = (s, id) => byId(s.conversations, id)?.name || id || 'Unknown channel';
+function messageCard(message, s, clickable = true, target = false) {
+  const card = el('article', null, 'message' + (target ? ' target' : ''));
+  card.append(el('strong', userName(s, message.author_id)));
+  card.append(el('div', [channelName(s, message.conversation_id), message.timestamp, message.id,
+    message.deleted ? 'DELETED' : '', message.thread_root_id ? 'Reply to ' + message.thread_root_id : 'Thread root'].filter(Boolean).join(' · '), 'meta'));
+  card.append(el('p', message.text || '(No text)', 'text'));
+  if (clickable) card.append(button('Open full thread', () => openMessage(message.id)));
+  raw(card, 'Message metadata', Object.fromEntries(Object.entries(message).filter(([key]) => key !== 'text')));
+  return card;
+}
+function openMessage(id) {
+  const box = clear('threadContent'), message = byId(snapshot.messages, id);
+  if (!message) note(box, 'Message not present in this artifact: ' + id);
+  else {
+    const rootId = message.thread_root_id || message.id;
+    const thread = list(snapshot.messages).filter(m => m.conversation_id === message.conversation_id && (m.id === rootId || m.thread_root_id === rootId));
+    thread.sort((a, b) => a.id === rootId ? -1 : b.id === rootId ? 1 : String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
+    note(box, 'Thread ' + rootId + ' · ' + thread.length + ' messages');
+    if (!thread.some(m => m.id === rootId)) note(box, 'Thread root is missing from this snapshot.');
+    for (const m of thread) box.append(messageCard(m, snapshot, false, m.id === id));
+  }
+  $('thread').focus(); $('thread').scrollIntoView({behavior:'smooth', block:'start'});
+}
+function openUser(id) {
+  const box = clear('threadContent'), user = byId(snapshot.users, id);
+  box.append(el('h3', 'User evidence · ' + id));
+  if (user) box.append(el('pre', fmt(user))); else note(box, 'User not present in this artifact.');
+  $('thread').focus(); $('thread').scrollIntoView({behavior:'smooth', block:'start'});
+}
+function renderTask() {
+  selectedTask = tasks[Number($('task').value)];
+  $('question').textContent = selectedTask?.question || 'No task available';
+  $('taskMeta').textContent = selectedTask ? [selectedTask.id, 'Actor: ' + userName(snapshot, selectedTask.actor_id), selectedTask.actor_id].filter(Boolean).join(' · ') : '';
+  const priv = clear('privateTask'), evidence = clear('evidence');
+  if (!selectedTask) return;
+  if (hidden()) note(priv, 'Private answer, reasoning, claim evidence, and gold calls are hidden.');
+  else {
+    priv.append(el('h3', 'Canonical answer'), el('p', fmt(selectedTask.answer?.canonical_answer ?? 'Not provided'), 'text'));
+    raw(priv, 'Required claims', selectedTask.answer?.required_claims);
+    raw(priv, 'Author reasoning', selectedTask.reasoning);
+    raw(priv, 'Fact references', selectedTask.fact_ids);
+    const binding = list(attempt.candidate?.bindings).find(b => b.task_id === selectedTask.id);
+    evidence.append(el('h3', 'Bound evidence'));
+    if (!binding) note(evidence, 'No evidence binding for this task.');
+    for (const claim of list(binding?.claims)) {
+      const row = el('div', null, 'claim'); row.append(el('strong', 'Claim index ' + claim.claim_index));
+      const required = list(selectedTask.answer?.required_claims)[claim.claim_index];
+      if (required !== undefined) row.append(el('p', fmt(required), 'text'));
+      row.append(el('div'));
+      for (const id of list(claim.message_ids)) row.append(button('Message · ' + id, () => openMessage(id)));
+      for (const id of list(claim.user_ids)) row.append(button('User · ' + userName(snapshot, id) + ' (' + id + ')', () => openUser(id)));
+      if (!list(claim.message_ids).length && !list(claim.user_ids).length) note(row, 'No evidence references.');
+      evidence.append(row);
+    }
+    raw(evidence, 'Gold calls (recorded, not executed)', binding?.gold_calls);
+  }
+}
+function renderCatalog() {
+  const node = clear('catalog'), catalog = attempt.catalog;
+  if (!catalog) { note(node, 'No catalog included.'); return; }
+  if (catalog.overview) node.append(el('p', fmt(catalog.overview), 'text'));
+  raw(node, 'Company', catalog.company); raw(node, 'People', catalog.people);
+  if (!hidden()) raw(node, 'Private catalog facts', catalog.facts);
+}
+function renderReview() {
+  const node = clear('review');
+  if (hidden()) { note(node, 'Review details can reveal answers. Uncheck “Hide private answers” to inspect them.'); return; }
+  const v = attempt.verdict;
+  if (!v) note(node, 'No judge verdict for this artifact.');
+  else {
+    const details = el('details'); details.append(el('summary', 'Judge verdict · ' + (v.approved === true ? 'Approved' : v.approved === false ? 'Not approved' : 'Recorded')));
+    if (v.summary) details.append(el('p', v.summary, 'text'));
+    raw(details, 'Scores / criteria', v.criteria ?? v.scores);
+    for (const issue of list(v.issues)) {
+      const finding = el('div', null, 'claim');
+      finding.append(el('h3', [issue.owner, issue.artifact].filter(Boolean).join(' · ')),
+        el('p', issue.defect, 'text'), el('strong', 'Requested change'),
+        el('p', issue.requested_change, 'text'));
+      for (const id of list(issue.message_ids)) finding.append(button('Inspect · ' + id, () => openMessage(id)));
+      raw(finding, 'Affected tasks and facts', {task_ids: issue.task_ids, fact_ids: issue.fact_ids});
+      details.append(finding);
+    }
+    raw(details, 'Selected task review', list(v.tasks).filter(t => t.task_id === selectedTask?.id));
+    raw(details, 'Complete verdict', v); node.append(details);
+  }
+  raw(node, 'Validation report (includes recorded outputs)', attempt.validation);
+}
+function renderMessages() {
+  const node = clear('messages'), channel = $('channel').value, query = $('search').value.trim().toLocaleLowerCase();
+  const messages = list(snapshot.messages).filter(m => (!channel || m.conversation_id === channel) &&
+    (!query || [m.text, m.id, m.author_id, userName(snapshot, m.author_id)].join(' ').toLocaleLowerCase().includes(query)));
+  messages.sort((a,b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
+  $('workspaceStats').textContent = messages.length + ' of ' + list(snapshot.messages).length + ' messages · ' + list(snapshot.users).length + ' users · ' + list(snapshot.conversations).length + ' channels';
+  if (!messages.length) note(node, snap(attempt) ? 'No messages match these filters.' : 'No candidate snapshot in this artifact.');
+  for (const m of messages) node.append(messageCard(m, snapshot));
+}
+function stable(value) {
+  if (Array.isArray(value)) return value.map(stable);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(k => [k, stable(value[k])]));
+  return value;
+}
+const equal = (a,b) => JSON.stringify(stable(a)) === JSON.stringify(stable(b));
+function renderDiff() {
+  const node = clear('diff'), artifacts = list(run?.attempts);
+  const a = snap(artifacts[Number($('before').value)]), b = snap(artifacts[Number($('after').value)]);
+  const leftCatalog = artifacts[Number($('before').value)]?.catalog;
+  const rightCatalog = artifacts[Number($('after').value)]?.catalog;
+  if (leftCatalog && rightCatalog && !hidden() && !equal(leftCatalog, rightCatalog)) {
+    const d = el('details'); d.append(el('summary', 'Private catalog changed · before / after'));
+    const pair = el('div', null, 'pair');
+    for (const [label, value] of [['Before', leftCatalog], ['After', rightCatalog]]) {
+      const side = el('div'); side.append(el('h3', label), el('pre', fmt(value))); pair.append(side);
+    }
+    d.append(pair); node.append(d);
+  }
+  if (!a || !b) {
+    $('diffStats').textContent = 'World comparison needs two snapshots. Unhide private details to inspect changed catalogs below. A missing snapshot is not an empty world.';
+    return;
+  }
+  const before = new Map(list(a.messages).map(m => [m.id,m])), after = new Map(list(b.messages).map(m => [m.id,m]));
+  const counts = {added:0, removed:0, text:0, metadata:0, unchanged:0};
+  const rows = [];
+  for (const id of new Set([...before.keys(), ...after.keys()])) {
+    const left = before.get(id), right = after.get(id), types = [];
+    if (!left) { counts.added++; types.push('Added'); }
+    else if (!right) { counts.removed++; types.push('Removed'); }
+    else {
+      if (!equal(left.text,right.text)) { counts.text++; types.push('Text changed'); }
+      const metadata = m => Object.fromEntries(Object.entries(m).filter(([key]) => key !== 'text'));
+      if (!equal(metadata(left),metadata(right))) { counts.metadata++; types.push('Metadata changed'); }
+      if (!types.length) counts.unchanged++;
+    }
+    if (types.length) rows.push({id,left,right,types});
+  }
+  $('diffStats').textContent = `${counts.added} added · ${counts.removed} removed · ${counts.text} text changes · ${counts.metadata} metadata changes · ${counts.unchanged} unchanged. Text and metadata counts can overlap.`;
+  for (const field of ['users','conversations']) {
+    if (!equal(a[field],b[field])) {
+      const d = el('details'); d.append(el('summary', field === 'users' ? 'User directory changed' : 'Channel directory changed'));
+      const pair = el('div', null, 'pair');
+      for (const [label, value] of [['Before',a[field]],['After',b[field]]]) { const side = el('div'); side.append(el('h3',label),el('pre',fmt(value ?? []))); pair.append(side); }
+      d.append(pair); node.append(d);
+    }
+  }
+  if (!rows.length) note(node, 'No message changes.');
+  for (const {id,left,right,types} of rows) {
+    const row = el('section', null, 'diffrow'); row.append(el('h3',id));
+    for (const type of types) row.append(el('span',type,'badge ' + (type === 'Added' ? 'added' : type === 'Removed' ? 'removed' : 'changed')));
+    const pair = el('div',null,'pair');
+    for (const [label,m,s] of [['Before',left,a],['After',right,b]]) {
+      const side = el('div'); side.append(el('div',label,'eyebrow'));
+      if (m) side.append(messageCard(m,s,false)); else note(side,'Not present');
+      pair.append(side);
+    }
+    row.append(pair); node.append(row);
+  }
+}
+function selectAttempt() {
+  attempt = list(run?.attempts)[Number($('attempt').value)] || {};
+  snapshot = snap(attempt) || {};
+  tasks = list(attempt.tasks?.tasks ?? attempt.tasks);
+  if (!tasks.length) tasks = list(attempt.catalog?.tasks);
+  options('task', tasks.map((t,i) => [i,t.id + ' · ' + (t.question || '').slice(0,80)]),0);
+  const source = clear('sources'); note(source, 'Run path: ' + (run?.path || 'Not supplied'));
+  raw(source,'Source paths',attempt.source);
+  if (!hidden()) raw(source,'Run summary',run?.summary);
+  $('status').textContent = `${run?.name || 'No run'} · ${attemptLabel(attempt) || 'No attempts'} · ${tasks.length} tasks`;
+  options('channel',[['','All channels'],...list(snapshot.conversations).map(c => [c.id,`${c.name || c.id} · ${c.kind || 'channel'}${c.is_archived ? ' · archived' : ''}`])],'');
+  $('search').value = ''; clear('threadContent');
+  const users = clear('users');
+  for (const u of list(snapshot.users)) users.append(button((u.name || u.id) + ' · ' + u.id,() => openUser(u.id)));
+  raw(users,'Channel membership and metadata',snapshot.conversations);
+  renderTask(); renderCatalog(); renderReview(); renderMessages();
+  const rows = list(run?.attempts).map((a,i) => [i,attemptLabel(a)]), index = Number($('attempt').value) || 0;
+  options('before',rows,Math.max(0,index-1)); options('after',rows,index); renderDiff();
+}
+function selectRun() {
+  run = runs[Number($('run').value)];
+  options('attempt',list(run?.attempts).map((a,i) => [i,attemptLabel(a)]),Math.max(0,list(run?.attempts).length-1));
+  selectAttempt();
+}
+$('run').onchange = selectRun; $('attempt').onchange = selectAttempt;
+$('task').onchange = () => { clear('threadContent'); renderTask(); renderReview(); };
+$('hide').onchange = () => {
+  clear('threadContent'); renderTask(); renderCatalog(); renderReview(); renderDiff();
+  const source = clear('sources'); note(source,'Run path: ' + (run?.path || 'Not supplied'));
+  raw(source,'Source paths',attempt.source); if (!hidden()) raw(source,'Run summary',run?.summary);
+};
+$('channel').onchange = renderMessages; $('search').oninput = renderMessages;
+$('before').onchange = renderDiff; $('after').onchange = renderDiff;
+options('run',runs.map((r,i) => [i,r.name || r.path || 'Run ' + (i+1)]),0);
+if (data) selectRun();
+</script>
+</body>
+</html>

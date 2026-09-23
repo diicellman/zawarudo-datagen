@@ -19,3 +19,7 @@ Avoid repeatedly reskinning one question. A plan, request, or constraint does no
 class SynthesizerTask(AuthorTask):
     output_type = Catalog
     instructions = CATALOG_GUIDE
+    seed_instructions = (
+        "Use examples to inform plausible processes, dependencies, coordination, and workstream development. "
+        "Create an original catalog; source conversations do not establish canonical facts or answers.\n"
+    )

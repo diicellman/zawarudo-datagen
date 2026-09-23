@@ -1,0 +1,7 @@
+output = "data/seed-study-01"
+seed_path = "data/seeds/slack-examples.json"
+configs = [
+    "configs/generation-qualification-1.toml",
+    "configs/generation-qualification-2.toml",
+    "configs/generation-qualification-3.toml",
+]

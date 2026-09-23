@@ -1,0 +1,12 @@
+sector = "IT for a managed service provider: customer infrastructure maintenance, service handovers, and change approvals"
+task_count = 10
+group_size = 5
+seed = 20260924
+output = "data/qualification-01/services"
+max_review_rounds = 5
+target_messages = 300
+research_budget_usd = 21.0068
+
+[env.timeout]
+episode = 21600
+finalize = 300

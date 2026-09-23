@@ -1,0 +1,36 @@
+output = "data/judge-ablation-01"
+guide_addendum = "generators/worldgen_slack/rubric-richness.md"
+seed = 20260921
+
+[[cases]]
+id = "duplicate-catalog"
+source = "data/feedback-check/attempts/catalog-01/review_input.json"
+phase = "catalog"
+
+[[cases]]
+id = "pilot-catalog"
+source = "data/pilot/attempts/final-g_002-03/review_input.json"
+phase = "catalog"
+repair = true
+
+[[cases]]
+id = "duplicate-world"
+source = "data/pilot/attempts/build-g_002-01/review_input.json"
+phase = "world"
+
+[[cases]]
+id = "templated-world"
+source = "data/pilot/attempts/build-g_002-02/review_input.json"
+phase = "world"
+repair = true
+
+[[cases]]
+id = "pilot-world"
+source = "data/pilot/attempts/final-g_002-03/review_input.json"
+phase = "world"
+repair = true
+
+[[cases]]
+id = "milestone-world"
+source = "data/milestone/attempts/final-grp_telemetry_migration-01/review_input.json"
+phase = "world"

@@ -29,9 +29,19 @@ def reference_for(task, candidate):
 
 
 class GenerationEnv(vf.Env[PipelineConfig]):
-    def __init__(self, settings, store):
+    def __init__(self, settings, store, seeds=None, *, fixed_catalog=False):
         self.settings, self.store = settings, store
+        if (settings.seed_data is None) != (seeds is None):
+            raise ValueError("seed configuration and loaded packet must agree")
+        self.seeds = seeds
+        self.fixed_catalog = fixed_catalog
         super().__init__(settings.env)
+
+    def author_seeds(self, role):
+        return self.seeds if self.settings.seed_data and role in self.settings.seed_data.roles else None
+
+    def seed_context(self, role):
+        return {"seed_data": "/task/seeds.json"} if self.author_seeds(role) is not None else {}
 
     async def setup(self, agents):
         for name in ("synthesizer", "builder", "judge", "solver"):
@@ -88,6 +98,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         self.store.trace(trace)
 
     def route_rejection(self, verdict, budget):
+        if self.fixed_catalog and any(issue.owner == "synthesizer" for issue in verdict.issues):
+            raise ReviewLimit("fixed study catalog needs repair; retain this arm as inconclusive")
         state = self.store.state
         state.feedback = verdict.model_dump_json()
         group_id = budget.partition(":")[2]
@@ -103,6 +115,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
     def catalog_context(self):
         state, cfg = self.store.state, self.settings
         return {
+            **self.seed_context("synthesizer"),
             "phase": "catalog",
             "sector": cfg.sector,
             "task_count": cfg.task_count,
@@ -117,7 +130,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
     async def synthesize(self, agents):
         state, cfg = self.store.state, self.settings
         initial = self.catalog_context()
-        task = SynthesizerTask.create(initial, "catalog")
+        task = SynthesizerTask.create(initial, "catalog", self.author_seeds("synthesizer"))
         async with agents.synthesizer.provision(task) as runtime:
             async with agents.synthesizer.interaction(task, runtime=runtime) as interaction:
                 first = True
@@ -176,6 +189,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         state, cfg = self.store.state, self.settings
         included = {*state.built_groups, group.id}
         return {
+            **self.seed_context("builder"),
             "phase": "world",
             "workspace_id": state.catalog.workspace_id,
             "group_id": group.id,
@@ -212,7 +226,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 self.store.finish_attempt(verdict.approved)
                 if verdict.approved or state.phase == "catalog":
                     return
-        task = BuilderTask.create(self.build_context(group), group.id)
+        task = BuilderTask.create(self.build_context(group), group.id, self.author_seeds("builder"))
         async with agents.builder.provision(task) as runtime:
             async with agents.builder.interaction(task, runtime=runtime) as interaction:
                 first = True

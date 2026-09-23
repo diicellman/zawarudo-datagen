@@ -7,7 +7,7 @@ import verifiers.v1 as vf
 from pydantic import Field
 
 from worldgen_slack.slack.api import digest
-from ..contracts import Candidate, Catalog, Verdict, quality, validate_verdict
+from ..contracts import Candidate, Catalog, Verdict, quality, validate_verdict, verdict_schema
 from worldgen_slack.slack.tools import ReadState, SlackTaskData, stage_tool_data
 from .inspection import ReviewTools, ReviewToolsConfig, missing_evidence
 
@@ -59,6 +59,7 @@ Do not rewrite inputs. Final prose is not a substitute for the verdict file.
 class JudgeConfig(vf.TaskConfig):
     tools: ReviewToolsConfig
     author_trace: str = Field(default="", exclude=True, repr=False)
+    review_guide: str | None = Field(default=None, exclude=True, repr=False)
 
 
 class JudgeTask(vf.Task[SlackTaskData, ReadState, JudgeConfig]):
@@ -69,7 +70,9 @@ class JudgeTask(vf.Task[SlackTaskData, ReadState, JudgeConfig]):
         return [ReviewTools(config.tools)]
 
     @classmethod
-    def create(cls, payload: dict, *, group_id: str = "", candidate_id: str = "") -> Self:
+    def create(
+        cls, payload: dict, *, group_id: str = "", candidate_id: str = "", review_guide: str | None = None
+    ) -> Self:
         groups = {t["group_id"] for t in payload["tasks"]}
         return cls(
             SlackTaskData(
@@ -82,7 +85,7 @@ class JudgeTask(vf.Task[SlackTaskData, ReadState, JudgeConfig]):
                 network_allow=[],
                 network_block=["*"],
             ),
-            JudgeConfig(tools=ReviewToolsConfig(payload_json=json.dumps(payload))),
+            JudgeConfig(tools=ReviewToolsConfig(payload_json=json.dumps(payload)), review_guide=review_guide),
         )
 
     async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
@@ -91,10 +94,14 @@ class JudgeTask(vf.Task[SlackTaskData, ReadState, JudgeConfig]):
         payload = json.loads(self.config.tools.payload_json)
         stage_tool_data(self, self.config.tools, payload)
         await runtime.write("/task/input.json", self.config.tools.payload_json.encode())
-        await runtime.write("/task/schemas.json", json.dumps(Verdict.model_json_schema()).encode())
+        await runtime.write("/task/schemas.json", json.dumps(verdict_schema(payload["phase"])).encode())
         await runtime.write(
             "/task/review.md",
-            (REVIEW_GUIDE + "\nreviewed_hash: " + digest(payload)).encode(),
+            (
+                (self.config.review_guide if self.config.review_guide is not None else REVIEW_GUIDE)
+                + "\nreviewed_hash: "
+                + digest(payload)
+            ).encode(),
         )
 
     async def finalize(self, trace: vf.Trace, runtime: vf.Runtime) -> None:

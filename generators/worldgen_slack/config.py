@@ -2,6 +2,7 @@
 
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 import verifiers.v1 as vf
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -21,12 +22,27 @@ class PipelineConfig(vf.EnvConfig):
     max_concurrent_agents: int | None = 2
 
 
+class SeedDataConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: Path
+    roles: list[Literal["synthesizer", "builder"]] = Field(default_factory=lambda: ["builder"], min_length=1)
+
+    @model_validator(mode="after")
+    def unique_roles(self):
+        if len(self.roles) != len(set(self.roles)):
+            raise ValueError("seed roles must be unique")
+        if not self.path.is_absolute():
+            self.path = (ROOT / self.path).resolve()
+        return self
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
     sector: str = Field(min_length=1)
     task_count: int = Field(gt=0, le=100)
     group_size: int = Field(default=10, gt=0, le=10)
     seed: int = Field(default=0, ge=0)
+    seed_data: SeedDataConfig | None = None
     output: Path
     max_review_rounds: int = Field(default=5, ge=1, le=20)
     target_messages: int = Field(default=2000, ge=1, le=10_000)

@@ -34,3 +34,7 @@ intended composition, but ordinary authoritative single-message lookups are vali
 class BuilderTask(AuthorTask):
     output_type = Candidate
     instructions = BUILDER_GUIDE
+    seed_instructions = (
+        "Use examples to inform dialogue, clarification, corrections, and follow-through. "
+        "The approved catalog remains authoritative for all generated facts and answers.\n"
+    )

@@ -748,6 +748,304 @@ async def check_live_feedback():
         store.close()
 
 
+async def check_ablation(root):
+    from .ablate_judge import AblationEnv, Case, Study, author_context, has_feedback
+    from .agents.judge import REVIEW_GUIDE
+    from .config import PipelineConfig
+
+    catalog, candidate = fixture()
+    payload = review_payload(catalog, candidate, [t.id for t in catalog.tasks], "world")
+    files = {}
+
+    async def write(path, value):
+        files[path] = value
+
+    for override in (None, "Experimental guide"):
+        task = JudgeTask.create(payload, review_guide=override)
+        await task.setup(None, SimpleNamespace(write=write))
+        assert (
+            files["/task/review.md"]
+            == (
+                (REVIEW_GUIDE if override is None else override) + "\nreviewed_hash: " + digest(payload)
+            ).encode()
+        )
+        task._tool_directory.cleanup()
+
+    cases = [Case(id=f"case{i}", source=Path("unused"), phase="world", repair=i < 3) for i in range(6)]
+    study = Study(output=root, guide_addendum=Path("unused"), seed=1, cases=cases)
+    revised = approval(payload).model_copy(
+        update={"summary": "Nonblocking improvements: explain the follow-up."}
+    )
+    assert not has_feedback(approval(payload)) and has_feedback(revised)
+    assert not has_feedback(revised.model_copy(update={"summary": "Nonblocking improvements: none."}))
+    one, two = author_context(payload, revised), author_context(payload, revised)
+    assert json.loads(one["feedback"])["summary"] == revised.summary
+    one["previous_output"]["snapshot"]["messages"].clear()
+    assert two["previous_output"]["snapshot"]["messages"] and payload["candidate"]["snapshot"]["messages"]
+    turns = []
+
+    class Author:
+        @asynccontextmanager
+        async def provision(self, task):
+            context = json.loads(task.config.files["input.json"])
+            assert json.loads(context["feedback"])["summary"] == revised.summary
+
+            async def read(path, max_bytes):
+                return candidate.model_dump_json().encode()
+
+            yield SimpleNamespace(read=read)
+
+        @asynccontextmanager
+        async def interaction(self, task, runtime):
+            async def turn():
+                turns.append(task.data.candidate_id)
+                return SimpleNamespace(terminated=False)
+
+            yield SimpleNamespace(turn=turn, trace=SimpleNamespace(id="check", ok=True))
+
+    class Experiment(AblationEnv):
+        def trace(self, trace):
+            pass
+
+        async def review(self, agents, payload, guide, name):
+            return {"verdict": (revised if guide == "revised" else approval(payload)).model_dump(mode="json")}
+
+    env = Experiment(
+        PipelineConfig(),
+        study,
+        {c.id: payload for c in cases},
+        {"baseline": REVIEW_GUIDE, "revised": "revised"},
+    )
+    agents = SimpleNamespace(builder=Author())
+    await env.arm(cases[0], "baseline", agents)
+    await env.arm(cases[0], "revised", agents)
+    await env.arm(cases[0], "revised", agents)
+    assert len(turns) == 1, "resume must never dispatch a second revision"
+    atomic_json(root / "jobs/interrupted/result.json", {"status": "running"})
+    result = await env.job("interrupted", lambda: (_ for _ in ()).throw(AssertionError("retried")))
+    assert result["status"] == "interrupted"
+    atomic_json(root / "traces/budget.json", {"usage": {"cost": 25}})
+    result = await env.job("over-budget", lambda: (_ for _ in ()).throw(AssertionError("dispatched")))
+    assert result["status"] == "budget_stopped"
+    print("PASS ablation default guide, feedback delivery, arm isolation, one revision, resume and budget")
+
+
+async def check_seeds(root):
+    from unittest.mock import patch
+    from scripts.worldgen_slack import run_seed_study
+    from .agents.author import FILE_GUIDE
+    from .agents.builder import BuilderTask
+    from .agents.synthesizer import SynthesizerTask
+    from .config import ROOT, SeedDataConfig
+    from .contracts import (
+        SEED_MAX_BYTES,
+        SEED_MAX_MESSAGES,
+        SEED_MAX_TEXT_CHARS,
+        SeedPacket,
+        load_seed_packet,
+        verdict_schema,
+    )
+    from .generate import provenance
+    from scripts.worldgen_slack.prepare_seeds import Selection, normalize, normalize_flyte, normalize_software
+
+    selection = Selection(
+        id="example",
+        dataset="unionai/flyte-slack-data",
+        revision="a" * 40,
+        start=0,
+        end=2,
+        notes="Manually checked sequence; metadata unavailable.",
+        join_pairs=True,
+    )
+    response = {
+        "rows": [
+            {"row_idx": 0, "row": {"input": "Can you check?", "output": "Checking."}, "truncated_cells": []},
+            {"row_idx": 1, "row": {"input": "Checking.", "output": "Fixed."}, "truncated_cells": []},
+        ]
+    }
+    packet = SeedPacket(examples=[normalize(selection, response)])
+    assert [message.text for message in packet.examples[0].messages] == [
+        "Can you check?",
+        "Checking.",
+        "Fixed.",
+    ]
+    assert all(
+        message.speaker is None and message.timestamp is None for message in packet.examples[0].messages
+    )
+    rows = [row["row"] for row in response["rows"]]
+    fails(normalize_flyte, rows, join_pairs=False)
+    fails(normalize_flyte, [rows[0], {"input": "Another conversation", "output": "OK"}], join_pairs=True)
+    fails(normalize, selection, {"rows": response["rows"][:1]})
+    truncated = json.loads(json.dumps(response))
+    truncated["rows"][0]["truncated_cells"] = ["input"]
+    fails(normalize, selection, truncated)
+    software = [
+        dict(workspace="workspace", channel="general", text="Done", user="A", ts="2018-01-01T12:00:00")
+    ]
+    messages = normalize_software(software)
+    assert messages[0].speaker == "A" and messages[0].timestamp == "2018-01-01T12:00:00"
+    fails(normalize_software, [software[0], dict(software[0], channel="elsewhere")])
+    fails(Selection.model_validate, dict(selection.model_dump(), end=101))
+    for roles in ([], ["judge"], ["solver"], ["builder", "builder"]):
+        fails(SeedDataConfig, path=root / "seeds.json", roles=roles)
+    assert SeedDataConfig(path=Path("data/seeds/example.json")).path == ROOT / "data/seeds/example.json"
+    for update in (
+        {"messages": [{"text": "x"}] * 102},
+        {"messages": [{"text": "x" * (SEED_MAX_TEXT_CHARS + 1)}]},
+        {"messages": [{"text": "   "}]},
+        {"notes": "x" * SEED_MAX_BYTES},
+        {"rows": [1, 0]},
+    ):
+        fails(SeedPacket.model_validate, {"examples": [dict(packet.examples[0].model_dump(), **update)]})
+    fails(SeedPacket, examples=packet.examples * 2)
+    expanded = [
+        dict(packet.examples[0].model_dump(), id=f"example-{index}", messages=[{"text": "x"}] * 64)
+        for index in range(SEED_MAX_MESSAGES // 64)
+    ]
+    assert (
+        sum(len(example.messages) for example in SeedPacket.model_validate({"examples": expanded}).examples)
+        == SEED_MAX_MESSAGES
+    )
+    expanded[0]["messages"].append({"text": "one too many"})
+    fails(SeedPacket.model_validate, {"examples": expanded})
+    root.mkdir(parents=True)
+    path = root / "seeds.json"
+    path.write_text(packet.model_dump_json())
+    assert load_seed_packet(path) == packet
+    oversized = root / "oversized.json"
+    oversized.write_bytes(b" " * (SEED_MAX_BYTES + 1))
+    fails(load_seed_packet, oversized)
+    catalog, candidate = fixture()
+    base = Config(sector="IT", task_count=2, group_size=1, output=root / "baseline")
+    assert "seed_data" not in provenance(base)["config"]
+    for roles in (None, ["builder"], ["synthesizer"], ["synthesizer", "builder"]):
+        config = base.model_copy(
+            update={"seed_data": SeedDataConfig(path=path, roles=roles) if roles else None}
+        )
+        seeds = load_seed_packet(path) if roles else None
+        run_root = root / ("-".join(roles) if roles else "baseline")
+        store = TestStore(run_root, provenance(config, seeds))
+        store.state.catalog = catalog
+        env = GenerationEnv(config, store, seeds)
+        for role, task_type in (("synthesizer", SynthesizerTask), ("builder", BuilderTask)):
+            for group in catalog.groups:
+                context = env.catalog_context() if role == "synthesizer" else env.build_context(group)
+                task = task_type.create(context, group.id, env.author_seeds(role))
+                selected = roles is not None and role in roles
+                assert ("seed_data" in context) == selected
+                assert ("seeds.json" in task.config.files) == selected
+                if not selected:
+                    assert task.config.files["guide.md"] == FILE_GUIDE + task_type.instructions
+                files = {}
+
+                async def write(name, value):
+                    files[name] = value
+
+                async def read(name, max_bytes):
+                    return candidate.model_dump_json().encode()
+
+                async def turn(message):
+                    assert ("/task/seeds.json" in files) == selected
+                    assert ("seed_data" in json.loads(files["/task/input.json"])) == selected
+                    if selected:
+                        assert SeedPacket.model_validate_json(files["/task/seeds.json"]) == packet
+                    return SimpleNamespace(terminated=False)
+
+                runtime = SimpleNamespace(write=write, read=read)
+                await task.setup(None, runtime)
+                interaction = SimpleNamespace(turn=turn, trace=SimpleNamespace(info={}))
+                await env.author_turn(interaction, runtime, context, "initial", True)
+                context["feedback"] = "Revise the world"
+                await env.author_turn(interaction, runtime, context, "repair", False)
+        solver = SolverTask.create(
+            catalog.tasks[0], candidate.snapshot, "ws1", reference_for(catalog.tasks[0], candidate)
+        )
+        assert "seeds.json" not in solver.data.model_dump_json() + solver.config.model_dump_json()
+        store.save()
+        store.close()
+        resumed = TestStore(run_root, provenance(config, seeds))
+        resumed.close()
+        if seeds:
+            changed = packet.model_copy(deep=True)
+            changed.examples[0].messages[0].text = "Changed source"
+            fails(Store, run_root, provenance(config, changed))
+    schema = verdict_schema("world")
+    assert set(schema["properties"]["criteria"]["required"]) == set(QUALITY_CRITERIA)
+    assert schema["properties"]["criteria"]["additionalProperties"] is False
+    assert "criteria" in schema["required"]
+    assert "required" not in verdict_schema("catalog")["properties"]["criteria"]
+    bad = approval(review_payload(catalog, candidate, ["t1", "t2"], "world")).model_dump()
+    bad["criteria"]["weighted_quality"] = 0.9
+    fails(Verdict.model_validate, bad)
+    saved_failure = ROOT / "data/qualification-01/services/failed-verdict.json"
+    if saved_failure.exists():
+        fails(Verdict.model_validate_json, saved_failure.read_bytes())
+    fixed_store = TestStore(root / "fixed", {"test": True})
+    fixed_store.state.catalog = catalog
+    fixed_store.state.phase = "build"
+    fixed = GenerationEnv(base, fixed_store, fixed_catalog=True)
+    rejection = approval(review_payload(catalog, candidate, ["t1", "t2"], "world")).model_copy(
+        update={
+            "approved": False,
+            "issues": [
+                Issue(owner="synthesizer", artifact="catalog", defect="Ambiguous", requested_change="Clarify")
+            ],
+        }
+    )
+    before = fixed_store.state.model_dump()
+    fails(fixed.route_rejection, rejection, "build:g1")
+    assert fixed_store.state.model_dump() == before
+    fixed_store.close()
+    dispatched = []
+
+    async def fake_run(config, **kwargs):
+        dispatched.append(config)
+        summary = {"status": "complete", "reported_model_cost": 13}
+        atomic_json(config.output / "run.json", {})
+        atomic_json(config.output / "summary.json", summary)
+        return summary
+
+    study_root = root / "study"
+    study = run_seed_study.Study(output="data/check", seed_path="unused", configs=["a", "b", "c"])
+    cases = [(base, catalog, approval(review_payload(catalog, None, ["t1", "t2"], "catalog")))] * 3
+    with (
+        patch.object(run_seed_study, "inputs", return_value=(study_root, path, cases, {"test": 1})),
+        patch.object(run_seed_study, "run", fake_run),
+    ):
+        await run_seed_study.execute(study)
+        await run_seed_study.execute(study)
+    assert len(dispatched) == 2 and [config.research_budget_usd for config in dispatched] == [25, 12]
+    assert dispatched[0].seed_data is None and dispatched[1].seed_data.roles == ["builder"]
+    result = json.loads((study_root / "results.json").read_text())
+    assert len(result["arms"]) == 6 and result["reported_model_cost"] == 26
+    assert all(arm["status"] == "budget_stopped" for arm in result["arms"][2:])
+    dispatched.clear()
+    study = study.model_copy(update={"prior_reported_cost_usd": 3.0})
+    with (
+        patch.object(run_seed_study, "inputs", return_value=(root / "parallel", path, cases, {"test": 1})),
+        patch.object(run_seed_study, "run", fake_run),
+    ):
+        await asyncio.gather(
+            run_seed_study.execute(study, "seeded"), run_seed_study.execute(study, "unseeded")
+        )
+        await run_seed_study.execute(study, "seeded")
+        await run_seed_study.execute(study, "unseeded")
+    assert len(dispatched) == 2
+    assert all(config.research_budget_usd == 11 for config in dispatched)
+    assert {config.output.parent.name for config in dispatched} == {"seeded", "unseeded"}
+    assert all(
+        (config.seed_data is not None) == (config.output.parent.name == "seeded") for config in dispatched
+    )
+    for arm in ("seeded", "unseeded"):
+        result = json.loads((root / "parallel" / arm / "results.json").read_text())
+        assert len(result["arms"]) == 3 and result["reported_model_cost"] == 13
+        assert all(item["seeded"] == (arm == "seeded") for item in result["arms"])
+        assert all(item["status"] == "budget_stopped" for item in result["arms"][1:])
+    print(
+        "PASS seed normalization, bounds, role targeting, repairs, resume, solver isolation, verdict schema"
+    )
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -761,5 +1059,7 @@ if __name__ == "__main__":
         check_contracts_and_reads()
         asyncio.run(check_native_servers())
         with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(check_seeds(Path(directory) / "seeds"))
             asyncio.run(check_flow(Path(directory) / "run"))
+            asyncio.run(check_ablation(Path(directory) / "ablation"))
         print("All generation checks passed.")

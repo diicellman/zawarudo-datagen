@@ -4,7 +4,8 @@ import re
 import unicodedata
 from collections import Counter
 from datetime import UTC, datetime
-from typing import Literal, Self
+from pathlib import Path
+from typing import Annotated, Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 
@@ -19,6 +20,60 @@ from worldgen_slack.slack.models import (
 )
 
 from worldgen_slack.slack.api import SlackAPI, ReadCall, canonical, digest
+
+SEED_MAX_BYTES = 262_144
+SEED_MAX_MESSAGES = 512
+SEED_MAX_TEXT_CHARS = 128_000
+
+
+class SeedMessage(StrictModel):
+    text: NonEmptyText
+    speaker: NonEmptyText | None = None
+    timestamp: NonEmptyText | None = None
+
+
+class SeedExample(StrictModel):
+    id: SafeId
+    dataset: NonEmptyText
+    revision: Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+    rows: list[Annotated[int, Field(ge=0)]] = Field(min_length=1, max_length=100)
+    source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    notes: NonEmptyText
+    messages: list[SeedMessage] = Field(min_length=1, max_length=101)
+
+    @model_validator(mode="after")
+    def ordered_rows(self) -> Self:
+        if self.rows != sorted(set(self.rows)):
+            raise ValueError("seed row indices must be unique and ascending")
+        return self
+
+
+class SeedPacket(StrictModel):
+    examples: list[SeedExample] = Field(min_length=1, max_length=48)
+
+    @model_validator(mode="after")
+    def bounded(self) -> Self:
+        if len({example.id for example in self.examples}) != len(self.examples):
+            raise ValueError("seed example IDs must be unique")
+        messages = [message for example in self.examples for message in example.messages]
+        if (
+            len(messages) > SEED_MAX_MESSAGES
+            or sum(len(message.text) for message in messages) > SEED_MAX_TEXT_CHARS
+        ):
+            raise ValueError("seed packet exceeds 512 messages or 128000 text characters")
+        if any(not message.text.strip() for message in messages):
+            raise ValueError("seed messages must not be blank")
+        if len(self.model_dump_json().encode()) + 1 > SEED_MAX_BYTES:
+            raise ValueError("seed packet exceeds 256 KiB")
+        return self
+
+
+def load_seed_packet(path: Path) -> SeedPacket:
+    with path.open("rb") as stream:
+        raw = stream.read(SEED_MAX_BYTES + 1)
+    if len(raw) > SEED_MAX_BYTES:
+        raise ValueError("seed packet exceeds 256 KiB")
+    return SeedPacket.model_validate_json(raw)
 
 
 def _compact_identifier(value: str) -> str:
@@ -239,6 +294,8 @@ class Verdict(StrictModel):
 
     @model_validator(mode="after")
     def consistent(self) -> Self:
+        if set(self.criteria) - set(QUALITY_CRITERIA):
+            raise ValueError("unknown quality criterion")
         if len({t.task_id for t in self.tasks}) != len(self.tasks):
             raise ValueError("duplicate task review")
         if any(not 0 <= value <= 1 for value in self.criteria.values()):
@@ -248,6 +305,19 @@ class Verdict(StrictModel):
         if not self.approved and not self.issues:
             raise ValueError("rejection must include actionable issues")
         return self
+
+
+def verdict_schema(phase: str) -> dict:
+    schema = Verdict.model_json_schema()
+    schema["properties"]["criteria"] = {
+        "type": "object",
+        "properties": {name: {"type": "number", "minimum": 0, "maximum": 1} for name in QUALITY_CRITERIA},
+        "additionalProperties": False,
+    }
+    if phase == "world":
+        schema["properties"]["criteria"]["required"] = list(QUALITY_CRITERIA)
+        schema["required"].append("criteria")
+    return schema
 
 
 def quality(verdict: Verdict) -> float:
