@@ -3,7 +3,7 @@
 Read-only human inspection of current worldgen artifacts. All new code lives here;
 no generator imports, model calls, server, dependencies, or changes to run data.
 
-## Open the qualification study
+## Open the v2-09 worlds
 
 From the repository root:
 
@@ -12,33 +12,16 @@ uv run --frozen python viewer/build.py
 open viewer/artifacts.html
 ```
 
-This exports the software, employee, and incomplete services runs into one offline
-HTML file. On other platforms, open the file using your browser's file menu.
-
-To select runs explicitly:
+With no arguments this exports the three v2-09 worlds (`data/v2-09/{software,employee,services}`) into one
+offline HTML file. On other platforms, open the file using your browser's file menu. To select runs explicitly:
 
 ```bash
-uv run --frozen python viewer/build.py data/qualification-01/software --output viewer/artifacts-software.html
+uv run --frozen python viewer/build.py data/<run>/software --output viewer/artifacts-software.html
 ```
 
 Rebuild after artifacts change. Generated pages are ignored by Git. **The page
 contains private answers, planning data, and full snapshots.** Share only with
 people authorized to inspect the dataset; hiding labels is not access control.
-
-## Seed study (22 September)
-
-```bash
-uv run --frozen python viewer/build.py data/study_22_09/unseeded/case-1-a data/study_22_09/seeded/case-1-b data/study_22_09/seeded/case-2-a data/study_22_09/unseeded/case-2-b data/study_22_09/unseeded/case-3-a data/study_22_09/seeded/case-3-b --output viewer/artifacts-study-22-09.html
-open viewer/artifacts-study-22-09.html
-```
-
-Case 1 = software; case 2 = employee; case 3 = services. Run labels identify
-seeded versus unseeded explicitly. Seeded services is incomplete: its last
-candidate is not an approved release. All six arms are included. The original
-qualification page remains `viewer/artifacts.html`. Open two browser windows to
-compare arms; the built-in before/after selector compares attempts within a run.
-This is not a blinded export. Source seed licensing is unresolved; keep this
-research export local rather than publishing it.
 
 ## Review workflow
 

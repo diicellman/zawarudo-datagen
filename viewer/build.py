@@ -32,7 +32,7 @@ def load_run(path):
             continue
         payload = read_json(folder / "review_input.json")
         validation = read_json(folder / "validation.json")
-        raw = read_json(folder / "author_output.json")
+        raw = read_json(folder / "author_output.json") or read_json(folder / "author_catalog.json")
         # Invalid author JSON is research evidence, not a reason to hide an attempt.
         parsed = None
         if payload is None and raw is not None:
@@ -89,9 +89,7 @@ def main():
     parser.add_argument("runs", nargs="*", type=Path, help="Run directories containing attempts/")
     parser.add_argument("--output", type=Path, default=HERE / "artifacts.html")
     args = parser.parse_args()
-    paths = args.runs or [
-        ROOT / "data/qualification-01" / name for name in ("software", "employee", "services")
-    ]
+    paths = args.runs or [ROOT / "data/v2-09" / name for name in ("software", "employee", "services")]
     output = args.output.resolve()
     if not output.is_relative_to(HERE):
         parser.error("Output must be inside viewer/ so run artifacts cannot be overwritten")

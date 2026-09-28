@@ -251,5 +251,8 @@ __marimo__/
 /*.zip
 /*.zip.sha256
 
+# Exported agent conversations
+/*.txt
+
 # macOS
 .DS_Store
