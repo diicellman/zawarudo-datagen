@@ -12,8 +12,7 @@ import verifiers.v1 as vf
 from .config import ROOT, Config, load_config
 from .env import GenerationEnv
 from .store import Store
-from .contracts import Catalog, SeedPacket, Verdict, load_seed_packet, validate_verdict
-from .agents.judge import review_payload
+from .contracts import SeedPacket, load_seed_packet
 from worldgen_slack.slack.api import digest
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from worldgen_slack.dataset import atomic_json
@@ -34,28 +33,9 @@ def provenance(config: Config, seeds: SeedPacket | None = None) -> dict:
     return result
 
 
-async def run(config: Config, *, catalog: Catalog | None = None, approval: Verdict | None = None) -> dict:
+async def run(config: Config) -> dict:
     seeds = load_seed_packet(config.seed_data.path) if config.seed_data else None
     manifest = provenance(config, seeds)
-    if (catalog is None) != (approval is None):
-        raise ValueError("a fixed catalog requires its approval")
-    if catalog is not None:
-        validate_verdict(
-            approval, review_payload(catalog, None, [task.id for task in catalog.tasks], "catalog")
-        )
-        if (
-            not approval.approved
-            or len(catalog.tasks) != config.task_count
-            or catalog.sector != config.sector
-        ):
-            raise ValueError("fixed catalog must be approved and match the run configuration")
-        if len(catalog.groups) != (config.task_count + config.group_size - 1) // config.group_size or any(
-            sum(task.group_id == group.id for task in catalog.tasks) > config.group_size
-            for group in catalog.groups
-        ):
-            raise ValueError("fixed catalog groups must match the run configuration")
-        manifest["fixed_catalog_hash"] = digest(catalog.model_dump(mode="json"))
-        manifest["catalog_approval_hash"] = digest(approval.model_dump(mode="json"))
     store = Store(config.output, manifest)
 
     async def heartbeat():
@@ -72,14 +52,8 @@ async def run(config: Config, *, catalog: Catalog | None = None, approval: Verdi
     try:
         if seeds is not None:
             atomic_json(store.root / "seeds.json", seeds.model_dump(mode="json"))
-        if catalog is not None and store.state.catalog is None:
-            store.state.catalog = catalog.model_copy(deep=True)
-            store.state.reviews["catalog"] = approval.model_dump(mode="json")
-            store.state.phase = "build"
-            store.save(approved=True)
-            store.event("fixed_catalog_loaded", catalog_hash=manifest["fixed_catalog_hash"])
         if store.state.phase != "done":
-            env = GenerationEnv(config, store, seeds, fixed_catalog=catalog is not None)
+            env = GenerationEnv(config, store, seeds)
             context = ModelContext(
                 model=config.env.solver.model,
                 client=EvalClientConfig(),
@@ -94,7 +68,9 @@ async def run(config: Config, *, catalog: Catalog | None = None, approval: Verdi
             if not episode.ok and (
                 store.state.phase != "done"
                 or episode.errors
-                or any(not trace.ok and trace.agent.name != "solver" for trace in episode.traces)
+                or any(
+                    not trace.ok and trace.agent.name not in {"solver", "writer"} for trace in episode.traces
+                )
             ):
                 reason = "; ".join(f"{e.type}: {e.message}" for e in episode.errors)
                 reason = reason or "; ".join(

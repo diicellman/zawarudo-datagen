@@ -1,17 +1,23 @@
 """Private generation contracts and checks for a shared Slack workspace."""
 
+import json
+import random
 import re
+import statistics
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal, Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
 from worldgen_slack.slack.models import (
     QUALITY_CRITERIA,
     AnswerSpec,
+    Conversation,
+    Message,
     NonEmptyText,
     SafeId,
     SlackWorld,
@@ -129,23 +135,83 @@ def normalized(text: str) -> str:
     return " ".join(re.findall(r"\w+", text.casefold()))
 
 
+def utc(value: str) -> str:
+    parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise ValueError("timestamps must be canonical UTC: YYYY-MM-DDTHH:MM:SSZ")
+    return value
+
+
+Timestamp = Annotated[str, AfterValidator(utc)]
+
+
+def wall_clock(value: str) -> str:
+    datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    return value
+
+
+def to_utc(local: str, timezone: str) -> str:
+    moment = datetime.strptime(local, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo(timezone))
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def to_local(utc: str, timezone: str, form: str = "%Y-%m-%d %H:%M:%S") -> str:
+    return datetime.fromisoformat(utc).astimezone(ZoneInfo(timezone)).strftime(form)
+
+
+def clock(scene: "ScenePlan", zones: dict[str, str]) -> str:
+    """A scene is written on one clock: its first participant's timezone."""
+    return zones[scene.participant_ids[0]]
+
+
+def zone(value: str) -> str:
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise ValueError(f"unknown IANA timezone {value!r}") from error
+    return value
+
+
+class Premise(StrictModel):
+    company: NonEmptyText
+    niche: NonEmptyText
+    region: NonEmptyText
+    size: NonEmptyText
+    culture: NonEmptyText
+    cast: NonEmptyText
+
+
+class Premises(StrictModel):
+    premises: list[Premise] = Field(min_length=2)
+
+
+def pick_premise(premises: Premises, count: int, used: list[str], seed: int) -> Premise:
+    """Entropy comes from code: the model proposes distinct options, the run seed chooses one."""
+    names = [normalized(p.company).split()[0] for p in premises.premises]
+    taken = {normalized(name).split()[0] for name in used if normalized(name)}
+    if len(names) != count or len(set(names)) != count:
+        raise ValueError(f"propose exactly {count} premises whose company names start with distinct words")
+    if reused := sorted(set(names) & taken):
+        raise ValueError(f"company names reuse names from used_names: {reused}")
+    return random.Random(seed).choice(premises.premises)
+
+
+class Persona(StrictModel):
+    id: SafeId
+    role: NonEmptyText
+    seniority: NonEmptyText
+    timezone: Annotated[str, AfterValidator(zone)]
+    voice: NonEmptyText
+
+
 class Fact(StrictModel):
     id: SafeId
     subject: NonEmptyText
     predicate: NonEmptyText
     value: NonEmptyText
-    valid_from: str
-    valid_until: str | None = None
+    valid_from: Timestamp
+    valid_until: Timestamp | None = None
     description: NonEmptyText
-
-    @field_validator("valid_from", "valid_until")
-    @classmethod
-    def timestamp(cls, value):
-        if value is not None:
-            parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-            if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
-                raise ValueError("fact dates must be canonical UTC timestamps")
-        return value
 
     @model_validator(mode="after")
     def interval(self) -> Self:
@@ -175,6 +241,7 @@ class Catalog(StrictModel):
     company: NonEmptyText
     overview: NonEmptyText
     people: list[User] = Field(min_length=1)
+    personas: list[Persona] = Field(default_factory=list)
     groups: list[WorkGroup] = Field(min_length=1)
     facts: list[Fact] = Field(min_length=1)
     tasks: list[PlannedTask] = Field(min_length=1)
@@ -184,6 +251,8 @@ class Catalog(StrictModel):
         for label, values in (("task", self.tasks), ("fact", self.facts), ("group", self.groups)):
             if len({v.id for v in values}) != len(values):
                 raise ValueError(f"duplicate {label} ID")
+        if self.personas and sorted(p.id for p in self.personas) != sorted(p.id for p in self.people):
+            raise ValueError("personas must describe every person exactly once")
         facts = {v.id for v in self.facts}
         groups = {v.id for v in self.groups}
         if len({p.id for p in self.people}) != len(self.people):
@@ -259,6 +328,245 @@ class Candidate(StrictModel):
         return self
 
 
+class Beat(StrictModel):
+    fact_id: SafeId
+    author_id: SafeId
+
+
+class ScenePlan(StrictModel):
+    id: SafeId
+    conversation_id: SafeId
+    participant_ids: list[SafeId] = Field(min_length=1)
+    start: Timestamp
+    end: Timestamp
+    situation: NonEmptyText
+    beats: list[Beat] = Field(default_factory=list)
+    length: int = Field(ge=1, le=60)
+    revision_note: str = ""
+
+    @model_validator(mode="after")
+    def ordered(self) -> Self:
+        if self.end <= self.start:
+            raise ValueError(f"{self.id}: end must come after start")
+        return self
+
+
+class Detail(StrictModel):
+    value: NonEmptyText
+    since: Timestamp | None = None
+    at: Timestamp | None = None
+
+
+class Plan(StrictModel):
+    conversations: list[Conversation] = Field(min_length=1)
+    scenes: list[ScenePlan] = Field(min_length=1)
+    details: dict[NonEmptyText, Detail] = Field(default_factory=dict)
+
+
+def listed(value):
+    """Models often write null for an empty list, a bare string for a one-item list, or a list as a string."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return json.loads(value) if value.startswith("[") else [value]
+    return value
+
+
+def noted(value):
+    """Notes are strings; models often write a note as an object such as {who, what, by}."""
+    return [", ".join(str(v) for v in n.values()) if isinstance(n, dict) else n for n in listed(value)]
+
+
+Conveys = Annotated[list[SafeId], BeforeValidator(listed)]
+Notes = Annotated[list[NonEmptyText], BeforeValidator(noted)]
+
+
+class Line(StrictModel):
+    author_id: SafeId
+    text: NonEmptyText
+    local_time: Annotated[str, AfterValidator(wall_clock)]
+    reply_to: int | None = Field(default=None, ge=0)
+    conveys: Conveys = Field(default_factory=list)
+
+
+class WrittenScene(StrictModel):
+    lines: list[Line] = Field(min_length=1)
+    introduces: Notes = Field(default_factory=list)
+    promises: Notes = Field(default_factory=list)
+
+
+class SceneRecord(StrictModel):
+    key: str
+    scene: WrittenScene
+
+
+class Rewrite(StrictModel):
+    scene_id: SafeId
+    note: NonEmptyText
+
+
+class BindOutput(StrictModel):
+    bindings: list[Binding]
+    rewrites: list[Rewrite] = Field(default_factory=list)
+
+
+def first_mentions(plan: Plan) -> dict[str, str]:
+    """fact_id → the earliest scene that has a beat for it."""
+    first = {}
+    for scene in sorted(plan.scenes, key=lambda s: (s.start, s.id)):
+        for beat in scene.beats:
+            first.setdefault(beat.fact_id, scene.id)
+    return first
+
+
+def timed(catalog: Catalog) -> dict[str, str]:
+    """Facts with a time of day: the world first states each in the minute of its valid_from. Date-only facts
+    (00:00:00Z) are not timed."""
+    return {f.id: f.valid_from for f in catalog.facts if not f.valid_from.endswith("T00:00:00Z")}
+
+
+def check_plan(catalog: Catalog, plan: Plan) -> Plan:
+    conversations = {c.id: c for c in plan.conversations}
+    facts = {f.id: f for f in catalog.facts}
+    if len(conversations) != len(plan.conversations):
+        raise ValueError("duplicate conversation ID")
+    if len({s.id for s in plan.scenes}) != len(plan.scenes):
+        raise ValueError("duplicate scene ID")
+    if unknown := {m for c in plan.conversations for m in c.member_ids} - {p.id for p in catalog.people}:
+        raise ValueError(f"conversation members outside the catalog: {sorted(unknown)}")
+    for scene in plan.scenes:
+        conversation = conversations.get(scene.conversation_id)
+        if conversation is None:
+            raise ValueError(f"{scene.id}: unknown conversation {scene.conversation_id}")
+        if outside := set(scene.participant_ids) - set(conversation.member_ids):
+            raise ValueError(f"{scene.id}: participants are not members: {sorted(outside)}")
+        for beat in scene.beats:
+            if beat.fact_id not in facts or beat.author_id not in scene.participant_ids:
+                raise ValueError(f"{scene.id}: beat needs a catalog fact and a participant author")
+    starts, minutes = {s.id: s.start for s in plan.scenes}, timed(catalog)
+    for fact_id, scene_id in first_mentions(plan).items():
+        if (minute := minutes.get(fact_id)) and starts[scene_id][:16] > minute[:16]:
+            raise ValueError(
+                f"{scene_id}: fact {fact_id} is stated at {facts[fact_id].valid_from}; the earliest scene "
+                "stating it must start by then"
+            )
+    return plan
+
+
+def check_scene(
+    plan: ScenePlan, scene: WrittenScene, zones: dict[str, str], timely: dict[str, str] | None = None
+) -> list[str]:
+    """`timely` maps facts first stated in this scene to the UTC minute they must be stated in."""
+    errors = []
+    if outside := {line.author_id for line in scene.lines} - set(plan.participant_ids):
+        errors.append(f"authors must be participants; not participants: {sorted(outside)}")
+    else:
+        zone = clock(plan, zones)
+        times = [to_utc(line.local_time, zone) for line in scene.lines]
+        if times[0] < plan.start:
+            errors.append(
+                f"line 0 is at {scene.lines[0].local_time}, before the scene start {to_local(plan.start, zone)}"
+            )
+        if times[-1] > plan.end:
+            errors.append(
+                f"the last line is at {scene.lines[-1].local_time}, after the scene end {to_local(plan.end, zone)}"
+            )
+        errors += [
+            f"line {i} is at {scene.lines[i].local_time}, before line {i - 1} at {scene.lines[i - 1].local_time}; "
+            "messages must follow each other in time"
+            for i in range(1, len(times))
+            if times[i] < times[i - 1]
+        ]
+        for fact_id, minute in (timely or {}).items():
+            stated = [(t, line) for t, line in zip(times, scene.lines) if fact_id in line.conveys]
+            if stated and stated[0][0][:16] != minute[:16]:
+                first = stated[0][1]
+                errors.append(
+                    f"fact {fact_id}: the first line stating it is at {first.local_time} but must be in "
+                    f"the minute {to_local(minute, zone, '%Y-%m-%d %H:%M')}"
+                )
+    for index, line in enumerate(scene.lines):
+        if line.reply_to is not None and line.reply_to >= index:
+            errors.append(f"line {index}: reply_to {line.reply_to} must name an earlier line of this scene")
+    beats = {b.fact_id for b in plan.beats}
+    if extra := {f for line in scene.lines for f in line.conveys} - beats:
+        errors.append(f"conveys may only list beat fact IDs; unknown: {sorted(extra)}")
+    for beat in plan.beats:
+        if not any(beat.fact_id in line.conveys and line.author_id == beat.author_id for line in scene.lines):
+            errors.append(f"{beat.author_id} must state fact {beat.fact_id} in a line that conveys it")
+    return errors
+
+
+def assemble(catalog: Catalog, plan: Plan, scenes: dict[str, WrittenScene]) -> tuple[SlackWorld, dict]:
+    """Deterministic scene → message mapping; returns the world and fact_id → conveying message IDs."""
+    zones = {p.id: p.timezone for p in catalog.personas}
+    messages, conveyed, placed = [], defaultdict(list), {}
+    for scene_plan in plan.scenes:
+        lines = scenes[scene_plan.id].lines
+
+        def root(index, lines=lines):
+            """Slack threads are one level deep: replying to a reply joins its thread."""
+            return index if lines[index].reply_to is None else root(lines[index].reply_to)
+
+        ids = placed[scene_plan.id] = [
+            "m" + digest([scene_plan.id, index])[:10] for index in range(len(scenes[scene_plan.id].lines))
+        ]
+        for message_id, line in zip(ids, scenes[scene_plan.id].lines, strict=True):
+            messages.append(
+                Message(
+                    id=message_id,
+                    conversation_id=scene_plan.conversation_id,
+                    author_id=line.author_id,
+                    text=line.text,
+                    timestamp=to_utc(line.local_time, clock(scene_plan, zones)),
+                    thread_root_id=None if line.reply_to is None else ids[root(line.reply_to)],
+                )
+            )
+            for fact_id in line.conveys:
+                conveyed[fact_id].append(message_id)
+    messages.sort(key=lambda m: (m.timestamp, m.id))
+    world = SlackWorld(users=catalog.people, conversations=plan.conversations, messages=messages)
+    promises = [{"scene_id": s.id, "promise": p} for s in plan.scenes for p in scenes[s.id].promises]
+    return world, {"conveyed": dict(conveyed), "scene_messages": placed, "open_promises": promises}
+
+
+def style(world: SlackWorld, personas: list[Persona]) -> dict:
+    """Surface statistics of voice and timing; people are compared with their personas by the judge."""
+    zones = {p.id: ZoneInfo(p.timezone) for p in personas}
+
+    def share(values):
+        values = list(values)
+        return round(sum(values) / len(values), 2) if values else None
+
+    def measure(messages):
+        texts = [m.text.strip() for m in messages]
+        local = [
+            datetime.fromisoformat(m.timestamp).astimezone(zones[m.author_id])
+            for m in messages
+            if m.author_id in zones
+        ]
+        return {
+            "messages": len(texts),
+            "median_words": statistics.median(len(t.split()) for t in texts),
+            "lowercase_start": share(t[:1].islower() for t in texts),
+            "period_end": share(t.endswith(".") for t in texts),
+            "question": share("?" in t for t in texts),
+            "short": share(len(t.split()) <= 4 for t in texts),
+            "seconds_zero": share(m.timestamp.endswith(":00Z") for m in messages),
+            "off_hours": share(t.hour < 7 or t.hour >= 20 or t.weekday() >= 5 for t in local),
+        }
+
+    live = [m for m in world.messages if not m.deleted]
+    if not live:
+        return {}
+    by_author = defaultdict(list)
+    for message in live:
+        by_author[message.author_id].append(message)
+    return measure(live) | {
+        "authors": {author: measure(items) for author, items in sorted(by_author.items())}
+    }
+
+
 class Issue(StrictModel):
     owner: Literal["synthesizer", "builder"]
     artifact: Literal["catalog", "workspace", "bindings"]
@@ -267,6 +575,7 @@ class Issue(StrictModel):
     message_ids: list[SafeId] = Field(default_factory=list)
     defect: NonEmptyText
     requested_change: NonEmptyText
+    blocking: bool = True
 
     @model_validator(mode="after")
     def ownership(self) -> Self:
@@ -300,8 +609,9 @@ class Verdict(StrictModel):
             raise ValueError("duplicate task review")
         if any(not 0 <= value <= 1 for value in self.criteria.values()):
             raise ValueError("criteria must be finite scores from zero to one")
-        if self.approved and (self.issues or any(not t.valid or not t.answer_complete for t in self.tasks)):
-            raise ValueError("approval contradicts defects")
+        blocking = any(i.blocking for i in self.issues)
+        if self.approved and (blocking or any(not t.valid or not t.answer_complete for t in self.tasks)):
+            raise ValueError("approval contradicts blocking defects")
         if not self.approved and not self.issues:
             raise ValueError("rejection must include actionable issues")
         return self
@@ -351,10 +661,20 @@ def validate_verdict(verdict: Verdict, payload: dict) -> None:
             raise ValueError("invalid supported claim indices")
         if verdict.approved and set(review.supported_claims) != expected:
             raise ValueError("approval requires support for every canonical answer claim")
-    if payload["phase"] == "world":
-        score = quality(verdict)
-        if verdict.approved and (score < 0.8 or min(verdict.criteria.values()) < 0.75):
-            raise ValueError("approval contradicts world quality floors")
+
+
+def accepted(verdict: Verdict, payload: dict, acceptance) -> bool:
+    """World acceptance from the judge's findings and the configured floors (`config.Acceptance`)."""
+    claims = {t["id"]: len(t["answer"]["required_claims"]) for t in payload["tasks"]}
+    return (
+        all(
+            t.valid and t.answer_complete and len(set(t.supported_claims)) == claims[t.task_id]
+            for t in verdict.tasks
+        )
+        and not any(i.blocking or acceptance.minor_issues_block for i in verdict.issues)
+        and min(verdict.criteria.values()) >= acceptance.criterion_floor
+        and quality(verdict) >= acceptance.quality_floor
+    )
 
 
 def validate_candidate(catalog: Catalog, candidate: Candidate, task_ids: list[str]) -> dict:
@@ -479,6 +799,7 @@ def validate_candidate(catalog: Catalog, candidate: Candidate, task_ids: list[st
         "common_reply_delays_seconds": [
             {"seconds": delay, "count": count} for delay, count in delays.most_common(5)
         ],
+        "style": style(world, catalog.personas),
     }
     return {
         "ok": not errors,

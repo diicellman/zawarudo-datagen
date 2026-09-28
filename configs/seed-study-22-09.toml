@@ -1,9 +1,0 @@
-output = "data/study_22_09"
-seed_path = "data/seeds/expanded/slack-examples.json"
-# Preserved original study and stopped small-packet restart: 3.3978 + 0.4866 USD.
-prior_reported_cost_usd = 3.8844
-configs = [
-    "configs/generation-qualification-1.toml",
-    "configs/generation-qualification-2.toml",
-    "configs/generation-qualification-3.toml",
-]

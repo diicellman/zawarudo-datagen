@@ -3,8 +3,6 @@ task_count = 3
 group_size = 2
 seed = 20260917
 output = "data/milestone"
-max_review_rounds = 5
-target_messages = 90
 research_budget_usd = 100.0
 
 [env.timeout]

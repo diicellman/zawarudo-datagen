@@ -1,0 +1,32 @@
+sector = "IT for a managed service provider: customer infrastructure maintenance, service handovers, and change approvals"
+task_count = 10
+group_size = 5
+seed = 20261004
+output = "data/v2-09/services"
+research_budget_usd = 20.0
+
+[seed_data]
+path = "generators/worldgen_slack/seeds/slack-examples.json"
+
+[env.timeout]
+episode = 21600
+finalize = 300
+
+# One model per agent. Unset fields (harness, runtime, sampling) keep the role defaults in config.py.
+[env.synthesizer]
+model = "openai/gpt-5.6-terra"
+
+[env.builder]
+model = "openai/gpt-5.6-terra"
+
+[env.writer]
+model = "z-ai/glm-5.3"
+
+[env.judge]
+model = "openai/gpt-6-sol"
+
+[env.solver]
+model = "z-ai/glm-5.3-flash"
+
+[answer_judge]
+model = "openai/gpt-6-sol"

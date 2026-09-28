@@ -7,7 +7,16 @@ import verifiers.v1 as vf
 from pydantic import Field
 
 from worldgen_slack.slack.api import digest
-from ..contracts import Candidate, Catalog, Verdict, quality, validate_verdict, verdict_schema
+from ..contracts import (
+    Candidate,
+    Catalog,
+    Verdict,
+    quality,
+    timed,
+    to_local,
+    validate_verdict,
+    verdict_schema,
+)
 from worldgen_slack.slack.tools import ReadState, SlackTaskData, stage_tool_data
 from .inspection import ReviewTools, ReviewToolsConfig, missing_evidence
 
@@ -18,11 +27,14 @@ Before approving, call inspect_check again and resolve every entry in uninspecte
 Write your structured verdict to /task/verdict.json. The reviewed_hash is in /task/review.md.
 Private facts, gold routes, author statements, and earlier verdicts are context, not proof.
 When present, /task/author_trace.json contains the author's observable trace for investigation.
+inspect_check and inspect_read are brokered network calls; if one fails as unavailable, call it again.
 """
 
 REVIEW_GUIDE = """Approve only after investigating the actual artifacts. Every requested task needs one review.
-Catalog: check full-answer completeness, distinct questions, coherent company/people/projects,
-shared facts and dates, scope/authority, requested output slots and ordering, and plausible read-only work.
+Catalog: check full-answer completeness, distinct questions, coherent company/people/projects, the selected
+premise, distinct plausible personas,
+shared facts and dates (fact_local_times shows timed facts on the company's local clocks),
+scope/authority, requested output slots and ordering, and plausible read-only work.
 Output restrictions must appear in the public question; private answer metadata cannot impose them.
 Detect semantic duplicates even when people or dates differ. shared fact intervals are [from, until).
 World: every canonical answer claim must follow from actor-visible messages/directory data.
@@ -44,14 +56,22 @@ Natural surrounding work matters; volume, extra tool calls, and random chatter a
 alone cannot support a public answer. Inspect the full world beyond the bound evidence where relevant.
 Inspect the activity statistics returned by inspect_check. Distinct text alone does not establish realism:
 repeated two-message exchanges, fixed reply delays, and mechanical posting schedules need investigation.
+activity.style reports voice and timing overall and per author: compare each author with their catalog
+persona. Different personas writing in one uniform register is a realism defect. Deleting activity or
+perturbing timestamps does not repair realism; request that the affected scenes be rewritten.
 Give every world criterion a score in [0, 1]: scenario_alignment, world_coherence,
 professional_realism, discoverability, shortcut_free, evidence_composition.
-Approval requires each >= .75 and weighted quality >= .8 (weights 1, 1.25, 1.25, 1, 1, 1.5).
+An issue is blocking when it changes, contradicts, hides or shortcuts evidence a task's answer relies on, or is a
+catalog or bindings defect; report other realism and chronology flaws with blocking false.
 All blocking issues need artifact and its responsible owner: catalog (questions, answers, shared facts)
 belongs to synthesizer; workspace (people/channels/messages) and bindings (evidence/gold routes) belong
 to builder. A route using undiscovered IDs is a bindings defect, never a catalog defect.
+Timed facts (fact_local_times) are first stated in the minute of their valid_from by construction; other facts'
+valid_from only orders values. A timed moment that is implausible in itself is a catalog defect.
 Include
-affected IDs, defect, and requested_change. No approval with unresolved issues.
+affected IDs, defect, and requested_change. No approval with blocking issues.
+When input.json has previous_issues and changed_messages, verify each previous issue is resolved and review the
+changed messages with their surroundings; in unchanged content already reviewed, report only blocking issues.
 Do not rewrite inputs. Final prose is not a substitute for the verdict file.
 """
 
@@ -59,7 +79,6 @@ Do not rewrite inputs. Final prose is not a substitute for the verdict file.
 class JudgeConfig(vf.TaskConfig):
     tools: ReviewToolsConfig
     author_trace: str = Field(default="", exclude=True, repr=False)
-    review_guide: str | None = Field(default=None, exclude=True, repr=False)
 
 
 class JudgeTask(vf.Task[SlackTaskData, ReadState, JudgeConfig]):
@@ -70,9 +89,7 @@ class JudgeTask(vf.Task[SlackTaskData, ReadState, JudgeConfig]):
         return [ReviewTools(config.tools)]
 
     @classmethod
-    def create(
-        cls, payload: dict, *, group_id: str = "", candidate_id: str = "", review_guide: str | None = None
-    ) -> Self:
+    def create(cls, payload: dict, *, group_id: str = "", candidate_id: str = "") -> Self:
         groups = {t["group_id"] for t in payload["tasks"]}
         return cls(
             SlackTaskData(
@@ -85,7 +102,7 @@ class JudgeTask(vf.Task[SlackTaskData, ReadState, JudgeConfig]):
                 network_allow=[],
                 network_block=["*"],
             ),
-            JudgeConfig(tools=ReviewToolsConfig(payload_json=json.dumps(payload)), review_guide=review_guide),
+            JudgeConfig(tools=ReviewToolsConfig(payload_json=json.dumps(payload))),
         )
 
     async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
@@ -97,11 +114,7 @@ class JudgeTask(vf.Task[SlackTaskData, ReadState, JudgeConfig]):
         await runtime.write("/task/schemas.json", json.dumps(verdict_schema(payload["phase"])).encode())
         await runtime.write(
             "/task/review.md",
-            (
-                (self.config.review_guide if self.config.review_guide is not None else REVIEW_GUIDE)
-                + "\nreviewed_hash: "
-                + digest(payload)
-            ).encode(),
+            (REVIEW_GUIDE + "\nreviewed_hash: " + digest(payload)).encode(),
         )
 
     async def finalize(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
@@ -127,9 +140,14 @@ class JudgeTask(vf.Task[SlackTaskData, ReadState, JudgeConfig]):
 def review_payload(
     catalog: Catalog, candidate: Candidate | None, task_ids: list[str], phase: str, **extra
 ) -> dict:
+    zones, minutes = sorted({p.timezone for p in catalog.personas}), timed(catalog)
     payload: dict[str, Any] = {
         "phase": phase,
         "catalog": catalog.model_dump(mode="json"),
+        # Derived view: when each timed fact is stated, on the wall clocks of the catalog's people.
+        "fact_local_times": {
+            f: {z: to_local(m, z, "%A %Y-%m-%d %H:%M") for z in zones} for f, m in minutes.items()
+        },
         "tasks": [t.model_dump(mode="json") for t in catalog.tasks if t.id in task_ids],
         **extra,
     }

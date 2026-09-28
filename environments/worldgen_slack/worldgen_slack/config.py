@@ -34,7 +34,8 @@ def role(model: str, *, author: bool = False, solver: bool = False) -> vf.AgentC
             disk=8,
             idle_timeout=1800,
         ),
-        sampling=vf.Sampling(temperature=0.5 if author else 0.0, max_tokens=16_000),
+        # Reasoning models (e.g. GLM 5.3) can spend >16k tokens thinking before an author writes its file.
+        sampling=vf.Sampling(temperature=0.5 if author else 0.0, max_tokens=64_000 if author else 16_000),
         max_turns=160 if not solver else 40,
         timeout=TimeoutConfig(setup=600, rollout=3600, finalize=120),
         retries=RetryConfig(max_retries=0),
