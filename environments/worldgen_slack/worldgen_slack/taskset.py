@@ -44,7 +44,7 @@ class AnswerJudge(vf.Judge[AnswerGrade]):
 class SolverConfig(vf.TaskConfig):
     tools: SlackToolsetConfig
     reference: PrivateAnswer = Field(exclude=True, repr=False)
-    judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-5.6-sol")
+    judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
 
 
 class SolverTask(vf.Task[SlackTaskData, ReadState, SolverConfig]):
@@ -130,7 +130,7 @@ class SolverTask(vf.Task[SlackTaskData, ReadState, SolverConfig]):
 
 class EvaluationConfig(vf.TaskConfig):
     release_dir: Path = Path("data/milestone/release")
-    judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-5.6-sol")
+    judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
 
 
 class EvaluationTask(vf.Task[SlackTaskData, vf.State, EvaluationConfig]):

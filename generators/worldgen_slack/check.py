@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from verifiers.v1.mcp.launch import serve
@@ -23,21 +24,47 @@ from worldgen_slack.taskset import (
 from worldgen_slack.dataset import atomic_json, load_release
 from .agents.judge import JudgeTask, review_payload
 from .agents.inspection import missing_evidence
-from .config import Config
+from .config import Acceptance, Config
 from .env import GenerationEnv, reference_for
 from .store import Store, ReviewLimit
+from .agents.writer import brief, excerpts, observed, visible
+from .store import used_names
 from .contracts import (
+    Beat,
+    BindOutput,
     Binding,
     Candidate,
     Catalog,
     ClaimEvidence,
+    Detail,
     Fact,
     Issue,
+    Line,
+    Persona,
+    Plan,
     PlannedTask,
+    Premise,
+    Premises,
+    Rewrite,
+    ScenePlan,
+    SeedExample,
+    SeedMessage,
+    SeedPacket,
     TaskReview,
     Verdict,
     WorkGroup,
+    WrittenScene,
+    accepted,
+    assemble,
+    check_plan,
+    check_scene,
+    first_mentions,
+    listed,
+    pick_premise,
     reveals_answer,
+    timed,
+    style,
+    to_utc,
     validate_candidate,
     validate_verdict,
 )
@@ -289,6 +316,21 @@ def check_contracts_and_reads():
     assert not validate_candidate(catalog, changed, ["t1"])["ok"]
     payload = review_payload(catalog, candidate, ["t1", "t2"], "world")
     assert set(missing_evidence(payload, [])) == {"t1", "t2"}
+    clean = approval(payload)
+    minor = Issue(owner="builder", artifact="workspace", defect="x", requested_change="y", blocking=False)
+    assert accepted(clean.model_copy(update={"issues": [minor]}), payload, Acceptance()), (
+        "minor issues do not block"
+    )
+    assert not accepted(
+        clean.model_copy(update={"issues": [minor.model_copy(update={"blocking": True})]}),
+        payload,
+        Acceptance(),
+    )
+    low = clean.model_copy(update={"criteria": {**clean.criteria, "world_coherence": 0.6}})
+    assert not accepted(low, payload, Acceptance()), "a criterion under its floor rejects"
+    assert not accepted(
+        clean.model_copy(update={"issues": [minor]}), payload, Acceptance(minor_issues_block=True)
+    )
     inspected = []
     for task, binding in zip(catalog.tasks, candidate.bindings):
         api = SlackAPI(candidate.snapshot, task.actor_id)
@@ -335,7 +377,10 @@ class TestStore(Store):
 class ScriptedAgent:
     @asynccontextmanager
     async def provision(self, task):
-        assert task.config.files["schemas.json"]
+        assert set(json.loads(task.config.files["schemas.json"])) in (
+            {"premise", "catalog"},
+            {"plan", "bind"},
+        )
         yield None
 
     @asynccontextmanager
@@ -343,18 +388,348 @@ class ScriptedAgent:
         yield SimpleNamespace(trace=SimpleNamespace(ok=True, info={}, record_reward=lambda *args: None))
 
 
-async def check_flow(root):
+def premises(count=12):
+    return Premises(
+        premises=[
+            Premise(
+                company=f"{name} Freight",
+                niche="cold-chain logistics IT",
+                region="Poland",
+                size="400 people",
+                culture="direct, hybrid",
+                cast="Polish and Ukrainian engineers",
+            )
+            for name in (
+                "Harbor",
+                "Kestrel",
+                "Wawel",
+                "Odra",
+                "Lynx",
+                "Bora",
+                "Tatra",
+                "Vistula",
+                "Amber",
+                "Mazur",
+                "Sokol",
+                "Brda",
+            )[:count]
+        ]
+    )
+
+
+def personas(catalog):
+    return [
+        Persona(
+            id=p.id, role="engineer", seniority="senior", timezone="Europe/Warsaw", voice="terse, lowercase"
+        )
+        for p in catalog.people
+    ]
+
+
+def plan_fixture(catalog):
+    conversations = fixture()[1].snapshot.conversations
+    return Plan(
+        conversations=conversations,
+        scenes=[
+            ScenePlan(
+                id="s_route",
+                conversation_id="c1",
+                participant_ids=["u1", "u2"],
+                start="2026-01-02T09:00:00Z",
+                end="2026-01-02T09:45:00Z",
+                situation="Choosing a destination",
+                beats=[Beat(fact_id="f1", author_id="u1")],
+                length=2,
+            ),
+            ScenePlan(
+                id="s_private",
+                conversation_id="c2",
+                participant_ids=["u2"],
+                start="2026-01-02T10:00:00Z",
+                end="2026-01-02T10:45:00Z",
+                situation="Private approval",
+                beats=[Beat(fact_id="f2", author_id="u2")],
+                length=1,
+            ),
+            ScenePlan(
+                id="s_chat",
+                conversation_id="c1",
+                participant_ids=["u1", "u2"],
+                start="2026-01-02T11:00:00Z",
+                end="2026-01-02T11:45:00Z",
+                situation="Lunch plans",
+                length=2,
+            ),
+        ],
+    )
+
+
+ZONES = {"u1": "Europe/Warsaw", "u2": "Europe/Warsaw"}
+
+
+def scripted_scene(scene, recent, previous):
+    base = datetime.fromisoformat(scene.start).astimezone(ZoneInfo("Europe/Warsaw"))
+
+    def at(minutes, seconds):
+        return (base + timedelta(minutes=minutes, seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+
+    texts = {"f1": "ok so work-1 goes to region-1", "f2": "work-2 is approved for region-2"}
+    lines = [
+        Line(author_id=b.author_id, text=texts[b.fact_id], local_time=at(0, 17), conveys=[b.fact_id])
+        for b in scene.beats
+    ] or [Line(author_id=scene.participant_ids[0], text="lunch?", local_time=at(0, 5))]
+    lines.append(
+        Line(
+            author_id=scene.participant_ids[-1],
+            text="rewritten" if scene.revision_note else f"seen {len(recent)}",
+            local_time=at(30, 41),
+            reply_to=0 if previous is None else None,
+        )
+    )
+    promises = {"s_route": ["u1 posts the region map"], "s_chat": ["u2 books the lunch table by noon"]}.get(
+        scene.id
+    )
+    written = WrittenScene(lines=lines, introduces=[f"{scene.id} detail"], promises=promises)
+    assert not check_scene(scene, written, ZONES)
+    return written
+
+
+def check_scenes(root):
     catalog, candidate = fixture()
+    chosen = pick_premise(premises(), 12, ["Northstar Systems"], seed=7)
+    assert chosen == pick_premise(premises(), 12, [], seed=7)
+    fails(pick_premise, premises(11), 12, [], 7)
+    fails(pick_premise, premises(), 12, ["Harbor Cloud Systems"], 7)
+    duplicated = premises()
+    duplicated.premises[1].company = "Harbor Logistics"
+    fails(pick_premise, duplicated, 12, [], 7)
+    catalog.personas = personas(catalog)
+    fails(Persona, id="u1", role="r", seniority="s", timezone="Mars/Olympus", voice="v")
+    fails(Catalog.model_validate, dict(catalog.model_dump(), personas=catalog.model_dump()["personas"][:1]))
+    plan = plan_fixture(catalog)
+    check_plan(catalog, plan)
+    outsider = plan.model_copy(deep=True)
+    outsider.scenes[1].participant_ids = ["u1"]
+    fails(check_plan, catalog, outsider)
+    scenes = {s.id: scripted_scene(s, [], None) for s in plan.scenes}
+    silent = WrittenScene(lines=[Line(author_id="u1", text="hi", local_time="2026-01-02 10:00:00")])
+    assert any("f1" in error for error in check_scene(plan.scenes[0], silent, ZONES))
+    local_start = WrittenScene(lines=[Line(author_id="u1", text="hi", local_time="2026-01-02 12:00:07")])
+    assert not check_scene(plan.scenes[2], local_start, ZONES)
+    overrun = WrittenScene(lines=[Line(author_id="u1", text="hi", local_time="2026-01-02 12:50:00")])
+    assert any("after the scene end" in e for e in check_scene(plan.scenes[2], overrun, ZONES)), "scenes end"
+    as_if_utc = WrittenScene(lines=[Line(author_id="u1", text="hi", local_time="2026-01-02 11:00:00")])
+    assert any("before the scene start" in error for error in check_scene(plan.scenes[2], as_if_utc, ZONES))
+    swapped = WrittenScene(
+        lines=[
+            Line(author_id="u1", text="a", local_time="2026-01-02 12:00:30"),
+            Line(author_id="u2", text="b", local_time="2026-01-02 12:00:12"),
+        ]
+    )
+    assert check_scene(plan.scenes[2], swapped, ZONES) == [
+        "line 1 is at 2026-01-02 12:00:12, before line 0 at 2026-01-02 12:00:30; messages must follow each other in time"
+    ]
+    in_order = WrittenScene(lines=list(reversed(swapped.lines)))
+    assert not check_scene(plan.scenes[2], in_order, {"u1": "Europe/Warsaw", "u2": "Asia/Singapore"}), (
+        "every line is on the scene clock, not its author's"
+    )
+    assert to_utc("2026-01-02 00:30:00", "Europe/Warsaw") == "2026-01-01T23:30:00Z"
+    assert to_utc("2026-01-01 22:00:00", "America/Santiago") == "2026-01-02T01:00:00Z"
+    fails(Line, author_id="u1", text="hi", local_time="2026-01-02T10:00:00Z")
+    lines = [
+        Line(author_id="u1", text="a", local_time="2026-01-02 12:00:01"),
+        Line(author_id="u2", text="b", local_time="2026-01-02 12:00:09"),
+        Line(author_id="u1", text="c", local_time="2026-01-02 12:01:00", reply_to=1),
+        Line(author_id="u2", text="d", local_time="2026-01-02 12:02:00", reply_to=2),
+    ]
+    assert not check_scene(plan.scenes[2], WrittenScene(lines=lines), ZONES)
+    nested, placed = assemble(
+        catalog, plan.model_copy(update={"scenes": [plan.scenes[2]]}), {"s_chat": WrittenScene(lines=lines)}
+    )
+    ids = placed["scene_messages"]["s_chat"]
+    assert {m.id: m.thread_root_id for m in nested.messages}[ids[3]] == ids[1], (
+        "a reply to a reply joins its thread"
+    )
+    lines[3].reply_to = 3
+    assert check_scene(plan.scenes[2], WrittenScene(lines=lines), ZONES) == [
+        "line 3: reply_to 3 must name an earlier line of this scene"
+    ]
+    lines[3].reply_to = 0
+    two_threads, placed = assemble(
+        catalog, plan.model_copy(update={"scenes": [plan.scenes[2]]}), {"s_chat": WrittenScene(lines=lines)}
+    )
+    ids = placed["scene_messages"]["s_chat"]
+    roots = {m.id: m.thread_root_id for m in two_threads.messages}
+    assert roots[ids[2]] == ids[1] and roots[ids[3]] == ids[0] and roots[ids[1]] is None
+    world, index = assemble(catalog, plan, scenes)
+    again, _ = assemble(catalog, plan, scenes)
+    assert world == again and len(world.messages) == 6
+    root_id, reply_id = index["scene_messages"]["s_route"]
+    assert next(m for m in world.messages if m.id == reply_id).thread_root_id == root_id
+    assert index["conveyed"] == {"f1": [root_id], "f2": [index["scene_messages"]["s_private"][0]]}
+    assert not any(reveals_answer(m.id, "region-1", "Which region?") for m in world.messages)
+    report = style(world, catalog.personas)
+    assert report["messages"] == 6 and report["seconds_zero"] == 0 and report["lowercase_start"] == 1
+    assert set(report["authors"]) == {"u1", "u2"} and report["off_hours"] == 0
+    seeds = SeedPacket(examples=[example(f"e{i}") for i in range(5)])
+    assert excerpts(seeds, "1:s") == excerpts(seeds, "1:s") and len(excerpts(seeds, "1:s")) == 2
+    assert excerpts(None, "1:s") == []
+    prompt = brief(
+        catalog,
+        chosen,
+        plan.model_copy(
+            update={
+                "details": {
+                    "QA pool": Detail(value="blr-fleet-2"),
+                    "incident": Detail(value="INC-9", since="2026-01-03T00:00:00Z"),
+                    "cutover": Detail(value="cutover window", at="2026-01-02T15:00:00Z"),
+                }
+            }
+        ),
+        plan.scenes[0],
+        {
+            "recent": [],
+            "elsewhere": [("2026-01-02T08:00:00Z", "restricted", lines[0])],
+            "established": ["release train is 8.4"],
+            "commitments": ["u2 books the lunch table by noon"],
+        },
+        excerpts(seeds, "1:s"),
+        None,
+        "English",
+        {"f1": "2026-01-02T09:15:00Z"},
+    )
+    assert "region-1" in prompt and "Which region" not in prompt and "canonical_answer" not in prompt
+    assert '"start": "2026-01-02 10:00:00"' in prompt and '"language": "English"' in prompt
+    assert '"utc"' not in prompt and "start_local" not in prompt, "the brief shows one clock"
+    assert json.loads(prompt)["world_details"] == {
+        "QA pool": "blr-fleet-2",
+        "cutover": {"value": "cutover window", "at": "Friday 2026-01-02 16:00"},
+    }, "details appear only once known; scheduled moments are on the scene clock"
+    assert json.loads(prompt)["commitments"] == ["u2 books the lunch table by noon"]
+    assert json.loads(prompt)["established_details"] == ["release train is 8.4"]
+    conversations = {c.id: c for c in plan.conversations}
+    route, private, chat = plan.scenes
+    assert visible(route, private, conversations) and visible(route, chat, conversations)
+    assert not visible(chat, route, conversations) and not visible(route, route, conversations)
+    alone = chat.model_copy(update={"participant_ids": ["u1"]})
+    assert not visible(private, alone, conversations), (
+        "u1 is not in the private channel, so it waits for nothing there"
+    )
+    loose = WrittenScene.model_validate_json(
+        '{"lines": [{"author_id": "u1", "text": "x", "local_time": "2026-01-02 12:00:01"}], "introduces": null, "promises": "lunch at noon"}'
+    )
+    assert loose.introduces == [] and loose.promises == ["lunch at noon"]
+    objects = WrittenScene.model_validate(
+        {
+            "lines": loose.model_dump()["lines"],
+            "promises": [{"who": "u2", "what": "book lunch", "by": "noon"}],
+        }
+    )
+    assert objects.promises == ["u2, book lunch, noon"], "a promise written as an object becomes a note"
+    assert '"state_at": "2026-01-02 10:15"' in prompt and '"established_facts"' in prompt
+    assert json.loads(prompt)["seen_elsewhere"] == [
+        {
+            "conversation": "restricted",
+            "author": "Alicia Rao",
+            "time": "Friday 2026-01-02 09:00:00",
+            "text": "a",
+        }
+    ]
+    assert listed('["f1"]') == ["f1"]
+    clocked = catalog.model_copy(deep=True)
+    clocked.facts[0].valid_from = "2026-01-02T08:30:00Z"
+    assert timed(clocked) == {"f1": "2026-01-02T08:30:00Z"}, (
+        "a fact with a time of day is stated in its minute"
+    )
+    local_times = review_payload(clocked, None, [], "catalog")["fact_local_times"]
+    assert local_times == {"f1": {"Europe/Warsaw": "Friday 2026-01-02 09:30"}}, (
+        "judges see timed facts locally"
+    )
+    assert first_mentions(plan) == {"f1": "s_route", "f2": "s_private"}
+    fails(check_plan, clocked, plan)
+    clocked.facts[0].valid_from = "2026-01-02T09:00:00Z"
+    check_plan(clocked, plan)
+    written = scripted_scene(plan.scenes[0], [], None)
+    assert not check_scene(plan.scenes[0], written, ZONES, {"f1": "2026-01-02T09:00:00Z"})
+    assert check_scene(plan.scenes[0], written, ZONES, {"f1": "2026-01-02T09:05:00Z"}) == [
+        "fact f1: the first line stating it is at 2026-01-02 10:00:17 but must be in the minute 2026-01-02 10:05"
+    ], "a timed fact is stated in its own minute, not merely before a deadline"
+    corpus = root / "corpus"
+    atomic_json(
+        corpus / "old/artifacts" / f"{digest(catalog.model_dump(mode='json'))}.json",
+        catalog.model_dump(mode="json"),
+    )
+    atomic_json(corpus / "old/state.json", {"catalog": digest(catalog.model_dump(mode="json"))})
+    atomic_json(corpus / "odd/state.json", [])
+    assert used_names(corpus, corpus / "new") == {
+        "companies": ["Harbor"],
+        "people": ["Alicia Rao", "Owen Sato"],
+    }
+    assert used_names(corpus, corpus / "old") == {"companies": [], "people": []}
+    print(
+        "PASS premise pick, personas, plan/scene contracts, deterministic assembly, style, excerpts, corpus names"
+    )
+
+
+async def check_flow(root):
+    catalog, _ = fixture()
+    catalog.personas = personas(catalog)
+    written, turns = [], []
 
     class ScriptedEnv(GenerationEnv):
         async def author_turn(self, interaction, runtime, context, attempt, first):
             assert context.get("group_id") != "g2", "already supported groups need review, not regeneration"
-            if not first:
-                assert context["feedback"]
-            return (catalog if context["phase"] == "catalog" else candidate).model_dump_json()
+            turns.append((attempt, context["phase"], bool(context.get("feedback"))))
+            if context["phase"] != "bind":
+                assert context["language"] == "English"
+            if context["phase"] == "premise":
+                assert first and context["used_names"] == {"companies": [], "people": []}
+                return premises().model_dump_json()
+            if context["phase"] == "catalog":
+                assert context["premise"]
+                return catalog.model_copy(update={"company": context["premise"]["company"]}).model_dump_json()
+            if context["phase"] == "plan":
+                assert context["new_messages_hint"] == "9-19", "15 messages per task in a one-task group"
+                plan = self.store.state.plan or plan_fixture(catalog)
+                if [phase for _, phase, _ in turns].count("plan") == 1:
+                    broken = plan.model_copy(deep=True)
+                    broken.scenes[0].conversation_id = "c_missing"
+                    return broken.model_dump_json()
+                return plan.model_dump_json()
+            conveyed = context["conveyed"]
+            assert "open_promises" in context
+            first_bind = not any(
+                line.text == "rewritten" for r in self.store.state.scenes.values() for line in r.scene.lines
+            )
+            misses = not first_bind and not any(phase == "bind" and fed for _, phase, fed in turns)
+            bindings = [
+                Binding(
+                    task_id=f"t{i}",
+                    claims=[ClaimEvidence(claim_index=0, message_ids=conveyed[f"f{i}"])],
+                    gold_calls=[
+                        ReadCall(
+                            action="search_messages", arguments={"query": "lunch" if misses else f"work-{i}"}
+                        )
+                    ],
+                )
+                for i in (1, 2)
+            ]
+            rewrites = [Rewrite(scene_id="s_chat", note="Make lunch plans specific")]
+            # A broken bind that also asks for a rewrite must still be validated once rewrites run out.
+            return BindOutput(
+                bindings=bindings, rewrites=rewrites if first_bind or misses else []
+            ).model_dump_json()
+
+        async def write_scene(self, agents, plan, scene, observed, previous, timely):
+            written.append(scene.id)
+            return scripted_scene(scene, observed["recent"], previous)
 
         async def review(self, agents, payload, attempt, author_trace=None):
             verdict = approval(payload)
+            if attempt == "build-g1-02":
+                assert payload["changed_messages"] and payload["previous_issues"], (
+                    "a repair is re-reviewed with focus"
+                )
             if attempt in {"catalog-01", "build-g1-01"}:
                 upstream = attempt.startswith("catalog")
                 return verdict.model_copy(
@@ -365,6 +740,7 @@ async def check_flow(root):
                                 owner="synthesizer" if upstream else "builder",
                                 artifact="catalog" if upstream else "workspace",
                                 task_ids=["t1"],
+                                message_ids=[] if upstream else ["m" + digest(["s_chat", 0])[:10]],
                                 defect="Duplicated question" if upstream else "Repetitive activity",
                                 requested_change="Repair the identified defect",
                             )
@@ -388,13 +764,51 @@ async def check_flow(root):
             self.store.state.phase = "done"
             self.store.save(approved=True)
 
-    config = Config(sector="IT", task_count=2, group_size=1, output=root, seed=1)
+    config = Config(sector="IT", task_count=2, group_size=1, output=root, seed=1, corpus=root / "corpus")
     store = TestStore(root, {"test": 1})
     store.state.catalog = catalog
     agents = SimpleNamespace(synthesizer=ScriptedAgent(), builder=ScriptedAgent())
     env = ScriptedEnv(config, store)
     await env.run(None, agents)
     assert store.state.phase == "done"
+    assert store.state.premise == pick_premise(premises(), 12, [], 1)
+    assert written == ["s_route", "s_private", "s_chat", "s_chat", "s_chat"], (
+        "scenes are written in world time; only new, revised or repaired ones"
+    )
+    assert not any(a == "build-g1-02" and phase == "plan" for a, phase, _ in turns), "a repair keeps the plan"
+    assert "Repetitive activity" in store.state.plan.scenes[2].revision_note, (
+        "the writer gets the judge's words"
+    )
+    chat = store.state.plan.scenes[2]
+    written_now = {k: v.scene for k, v in store.state.scenes.items()}
+    seen = observed(store.state.catalog, store.state.plan, written_now, chat)
+    assert [line.text for _, _, line in seen["recent"]] == ["ok so work-1 goes to region-1", "seen 0"]
+    assert [(name, line.text) for _, name, line in seen["elsewhere"]] == [
+        ("restricted", "work-2 is approved for region-2"),
+        ("restricted", "seen 0"),
+    ]
+    assert not observed(store.state.catalog, store.state.plan, written_now, store.state.plan.scenes[0])[
+        "elsewhere"
+    ]
+    assert seen["established"] == ["s_route detail", "s_private detail"]
+    assert seen["commitments"] == ["u1 posts the region map"], "earlier promises travel to later writers"
+    assert store.state.plan.scenes[2].revision_note and len(store.state.candidate.snapshot.messages) == 6
+    corrected = [(phase, fed) for attempt, phase, fed in turns if attempt == "build-g1-01"]
+    assert corrected[:2] == [("plan", False), ("plan", True)], "plan errors are corrected inside the attempt"
+    assert ("bind", True) in corrected, "bind validation errors are corrected inside the attempt"
+    assert json.loads((root / "attempts/build-g1-01/corrections.json").read_text())
+    judged = []
+
+    async def flaky(task):
+        judged.append(task)
+        verdict = approval(json.loads(task.config.tools.payload_json)).model_dump(mode="json")
+        return SimpleNamespace(ok=len(judged) > 1, errors=[], info={"verdict": verdict})
+
+    payload = review_payload(catalog, store.state.candidate, ["t1"], "world")
+    verdict = await GenerationEnv.review(
+        env, SimpleNamespace(judge=SimpleNamespace(run=flaky)), payload, "judge"
+    )
+    assert verdict.approved and len(judged) == 2 and judged[0] is not judged[1]
     atomic_json(
         store.root / "traces/billing-check.json",
         {"agent": {"name": "solver"}, "usage": {"cost": 1.0}, "extra_usage": [{"cost": 0.25}]},
@@ -406,6 +820,7 @@ async def check_flow(root):
     assert store.state.rounds == {"catalog": 2, "build:g1": 2, "build:g2": 1, "final:g1": 1, "final:g2": 1}
     store.publish()
     world, rows, answers = load_release(root / "release")
+    candidate = store.state.candidate
     assert world == candidate.snapshot and len(rows) == 2
     assert rows[0].snapshot_ref == rows[1].snapshot_ref
     assert "answer" not in rows[0].model_dump()
@@ -455,16 +870,22 @@ async def check_flow(root):
     assert resumed.state.last_approved_candidate is None
     catalog.tasks[1].question += " According to the final approval?"
     await repairing.synthesize(agents)
-    assert resumed.state.rounds["build:g2"] == before["build:g2"] + 1
+    assert resumed.state.rounds["catalog"] == before["catalog"] + 1, (
+        "catalog repairs use the catalog allowance"
+    )
+    assert resumed.state.rounds["build:g2"] == before["build:g2"]
     assert resumed.state.phase == "build" and not resumed.state.final_groups
     assert resumed.state.last_approved_candidate is None
     await repairing.run(None, agents)
     assert resumed.state.phase == "done" and resumed.state.final_groups == ["g1", "g2"]
+    assert repairing.current()
+    resumed.state.catalog.facts[0].value += " (revised)"
+    assert not repairing.current(), "a world written against old facts is rebuilt, not re-reviewed"
     assert resumed.state.rounds["build:g1"] == before["build:g1"]
-    assert resumed.state.rounds["build:g2"] == before["build:g2"] + 2
-    assert sum(resumed.state.rounds[f"{stage}:g2"] for stage in ("build", "final")) == 5
-    fails(resumed.reserve, "build:g2", 5)
-    fails(resumed.reserve, "final:g2", 5)
+    assert resumed.state.rounds["build:g2"] == before["build:g2"] + 1
+    assert resumed.state.rounds["final:g2"] == before["final:g2"] + 1
+    fails(resumed.reserve, "final:g2", resumed.state.rounds["final:g2"])
+    resumed.reserve("build:g2", resumed.state.rounds["build:g2"] + 1)
     resumed.close()
     print(
         "PASS complete feedback flow, upstream invalidation, bounded retries, crash/resume, release and task wire"
@@ -642,66 +1063,57 @@ async def check_live_feedback():
     """Controlled bad candidates exercise the real native author/reviewer exchanges."""
     import verifiers.v1 as vf
     from verifiers.v1.clients import EvalClientConfig, ModelContext
-    from .config import load_config
+    from .config import ROOT, load_config
     from .generate import provenance
 
-    config = load_config(Path("configs/generation.toml"))
-    config.output = config.output.parent / "feedback-check"
+    config = load_config(Path("configs/worldgen_slack/software.toml"))
+    config.output, config.task_count, config.group_size = ROOT / "data/feedback-check", 3, 2
     store = Store(config.output, provenance(config))
 
     class FeedbackEnv(GenerationEnv):
         async def author_turn(self, interaction, runtime, context, attempt, first):
             raw = await super().author_turn(interaction, runtime, context, attempt, first)
-            injected = self.store.root / ("injected-" + context["phase"] + ".json")
-            if injected.exists():
+            injected = self.store.root / "injected-catalog.json"
+            if context["phase"] != "catalog" or injected.exists():
                 return raw
             try:
-                if context["phase"] == "catalog":
-                    Catalog.model_validate_json(raw)
-                else:
-                    candidate = Candidate.model_validate_json(raw)
-                    if not validate_candidate(
-                        self.store.state.catalog, candidate, context["required_task_ids"]
-                    )["ok"]:
-                        return raw
+                Catalog.model_validate_json(raw)
             except ValueError:
                 return raw
             content = json.loads(raw)
             self.store.artifact(attempt, "before_test_injection", content)
-            if context["phase"] == "catalog":
-                original, replacement = content["tasks"][:2]
-                content["tasks"][1] = dict(
-                    original,
-                    id=replacement["id"],
-                    group_id=replacement["group_id"],
-                    question="In this workspace, "
-                    + original["question"][:1].lower()
-                    + original["question"][1:],
-                )
-            else:
-                world = content["snapshot"]
-                channel = next(
-                    c for c in world["conversations"] if c["kind"] == "public_channel" and c["member_ids"]
-                )
-                latest = max(datetime.fromisoformat(m["timestamp"]) for m in world["messages"])
-                for i in range(40):
-                    world["messages"].append(
-                        {
-                            "id": f"xcheck{i:04d}",
-                            "conversation_id": channel["id"],
-                            "author_id": channel["member_ids"][0],
-                            "text": "Status update: everything remains on track. No new information.",
-                            "timestamp": (latest + timedelta(minutes=5 * (i + 1))).strftime(
-                                "%Y-%m-%dT%H:%M:%SZ"
-                            ),
-                        }
-                    )
+            original, replacement = content["tasks"][:2]
+            content["tasks"][1] = dict(
+                original,
+                id=replacement["id"],
+                group_id=replacement["group_id"],
+                question="In this workspace, " + original["question"][:1].lower() + original["question"][1:],
+            )
             raw = json.dumps(content)
-            await runtime.write("/task/output.json", raw.encode())
-            self.store.artifact(attempt, "author_output", {"text": raw, "controlled_test_injection": True})
+            await runtime.write("/task/catalog.json", raw.encode())
+            self.store.artifact(attempt, "author_catalog", {"text": raw, "controlled_test_injection": True})
             atomic_json(injected, {"attempt": attempt})
             self.store.event("controlled_defect_injected", attempt=attempt)
             return raw
+
+        async def write_scene(self, agents, plan, scene, seen, previous, timely):
+            written = await super().write_scene(agents, plan, scene, seen, previous, timely)
+            injected = self.store.root / "injected-world.json"
+            if scene.beats or injected.exists():
+                return written
+            author = next(line.author_id for line in written.lines)
+            latest = datetime.strptime(max(line.local_time for line in written.lines), "%Y-%m-%d %H:%M:%S")
+            written.lines += [
+                Line(
+                    author_id=author,
+                    text="Status update: everything remains on track. No new information.",
+                    local_time=(latest + timedelta(days=1, minutes=5 * i)).strftime("%Y-%m-%d %H:%M:%S"),
+                )
+                for i in range(40)
+            ]
+            atomic_json(injected, {"attempt": self.store.state.active_attempt, "scene_id": scene.id})
+            self.store.event("controlled_defect_injected", scene_id=scene.id)
+            return written
 
         async def run(self, task, agents):
             if self.store.state.phase == "catalog":
@@ -748,6 +1160,113 @@ async def check_live_feedback():
         store.close()
 
 
+def example(identifier):
+    return SeedExample(
+        id=identifier,
+        dataset="unionai/flyte-slack-data",
+        revision="a" * 40,
+        rows=[0],
+        source_sha256="b" * 64,
+        notes="Fixture excerpt.",
+        messages=[SeedMessage(text=f"{identifier} question?", speaker="speaker_1")],
+    )
+
+
+def check_seeds(root):
+    from .config import ROOT, SeedDataConfig
+    from .contracts import (
+        SEED_MAX_BYTES,
+        SEED_MAX_MESSAGES,
+        SEED_MAX_TEXT_CHARS,
+        load_seed_packet,
+        verdict_schema,
+    )
+    from .generate import provenance
+    from scripts.worldgen_slack.prepare_seeds import Selection, normalize, normalize_flyte, normalize_software
+
+    selection = Selection(
+        id="example",
+        dataset="unionai/flyte-slack-data",
+        revision="a" * 40,
+        start=0,
+        end=2,
+        notes="Manually checked sequence; metadata unavailable.",
+        join_pairs=True,
+    )
+    response = {
+        "rows": [
+            {"row_idx": 0, "row": {"input": "Can you check?", "output": "Checking."}, "truncated_cells": []},
+            {"row_idx": 1, "row": {"input": "Checking.", "output": "Fixed."}, "truncated_cells": []},
+        ]
+    }
+    packet = SeedPacket(examples=[normalize(selection, response)])
+    assert [message.text for message in packet.examples[0].messages] == [
+        "Can you check?",
+        "Checking.",
+        "Fixed.",
+    ]
+    assert all(m.speaker is None and m.timestamp is None for m in packet.examples[0].messages)
+    rows = [row["row"] for row in response["rows"]]
+    fails(normalize_flyte, rows, join_pairs=False)
+    fails(normalize_flyte, [rows[0], {"input": "Another conversation", "output": "OK"}], join_pairs=True)
+    fails(normalize, selection, {"rows": response["rows"][:1]})
+    truncated = json.loads(json.dumps(response))
+    truncated["rows"][0]["truncated_cells"] = ["input"]
+    fails(normalize, selection, truncated)
+    software = [
+        dict(workspace="workspace", channel="general", text="Done", user="A", ts="2018-01-01T12:00:00")
+    ]
+    messages = normalize_software(software)
+    assert messages[0].speaker == "A" and messages[0].timestamp == "2018-01-01T12:00:00"
+    fails(normalize_software, [software[0], dict(software[0], channel="elsewhere")])
+    fails(Selection.model_validate, dict(selection.model_dump(), end=101))
+    assert SeedDataConfig(path=Path("data/seeds/example.json")).path == ROOT / "data/seeds/example.json"
+    for update in (
+        {"messages": [{"text": "x"}] * 102},
+        {"messages": [{"text": "x" * (SEED_MAX_TEXT_CHARS + 1)}]},
+        {"messages": [{"text": "   "}]},
+        {"notes": "x" * SEED_MAX_BYTES},
+        {"rows": [1, 0]},
+    ):
+        fails(SeedPacket.model_validate, {"examples": [dict(packet.examples[0].model_dump(), **update)]})
+    fails(SeedPacket, examples=packet.examples * 2)
+    expanded = [
+        dict(packet.examples[0].model_dump(), id=f"example-{index}", messages=[{"text": "x"}] * 64)
+        for index in range(SEED_MAX_MESSAGES // 64)
+    ]
+    assert (
+        sum(len(e.messages) for e in SeedPacket.model_validate({"examples": expanded}).examples)
+        == SEED_MAX_MESSAGES
+    )
+    expanded[0]["messages"].append({"text": "one too many"})
+    fails(SeedPacket.model_validate, {"examples": expanded})
+    root.mkdir(parents=True)
+    path = root / "seeds.json"
+    path.write_text(packet.model_dump_json())
+    assert load_seed_packet(path) == packet
+    oversized = root / "oversized.json"
+    oversized.write_bytes(b" " * (SEED_MAX_BYTES + 1))
+    fails(load_seed_packet, oversized)
+    base = Config(sector="IT", task_count=2, group_size=1, output=root / "baseline")
+    assert "seed_data" not in provenance(base)["config"]
+    seeded = base.model_copy(update={"seed_data": SeedDataConfig(path=path)})
+    fails(provenance, seeded)
+    TestStore(root / "seeded", provenance(seeded, packet)).close()
+    changed = packet.model_copy(deep=True)
+    changed.examples[0].messages[0].text = "Changed source"
+    fails(Store, root / "seeded", provenance(seeded, changed))
+    catalog, candidate = fixture()
+    schema = verdict_schema("world")
+    assert set(schema["properties"]["criteria"]["required"]) == set(QUALITY_CRITERIA)
+    assert schema["properties"]["criteria"]["additionalProperties"] is False
+    assert "criteria" in schema["required"]
+    assert "required" not in verdict_schema("catalog")["properties"]["criteria"]
+    bad = approval(review_payload(catalog, candidate, ["t1", "t2"], "world")).model_dump()
+    bad["criteria"]["weighted_quality"] = 0.9
+    fails(Verdict.model_validate, bad)
+    print("PASS seed normalization, bounds, packet provenance and resume, verdict schema")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -761,5 +1280,7 @@ if __name__ == "__main__":
         check_contracts_and_reads()
         asyncio.run(check_native_servers())
         with tempfile.TemporaryDirectory() as directory:
+            check_seeds(Path(directory) / "seeds")
+            check_scenes(Path(directory) / "scenes")
             asyncio.run(check_flow(Path(directory) / "run"))
         print("All generation checks passed.")

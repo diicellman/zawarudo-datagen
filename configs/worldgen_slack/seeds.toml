@@ -1,0 +1,251 @@
+output = "data/seeds/expanded/slack-examples.draft.json"
+
+
+[[examples]]
+id = "software-measured-result"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 0
+end = 5
+notes = "Troubleshooting with a measured improvement. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-assumption-correction"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 5
+end = 14
+notes = "Questioned documentation and correction of an explanation. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-specialist-handoff"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 14
+end = 30
+notes = "Interleaved channel discussion with a correction and handoff to a specialist channel; not one verified thread. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-dependency-clarification"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 154969
+end = 154990
+notes = "Starts during an ongoing discussion; dependency details, self-correction and confirmed solution. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-confirmed-fix"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 309939
+end = 309947
+notes = "Reported fix; referenced code attachment is absent and must not be reconstructed. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-requirements-tradeoff"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 309947
+end = 309957
+notes = "Alternative proposals, requirements clarification and a durability caveat; no confirmed implementation. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-scope-and-banter"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 309958
+end = 309964
+notes = "Testing scope clarification followed by informal thanks and banter. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-partial-workaround"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 464906
+end = 464913
+notes = "Partial UI workaround; referenced visual context is unavailable. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-design-reconsideration"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 464915
+end = 464927
+notes = "Design alternatives and correction of a misunderstood proposal. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-documentation-disagreement"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 619868
+end = 619897
+notes = "Interleaved channel discussion, newcomer help, disagreement and humor; not one verified thread and no final resolution. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-unresolved-investigation"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 774849
+end = 774863
+notes = "Several attempted fixes fail; excerpt ends with an open question and missing requested traceback. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "software-delayed-followthrough"
+dataset = "spencer/software_slacks"
+revision = "2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a"
+start = 1239737
+end = 1239759
+notes = "Starts mid-discussion; promised later investigation and follow-through interleave with an unrelated regex question. Referenced repo/code context is absent; not one verified thread. Source license unspecified. Channel window; no thread IDs or source timezone."
+
+[[examples]]
+id = "flyte-contributor-onboarding"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 12
+end = 33
+join_pairs = true
+notes = "Contributor onboarding, ownership assignment, availability constraints and a handoff to another channel. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-priority-and-workaround"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 33
+end = 45
+join_pairs = true
+notes = "Missing feature, proposed fix, temporary workaround and deferred prioritization. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-migration-followthrough"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 78
+end = 98
+join_pairs = true
+notes = "Coordinated migration across repositories, review, merge and a subsequent regression; linked issue context is absent. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-diagnosis-and-release"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 3150
+end = 3166
+join_pairs = true
+notes = "Initial UI diagnosis revised after further evidence; later root cause and release follow-up. Referenced screenshots are unavailable. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-notification-docs"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 6276
+end = 6289
+join_pairs = true
+notes = "Configuration diagnosis, successful retry and documentation ownership; screenshots and some configuration context are absent. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-quota-defaults"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 6293
+end = 6298
+join_pairs = true
+notes = "Reported limit, proposed default change, safety clarification and a promised PR; not evidence the PR shipped. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-unsupported-behavior"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 9408
+end = 9412
+join_pairs = true
+notes = "Clarified unsupported deletion behavior and an invitation to file a feature request. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-logging-followup"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 12580
+end = 12587
+join_pairs = true
+notes = "Configuration correction, explicit delayed availability and issue creation; no confirmed final test. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-local-workflow-docs"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 12592
+end = 12608
+join_pairs = true
+notes = "Capability discovery, clarification, adoption plan and documentation follow-up; includes issue-template prompts as source text only. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-reproduction-request"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 15754
+end = 15760
+join_pairs = true
+notes = "Request for reproduction, uncertain version, minimized example and diagnosis; log attachment unavailable, no shipped fix shown. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-working-group"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 15762
+end = 15769
+join_pairs = true
+notes = "Support uncertainty, knowledge retention, community working group and discussion handoff. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-api-migration-review"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 18828
+end = 18835
+join_pairs = true
+notes = "Migration proposal, PR references, review correction and acknowledgement. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-default-change-decision"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 18903
+end = 18907
+join_pairs = true
+notes = "Follow-up on earlier deployment discussion, two alternatives, agreement and tracking issue; earlier context absent. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-shared-test-environment"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 18907
+end = 18912
+join_pairs = true
+notes = "Cross-team volunteer coordination, permissions prerequisite and planning document; window ends during planning. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-repository-transfer"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 21960
+end = 21965
+join_pairs = true
+notes = "Migration agreement followed by preserving fork compatibility and history; no completed migration shown. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-interface-consistency"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 22017
+end = 22027
+join_pairs = true
+notes = "CLI design debate, clarification of mutable fields and competing UX preferences; no final implementation shown. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."
+
+[[examples]]
+id = "flyte-compatibility-recovery"
+dataset = "unionai/flyte-slack-data"
+revision = "fc79c30fae4e14d4376c55bc439ab82491e20b6b"
+start = 25171
+end = 25175
+join_pairs = true
+notes = "Regression report, version-pin workaround, PR and coordinated patch-release plan; no completed release shown. Source license unspecified. Adjacent pairs manually reviewed for topical continuity before collapsing overlap; no speaker, timestamp, channel or thread metadata."

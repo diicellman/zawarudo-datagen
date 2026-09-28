@@ -5,7 +5,7 @@ starts a fresh solver session with actor-scoped tools. A native `vf.Judge` call 
 correctness and grounding in the solver's own observations. It does not launch a judge agent.
 
 ```bash
-uv run eval @ configs/eval-generated.toml -n 1 -r 2 --no-push --plain
+uv run eval @ configs/worldgen_slack/eval.toml -n 1 -r 2 --no-push --plain
 ```
 
 Set `--env.taskset.task.release_dir` to select another generated release. Public rows and

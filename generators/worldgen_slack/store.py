@@ -10,12 +10,43 @@ from pydantic import Field
 from worldgen_slack.dataset import PublicTask, atomic_json, read_json, write_release
 from worldgen_slack.slack.api import canonical, digest
 from worldgen_slack.slack.models import StrictModel
-from .contracts import Catalog, Candidate, Verdict, validate_candidate, validate_verdict
+from .contracts import (
+    Catalog,
+    Candidate,
+    Plan,
+    Premise,
+    SceneRecord,
+    Verdict,
+    validate_candidate,
+    validate_verdict,
+)
+
+
+def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
+    """Companies and people from every other catalog checkpoint in the corpus."""
+    companies, people = set(), set()
+    for path in corpus.glob("**/state.json"):
+        state = read_json(path)
+        reference = state.get("catalog") if isinstance(state, dict) else None
+        artifact = path.parent / "artifacts" / f"{reference}.json"
+        if (
+            path.parent.resolve() == exclude.resolve()
+            or not isinstance(reference, str)
+            or not artifact.exists()
+        ):
+            continue
+        catalog = read_json(artifact)
+        companies.add(catalog["company"])
+        people.update(person["name"] for person in catalog["people"])
+    return {"companies": sorted(companies), "people": sorted(people)}
 
 
 class RunState(StrictModel):
     phase: Literal["catalog", "build", "final", "evaluate", "done"] = "catalog"
+    premise: Premise | None = None
     catalog: Catalog | None = None
+    plan: Plan | None = None
+    scenes: dict[str, SceneRecord] = Field(default_factory=dict)
     candidate: Candidate | None = None
     built_groups: list[str] = Field(default_factory=list)
     final_groups: list[str] = Field(default_factory=list)
@@ -23,9 +54,9 @@ class RunState(StrictModel):
     reviews: dict[str, dict] = Field(default_factory=dict)
     evaluation: dict[str, dict] = Field(default_factory=dict)
     feedback: str = ""
-    catalog_budget: str = "catalog"
     active_attempt: str | None = None
     last_approved_candidate: str | None = None
+    last_verdict: Verdict | None = None
 
 
 class ReviewLimit(RuntimeError):
@@ -96,14 +127,8 @@ class Store:
 
     def reserve(self, key, maximum):
         used = self.state.rounds.get(key, 0)
-        phase, _, group = key.partition(":")
-        consumed = (
-            sum(self.state.rounds.get(f"{stage}:{group}", 0) for stage in ("build", "final"))
-            if phase in {"build", "final"}
-            else used
-        )
-        if consumed >= maximum:
-            raise ReviewLimit(f"review limit exhausted for {key}: {consumed}/{maximum}")
+        if used >= maximum:
+            raise ReviewLimit(f"review limit exhausted for {key}: {used}/{maximum}")
         self.state.rounds[key] = used + 1
         attempt = f"{key.replace(':', '-')}-{used + 1:02d}"
         self.state.active_attempt = attempt

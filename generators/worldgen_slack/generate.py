@@ -12,20 +12,31 @@ import verifiers.v1 as vf
 from .config import ROOT, Config, load_config
 from .env import GenerationEnv
 from .store import Store
+from .contracts import SeedPacket, load_seed_packet
+from worldgen_slack.slack.api import digest
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from worldgen_slack.dataset import atomic_json
 
 
-def provenance(config: Config) -> dict:
-    return {
-        "config": config.model_dump(mode="json"),
+def provenance(config: Config, seeds: SeedPacket | None = None) -> dict:
+    if (config.seed_data is None) != (seeds is None):
+        raise ValueError("seed configuration and loaded packet must agree")
+    result = {
+        "config": config.model_dump(
+            mode="json", exclude={"seed_data"} if config.seed_data is None else set()
+        ),
         "verifiers_revision": "ac2ec29",
         "lock_hash": hashlib.sha256((ROOT / "uv.lock").read_bytes()).hexdigest(),
     }
+    if seeds is not None:
+        result["seed_data_hash"] = digest(seeds.model_dump(mode="json"))
+    return result
 
 
 async def run(config: Config) -> dict:
-    store = Store(config.output, provenance(config))
+    seeds = load_seed_packet(config.seed_data.path) if config.seed_data else None
+    manifest = provenance(config, seeds)
+    store = Store(config.output, manifest)
 
     async def heartbeat():
         while True:
@@ -39,8 +50,10 @@ async def run(config: Config) -> dict:
 
     pulse = asyncio.create_task(heartbeat())
     try:
+        if seeds is not None:
+            atomic_json(store.root / "seeds.json", seeds.model_dump(mode="json"))
         if store.state.phase != "done":
-            env = GenerationEnv(config, store)
+            env = GenerationEnv(config, store, seeds)
             context = ModelContext(
                 model=config.env.solver.model,
                 client=EvalClientConfig(),
@@ -55,7 +68,9 @@ async def run(config: Config) -> dict:
             if not episode.ok and (
                 store.state.phase != "done"
                 or episode.errors
-                or any(not trace.ok and trace.agent.name != "solver" for trace in episode.traces)
+                or any(
+                    not trace.ok and trace.agent.name not in {"solver", "writer"} for trace in episode.traces
+                )
             ):
                 reason = "; ".join(f"{e.type}: {e.message}" for e in episode.errors)
                 reason = reason or "; ".join(
@@ -86,6 +101,8 @@ def main() -> int:
     args = parser.parse_args()
     config = load_config(args.config)
     if args.dry_run:
+        if config.seed_data:
+            load_seed_packet(config.seed_data.path)
         print(config.model_dump_json(indent=2))
         return 0
     result = asyncio.run(run(config))
