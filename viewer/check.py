@@ -8,13 +8,15 @@ from build import ROOT, load_run, render
 
 
 def main():
-    run = load_run(ROOT / "data/qualification-01/software")
-    assert run["attempts"][0]["id"] == "catalog-01"
-    assert run["attempts"][0]["validation"]["ok"] is False
-    world = next(a for a in run["attempts"] if a["id"] == "build-grp_helix48-01")
-    assert len(world["candidate"]["snapshot"]["messages"]) == 150
-    assert world["tasks"][0]["answer"]["canonical_answer"]
-    assert world["verdict"]["approved"] is False
+    local = ROOT / "data/qualification-01/software"
+    if local.exists():  # a local research run; fresh clones check only the synthetic cases below
+        run = load_run(local)
+        assert run["attempts"][0]["id"] == "catalog-01"
+        assert run["attempts"][0]["validation"]["ok"] is False
+        world = next(a for a in run["attempts"] if a["id"] == "build-grp_helix48-01")
+        assert len(world["candidate"]["snapshot"]["messages"]) == 150
+        assert world["tasks"][0]["answer"]["canonical_answer"]
+        assert world["verdict"]["approved"] is False
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp)
         attempt = path / "attempts/broken"
