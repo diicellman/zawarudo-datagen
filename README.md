@@ -13,13 +13,14 @@ access. Authenticate with `prime login` or set `PRIME_API_KEY`.
 git clone <repo> && cd zawarudo-datagen && git checkout feat/scene-writer
 uv sync --all-extras --all-groups
 uv run --frozen python -m generators.worldgen_slack.check        # offline checks, no paid calls
-uv run --frozen worldgen-slack --config configs/generation-v2-software.toml --dry-run
+uv run --frozen worldgen-slack --config configs/worldgen_slack/software.toml --dry-run
 mkdir -p runs
-uv run --frozen worldgen-slack --config configs/generation-v2-software.toml > runs/software.log 2>&1   # paid
+uv run --frozen worldgen-slack --config configs/worldgen_slack/software.toml > runs/software.log 2>&1   # paid
 ```
 
-- **Configs:** `generation-v2-{software,employee,services}.toml` each generate one 10-task world (two groups of 5).
-  `generation-v2-smoke.toml` is a small smoke run.
+- **Configs** (`configs/worldgen_slack/`): `software.toml`, `employee.toml` and `services.toml` each generate one
+  10-task world (two groups of 5). These are the v2-09 run configs. `seeds.toml` rebuilds the seed packet, and
+  `eval.toml` evaluates a released world. `configs/{eval,gepa,rl}` are Prime Lab templates.
 - **Change `output` and `seed` for each new world.** A rerun of the same command resumes from `state.json`.
   Resume is refused if the config differs from the run's `run.json`.
 - **Models:** per agent in `[env.<role>]` (synthesizer, builder, writer, judge, solver) and `[answer_judge]`.
@@ -110,7 +111,7 @@ actor-scoped tools, never the release directory or sibling catalog.
 ```bash
 uv run python -m generators.worldgen_slack.check
 uv run python -m generators.worldgen_slack.check --live-feedback
-uv run eval @ configs/eval-generated.toml -n 1 -r 2 --no-push --plain
+uv run eval @ configs/worldgen_slack/eval.toml -n 1 -r 2 --no-push --plain
 ```
 
 The single generator check includes retained Slack domain checks, native tool startup,

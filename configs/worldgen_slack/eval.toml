@@ -1,0 +1,9 @@
+model = "z-ai/glm-5.3-flash"
+num_examples = 10
+rollouts_per_example = 1
+
+[env.taskset]
+id = "worldgen-slack"
+
+[env.taskset.task]
+release_dir = "data/v2-09/software/release"

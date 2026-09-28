@@ -71,8 +71,8 @@ writer calls, cost and solving.
 Prepare reference examples separately from world generation:
 
 ```bash
-uv run --frozen python scripts/worldgen_slack/prepare_seeds.py --config configs/seed-preparation-expanded.toml --dry-run
-uv run --frozen python scripts/worldgen_slack/prepare_seeds.py --config configs/seed-preparation-expanded.toml
+uv run --frozen python scripts/worldgen_slack/prepare_seeds.py --config configs/worldgen_slack/seeds.toml --dry-run
+uv run --frozen python scripts/worldgen_slack/prepare_seeds.py --config configs/worldgen_slack/seeds.toml
 ```
 
 The selection TOML specifies dataset revisions and row ranges (`start` inclusive, `end`

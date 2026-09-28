@@ -1063,11 +1063,11 @@ async def check_live_feedback():
     """Controlled bad candidates exercise the real native author/reviewer exchanges."""
     import verifiers.v1 as vf
     from verifiers.v1.clients import EvalClientConfig, ModelContext
-    from .config import load_config
+    from .config import ROOT, load_config
     from .generate import provenance
 
-    config = load_config(Path("configs/generation.toml"))
-    config.output = config.output.parent / "feedback-check"
+    config = load_config(Path("configs/worldgen_slack/software.toml"))
+    config.output, config.task_count, config.group_size = ROOT / "data/feedback-check", 3, 2
     store = Store(config.output, provenance(config))
 
     class FeedbackEnv(GenerationEnv):
