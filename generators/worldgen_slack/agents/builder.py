@@ -1,11 +1,14 @@
 from .author import AuthorTask
-from ..contracts import BindOutput, Plan
+from .writer import frozen
+from ..contracts import BindOutput, Plan, first_mentions, timed
 
 BUILDER_GUIDE = """You plan the workspace and bind evidence. You never write message text: a separate writer turns
 each scene into messages in the voices of the catalog personas.
 
-Phase plan: write the Plan for the WHOLE workspace, including every earlier conversation and scene from
-previous_output. Preserve earlier scenes and their IDs unless feedback requires a change.
+Phase plan: the catalog holds the tasks built so far, this group's tasks, and their workstreams' facts.
+Write the Plan with every conversation and scene from previous_output plus the scenes this group's facts need.
+Scenes in frozen_scene_ids belong to the approved world: keep them unchanged except for their revision_note. Other
+earlier scenes may change when feedback requires it.
 Conversations: channels, private channels, DMs and group DMs the company would really use. Public channels
 are readable by all users; private channels/DMs only by members. Archived content cannot support answers.
 A scene is one stretch of talk in one conversation: a thread or a run of top-level messages. Give its
@@ -35,9 +38,7 @@ No answer caches, benchmark questions, private contract fields, or generation ma
 
 Phase bind: input.json holds the assembled workspace, scene_messages (scene → message IDs) and conveyed
 (fact → messages stating it). Write bindings for every required task; keep earlier bindings valid.
-Read the messages you bind. If a message does not really support its claim or a scene contradicts the
-catalog, add a rewrite {scene_id, note} instead; the scene is rewritten and you bind again. open_promises
-lists commitments made in scenes; when a required answer relies on one, a later scene must keep it.
+Read the messages you bind: each claim needs messages that really state it.
 Each Binding maps every canonical claim index to message_ids and/or user_ids, and has replayable gold_calls.
 Actions: list_conversations(cursor?,limit?), search_messages(query,conversation_id?,author_id?,after?,before?,
 cursor?,limit?), get_conversation_history(conversation_id,cursor?,limit?),
@@ -54,3 +55,46 @@ Use global search or list_conversations first. Bindings and gold routes are buil
 class BuilderTask(AuthorTask):
     outputs = {"plan": Plan, "bind": BindOutput}
     instructions = BUILDER_GUIDE
+
+
+def scoped(state, group_id):
+    """The catalog as a group sees it: built and current tasks, and the facts of their workstreams."""
+    included = {*state.built_groups, group_id}
+    tasks = [t for t in state.catalog.tasks if t.group_id in included]
+    shown = {f for t in tasks for f in t.fact_ids} | (
+        set(first_mentions(state.plan)) if state.plan else set()
+    )
+    facts = [f for f in state.catalog.facts if f.group_id in included or f.id in shown]
+    groups = [g for g in state.catalog.groups if g.id in included | {f.group_id for f in facts}]
+    return state.catalog.model_copy(update={"tasks": tasks, "facts": facts, "groups": groups})
+
+
+def later_groups(state, catalog) -> list[dict]:
+    """Workstreams a scoped view leaves out because they are built later."""
+    return [g.model_dump() for g in state.catalog.groups if g not in catalog.groups]
+
+
+def group_scope(state, group_id) -> dict:
+    catalog = scoped(state, group_id)
+    return {
+        "workspace_id": state.catalog.workspace_id,
+        "group_id": group_id,
+        "catalog": catalog.model_dump(mode="json"),
+        "required_task_ids": [t.id for t in catalog.tasks],
+        "later_groups": later_groups(state, catalog),
+        "feedback": state.feedback,
+    }
+
+
+def plan_context(settings, state, group_id) -> dict:
+    per_group = settings.messages_per_task * sum(t.group_id == group_id for t in state.catalog.tasks)
+    return {
+        "phase": "plan",
+        **group_scope(state, group_id),
+        "language": settings.language,
+        "premise": state.premise.model_dump(),
+        "new_messages_hint": f"{per_group * 6 // 10}-{per_group * 13 // 10}",
+        "timed_facts": sorted(timed(scoped(state, group_id))),
+        "frozen_scene_ids": sorted(s.id for s in frozen(state)),
+        "previous_output": state.plan.model_dump(mode="json") if state.plan else None,
+    }

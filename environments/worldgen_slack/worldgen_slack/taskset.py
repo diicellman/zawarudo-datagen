@@ -53,7 +53,16 @@ class SolverTask(vf.Task[SlackTaskData, ReadState, SolverConfig]):
         return [SlackToolset(config.tools)]
 
     @classmethod
-    def create(cls, task, world: SlackWorld, workspace_id: str, reference: PrivateAnswer, judge=None) -> Self:
+    def create(
+        cls,
+        task,
+        world: SlackWorld,
+        workspace_id: str,
+        reference: PrivateAnswer,
+        judge=None,
+        network_policy=True,
+    ) -> Self:
+        """`network_policy` blocks egress; only sandboxed runtimes can enforce it."""
         config = SolverConfig(
             tools=SlackToolsetConfig(snapshot_json=world.model_dump_json(), actor_id=task.actor_id),
             reference=reference,
@@ -67,14 +76,36 @@ class SolverTask(vf.Task[SlackTaskData, ReadState, SolverConfig]):
                 workspace_id=workspace_id,
                 snapshot_hash=digest(world.model_dump(mode="json")),
                 prompt=task.question,
-                network_allow=[],
-                network_block=["*"],
+                **({"network_allow": [], "network_block": ["*"]} if network_policy else {}),
             ),
             config,
         )
 
     async def setup(self, trace, runtime):
         stage_tool_data(self, self.config.tools, json.loads(self.config.tools.snapshot_json))
+
+    @staticmethod
+    def outcome(trace: vf.Trace) -> dict:
+        """A finished solve's graded result; a solve that failed before grading scores zero."""
+        result = trace.info.get("evaluation")
+        if result is None and trace.info.get("grading_started"):
+            raise RuntimeError("LLM answer grading failed: " + "; ".join(e.message for e in trace.errors))
+        if result is None:
+            result = {
+                "task_id": trace.task.data.task_id,
+                "snapshot_hash": trace.task.data.snapshot_hash,
+                "execution_ok": False,
+                "semantic_correctness": 0.0,
+                "correct": False,
+                "grounded": False,
+                "read_count": len(trace.info.get("observations", [])),
+                "solver_trace_id": trace.id,
+                "reason": "; ".join(e.message for e in trace.errors),
+                "response": trace.last_reply,
+            }
+        if not trace.ok:
+            result.update(execution_ok=False, semantic_correctness=0.0)
+        return result
 
     async def finalize(self, trace):
         self._tool_directory.cleanup()

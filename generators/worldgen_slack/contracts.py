@@ -12,6 +12,7 @@ from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from worldgen_slack.slack.models import (
     QUALITY_CRITERIA,
@@ -179,6 +180,7 @@ class Premise(StrictModel):
     size: NonEmptyText
     culture: NonEmptyText
     cast: NonEmptyText
+    occupations: list[NonEmptyText] = Field(default_factory=list)
 
 
 class Premises(StrictModel):
@@ -196,16 +198,78 @@ def pick_premise(premises: Premises, count: int, used: list[str], seed: int) -> 
     return random.Random(seed).choice(premises.premises)
 
 
+class Typing(StrictModel):
+    """How one real Slack user types: medians and shares over their messages."""
+
+    id: SafeId
+    messages: int
+    median_words: float
+    short_share: float
+    question_share: float
+    lowercase_share: float
+    emoji_share: float
+
+
+class SeedPersona(StrictModel):
+    """A person from the seed persona file (scripts/worldgen_slack/personas.sql); `typing` is paired by the seed."""
+
+    uuid: SafeId
+    name: NonEmptyText
+    sex: NonEmptyText
+    age: int
+    marital_status: NonEmptyText
+    education_level: NonEmptyText
+    bachelors_field: str | None
+    occupation: NonEmptyText
+    city: NonEmptyText
+    state: NonEmptyText
+    country: NonEmptyText
+    timezone: Annotated[str, AfterValidator(zone)]
+    persona: NonEmptyText
+    professional_persona: NonEmptyText
+    cultural_background: NonEmptyText
+    skills: list[str]
+    hobbies: list[str]
+    typing: Typing | None = None
+
+
+def census(personas) -> tuple[list[str], Counter]:
+    """The persona file's countries, and how many people hold each occupation."""
+    people = [json.loads(line) for line in personas.path.read_text().splitlines()]
+    return sorted({p["country"] for p in people}), Counter(p["occupation"] for p in people)
+
+
+def pick_cast(personas, seed: int, used: list[str], occupations: list[str]) -> list[SeedPersona]:
+    """Entropy comes from code: the run seed draws the candidate cast from the company's occupations, skipping
+    people used elsewhere in the corpus, and pairs each candidate with a real user's typing."""
+    rng, taken, cast = random.Random(seed), set(used), []
+    lines = personas.path.read_text().splitlines()
+    for line in rng.sample(lines, len(lines)):
+        if len(cast) == personas.pool:
+            break
+        person = SeedPersona.model_validate_json(line)
+        if person.occupation in occupations and person.name not in taken:
+            cast.append(person)
+    if len(cast) < personas.pool:
+        raise ValueError(f"the persona file has fewer than {personas.pool} people unused in the corpus")
+    typing = rng.sample(personas.typing.read_text().splitlines(), len(cast))
+    return [p.model_copy(update={"typing": Typing.model_validate_json(t)}) for p, t in zip(cast, typing)]
+
+
 class Persona(StrictModel):
     id: SafeId
     role: NonEmptyText
     seniority: NonEmptyText
     timezone: Annotated[str, AfterValidator(zone)]
     voice: NonEmptyText
+    seed_id: SafeId | None = None
+    # Attached by code from the seeded cast, never written by the synthesizer.
+    profile: SkipJsonSchema[SeedPersona | None] = None
 
 
 class Fact(StrictModel):
     id: SafeId
+    group_id: SafeId
     subject: NonEmptyText
     predicate: NonEmptyText
     value: NonEmptyText
@@ -255,6 +319,8 @@ class Catalog(StrictModel):
             raise ValueError("personas must describe every person exactly once")
         facts = {v.id for v in self.facts}
         groups = {v.id for v in self.groups}
+        if unknown := {f.id for f in self.facts if f.group_id not in groups}:
+            raise ValueError(f"facts in unknown groups: {sorted(unknown)}")
         if len({p.id for p in self.people}) != len(self.people):
             raise ValueError("duplicate person ID")
         questions: set[str] = set()
@@ -281,8 +347,6 @@ class Catalog(StrictModel):
                 "catalog person IDs encode answer content; rename these IDs and their actor references: "
                 + "; ".join(directory_leaks)
             )
-        if groups != {t.group_id for t in self.tasks}:
-            raise ValueError("every group must have tasks")
         # Catalogs contain hundreds of facts; replace this quadratic scan with an interval index at larger scales.
         for index, left in enumerate(self.facts):
             for right in self.facts[index + 1 :]:
@@ -400,14 +464,8 @@ class SceneRecord(StrictModel):
     scene: WrittenScene
 
 
-class Rewrite(StrictModel):
-    scene_id: SafeId
-    note: NonEmptyText
-
-
 class BindOutput(StrictModel):
     bindings: list[Binding]
-    rewrites: list[Rewrite] = Field(default_factory=list)
 
 
 def first_mentions(plan: Plan) -> dict[str, str]:
@@ -425,9 +483,19 @@ def timed(catalog: Catalog) -> dict[str, str]:
     return {f.id: f.valid_from for f in catalog.facts if not f.valid_from.endswith("T00:00:00Z")}
 
 
-def check_plan(catalog: Catalog, plan: Plan) -> Plan:
+def check_plan(catalog: Catalog, plan: Plan, frozen: list[ScenePlan] = ()) -> Plan:
+    """`frozen` scenes belong to the approved world: the plan keeps them and may only change their revision_note."""
     conversations = {c.id: c for c in plan.conversations}
     facts = {f.id: f for f in catalog.facts}
+    scenes = {s.id: s for s in plan.scenes}
+    for old in frozen:
+        new = scenes.get(old.id)
+        if new is None or new.model_copy(update={"revision_note": ""}) != old.model_copy(
+            update={"revision_note": ""}
+        ):
+            raise ValueError(
+                f"{old.id} is part of the approved world: keep it unchanged; set its revision_note to revise its text"
+            )
     if len(conversations) != len(plan.conversations):
         raise ValueError("duplicate conversation ID")
     if len({s.id for s in plan.scenes}) != len(plan.scenes):
@@ -526,8 +594,7 @@ def assemble(catalog: Catalog, plan: Plan, scenes: dict[str, WrittenScene]) -> t
                 conveyed[fact_id].append(message_id)
     messages.sort(key=lambda m: (m.timestamp, m.id))
     world = SlackWorld(users=catalog.people, conversations=plan.conversations, messages=messages)
-    promises = [{"scene_id": s.id, "promise": p} for s in plan.scenes for p in scenes[s.id].promises]
-    return world, {"conveyed": dict(conveyed), "scene_messages": placed, "open_promises": promises}
+    return world, {"conveyed": dict(conveyed), "scene_messages": placed}
 
 
 def style(world: SlackWorld, personas: list[Persona]) -> dict:
@@ -617,38 +684,58 @@ class Verdict(StrictModel):
         return self
 
 
-def verdict_schema(phase: str) -> dict:
+# A task review scores one task's evidence; a world review scores the workspace text.
+PHASE_CRITERIA = {
+    "task": ("discoverability", "shortcut_free", "evidence_composition"),
+    "world": ("scenario_alignment", "world_coherence", "professional_realism"),
+}
+
+
+def verdict_schema(phase: str, task_ids: list[str]) -> dict:
+    """The contract `validate_verdict` enforces: exactly one review per requested task, and the phase's criteria."""
     schema = Verdict.model_json_schema()
+    schema["properties"]["tasks"] |= {"minItems": len(task_ids), "maxItems": len(task_ids)}
+    if task_ids:
+        schema["$defs"]["TaskReview"]["properties"]["task_id"]["enum"] = task_ids
+    names = PHASE_CRITERIA.get(phase, QUALITY_CRITERIA)
     schema["properties"]["criteria"] = {
         "type": "object",
-        "properties": {name: {"type": "number", "minimum": 0, "maximum": 1} for name in QUALITY_CRITERIA},
+        "properties": {name: {"type": "number", "minimum": 0, "maximum": 1} for name in names},
         "additionalProperties": False,
     }
-    if phase == "world":
-        schema["properties"]["criteria"]["required"] = list(QUALITY_CRITERIA)
+    if phase in PHASE_CRITERIA:
+        schema["properties"]["criteria"]["required"] = list(names)
         schema["required"].append("criteria")
     return schema
 
 
 def quality(verdict: Verdict) -> float:
-    weights = dict(zip(QUALITY_CRITERIA, (1.0, 1.25, 1.25, 1.0, 1.0, 1.5), strict=True))
-    if set(verdict.criteria) != set(weights):
-        raise ValueError("world review must score all six quality criteria")
-    return sum(weights[k] * verdict.criteria[k] for k in weights) / sum(weights.values())
+    if not verdict.criteria:
+        raise ValueError("a task or world review must score its criteria")
+    return sum(verdict.criteria.values()) / len(verdict.criteria)
+
+
+def private_tokens(answer: str, question: str) -> set[str]:
+    """Answer words the question does not give away."""
+    return {
+        token for token in _meaningful_tokens(answer) - _meaningful_tokens(question) if not token.isdigit()
+    }
 
 
 def reveals_answer(identifier: str, answer: str, question: str) -> bool:
-    private_tokens = {
-        token for token in _meaningful_tokens(answer) - _meaningful_tokens(question) if not token.isdigit()
-    }
     return _identifier_reveals(identifier, answer, match_tokens=False) or any(
-        _identifier_reveals(identifier, token, match_tokens=False) for token in private_tokens
+        _identifier_reveals(identifier, token, match_tokens=False)
+        for token in private_tokens(answer, question)
     )
 
 
 def validate_verdict(verdict: Verdict, payload: dict) -> None:
     if verdict.reviewed_hash != digest(payload):
         raise ValueError("stale review: candidate hash differs")
+    if payload["phase"] in PHASE_CRITERIA and set(verdict.criteria) != set(PHASE_CRITERIA[payload["phase"]]):
+        raise ValueError(
+            f"a {payload['phase']} review scores exactly {list(PHASE_CRITERIA[payload['phase']])}"
+        )
     tasks = {t["id"]: t for t in payload["tasks"]}
     if {r.task_id for r in verdict.tasks} != set(tasks):
         raise ValueError("judge must review every requested task exactly once")
@@ -663,17 +750,39 @@ def validate_verdict(verdict: Verdict, payload: dict) -> None:
             raise ValueError("approval requires support for every canonical answer claim")
 
 
+def review_key(catalog: Catalog, candidate: Candidate, task_id: str, outputs: list) -> str:
+    """What a task review depends on: the task, its facts, its binding and what its gold route observes."""
+    task = next(t for t in catalog.tasks if t.id == task_id)
+    binding = next(b for b in candidate.bindings if b.task_id == task_id)
+    facts = [f.model_dump(mode="json") for f in catalog.facts if f.id in task.fact_ids]
+    return digest([task.model_dump(mode="json"), facts, binding.model_dump(mode="json"), outputs])
+
+
+def deciding(verdict: Verdict, acceptance) -> list[Issue]:
+    """The issues that decide acceptance and a rejection's route: blocking ones, and minor ones when they block."""
+    return [i for i in verdict.issues if i.blocking or acceptance.minor_issues_block]
+
+
 def accepted(verdict: Verdict, payload: dict, acceptance) -> bool:
-    """World acceptance from the judge's findings and the configured floors (`config.Acceptance`)."""
+    """Blocking issues decide (`config.Acceptance`); the judge's scores are reported, not thresholds."""
     claims = {t["id"]: len(t["answer"]["required_claims"]) for t in payload["tasks"]}
-    return (
-        all(
-            t.valid and t.answer_complete and len(set(t.supported_claims)) == claims[t.task_id]
-            for t in verdict.tasks
-        )
-        and not any(i.blocking or acceptance.minor_issues_block for i in verdict.issues)
-        and min(verdict.criteria.values()) >= acceptance.criterion_floor
-        and quality(verdict) >= acceptance.quality_floor
+    return all(
+        t.valid and t.answer_complete and len(set(t.supported_claims)) == claims[t.task_id]
+        for t in verdict.tasks
+    ) and not deciding(verdict, acceptance)
+
+
+def accepted_task(verdict: Verdict, payload: dict, acceptance, task_id: str) -> bool:
+    """One task of a batched review passes on its own review and the issues that name it or no task."""
+    return accepted(
+        verdict.model_copy(
+            update={
+                "tasks": [r for r in verdict.tasks if r.task_id == task_id],
+                "issues": [i for i in verdict.issues if task_id in i.task_ids or not i.task_ids],
+            }
+        ),
+        {"tasks": [t for t in payload["tasks"] if t["id"] == task_id]},
+        acceptance,
     )
 
 
@@ -750,7 +859,16 @@ def validate_candidate(catalog: Catalog, candidate: Candidate, task_ids: list[st
                 api.get_user(user_id)
             outputs = []
             observed_text = task.question
+            private = private_tokens(task.answer.canonical_answer, task.question)
             for call in binding.gold_calls:
+                query = call.arguments.get("query")
+                if query and (
+                    leaked := _meaningful_tokens(str(query)) & private - _meaningful_tokens(observed_text)
+                ):
+                    raise ValueError(
+                        f"gold search {query!r} uses answer terms {sorted(leaked)} that neither the question nor "
+                        "earlier outputs reveal; search with the question's clues and discover the answer"
+                    )
                 for name in ("conversation_id", "root_message_id", "user_id", "author_id", "cursor"):
                     value = call.arguments.get(name)
                     if value is not None and not re.search(

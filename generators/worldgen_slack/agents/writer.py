@@ -4,6 +4,7 @@ import json
 import random
 import verifiers.v1 as vf
 from datetime import datetime, timedelta
+from worldgen_slack.slack.api import digest
 from ..contracts import (
     Catalog,
     Plan,
@@ -11,9 +12,12 @@ from ..contracts import (
     SceneRecord,
     ScenePlan,
     SeedPacket,
+    SeedPersona,
     WrittenScene,
     check_scene,
     clock,
+    first_mentions,
+    timed,
     to_local,
     to_utc,
 )
@@ -24,7 +28,10 @@ The brief gives the company, the conversation, the participants with personas, t
 messages, and beats. recent_messages come earlier in this conversation; seen_elsewhere are recent messages
 the participants saw in other conversations; established_facts are true at the scene start; world_details and established_details are fixed facts of this
 workspace. Never contradict any of them, and restate them only when the work calls for it. commitments are
-promises made earlier: keep them, or have someone explicitly change them. Each person writes in their own voice as their persona describes; people differ in
+promises made earlier: keep them, or have someone explicitly change them. A participant's profile is who they are
+outside their role; typing is how they type in Slack, measured on a real person: median words per message and
+the shares of their messages with at most four words, a question, a lowercase start, or an emoji. Their lines
+follow those numbers. Each person writes in their own voice as their persona describes; people differ in
 length, capitalization, punctuation, formality, abbreviations and emoji. Slack is chat, not email: most
 messages are one line, many are a few words (acks, quick questions, "on it", "hmm"), people split a thought
 across several messages, and multi-paragraph posts are rare. Write in the brief's language. Continue the
@@ -57,6 +64,23 @@ def excerpts(seeds: SeedPacket | None, key: str, count: int = 2) -> list[str]:
         return []
     chosen = random.Random(key).sample(seeds.examples, min(count, len(seeds.examples)))
     return ["\n".join(f"{m.speaker or 'someone'}: {m.text}" for m in e.messages[:14]) for e in chosen]
+
+
+def portrait(profile: SeedPersona | None) -> dict:
+    """A seeded person beyond their role, and how they type in Slack."""
+    if profile is None:
+        return {}
+    return {
+        "profile": {
+            "age": profile.age,
+            "home": f"{profile.city}, {profile.state}",
+            "background": profile.cultural_background,
+            "personality": profile.persona,
+            "work_style": profile.professional_persona,
+            "interests": profile.hobbies,
+        },
+        "typing": profile.typing.model_dump(exclude={"id", "messages"}),
+    }
 
 
 def brief(
@@ -99,7 +123,8 @@ def brief(
         "conversation": conversation.model_dump(include={"name", "kind", "topic", "purpose"}),
         "participants": [
             {"author_id": i, "name": people[i].name, "team": people[i].team}
-            | personas[i].model_dump(exclude={"id"})
+            | personas[i].model_dump(exclude={"id", "seed_id", "profile"})
+            | portrait(personas[i].profile)
             for i in scene.participant_ids
         ],
         "scene": {
@@ -206,3 +231,46 @@ async def compose(
                 errors
             )
     return written, errors, interaction.trace
+
+
+def scene_key(catalog: Catalog, plan: Plan, scene: ScenePlan) -> tuple[str, dict[str, str]]:
+    """Digest of what a scene is written from, plus the minutes its first-stated timed facts must land in."""
+    facts = {f.id: f for f in catalog.facts}
+    personas = {p.id: p for p in catalog.personas}
+    minutes = timed(catalog)
+    timely = {
+        f: minutes[f] for f, where in first_mentions(plan).items() if where == scene.id and f in minutes
+    }
+    key = digest(
+        [
+            scene.model_dump(mode="json"),
+            [facts[b.fact_id].model_dump(mode="json") for b in scene.beats],
+            [personas[i].model_dump(mode="json") for i in scene.participant_ids],
+            timely,
+        ]
+    )
+    return key, timely
+
+
+def current(state) -> bool:
+    """Whether every written scene still matches the catalog, so the candidate can be reviewed again."""
+    return all(
+        (record := state.scenes.get(s.id)) and record.key == scene_key(state.catalog, state.plan, s)[0]
+        for s in state.plan.scenes
+    )
+
+
+def frozen(state) -> list[ScenePlan]:
+    """Scenes exactly as approved: a later plan keeps them and may only change their revision_note."""
+    if state.plan is None:
+        return []
+    return [
+        s
+        for s in state.plan.scenes
+        if state.frozen_scenes.get(s.id) == scene_key(state.catalog, state.plan, s)[0]
+    ]
+
+
+def changed(state) -> list[str]:
+    """Scenes written since the world was last approved."""
+    return [s.id for s in state.plan.scenes if state.frozen_scenes.get(s.id) != state.scenes[s.id].key]

@@ -1,33 +1,36 @@
-"""Catalog → reviewed build groups → final review → independent solves."""
+"""The generation episode's control flow: catalog → incrementally built, reviewed groups → final review.
+
+What each role sees and how its output is parsed lives with the role in `agents/`; the rules are in `contracts`."""
 
 import asyncio
 import json
 from collections import defaultdict
 import verifiers.v1 as vf
+from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.errors import SandboxError
 from worldgen_slack.dataset import PrivateAnswer, atomic_json
 from worldgen_slack.slack.api import digest
 from worldgen_slack.taskset import SolverTask
-from .agents.synthesizer import SynthesizerTask
+from .agents import builder, synthesizer, writer
 from .agents.builder import BuilderTask
 from .agents.judge import JudgeTask, review_payload
-from .agents.writer import brief, compose, excerpts, observed, visible
+from .agents.synthesizer import SynthesizerTask
 from .config import PipelineConfig
 from .contracts import (
+    PHASE_CRITERIA,
     BindOutput,
     Candidate,
-    Catalog,
     Plan,
-    Premises,
     SceneRecord,
     Verdict,
     accepted,
+    accepted_task,
     assemble,
+    deciding,
     check_plan,
-    first_mentions,
-    pick_premise,
+    pick_cast,
     quality,
-    timed,
+    review_key,
     validate_candidate,
 )
 from .store import ReviewLimit, used_names
@@ -36,6 +39,15 @@ from .store import ReviewLimit, used_names
 def require_trace(trace):
     if not trace.ok:
         raise RuntimeError("agent execution failed: " + "; ".join(e.message for e in trace.errors))
+
+
+def observable(trace):
+    """A trace record without hidden reasoning or provider state, for another agent to investigate."""
+    record = trace.to_record()
+    for node in record["nodes"]:
+        node["message"].pop("reasoning_content", None)
+        node["message"].pop("provider_state", None)
+    return record
 
 
 def reference_for(task, candidate):
@@ -106,45 +118,36 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 self.store.artifact(attempt, "corrections", errors)
         raise ValueError(errors[-1])
 
-    async def review(self, agents, payload, attempt, author_trace=None):
+    async def review(self, agents, payload, attempt, files=None, label=""):
+        """`files` maps /task file names to trace records the judge may investigate; `label` names one of an
+        attempt's several reviews."""
+        suffix, files = ("-" + label if label else ""), files or {}
         self.budget_check()
-        self.store.artifact(attempt, "review_input", payload)
-        self.store.event("review_started", attempt=attempt, task_ids=[t["id"] for t in payload["tasks"]])
-        record = None
-        if author_trace is not None:
-            record = author_trace.to_record()
-            for node in record["nodes"]:
-                node["message"].pop("reasoning_content", None)
-                node["message"].pop("provider_state", None)
-            self.store.artifact(attempt, "author_trace", record)
+        self.store.artifact(attempt, "review_input" + suffix, payload)
+        self.store.event(
+            "review_started", attempt=attempt, label=label, task_ids=[t["id"] for t in payload["tasks"]]
+        )
+        if "author_trace.json" in files:
+            self.store.artifact(attempt, "author_trace", files["author_trace.json"])
         # One fresh rerun absorbs a malformed verdict; the review round is still spent only once.
         for _ in range(2):
             task = JudgeTask.create(payload, candidate_id=attempt)
-            if record is not None:
-                task.config.author_trace = json.dumps(record)
+            task.config.files = {name: json.dumps(record) for name, record in files.items()}
             trace = await agents.judge.run(task)
             self.store.trace(trace)
             if trace.ok:
                 break
         require_trace(trace)
         verdict = Verdict.model_validate(trace.info["verdict"])
-        self.store.artifact(attempt, "verdict", verdict.model_dump(mode="json"))
-        if payload["phase"] == "world":
+        self.store.artifact(attempt, "verdict" + suffix, verdict.model_dump(mode="json"))
+        if payload["phase"] in PHASE_CRITERIA:
             verdict = verdict.model_copy(
                 update={"approved": accepted(verdict, payload, self.settings.acceptance)}
             )
             self.store.artifact(
-                attempt, "acceptance", {"approved": verdict.approved, "quality": quality(verdict)}
+                attempt, "acceptance" + suffix, {"approved": verdict.approved, "quality": quality(verdict)}
             )
         return verdict
-
-    def record_quality(self, trace, verdict, name):
-        value = float(verdict.approved) if name == "catalog_quality" else quality(verdict)
-        trace.record_reward(name, value)
-        trace.info.setdefault("quality_reviews", []).append(
-            {"candidate_id": self.store.state.active_attempt, "value": value}
-        )
-        self.store.trace(trace)
 
     def route_rejection(self, verdict, budget):
         state = self.store.state
@@ -152,93 +155,51 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         group_id = budget.partition(":")[2]
         if group_id in state.built_groups:
             state.built_groups.remove(group_id)
-        if any(issue.owner == "synthesizer" for issue in verdict.issues):
+        if any(issue.owner == "synthesizer" for issue in deciding(verdict, self.settings.acceptance)):
             self.store.invalidate("catalog repair requested")
             state.phase = "catalog"
         else:
             state.phase = "build"
 
-    def catalog_context(self):
-        state, cfg = self.store.state, self.settings
-        return {
-            "phase": "catalog",
-            "sector": cfg.sector,
-            "task_count": cfg.task_count,
-            "group_size": cfg.group_size,
-            "language": cfg.language,
-            "premise": state.premise.model_dump() if state.premise else None,
-            "used_names": self.used,
-            "workspace_id": state.catalog.workspace_id if state.catalog else f"workspace-{cfg.seed}",
-            "feedback": state.feedback,
-            "previous_output": state.catalog.model_dump(mode="json") if state.catalog else None,
-            "instructions": "Create the whole catalog. On repair preserve task IDs, group IDs, and assignments.",
-        }
-
-    async def choose_premise(self, interaction, runtime):
-        """The synthesizer proposes distinct premises; the run seed, not the model, picks one."""
-        state, cfg = self.store.state, self.settings
-        context = {
-            "phase": "premise",
-            "sector": cfg.sector,
-            "language": cfg.language,
-            "premise_count": cfg.premise_count,
-            "used_names": self.used,
-            "workspace_id": f"workspace-{cfg.seed}",
-            "feedback": "",
-        }
-
-        def parse(raw):
-            premises = Premises.model_validate_json(raw)
-            return pick_premise(premises, cfg.premise_count, self.used["companies"], cfg.seed)
-
-        try:
-            state.premise = await self.author(interaction, runtime, context, "premise", True, parse)
-        except ValueError as error:
-            raise ReviewLimit(f"synthesizer proposed no valid premise set: {error}") from None
-        self.store.save()
-        self.store.event("premise_selected", company=state.premise.company)
-
-    def check_catalog(self, raw, context):
-        state, cfg = self.store.state, self.settings
-        catalog = Catalog.model_validate_json(raw)
-        if len(catalog.tasks) != cfg.task_count or catalog.sector.casefold() != cfg.sector.casefold():
-            raise ValueError("catalog must match requested task count and sector")
-        if catalog.workspace_id != context["workspace_id"]:
-            raise ValueError("workspace ID must remain stable")
-        if len(catalog.groups) != (cfg.task_count + cfg.group_size - 1) // cfg.group_size:
-            raise ValueError("catalog has the wrong number of groups")
-        if any(sum(t.group_id == g.id for t in catalog.tasks) > cfg.group_size for g in catalog.groups):
-            raise ValueError("group exceeds configured task count")
-        if state.catalog and {(t.id, t.group_id) for t in catalog.tasks} != {
-            (t.id, t.group_id) for t in state.catalog.tasks
-        }:
-            raise ValueError("catalog repair must preserve task IDs and group assignments")
-        if not catalog.personas or catalog.company != state.premise.company:
-            raise ValueError("catalog must use premise.company and give every person a persona")
-        if reused := {p.name for p in catalog.people} & set(self.used["people"]):
-            raise ValueError(f"people reuse names from used_names: {sorted(reused)}")
-        return catalog
+    def reject_structure(self, attempt, error):
+        self.store.state.feedback, self.store.state.last_verdict = error[:8000], None
+        self.store.artifact(attempt, "validation", {"ok": False, "errors": [error]})
+        self.store.finish_attempt(False)
 
     async def synthesize(self, agents):
         state, cfg = self.store.state, self.settings
-        task = SynthesizerTask.create(self.catalog_context(), "catalog")
+        task = SynthesizerTask.create(synthesizer.catalog_context(cfg, state, self.used), "catalog")
         async with agents.synthesizer.provision(task) as runtime:
             async with agents.synthesizer.interaction(task, runtime=runtime) as interaction:
                 first = True
                 if state.premise is None:
-                    await self.choose_premise(interaction, runtime)
+                    try:
+                        state.premise = await self.author(
+                            interaction,
+                            runtime,
+                            synthesizer.premise_context(cfg, self.used),
+                            "premise",
+                            True,
+                            lambda raw: synthesizer.parse_premise(raw, cfg, self.used),
+                        )
+                    except ValueError as error:
+                        raise ReviewLimit(f"synthesizer proposed no valid premise set: {error}") from None
+                    if cfg.personas:
+                        occupations = state.premise.occupations
+                        state.cast = pick_cast(cfg.personas, cfg.seed, self.used["people"], occupations)
                     first = False
+                    self.store.save()
+                    self.store.event("premise_selected", company=state.premise.company)
                 while state.phase == "catalog":
                     attempt = self.store.reserve("catalog", cfg.review_rounds.catalog)
-                    context = self.catalog_context()
                     try:
                         catalog = await self.author(
                             interaction,
                             runtime,
-                            context,
+                            synthesizer.catalog_context(cfg, state, self.used),
                             attempt,
                             first,
-                            lambda raw, context=context: self.check_catalog(raw, context),
+                            lambda raw: synthesizer.check_catalog(raw, cfg, state, self.used),
                         )
                     except ValueError as error:
                         self.reject_structure(attempt, str(error))
@@ -249,9 +210,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                         agents,
                         review_payload(catalog, None, [t.id for t in catalog.tasks], "catalog"),
                         attempt,
-                        interaction.trace,
+                        {"author_trace.json": observable(interaction.trace)},
                     )
-                    self.record_quality(interaction.trace, verdict, "catalog_quality")
                     state.catalog = catalog
                     state.feedback = verdict.model_dump_json()
                     if verdict.approved:
@@ -263,75 +223,21 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             self.store.trace(interaction.trace)
             require_trace(interaction.trace)
 
-    def reject_structure(self, attempt, error):
-        self.store.state.feedback, self.store.state.last_verdict = error[:8000], None
-        self.store.artifact(attempt, "validation", {"ok": False, "errors": [error]})
-        self.store.finish_attempt(False)
-
-    def group_scope(self, group):
-        state = self.store.state
-        included = {*state.built_groups, group.id}
-        return {
-            "workspace_id": state.catalog.workspace_id,
-            "group_id": group.id,
-            "catalog": state.catalog.model_dump(mode="json"),
-            "required_task_ids": [t.id for t in state.catalog.tasks if t.group_id in included],
-            "feedback": state.feedback,
-        }
-
-    def plan_context(self, group):
-        state, cfg = self.store.state, self.settings
-        per_group = cfg.messages_per_task * sum(t.group_id == group.id for t in state.catalog.tasks)
-        return {
-            "phase": "plan",
-            **self.group_scope(group),
-            "language": cfg.language,
-            "premise": state.premise.model_dump(),
-            "new_messages_hint": f"{per_group * 6 // 10}-{per_group * 13 // 10}",
-            "timed_facts": sorted(timed(state.catalog)),
-            "previous_output": state.plan.model_dump(mode="json") if state.plan else None,
-        }
-
-    def scene_key(self, plan, scene):
-        """Digest of what a scene is written from, plus the minutes its first-stated timed facts must land in."""
-        catalog = self.store.state.catalog
-        facts = {f.id: f for f in catalog.facts}
-        personas = {p.id: p for p in catalog.personas}
-        first = first_mentions(plan)
-        minutes = timed(catalog)
-        timely = {f: minutes[f] for f, where in first.items() if where == scene.id and f in minutes}
-        key = digest(
-            [
-                scene.model_dump(mode="json"),
-                [facts[b.fact_id].model_dump(mode="json") for b in scene.beats],
-                [personas[i].model_dump(mode="json") for i in scene.participant_ids],
-                timely,
-            ]
-        )
-        return key, timely
-
-    def current(self):
-        """Whether every written scene still matches the catalog, so the candidate can be reviewed again."""
-        state = self.store.state
-        return all(
-            (record := state.scenes.get(s.id)) and record.key == self.scene_key(state.plan, s)[0]
-            for s in state.plan.scenes
-        )
-
     async def write_scene(self, agents, plan, scene, seen, previous, timely):
         state = self.store.state
-        prompt = brief(
+        prompt = writer.brief(
             state.catalog,
             state.premise,
             plan,
             scene,
             seen,
-            excerpts(self.seeds, f"{self.settings.seed}:{scene.id}"),
+            writer.excerpts(self.seeds, f"{self.settings.seed}:{scene.id}"),
             previous,
             self.settings.language,
             timely,
         )
-        written, errors, trace = await compose(agents.writer, prompt, scene, state.catalog, timely)
+        written, errors, trace = await writer.compose(agents.writer, prompt, scene, state.catalog, timely)
+        trace.info["scene_id"] = scene.id
         self.store.trace(trace)
         if errors:
             raise ValueError(f"scene {scene.id} could not be written: {'; '.join(errors)}")
@@ -345,11 +251,12 @@ class GenerationEnv(vf.Env[PipelineConfig]):
 
         async def one(scene):
             for other in plan.scenes:
-                if visible(other, scene, conversations):
+                if writer.visible(other, scene, conversations):
                     await done[other.id].wait()
-            (key, timely), previous = self.scene_key(plan, scene), state.scenes.get(scene.id)
+            (key, timely), previous = writer.scene_key(state.catalog, plan, scene), state.scenes.get(scene.id)
             if previous is None or previous.key != key:
-                seen = observed(state.catalog, plan, {k: v.scene for k, v in state.scenes.items()}, scene)
+                scenes = {k: v.scene for k, v in state.scenes.items()}
+                seen = writer.observed(state.catalog, plan, scenes, scene)
                 written = await self.write_scene(agents, plan, scene, seen, previous, timely)
                 state.scenes[scene.id] = SceneRecord(key=key, scene=written)
                 self.store.save()
@@ -367,19 +274,20 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         return assemble(state.catalog, plan, {k: v.scene for k, v in state.scenes.items()})
 
     def repairs(self):
-        """Scene → the judge's words, when every issue of the last rejection points at messages of known scenes."""
+        """Scene → the judge's words, when every deciding issue of the last rejection points at messages of known
+        scenes."""
         state = self.store.state
-        last = state.last_verdict
+        issues = deciding(state.last_verdict, self.settings.acceptance) if state.last_verdict else []
         if (
-            last is None
+            not issues
             or state.plan is None
-            or any(i.artifact != "workspace" or not i.message_ids for i in last.issues)
+            or any(i.artifact != "workspace" or not i.message_ids for i in issues)
         ):
             return {}
         _, index = assemble(state.catalog, state.plan, {k: v.scene for k, v in state.scenes.items()})
         owner = {m: s for s, ids in index["scene_messages"].items() for m in ids}
         notes = defaultdict(list)
-        for issue in last.issues:
+        for issue in issues:
             if not (scenes := {owner[m] for m in issue.message_ids if m in owner}):
                 return {}
             for scene_id in scenes:
@@ -390,169 +298,238 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         """Plan (unless a repaired plan is given), write, assemble, bind. Returns a checked candidate, or None
         after a structural rejection."""
         state = self.store.state
-        required = self.group_scope(group)["required_task_ids"]
-        if plan is None:
-            try:
+        scope = builder.group_scope(state, group.id)
+        try:
+            if plan is None:
                 plan = await self.author(
                     interaction,
                     runtime,
-                    self.plan_context(group),
+                    builder.plan_context(self.settings, state, group.id),
                     attempt,
                     first,
-                    lambda raw: check_plan(state.catalog, Plan.model_validate_json(raw)),
+                    lambda raw: check_plan(
+                        builder.scoped(state, group.id), Plan.model_validate_json(raw), writer.frozen(state)
+                    ),
                 )
-            except ValueError as error:
-                self.reject_structure(attempt, str(error))
-                return None
-            first = False
-        state.plan = plan
-        scenes = {s.id: s for s in plan.scenes}
-        for round in range(3):
-            try:
-                world, index = await self.write(agents, plan)
-            except ValueError as error:
-                self.reject_structure(attempt, str(error))
-                return None
+                first = False
+            state.plan = plan
+            world, index = await self.write(agents, plan)
 
-            def bind(raw, world=world, last=round == 2):
+            def bind(raw):
                 bound = BindOutput.model_validate_json(raw)
-                if last or not any(r.scene_id in scenes for r in bound.rewrites):
-                    report = validate_candidate(
-                        state.catalog, Candidate(snapshot=world, bindings=bound.bindings), required
-                    )
-                    if not report["ok"]:
-                        raise ValueError(json.dumps(report["errors"]))
+                candidate = Candidate(snapshot=world, bindings=bound.bindings)
+                if not (report := validate_candidate(state.catalog, candidate, scope["required_task_ids"]))[
+                    "ok"
+                ]:
+                    raise ValueError(json.dumps(report["errors"]))
                 return bound
 
             context = {
                 "phase": "bind",
-                **self.group_scope(group),
+                **scope,
                 "workspace": world.model_dump(mode="json"),
                 **index,
                 "previous_bindings": [b.model_dump(mode="json") for b in state.candidate.bindings]
                 if state.candidate
                 else [],
             }
-            try:
-                bound = await self.author(interaction, runtime, context, attempt, first, bind)
-                first = False
-            except ValueError as error:
-                self.reject_structure(attempt, str(error))
-                return None
-            rewrites = [r for r in bound.rewrites if r.scene_id in scenes]
-            if not rewrites or round == 2:
-                break
-            for rewrite in rewrites:
-                scenes[rewrite.scene_id].revision_note = rewrite.note
-            self.store.event("scenes_rewritten", attempt=attempt, scene_ids=[r.scene_id for r in rewrites])
-        candidate = Candidate(snapshot=world, bindings=bound.bindings)
-        state.candidate = candidate
-        report = validate_candidate(state.catalog, candidate, required)
-        self.store.artifact(attempt, "validation", report)
-        if not report["ok"]:
-            self.reject_structure(attempt, json.dumps(report["errors"]))
+            bound = await self.author(interaction, runtime, context, attempt, first, bind)
+        except ValueError as error:
+            self.reject_structure(attempt, str(error))
             return None
-        return candidate
+        state.candidate = Candidate(snapshot=world, bindings=bound.bindings)
+        report = validate_candidate(state.catalog, state.candidate, scope["required_task_ids"])
+        self.store.artifact(attempt, "validation", report)
+        return state.candidate
 
     async def build_group(self, agents, group):
         state, cfg = self.store.state, self.settings
         budget = "build:" + group.id
-        if state.candidate is not None and not state.feedback and self.current():
-            context = self.group_scope(group)
-            report = validate_candidate(state.catalog, state.candidate, context["required_task_ids"])
+        if state.candidate is not None and not state.feedback and writer.current(state):
+            required = builder.group_scope(state, group.id)["required_task_ids"]
+            report = validate_candidate(state.catalog, state.candidate, required)
             if report["ok"]:
                 attempt = self.store.reserve(budget, cfg.review_rounds.build)
                 self.store.artifact(attempt, "validation", report)
                 self.store.event("candidate_reused", attempt=attempt, group_id=group.id)
-                verdict = await self.review(
-                    agents,
-                    review_payload(state.catalog, state.candidate, context["required_task_ids"], "world"),
-                    attempt,
-                )
-                if verdict.approved:
-                    state.built_groups.append(group.id)
-                    state.reviews[budget] = verdict.model_dump(mode="json")
-                else:
-                    self.route_rejection(verdict, budget)
-                self.store.finish_attempt(verdict.approved)
+                verdict, _ = await self.assess(agents, group, state.candidate, attempt, writer.changed(state))
+                self.settle(group, verdict, budget)
                 if verdict.approved or state.phase == "catalog":
                     return
         # One VM per group keeps the builder's files; a fresh conversation per attempt keeps its context bounded.
         async with agents.builder.provision(
-            BuilderTask.create(self.plan_context(group), group.id)
+            BuilderTask.create(builder.plan_context(cfg, state, group.id), group.id)
         ) as runtime:
             while state.phase == "build" and group.id not in state.built_groups:
                 attempt = self.store.reserve(budget, cfg.review_rounds.build)
-                task = BuilderTask.create(self.plan_context(group), group.id)
-                # Issues that name messages repair those scenes in the judge's words; others re-plan.
-                notes, focus = self.repairs(), {}
+                task = BuilderTask.create(builder.plan_context(cfg, state, group.id), group.id)
+                # Issues that name messages repair those scenes in the judge's words; bindings-only issues
+                # bind again on the same scenes; others re-plan.
+                notes = self.repairs()
+                issues = deciding(state.last_verdict, cfg.acceptance) if state.last_verdict else []
+                rebind = bool(issues) and all(i.artifact == "bindings" for i in issues)
                 plan = None
-                if notes:
+                if notes or rebind:
                     plan = state.plan.model_copy(deep=True)
                     for scene in plan.scenes:
                         scene.revision_note = notes.get(scene.id, scene.revision_note)
-                    self.store.event("scenes_repaired", attempt=attempt, scene_ids=sorted(notes))
+                route = "repair" if notes else "rebind" if rebind else "plan"
+                self.store.event("attempt_routed", attempt=attempt, route=route, scene_ids=sorted(notes))
                 async with agents.builder.interaction(task, runtime=runtime) as interaction:
                     candidate = await self.construct(agents, interaction, runtime, group, attempt, True, plan)
-                    if candidate is not None and notes:
-                        _, index = assemble(
-                            state.catalog, state.plan, {k: v.scene for k, v in state.scenes.items()}
-                        )
-                        focus = {
-                            "previous_issues": [i.model_dump(mode="json") for i in state.last_verdict.issues],
-                            "changed_messages": sorted(m for s in notes for m in index["scene_messages"][s]),
-                        }
                     if candidate is not None:
-                        # At 100 tasks, reviewing all built tasks is simpler and safer than a dependency engine.
-                        verdict = await self.review(
-                            agents,
-                            review_payload(
-                                state.catalog,
-                                candidate,
-                                self.group_scope(group)["required_task_ids"],
-                                "world",
-                                **focus,
-                            ),
-                            attempt,
-                            interaction.trace,
+                        verdict, _ = await self.assess(
+                            agents, group, candidate, attempt, writer.changed(state), interaction.trace
                         )
-                        self.record_quality(interaction.trace, verdict, "world_quality")
-                        if verdict.approved:
-                            state.built_groups.append(group.id)
-                            state.reviews[budget] = verdict.model_dump(mode="json")
-                            state.feedback, state.last_verdict = "", None
-                        else:
-                            self.route_rejection(verdict, budget)
-                        self.store.finish_attempt(verdict.approved)
+                        self.settle(group, verdict, budget)
                 self.store.trace(interaction.trace)
                 require_trace(interaction.trace)
+
+    def settle(self, group, verdict, budget):
+        state = self.store.state
+        if verdict.approved:
+            state.built_groups.append(group.id)
+            state.frozen_scenes = {s.id: state.scenes[s.id].key for s in state.plan.scenes}
+            state.feedback, state.last_verdict = "", None
+        else:
+            self.route_rejection(verdict, budget)
+        self.store.finish_attempt(verdict.approved)
+
+    def solver_task(self, task, candidate):
+        """A solver outside a sandbox executes no code (`config.secure`), so it gets no network policy to enforce."""
+        return SolverTask.create(
+            task,
+            candidate.snapshot,
+            self.store.state.catalog.workspace_id,
+            reference_for(task, candidate),
+            self.settings.answer_judge,
+            network_policy=isinstance(self.settings.env.solver.runtime, NetworkPolicyConfig),
+        )
+
+    async def attempt(self, agents, task, candidate):
+        """One independent solve of a task, graded for correctness and grounding."""
+        self.budget_check()
+        trace = await agents.solver.run(self.solver_task(task, candidate))
+        self.store.trace(trace)
+        return SolverTask.outcome(trace), trace
+
+    async def assess(self, agents, group, candidate, attempt, changed, author=None):
+        """Solve and judge every task of `group`'s scope whose review is stale, and judge the scenes written since
+        the last approval. `group=None` is the final review: the whole catalog and the whole world without focus.
+        Returns the combined verdict and the world verdict."""
+        state, n = self.store.state, self.settings.solves_per_task
+        catalog = state.catalog if group is None else builder.scoped(state, group.id)
+        later = {"later_groups": groups} if (groups := builder.later_groups(state, catalog)) else {}
+        previous = state.last_verdict.issues if state.last_verdict else []
+        task_ids = [t.id for t in catalog.tasks]
+        outputs = validate_candidate(catalog, candidate, task_ids)["gold_outputs"]
+        keys = {t: review_key(catalog, candidate, t, outputs[t]) for t in task_ids}
+        due = [t for t in catalog.tasks if state.task_reviews.get(t.id, {}).get("key") != keys[t.id]]
+
+        async def check():
+            """The proposer–solver fan-out: n independent solves of every due task, then one judge that
+            investigates them together."""
+            solves = await asyncio.gather(
+                *(asyncio.gather(*(self.attempt(agents, t, candidate) for _ in range(n))) for t in due)
+            )
+            runs = {t.id: runs for t, runs in zip(due, solves)}
+            payload = review_payload(
+                catalog,
+                candidate,
+                list(runs),
+                "task",
+                solves=[result for task_runs in runs.values() for result, _ in task_runs],
+                previous_issues=[
+                    i.model_dump(mode="json") for i in previous if set(i.task_ids) & runs.keys()
+                ],
+                **later,
+            )
+            files = {
+                f"solver_{t}_{k}.json": observable(trace)
+                for t, task_runs in runs.items()
+                for k, (_, trace) in enumerate(task_runs, 1)
+            }
+            return runs, payload, await self.review(agents, payload, attempt, files, "tasks")
+
+        workspace = [i.model_dump(mode="json") for i in previous if i.artifact == "workspace"]
+        world_payload = None
+        if group is None:
+            world_payload = review_payload(catalog, candidate, [], "world")
+        elif changed or workspace:
+            _, index = assemble(catalog, state.plan, {k: v.scene for k, v in state.scenes.items()})
+            world_payload = review_payload(
+                catalog,
+                candidate,
+                [],
+                "world",
+                previous_issues=workspace,
+                changed_messages=sorted(m for s in changed for m in index["scene_messages"][s]),
+                **later,
+            )
+        files = {"author_trace.json": observable(author)} if author is not None else {}
+        async with asyncio.TaskGroup() as tasks:
+            world = (
+                tasks.create_task(self.review(agents, world_payload, attempt, files, "world"))
+                if world_payload is not None
+                else None
+            )
+            checked = tasks.create_task(check()) if due else None
+        runs, payload, judged = checked.result() if checked else ({}, None, None)
+        verdicts = [v for v in (judged, world.result() if world else None) if v is not None]
+        rejected = [v for v in verdicts if not v.approved]
+        for task_id, task_runs in runs.items():
+            results = [result for result, _ in task_runs]
+            rate = sum(r["semantic_correctness"] for r in results) / n
+            approved = accepted_task(judged, payload, self.settings.acceptance, task_id)
+            if approved:
+                state.task_reviews[task_id] = {"key": keys[task_id], "solve_rate": rate, "results": results}
+            self.store.event(
+                "task_reviewed",
+                attempt=attempt,
+                task_id=task_id,
+                approved=approved,
+                solve_rate=rate,
+                learnability=4 * rate * (1 - rate),
+            )
+        merged = Verdict.model_construct(
+            reviewed_hash="",
+            approved=not rejected,
+            tasks=[r for v in verdicts for r in v.tasks],
+            issues=[i for v in verdicts for i in v.issues],
+            criteria={},
+            # A rejection's feedback carries only the rejecting reviews' words.
+            summary=" ".join(v.summary for v in rejected or verdicts) or "No task or scene needed review.",
+        )
+        self.store.artifact(attempt, "review_input", review_payload(catalog, candidate, list(runs), "world"))
+        self.store.artifact(attempt, "verdict", merged.model_dump(mode="json"))
+        self.store.artifact(
+            attempt,
+            "acceptance",
+            {
+                "approved": merged.approved,
+                "quality": sum(quality(v) for v in verdicts) / len(verdicts) if verdicts else None,
+                "reviewed_tasks": list(runs),
+                "changed_scenes": changed,
+            },
+        )
+        return merged, world.result() if world else None
 
     async def final_review(self, agents):
         state, cfg = self.store.state, self.settings
         report = validate_candidate(state.catalog, state.candidate, [t.id for t in state.catalog.tasks])
         if not report["ok"]:
             raise ValueError("final deterministic regression failed: " + "; ".join(report["errors"]))
-        for group in state.catalog.groups:
-            if group.id in state.final_groups:
-                continue
-            budget = "final:" + group.id
-            attempt = self.store.reserve(budget, cfg.review_rounds.final)
-            payload = review_payload(
-                state.catalog,
-                state.candidate,
-                [t.id for t in state.catalog.tasks if t.group_id == group.id],
-                "world",
-            )
-            verdict = await self.review(agents, payload, attempt)
-            if verdict.approved:
-                state.final_groups.append(group.id)
-                state.reviews[budget] = verdict.model_dump(mode="json")
-            else:
-                self.store.invalidate("final review found a regression", catalog=False)
-                self.route_rejection(verdict, budget)
-            self.store.finish_attempt(verdict.approved)
-            if not verdict.approved:
-                return
+        attempt = self.store.reserve("final", cfg.review_rounds.final)
+        verdict, world = await self.assess(agents, None, state.candidate, attempt, None)
+        if verdict.approved:
+            state.reviews["final"] = world.model_dump(mode="json")
+        else:
+            # Repairs of any scene run in the last group's build; its review covers every scene that changes.
+            self.store.invalidate("final review found a regression", catalog=False)
+            self.route_rejection(verdict, "final:" + state.built_groups[-1])
+        self.store.finish_attempt(verdict.approved)
+        if not verdict.approved:
+            return
         atomic_json(
             self.store.root / "frozen.json",
             {
@@ -560,63 +537,13 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 "candidate_hash": digest(state.candidate.model_dump(mode="json")),
             },
         )
-        state.phase = "evaluate"
-        self.store.save(approved=True)
+        state.phase = "done"
+        self.store.save()
         self.store.event(
             "workspace_frozen",
             tasks=len(state.catalog.tasks),
             messages=len(state.candidate.snapshot.messages),
         )
-
-    async def evaluate(self, agents):
-        state = self.store.state
-
-        async def solve(task):
-            self.budget_check()
-            self.store.event("solver_started", task_id=task.id)
-            trace = await agents.solver.run(
-                SolverTask.create(
-                    task,
-                    state.candidate.snapshot,
-                    state.catalog.workspace_id,
-                    reference_for(task, state.candidate),
-                    self.settings.answer_judge,
-                )
-            )
-            self.store.trace(trace)
-            result = trace.info.get("evaluation")
-            if result is None and trace.info.get("grading_started"):
-                raise RuntimeError("LLM answer grading failed: " + "; ".join(e.message for e in trace.errors))
-            if result is None:
-                result = {
-                    "task_id": task.id,
-                    "snapshot_hash": trace.task.data.snapshot_hash,
-                    "execution_ok": False,
-                    "semantic_correctness": 0.0,
-                    "correct": False,
-                    "grounded": False,
-                    "read_count": len(trace.info.get("observations", [])),
-                    "solver_trace_id": trace.id,
-                    "reason": "; ".join(e.message for e in trace.errors),
-                    "response": trace.last_reply,
-                }
-            if not trace.ok:
-                result.update(execution_ok=False, semantic_correctness=0.0)
-            state.evaluation[task.id] = result
-            self.store.save()
-            self.store.event("task_evaluated", task_id=task.id, score=result["semantic_correctness"])
-
-        pending = [t for t in state.catalog.tasks if t.id not in state.evaluation]
-        width = self.config.max_concurrent_agents or 2
-        for start in range(0, len(pending), width):
-            results = await asyncio.gather(
-                *(solve(t) for t in pending[start : start + width]), return_exceptions=True
-            )
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
-        state.phase = "done"
-        self.store.save(approved=True)
 
     async def run(self, task, agents):
         state = self.store.state
@@ -633,5 +560,3 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     await self.build_group(agents, group)
             elif state.phase == "final":
                 await self.final_review(agents)
-            elif state.phase == "evaluate":
-                await self.evaluate(agents)

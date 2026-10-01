@@ -16,7 +16,9 @@ from .contracts import (
     Plan,
     Premise,
     SceneRecord,
+    SeedPersona,
     Verdict,
+    review_key,
     validate_candidate,
     validate_verdict,
 )
@@ -42,20 +44,20 @@ def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
 
 
 class RunState(StrictModel):
-    phase: Literal["catalog", "build", "final", "evaluate", "done"] = "catalog"
+    phase: Literal["catalog", "build", "final", "done"] = "catalog"
+    cast: list[SeedPersona] = Field(default_factory=list)
     premise: Premise | None = None
     catalog: Catalog | None = None
     plan: Plan | None = None
     scenes: dict[str, SceneRecord] = Field(default_factory=dict)
     candidate: Candidate | None = None
     built_groups: list[str] = Field(default_factory=list)
-    final_groups: list[str] = Field(default_factory=list)
+    frozen_scenes: dict[str, str] = Field(default_factory=dict)
+    task_reviews: dict[str, dict] = Field(default_factory=dict)
     rounds: dict[str, int] = Field(default_factory=dict)
     reviews: dict[str, dict] = Field(default_factory=dict)
-    evaluation: dict[str, dict] = Field(default_factory=dict)
     feedback: str = ""
     active_attempt: str | None = None
-    last_approved_candidate: str | None = None
     last_verdict: Verdict | None = None
 
 
@@ -106,7 +108,7 @@ class Store:
             os.fsync(stream.fileno())
         print(json.dumps(row), flush=True)
 
-    def save(self, *, approved=False):
+    def save(self):
         checkpoint = self.state.model_dump(mode="json")
         for key in ("catalog", "candidate"):
             if checkpoint[key] is not None:
@@ -116,13 +118,6 @@ class Store:
                 if not path.exists():
                     atomic_json(path, value)
                 checkpoint[key] = identifier
-        if (
-            approved
-            and checkpoint["candidate"]
-            and any(key.startswith(("build:", "final:")) for key in self.state.reviews)
-        ):
-            self.state.last_approved_candidate = checkpoint["candidate"]
-            checkpoint["last_approved_candidate"] = checkpoint["candidate"]
         atomic_json(self.root / "state.json", checkpoint)
 
     def reserve(self, key, maximum):
@@ -154,15 +149,12 @@ class Store:
     def finish_attempt(self, approved):
         self.event("candidate_finished", attempt=self.state.active_attempt, approved=approved)
         self.state.active_attempt = None
-        self.save(approved=approved)
+        self.save()
 
     def invalidate(self, reason, *, catalog=True):
-        self.state.final_groups.clear()
         self.state.reviews = {
             key: review for key, review in self.state.reviews.items() if key == "catalog" and not catalog
         }
-        self.state.evaluation.clear()
-        self.state.last_approved_candidate = None
         self.event("approvals_invalidated", reason=reason)
 
     def summary(self, status, reason=""):
@@ -202,24 +194,29 @@ class Store:
             for binding in self.state.candidate.bindings:
                 for identifier in {m for c in binding.claims for m in c.message_ids}:
                     evidence.setdefault(identifier, set()).add(binding.task_id)
-        results = list(self.state.evaluation.values())
+        reviews = self.state.task_reviews
+        results = [r for review in reviews.values() for r in review["results"]]
+        rates = {task: review["solve_rate"] for task, review in reviews.items()}
         summary = {
             "status": status,
             "reason": reason,
             "phase": self.state.phase,
             "rounds": self.state.rounds,
             "built_groups": self.state.built_groups,
-            "final_groups": self.state.final_groups,
+            "final_approved": "final" in self.state.reviews,
             "task_count": len(self.state.catalog.tasks) if self.state.catalog else 0,
             "message_count": len(self.state.candidate.snapshot.messages) if self.state.candidate else 0,
             "workspace_hash": digest(self.state.candidate.snapshot.model_dump(mode="json"))
             if self.state.candidate
             else None,
-            "evaluated_tasks": len(results),
-            "solved_tasks": sum(r["semantic_correctness"] == 1 for r in results),
-            "grounded_tasks": sum(r["grounded"] for r in results),
+            "evaluated_tasks": len(reviews),
+            "solved_tasks": sum(rate > 0 for rate in rates.values()),
+            "grounded_solves": sum(r["grounded"] for r in results),
+            "solves": len(results),
             "solver_calls": sum(r["read_count"] for r in results),
             "solver_execution_failures": sum(not r["execution_ok"] for r in results),
+            "solve_rates": rates,
+            "mean_learnability": sum(4 * p * (1 - p) for p in rates.values()) / len(rates) if rates else None,
             "usage_by_role": usage,
             "reported_model_cost": sum(r["reported_cost"] for r in usage.values()),
             "elapsed_seconds": events[-1]["time"] - events[0]["time"] if events else 0,
@@ -228,7 +225,6 @@ class Store:
             ),
             "evidence_messages": len(evidence),
             "reused_evidence_messages": sum(len(tasks) > 1 for tasks in evidence.values()),
-            "last_approved_candidate": self.state.last_approved_candidate,
         }
         atomic_json(self.root / "summary.json", summary)
         return summary
@@ -238,21 +234,27 @@ class Store:
         from .env import reference_for
 
         state = self.state
-        if state.phase != "done" or set(state.evaluation) != {t.id for t in state.catalog.tasks}:
-            raise ValueError("release requires every task to finish evaluation")
+        if state.phase != "done":
+            raise ValueError("release requires a finished run")
         catalog, candidate = state.catalog, state.candidate
-        if not validate_candidate(catalog, candidate, [t.id for t in catalog.tasks])["ok"]:
+        report = validate_candidate(catalog, candidate, [t.id for t in catalog.tasks])
+        if not report["ok"]:
             raise ValueError("release fails deterministic validation")
-        scopes = [("catalog", None, [t.id for t in catalog.tasks], "catalog")]
-        scopes += [
-            ("final:" + g.id, candidate, [t.id for t in catalog.tasks if t.group_id == g.id], "world")
-            for g in catalog.groups
+        scopes = [
+            ("catalog", None, [t.id for t in catalog.tasks], "catalog"),
+            ("final", candidate, [], "world"),
         ]
         for key, snapshot, ids, phase in scopes:
             verdict = Verdict.model_validate(state.reviews[key])
             validate_verdict(verdict, review_payload(catalog, snapshot, ids, phase))
             if not verdict.approved:
                 raise ValueError("release includes rejected work")
+        for task in catalog.tasks:
+            review = state.task_reviews.get(task.id)
+            if review is None or review["key"] != review_key(
+                catalog, candidate, task.id, report["gold_outputs"][task.id]
+            ):
+                raise ValueError(f"release requires a current approved review of {task.id}")
         world_hash = digest(candidate.snapshot.model_dump(mode="json"))
         rows = [
             PublicTask(

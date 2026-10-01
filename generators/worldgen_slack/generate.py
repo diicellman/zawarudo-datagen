@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import contextlib
 import hashlib
 import json
 import sys
@@ -12,7 +11,7 @@ import verifiers.v1 as vf
 from .config import ROOT, Config, load_config
 from .env import GenerationEnv
 from .store import Store
-from .contracts import SeedPacket, load_seed_packet
+from .contracts import SeedPacket, census, load_seed_packet, pick_cast
 from worldgen_slack.slack.api import digest
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from worldgen_slack.dataset import atomic_json
@@ -23,7 +22,7 @@ def provenance(config: Config, seeds: SeedPacket | None = None) -> dict:
         raise ValueError("seed configuration and loaded packet must agree")
     result = {
         "config": config.model_dump(
-            mode="json", exclude={"seed_data"} if config.seed_data is None else set()
+            mode="json", exclude={k for k in ("seed_data", "personas") if getattr(config, k) is None}
         ),
         "verifiers_revision": "ac2ec29",
         "lock_hash": hashlib.sha256((ROOT / "uv.lock").read_bytes()).hexdigest(),
@@ -38,17 +37,6 @@ async def run(config: Config) -> dict:
     manifest = provenance(config, seeds)
     store = Store(config.output, manifest)
 
-    async def heartbeat():
-        while True:
-            await asyncio.sleep(10)
-            store.event(
-                "heartbeat",
-                attempt=store.state.active_attempt,
-                built_groups=len(store.state.built_groups),
-                evaluated=len(store.state.evaluation),
-            )
-
-    pulse = asyncio.create_task(heartbeat())
     try:
         if seeds is not None:
             atomic_json(store.root / "seeds.json", seeds.model_dump(mode="json"))
@@ -88,9 +76,6 @@ async def run(config: Config) -> dict:
         )
         raise
     finally:
-        pulse.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await pulse
         store.close()
 
 
@@ -103,6 +88,8 @@ def main() -> int:
     if args.dry_run:
         if config.seed_data:
             load_seed_packet(config.seed_data.path)
+        if config.personas:
+            pick_cast(config.personas, config.seed, [], list(census(config.personas)[1]))
         print(config.model_dump_json(indent=2))
         return 0
     result = asyncio.run(run(config))

@@ -5,10 +5,12 @@ uv run --frozen python scripts/worldgen_slack/measure.py data/v2-01/* --baseline
 
 import argparse
 import json
+import statistics
 from pathlib import Path
+from types import SimpleNamespace
 
 from generators.worldgen_slack.config import ROOT
-from generators.worldgen_slack.contracts import Catalog, load_seed_packet, style
+from generators.worldgen_slack.contracts import Persona, Typing, load_seed_packet, style
 from generators.worldgen_slack.store import used_names
 from worldgen_slack.slack.models import Message, SlackWorld, User
 
@@ -20,8 +22,13 @@ def read(path):
 
 
 def catalog_of(run):
-    state = read(run / "state.json")
-    return Catalog.model_validate(read(run / "artifacts" / f"{state['catalog']}.json"))
+    """The catalog parts measured here; older catalogs predate later catalog fields."""
+    catalog = read(run / "artifacts" / f"{read(run / 'state.json')['catalog']}.json")
+    return SimpleNamespace(
+        company=catalog["company"],
+        people=[User.model_validate(p) for p in catalog["people"]],
+        personas=[Persona.model_validate(p) for p in catalog["personas"]],
+    )
 
 
 def candidates(run):
@@ -63,6 +70,15 @@ def world_row(name, world, personas=()):
     return [name, measured["messages"], *(measured[k] if measured[k] is not None else "–" for k in STYLE)]
 
 
+def target(typing):
+    if typing is None:
+        return "–"
+    return (
+        f"{typing.median_words:g}w lc {typing.lowercase_share:.2f} q {typing.question_share:.2f} "
+        f"short {typing.short_share:.2f}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runs", nargs="+", type=Path)
@@ -71,6 +87,7 @@ def main():
     parser.add_argument(
         "--seeds", type=Path, default=ROOT / "generators/worldgen_slack/seeds/slack-examples.json"
     )
+    parser.add_argument("--typing", type=Path, default=ROOT / "data/seeds/typing-profiles.jsonl")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     sections, overview, names, authors, styles = [], [], [], [], []
@@ -81,7 +98,10 @@ def main():
         label = f"{run.parent.name}/{run.name}"
         cost = sum(r["reported_cost"] for r in summary.get("usage_by_role", {}).values())
         writers = summary.get("usage_by_role", {}).get("writer", {}).get("traces", 0)
-        results = state["evaluation"].values()
+        # v2 runs evaluated once per task; v3 runs keep every build solve of each approved task review.
+        results = state.get("evaluation", {}).values() or [
+            r for review in state.get("task_reviews", {}).values() for r in review.get("results", [])
+        ]
         corrections = sum(len(read(path)) for path in run.glob("attempts/*/corrections.json"))
         overview.append(
             [
@@ -118,6 +138,7 @@ def main():
             styles.append(world_row(label, world, catalog.personas))
             if run in args.runs:
                 voices = {p.id: p.voice for p in catalog.personas}
+                targets = {p.id: p.profile.typing for p in catalog.personas if p.profile}
                 for author, measured in style(world, catalog.personas)["authors"].items():
                     person = next(p.name for p in catalog.people if p.id == author)
                     authors.append(
@@ -127,6 +148,7 @@ def main():
                             voices.get(author, "–")[:60],
                             measured["messages"],
                             *(measured[k] for k in STYLE[:5]),
+                            target(targets.get(author)),
                         ]
                     )
         sections.append(f"### {label}\n\n" + "\n".join(f"- {row}" for row in revisions(run)))
@@ -153,6 +175,21 @@ def main():
             ),
         )
         styles.append(row[:7] + ["–", "–"])
+    if args.typing.exists():
+        users = [Typing.model_validate_json(line) for line in args.typing.read_text().splitlines()]
+        middle = {
+            k: statistics.median(getattr(u, k) for u in users) for k in Typing.model_fields if k != "id"
+        }
+        styles.append(
+            [
+                f"real users (median of {len(users)})",
+                "–",
+                middle["median_words"],
+                middle["lowercase_share"],
+                "–",
+            ]
+            + [middle["question_share"], middle["short_share"], "–", "–"]
+        )
     report = "\n\n".join(
         [
             "## Runs\n\n"
@@ -178,7 +215,7 @@ def main():
             ),
             "## Voice and timing\n\n" + table(["world", "messages", *STYLE], styles),
             "## Per author (new runs)\n\n"
-            + table(["run", "person", "persona voice", "messages", *STYLE[:5]], authors),
+            + table(["run", "person", "persona voice", "messages", *STYLE[:5], "typing target"], authors),
             "## Revisions per build attempt\n\n" + "\n\n".join(sections),
         ]
     )

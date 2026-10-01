@@ -50,6 +50,11 @@ class ReviewTools(RecordedTools[ReviewToolsConfig]):
     async def setup(self) -> None:
         await super().setup()
         self.payload = read_tool_data(self.config)
+        self.world = (
+            SlackWorld.model_validate_json(json.dumps(self.payload["candidate"]["snapshot"]))
+            if "candidate" in self.payload
+            else None
+        )
 
     @vf.tool
     async def check(self) -> dict:
@@ -67,13 +72,18 @@ class ReviewTools(RecordedTools[ReviewToolsConfig]):
 
     @vf.tool
     async def read(self, actor_id: str, action: ActionName, arguments: dict[str, JsonValue]) -> dict:
-        """Execute a slack.readonly.v2 action as a task's reader; returns actor-visible observations."""
+        """Execute a slack.readonly.v2 action as a task's reader; returns actor-visible observations.
+
+        Actions and arguments: list_conversations(cursor?, limit?); search_messages(query, conversation_id?,
+        author_id?, after?, before?, cursor?, limit?); get_conversation_history(conversation_id, cursor?, limit?);
+        get_thread(conversation_id, root_message_id, cursor?, limit?); get_user(user_id). Reads return
+        {items, next_cursor} except get_user; limit is 1-100.
+        """
         if actor_id not in {t["actor_id"] for t in self.payload["tasks"]}:
             raise ValueError("actor is outside this review's task scope")
         if len(self.state.reads) >= 4096:
             raise ValueError("review read history exhausted")
-        world = SlackWorld.model_validate_json(json.dumps(self.payload["candidate"]["snapshot"]))
-        api = SlackAPI(world, actor_id)
+        api = SlackAPI(self.world, actor_id)
         call = ReadCall(action=action, arguments=arguments)
         output = api.execute(call)
         self.state.reads.append(ReadRecord(actor_id=actor_id, call=call, output=output))
