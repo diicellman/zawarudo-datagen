@@ -1,36 +1,36 @@
-"""Small offline check: run with uv run --frozen python viewer/check.py."""
+"""Offline check on a scripted run: uv run --frozen python viewer/check.py"""
 
-import json
+import asyncio
 import tempfile
 from pathlib import Path
 
-from build import ROOT, load_run, render
+from build import load_run, render
+from generators.worldgen_slack.check import check_flow
 
 
 def main():
-    local = ROOT / "data/qualification-01/software"
-    if local.exists():  # a local research run; fresh clones check only the synthetic cases below
-        run = load_run(local)
-        assert run["attempts"][0]["id"] == "catalog-01"
-        assert run["attempts"][0]["validation"]["ok"] is False
-        world = next(a for a in run["attempts"] if a["id"] == "build-grp_helix48-01")
-        assert len(world["candidate"]["snapshot"]["messages"]) == 150
-        assert world["tasks"][0]["answer"]["canonical_answer"]
-        assert world["verdict"]["approved"] is False
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp)
-        attempt = path / "attempts/broken"
-        attempt.mkdir(parents=True)
-        (attempt / "author_output.json").write_text(json.dumps({"text": "not json"}))
-        broken = load_run(path)["attempts"][0]
-        assert broken["candidate"] is None
-        assert "viewer_parse_error" in broken["validation"]
+        root = Path(tmp) / "run"
+        asyncio.run(check_flow(root))
+        run = load_run(root)
+    ids = [a["id"] for a in run["attempts"]]
+    assert ids[:5] == ["build-g1-01", "build-g1-02", "build-g2-01", "build-g2-02", "final-01"], (
+        "attempts in run order"
+    )
+    assert any(e["event"] == "attempt_routed" for e in run["events"]), "routes reach the page"
+    assert run["chains"].keys() == run["bindings"].keys(), "every task shows its gold route"
+    for task_id, steps in run["chains"].items():
+        bound = {m for claim in run["bindings"][task_id]["claims"] for m in claim["message_ids"]}
+        assert {m for step in steps for m in step["evidence"]} == bound, (
+            "the route reaches all bound evidence"
+        )
+    assert set(run["scene_of"]) == {m["id"] for m in run["world"]["messages"]}, (
+        "every message maps to its scene"
+    )
     attack = "</script><script>alert('artifact')</script>&"
     html = render({"runs": [], "probe": attack})
-    assert attack not in html
-    assert "__VIEWER_DATA__" not in html
-    assert "\\u003c/script\\u003e" in html
-    print("Viewer checks passed: ordering, rejected artifacts, evidence, malformed output, HTML escaping.")
+    assert attack not in html and "__VIEWER_DATA__" not in html and "\\u003c/script\\u003e" in html
+    print("Viewer checks passed: attempt order, routes, gold chains, scene mapping, HTML escaping.")
 
 
 if __name__ == "__main__":

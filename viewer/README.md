@@ -1,53 +1,52 @@
-# Local artifact viewer
+# Worldgen viewer
 
-Read-only human inspection of current worldgen artifacts. All new code lives here;
-no generator imports, model calls, server, dependencies, or changes to run data.
-
-## Open the v2-09 worlds
-
-From the repository root:
+An offline HTML page per generation run. It reads a run's saved files and embeds them, with no model calls, no
+server, and no changes to run data.
 
 ```bash
-uv run --frozen python viewer/build.py
-open viewer/artifacts.html
+uv run --frozen python viewer/build.py data/v3-03/software --output viewer/artifacts-v3-03.html
+open viewer/artifacts-v3-03.html
 ```
 
-With no arguments this exports the three v2-09 worlds (`data/v2-09/{software,employee,services}`) into one
-offline HTML file. On other platforms, open the file using your browser's file menu. To select runs explicitly:
+- Pass several run directories to compare them on one page.
+- `--traces` embeds every agent transcript, which makes the page several MB larger.
+- Generated pages are ignored by Git.
+- **A page contains private answers, facts and full snapshots.** The "Answers shown" toggle only hides them on
+  screen; it is not redaction.
 
-```bash
-uv run --frozen python viewer/build.py data/<run>/software --output viewer/artifacts-software.html
-```
+## Tabs
 
-Rebuild after artifacts change. Generated pages are ignored by Git. **The page
-contains private answers, planning data, and full snapshots.** Share only with
-people authorized to inspect the dataset; hiding labels is not access control.
+| tab | shows | built from |
+|---|---|---|
+| Overview | company, premise, counts, cost, wall time, solve rate per task, usage by role | `summary.json`, `state.json` |
+| Lineage | the attempt graph (premise → catalog → groups → final → publish). Each edge is labelled with the route taken next: repair, rebind, re-plan, catalog repair, resume. Selecting an attempt shows its reviews, criteria, issues (with links to the flagged messages), validation errors, in-attempt corrections, and world changes since the previous snapshot. Below it, a timeline of every agent run by role | `attempts/*`, `progress.jsonl` (`attempt_routed`, `candidate_*`), `traces/*` |
+| World | a Slack-style view of the final world or of any attempt's world. It has a reader filter (only what one person can see). Each message shows its evidence chips and the scene that wrote it; the thread pane shows the scene's situation, beats and open promises | the candidate snapshot, `state.plan`, `state.scenes` |
+| Tasks | question, reader, canonical answer, claims → evidence messages; the gold route step by step (results, evidence hits, which IDs feed the next call); the independent solves with their read routes; the task judge's verdict | bindings, `validation.json` `gold_outputs`, `review_input-<task>.json` solves, solver traces |
+| Cast | people with their persona, seeded profile, and typing target next to what they actually wrote | catalog personas, snapshot |
+| Traces | every agent run: role, attempt, task or scene, duration, tokens and cost. Transcripts appear only with `--traces` | `traces/*.json` |
 
-## Review workflow
+## Notes
 
-1. Select a workspace, attempt, and task.
-2. Read the question; optionally hide private labels before exploring.
-3. Follow evidence links into full threads, or browse/search the whole workspace.
-4. Read the saved judge findings. They are allegations, not ground truth.
-5. Compare two attempts. Inspect text changes separately from metadata changes.
-   The earlier verdict describes the earlier artifact; the later verdict reviews
-   the later artifact. Adjacent attempts may add a group, not just repair defects.
-
-Attempt order comes from progress events, with name ordering only as fallback.
-Catalog attempts and rejected structural outputs remain visible. Missing verdicts
-are not approval. A snapshot is not necessarily a frozen release. This is an
-omniscient reviewer view, **not a solver-access simulation** or a replay of tools.
-The first version supports current `attempts/` artifacts, not legacy independent
-world formats. It does not execute traces, validate release integrity, or grade
-answers. Original artifacts remain the source of truth.
+- The page reads saved outputs; it never imports or runs the generator.
+  - The gold chain uses the gold outputs saved with the latest candidate, so it describes the current bindings.
+  - Message → scene mapping uses the generator's message-id rule (`"m" + digest([scene_id, line])[:10]`).
+- **Older runs:**
+  - v2 runs predate per-review files and `attempt_routed`, so the lineage derives their routes from attempt
+    order.
+  - Writer traces before v3-03 have no scene id.
+- This is an omniscient reviewer view, not a replay of what a solver could access. The reader filter shows the
+  conversations a person can see; it does not re-run the tools.
 
 ## Check
 
 ```bash
 uv run --frozen python viewer/check.py
-uv run ruff check viewer
-uv run ruff format --check viewer
+uv run --frozen ruff check viewer && uv run --frozen ruff format --check viewer
 ```
 
-The small check uses the saved software qualification run and temporary malformed
-input. No calls to models or sandboxes are made.
+The check builds a page from the scripted generation run. It asserts:
+- attempt order;
+- that route events reach the page;
+- that every task's gold chain reaches all its bound evidence;
+- that every message maps to its scene;
+- HTML escaping.
