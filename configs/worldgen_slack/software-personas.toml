@@ -2,11 +2,16 @@ sector = "IT for a business-to-business software company: cloud platform operati
 task_count = 10
 group_size = 5
 seed = 20261005
-output = "data/v3-08/software"
+output = "data/v3-07/software"
 research_budget_usd = 20.0
 
 [seed_data]
 path = "generators/worldgen_slack/seeds/slack-examples.json"
+
+# Built by: duckdb < scripts/worldgen_slack/personas.sql
+[personas]
+path = "data/seeds/personas-usa.jsonl"
+typing = "data/seeds/typing-profiles.jsonl"
 
 [env.timeout]
 episode = 21600
