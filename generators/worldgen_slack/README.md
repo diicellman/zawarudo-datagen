@@ -31,5 +31,5 @@ holds the present (`world_meta.now_us`), and nothing is written before it.
    published.
 
 The judge cannot edit the world. Its scores are reported; blocking issues decide acceptance (`[acceptance]`). An
-interrupted run resumes from its checkpoint and the last closed block. `research_budget_usd` stops new calls once
-the reported spend reaches it.
+interrupted run resumes from its checkpoint and the last closed block. Spend is reported, never capped: the summary
+gives it per role.

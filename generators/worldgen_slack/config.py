@@ -177,7 +177,6 @@ class Config(Section):
     acceptance: Acceptance = Field(default_factory=Acceptance)
     author: AuthorSettings = Field(default_factory=AuthorSettings)
     solves_per_task: int = Field(default=4, ge=1, le=16)
-    research_budget_usd: float = Field(default=900.0, gt=0)
     env: PipelineConfig = Field(default_factory=PipelineConfig)
     answer_judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
 

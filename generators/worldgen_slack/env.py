@@ -109,13 +109,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         for name in ("author", "judge", "solver"):
             getattr(agents, name).trainable = False
 
-    def budget_check(self):
-        if self.store.summary("running")["reported_model_cost"] >= self.settings.research_budget_usd:
-            raise ReviewLimit("reported model spend reached the budget")
-
     # ------------------------------------------------------------------ authors
     async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
-        self.budget_check()
         self.store.event("author_started", attempt=attempt, phase_document=context["phase"])
         for name, text in task_cls.files(context).items():
             await runtime.write("/task/" + name, text.encode())
@@ -213,7 +208,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         """`files` maps /task file names to trace records the judge may investigate; `label` names one of an
         attempt's several reviews."""
         suffix, files = ("-" + label if label else ""), files or {}
-        self.budget_check()
         self.store.artifact(attempt, "review_input" + suffix, payload)
         self.store.event(
             "review_started", attempt=attempt, label=label, task_ids=[t["id"] for t in payload["tasks"]]
@@ -281,7 +275,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
 
     async def solve(self, agents, task):
         """One independent solve of a task, graded for correctness and grounding."""
-        self.budget_check()
         trace = await agents.solver.run(task)
         self.store.trace(trace)
         return SolverTask.outcome(trace), trace
@@ -336,7 +329,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
     async def author_step(self, interaction, runtime, prompt: str, attempt: str, mode: str) -> None:
         """One author turn: code's memory of the world, rendered fresh, then the turn; the author works through its
         tools, and the world file is code's again when the turn ends."""
-        self.budget_check()
         await upload(runtime, files(self.world, self.settings, self.author_context(), mode), "/task/memory")
         self.store.event("author_turn", attempt=attempt, mode=mode, day=self.store.state.day)
         segment = await interaction.turn(prompt)
