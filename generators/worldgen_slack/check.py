@@ -1706,7 +1706,8 @@ async def check_author(root):
                 first, second = [
                     m for (m,) in self.world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")
                 ]
-                issues = [Issue(artifact="workspace", message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser")]  # fmt: skip
+                # A mid-run review's note blocks nothing, and still opens the next day.
+                issues = [Issue(artifact="workspace", message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
             # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
             reviews = [TaskReview(task_id=t["id"], valid=(attempt, t["id"]) != ("tasks-01", "t3"), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip

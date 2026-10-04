@@ -450,7 +450,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
 
     async def review_so_far(self, agents) -> None:
         """The judge reviews the world written so far; its issues open the author's next day."""
-        state, cfg = self.store.state, self.settings
+        state = self.store.state
         attempt = self.store.reserve(f"review-{state.day:02d}", 2)
         payload = review_payload(
             self.world,
@@ -461,7 +461,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             ledger=ledger_digest(self.world),
         )
         verdict = await self.review(agents, payload, attempt, {}, "world")
-        state.issues = deciding(verdict, cfg.acceptance)
+        # It rejects nothing, so every issue is a note for what is written next, blocking or not.
+        state.issues = verdict.issues
         state.day, state.phase = state.day + 1, "day"
         self.store.finish_attempt(verdict.approved)
 
