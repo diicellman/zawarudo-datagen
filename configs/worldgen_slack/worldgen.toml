@@ -3,9 +3,8 @@
 # Now: the smoke run (S1a), 2 days, 80 messages, 2 tasks. The full world (S1) is output "data/v7-01/software",
 # [calendar] days = 10, [activity] messages = 400, [tasks] count = 10, and a budget set from the smoke's cost per day.
 sector = "IT for a business-to-business software company: cloud platform operations, service releases, and customer incident coordination"
-seed = 20261006
-output = "data/v7-02-smoke/software"
-research_budget_usd = 12.0
+seed = 20261007
+output = "data/v7-03-smoke/software"
 
 # One author writes the world in time order.
 [author]
@@ -150,6 +149,12 @@ finalize = 300
 
 [env.author]
 model = "anthropic/claude-opus-5.5"  # the voice lab (2026-10-04): 0.77 blind realism on one prompt, against terra's 0.43
+
+# Anthropic caches a prompt only when asked: each request's prefix is cached up to its end, so an agent's next step
+# pays for its new tail alone. Without it every step was billed in full, and the harness's token cap (new tokens only)
+# cut smoke 02's second day.
+[env.author.sampling]
+cache_control = { type = "ephemeral" }
 
 [env.judge]
 model = "openai/gpt-6-sol"
