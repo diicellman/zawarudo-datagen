@@ -43,7 +43,7 @@ def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
 
 
 class RunState(StrictModel):
-    phase: Literal["premise", "organization", "plan", "day", "tasks", "final", "done"] = "premise"
+    phase: Literal["premise", "organization", "plan", "day", "review", "tasks", "final", "done"] = "premise"
     premise: Premise | None = None
     cast: list[SeedPersona] = Field(default_factory=list)
     quota: list[Cell] = Field(default_factory=list)
@@ -56,12 +56,13 @@ class RunState(StrictModel):
     feedback: str = ""
     active_attempt: str | None = None
     last_verdict: Verdict | None = None
-    # The world author: the day being written, the attempt whose world and notes it starts from, a review's
-    # issues waiting for the author's next turn, and the solver runs spent on probing tasks.
+    # The world author: the day being written (or reviewed), the attempt whose world and notes it starts from, a
+    # review's issues waiting for the author's next turn, the solver's runs of each task as it was when solved
+    # (probes and the final review share them), and the solver runs spent on probing tasks.
     day: int = 0
     restore_point: str = ""
     issues: list[Issue] = Field(default_factory=list)
-    probed: dict[str, str] = Field(default_factory=dict)  # task → what it was when the solver last tried it
+    solves: dict[str, dict] = Field(default_factory=dict)  # task → {key, results, traces}
     probe_solves: int = 0
 
 

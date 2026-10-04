@@ -698,17 +698,22 @@ class WorldAuthorTask(vf.Task[WorldTaskData, AuthorState, WorldAuthorConfig]):
         return cls(data, WorldAuthorConfig(tools=tools))
 
 
-def plan_prompt(world, settings) -> str:
+def rejected(feedback: str, restored: str = "") -> str:
+    """Why the last attempt at this block was rejected, and what was put back."""
+    return f"\nYour last attempt at this was rejected{restored}: {feedback}" if feedback else ""
+
+
+def plan_prompt(world, settings, feedback: str = "") -> str:
     count = -(-settings.tasks.count // settings.tasks.per_storyline)
     return (
         f"Before day 1 ({when(world, bounds(world, 1)[0])[:14]}): plan the ledger with world_plan: exactly {count} "
         "storylines, their events and their facts, over the calendar in now.md. Then write /task/notes/plan.md: each "
         "storyline's arc day by day, and a board of what each task cell in now.md will rest on. End your turn when the "
-        "ledger is planned."
+        f"ledger is planned.{rejected(feedback)}"
     )
 
 
-def day_prompt(world, day: int, issues: list | None = None) -> str:
+def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") -> str:
     total = world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0]
     review = (
         "\nThe judge reviewed the world so far. Fix what you can in what you write next (world_revise rewrites a "
@@ -717,7 +722,8 @@ def day_prompt(world, day: int, issues: list | None = None) -> str:
         else ""
     )
     return (
-        f"It is {when(world, present(world))}, day {day} of {total}.{review}\nRead world_now() and your notes, and "
+        f"It is {when(world, present(world))}, day {day} of {total}.{review}"
+        f"{rejected(feedback, ', and the world and your notes are back at the start of the day')}\nRead world_now() and your notes, and "
         "write today: post its conversations in the order they happen with world_post, and move on with "
         "world_advance(); from the night it closes the day once today's checks pass. Then write /task/notes/recap.md "
         "(what happened today, what is open), update plan.md, and end your turn."

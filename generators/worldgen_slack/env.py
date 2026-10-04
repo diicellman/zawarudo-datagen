@@ -55,9 +55,8 @@ def require_trace(trace):
         raise RuntimeError("agent execution failed: " + "; ".join(e.message for e in trace.errors))
 
 
-def observable(trace):
+def observable(record: dict) -> dict:
     """A trace record without hidden reasoning or provider state, for another agent to investigate."""
-    record = trace.to_record()
     for node in record["nodes"]:
         node["message"].pop("reasoning_content", None)
         node["message"].pop("provider_state", None)
@@ -268,32 +267,38 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         state, n = self.store.state, self.settings.solves_per_task
         self.refresh_gold()
         keys = {t: self.task_key(t) for (t,) in self.world.db.execute("SELECT id FROM tasks ORDER BY id")}
+        # A task replaced since its review is gone from the world, and so are its review and its runs.
+        state.task_reviews = {t: r for t, r in state.task_reviews.items() if t in keys}
+        state.solves = {t: r for t, r in state.solves.items() if t in keys}
         due = [t for t, key in keys.items() if state.task_reviews.get(t, {}).get("key") != key]
         previous = state.last_verdict.issues if state.last_verdict else []
         people = {user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) for p in state.cast}
 
         async def check():
-            runs = await self.solves(agents, due, attempt, n)
+            # The solver's runs of a task as it is now are reused, a probe's included; only changed tasks are solved.
+            fresh = [t for t in due if state.solves.get(t, {}).get("key") != keys[t]]
+            for task_id, task_runs in (await self.solves(agents, fresh, attempt, n)).items():
+                self.keep_solves(task_id, keys[task_id], task_runs)
+            runs = {t: state.solves[t] for t in due}
             payload = review_payload(
                 self.world, "task", due, self.settings.taxonomy,
-                solves=[result for task_runs in runs.values() for result, _ in task_runs],
+                solves=[result for t in due for result in runs[t]["results"]],
                 previous_issues=[i.model_dump(mode="json") for i in previous if set(i.task_ids) & runs.keys()],
             )  # fmt: skip
-            files = {f"solver_{t}_{k}.json": observable(trace) for t, task_runs in runs.items() for k, (_, trace) in enumerate(task_runs, 1)}  # fmt: skip
+            files = {f"solver_{t}_{k}.json": record for t in due for k, trace_id in enumerate(runs[t]["traces"], 1) if (record := self.saved_trace(trace_id))}  # fmt: skip
             return runs, payload, await self.review(agents, payload, attempt, files, "tasks")
 
-        world_payload = review_payload(
-            self.world, "world", [], people=people, ledger=ledger_digest(self.world)
-        )
+        workspace = [i.model_dump(mode="json") for i in previous if i.artifact == "workspace"]
+        world_payload = review_payload(self.world, "world", [], people=people, ledger=ledger_digest(self.world), **({"previous_issues": workspace} if workspace else {}))  # fmt: skip
         async with asyncio.TaskGroup() as group:
             world = group.create_task(self.review(agents, world_payload, attempt, {}, "world"))
             checked = group.create_task(check()) if due else None
         runs, payload, judged = checked.result() if checked else ({}, None, None)
         verdicts = [v for v in (judged, world.result()) if v is not None]
         rejected = [v for v in verdicts if not v.approved]
-        for task_id, task_runs in runs.items():
-            results = [result for result, _ in task_runs]
-            rate = sum(r["semantic_correctness"] for r in results) / n
+        for task_id, cached in runs.items():
+            results = cached["results"]
+            rate = sum(r["semantic_correctness"] for r in results) / len(results)
             approved = accepted_task(judged, self.settings.acceptance, task_id)
             fit = next(r.level_fit for r in judged.tasks if r.task_id == task_id)
             if approved:
@@ -355,7 +360,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             await self.premise_and_organization(interaction, runtime, "plan")
         self.store.trace(interaction.trace)
         require_trace(interaction.trace)
-        await runtime.run(["rm", "-f", *(f"/task/{name}" for name in SETUP_FILES)], {})
 
     async def plan_world(self, agents, runtime) -> None:
         """The ledger, before day 1: storylines, events and facts, and the author's plan of them."""
@@ -371,7 +375,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         task = WorldAuthorTask.create("plan", 0, self.world.path, self.author_context(), attempt)
         count = -(-cfg.tasks.count // cfg.tasks.per_storyline)
         async with agents.author.interaction(task, runtime=runtime) as interaction:
-            prompt, errors = plan_prompt(self.world, cfg), []
+            prompt, errors = plan_prompt(self.world, cfg, state.feedback), []
             for _ in range(3):
                 await self.author_step(interaction, runtime, prompt, attempt, "plan")
                 planned = self.world.db.execute("SELECT COUNT(*) FROM storylines").fetchone()[0]
@@ -387,7 +391,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         if errors:
             return self.reject_structure(attempt, "; ".join(errors))
         await self.keep_notes(runtime, attempt)
-        state.phase, state.day, state.restore_point = "day", 1, attempt
+        state.phase, state.day, state.restore_point, state.feedback = "day", 1, attempt, ""
         self.store.finish_attempt(True)
 
     async def write_day(self, agents, runtime) -> None:
@@ -404,7 +408,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             self.store.event("issues_delivered", attempt=attempt, issues=len(issues))
         task = WorldAuthorTask.create("day", day, self.world.path, self.author_context(), attempt)
         async with agents.author.interaction(task, runtime=runtime) as interaction:
-            prompt, errors = day_prompt(self.world, day, issues), []
+            prompt, errors = day_prompt(self.world, day, issues, state.feedback), []
             for _ in range(3):
                 await self.author_step(interaction, runtime, prompt, attempt, "day")
                 errors = []
@@ -422,11 +426,12 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         await self.keep_notes(runtime, attempt)
         start, end = bounds(self.world, day)
         self.store.event("day_closed", attempt=attempt, day=day, messages=posted(self.world, start, end))
-        state.issues, state.restore_point = [], attempt
+        state.issues, state.restore_point, state.feedback = [], attempt, ""
         self.store.finish_attempt(True)
         if day in cfg.author.review_days and day < total:
-            await self.review_so_far(agents)
-        state.day, state.phase = (day + 1, "day") if day < total else (day, "tasks")
+            state.phase = "review"  # the closed day's review; a resume runs it, not the day again
+        else:
+            state.day, state.phase = (day + 1, "day") if day < total else (day, "tasks")
         self.store.save()
 
     def people_typing(self) -> dict:
@@ -437,7 +442,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
     async def review_so_far(self, agents) -> None:
         """The judge reviews the world written so far; its issues open the author's next day."""
         state, cfg = self.store.state, self.settings
-        attempt = self.store.reserve("review", len(cfg.author.review_days))
+        attempt = self.store.reserve(f"review-{state.day:02d}", 2)
         payload = review_payload(
             self.world,
             "world",
@@ -448,21 +453,32 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         )
         verdict = await self.review(agents, payload, attempt, {}, "world")
         state.issues = deciding(verdict, cfg.acceptance)
+        state.day, state.phase = state.day + 1, "day"
         self.store.finish_attempt(verdict.approved)
 
+    def keep_solves(self, task_id: str, key: str, runs: list) -> None:
+        """A task's solver runs, kept with what the task was when they ran."""
+        self.store.state.solves[task_id] = {"key": key, "results": [r for r, _ in runs], "traces": [t.id for _, t in runs]}  # fmt: skip
+
+    def saved_trace(self, trace_id: str) -> dict | None:
+        """A saved solver trace, as the judge may read it."""
+        path = self.store.root / "traces" / f"{trace_id}.json"
+        return observable(json.loads(path.read_text())) if path.exists() else None
+
     async def probe(self, agents, attempt: str) -> dict:
-        """The solver tries each task that changed since its last try, within the world's probe budget; each task's
-        solve rate and fewest calls are kept on it."""
+        """The solver tries each task that changed since its last runs, within the world's probe budget; each task's
+        solve rate and fewest calls are kept on it, and its runs are kept for the final review."""
         state, cfg = self.store.state, self.settings
         self.refresh_gold()
         keys = {t: self.task_key(t) for (t,) in self.world.db.execute("SELECT id FROM tasks ORDER BY id")}
         n = cfg.author.probe_solves
-        due = [t for t, key in keys.items() if state.probed.get(t) != key]
+        due = [t for t, key in keys.items() if state.solves.get(t, {}).get("key") != key]
         due = due[: max(0, cfg.author.probe_budget - state.probe_solves) // n]
         if not due:
             return {}
         results = {}
         for task_id, runs in (await self.solves(agents, due, attempt, n)).items():
+            self.keep_solves(task_id, keys[task_id], runs)
             outcomes = [outcome for outcome, _ in runs]
             rate = sum(o["semantic_correctness"] for o in outcomes) / n
             fewest = min((o["calls"] for o in outcomes if o["correct"]), default=None)
@@ -470,7 +486,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 "UPDATE tasks SET solve_rate = ?, min_calls = ? WHERE id = ?", (rate, fewest, task_id)
             )
             results[task_id] = {"solve_rate": rate, "tries": [{k: o.get(k) for k in ("correct", "calls", "reason")} for o in outcomes]}  # fmt: skip
-            state.probed[task_id] = keys[task_id]
         state.probe_solves += n * len(due)
         self.store.event("probe", attempt=attempt, rates={t: r["solve_rate"] for t, r in results.items()})
         self.store.save()
@@ -480,14 +495,15 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         """After the last day, in one interaction: the tasks, the solver's tries and the author's hardening, then the
         final review, whose issues the author fixes until the judge approves or the rounds run out."""
         state, cfg = self.store.state, self.settings
-        attempt = self.store.reserve("tasks", cfg.review_rounds.final)
         await self.bring_notes(runtime, state.restore_point)
+        final = lambda: f"final-{state.rounds.get('final', 0):02d}"  # noqa: E731
+        attempt = self.store.reserve("tasks", cfg.review_rounds.final) if state.phase == "tasks" else final()
         task = WorldAuthorTask.create("tasks", 0, self.world.path, self.author_context(), attempt)
         cells = {tuple(c[:2]) for c in state.quota}
         async with agents.author.interaction(task, runtime=runtime) as interaction:
 
-            async def turn(prompt):
-                await self.author_step(interaction, runtime, prompt, attempt, "tasks")
+            async def turn(prompt, label=attempt):
+                await self.author_step(interaction, runtime, prompt, label, "tasks")
 
             if state.phase == "tasks":
                 prompt = tasks_prompt(cfg)
@@ -504,8 +520,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     if not results or not left:
                         break
                     await turn(harden_prompt(results, (cfg.author.probe_budget - state.probe_solves) // cfg.author.probe_solves))  # fmt: skip
-                state.phase = "final"
-                self.store.save()
+                await self.keep_notes(runtime, attempt)
+                state.phase, state.restore_point = "final", attempt
+                self.store.finish_attempt(True)
             while state.phase == "final":
                 if (verdict := await self.final_world(agents)).approved:
                     break
@@ -513,7 +530,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 await turn(
                     fix_prompt(
                         [i.model_dump(mode="json") for i in deciding(verdict, cfg.acceptance)] + invalid
-                    )
+                    ),
+                    final(),
                 )
         self.store.trace(interaction.trace)
         require_trace(interaction.trace)
@@ -542,10 +560,14 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         async with agents.author.provision(setup) as runtime:
             if state.phase in ("premise", "organization"):
                 await self.setup_world(agents, runtime, setup)
+            # Provisioning lays out the setup files again on every resume; the author's later turns never see them.
+            await runtime.run(["rm", "-f", *(f"/task/{name}" for name in SETUP_FILES)], {})
             while state.phase == "plan":
                 await self.plan_world(agents, runtime)
-            while state.phase == "day":
-                await self.write_day(agents, runtime)
+            while state.phase in ("day", "review"):
+                await (
+                    self.review_so_far(agents) if state.phase == "review" else self.write_day(agents, runtime)
+                )
             if state.phase in ("tasks", "final"):
                 await self.finish_world(agents, runtime)
 

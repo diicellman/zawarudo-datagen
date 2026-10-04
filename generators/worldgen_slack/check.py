@@ -1479,7 +1479,9 @@ class ScriptedAuthor(ScriptedAgent):
 
     @asynccontextmanager
     async def provision(self, task):
-        yield FakeRuntime()
+        runtime = FakeRuntime()
+        await task.setup(None, runtime)  # as a VM is provisioned: the setup task's files are laid out
+        yield runtime
 
     @asynccontextmanager
     async def interaction(self, task, runtime):
@@ -1498,8 +1500,9 @@ class ScriptedAuthor(ScriptedAgent):
 
 async def check_author(root):
     """One world written by a scripted author through the v7 driver: setup, the plan, days that close only when done,
-    a review after day 2 whose issues open day 3, a crash in day 3 and a resume from day 2's world and notes, tasks,
-    probes within their budget and a hardening turn, a final rejection fixed in the same session, publish."""
+    a review after day 2 whose issues open day 3, a crash in that review and in day 3 with resumes from day 2's world
+    and notes, tasks, probes within their budget and a hardening turn, a final rejection fixed in the same session,
+    publish."""
     root.mkdir(parents=True)
     base = flow_settings(root, 3)
     settings = base.model_copy(
@@ -1518,7 +1521,7 @@ async def check_author(root):
             ),
         }
     )
-    seen, crash = [], {"armed": True}
+    seen, crash, solved = [], {"armed": True, "review": True, "plans": 0}, Counter()
 
     class AuthorEnv(GenerationEnv):
         async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
@@ -1530,14 +1533,16 @@ async def check_author(root):
             return Organization(people=[Person(user_id=u, title="Engineer", team="Platform") for u in ids], channels=channels, dm_routines=kinds).model_dump_json()  # fmt: skip
 
         async def solve(self, agents, task):
-            return {"semantic_correctness": 0.5, "correct": True, "grounded": True, "execution_ok": True, "calls": 3, "reason": "r"}, SimpleNamespace(to_record=lambda: {"nodes": []})  # fmt: skip
+            solved[self.store.state.active_attempt, task.data.task_id] += 1
+            return {"semantic_correctness": 0.5, "correct": True, "grounded": True, "execution_ok": True, "calls": 3, "reason": "r"}, SimpleNamespace(id="solve", to_record=lambda: {"nodes": []})  # fmt: skip
 
         async def review(self, agents, payload, attempt, files=None, label=""):
-            seen.append(
-                ("review", attempt, payload["phase"], "written_through" in payload, "ledger" in payload)
-            )
+            seen.append(("review", attempt, payload["phase"], "written_through" in payload, "ledger" in payload, bool(payload.get("previous_issues")), tuple(t["id"] for t in payload["tasks"])))  # fmt: skip
+            if attempt == "review-02-01" and crash["review"]:
+                crash["review"] = False
+                raise KeyboardInterrupt("simulated crash in a review")
             issues = []
-            if payload["phase"] == "world" and attempt in ("review-01", "final-01"):
+            if payload["phase"] == "world" and attempt in ("review-02-02", "final-01"):
                 first, second = [
                     m for (m,) in self.world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")
                 ]
@@ -1556,6 +1561,7 @@ async def check_author(root):
         assert runtime.files["/task/memory/now.md"].startswith(b"# Now: "), (
             "memory is rendered before every turn"
         )
+        assert "/task/input.json" not in runtime.files, "the setup files are gone, after a resume too"
         seen.append(("turn", tools.config.mode, tools.config.day, prompt.split(":")[0][:40]))
 
         def talk(channel, *lines):
@@ -1566,7 +1572,11 @@ async def check_author(root):
             while today(world) == tools.config.day:
                 await call("advance")
 
-        if prompt.startswith("Before day 1"):
+        if tools.config.mode == "plan":
+            crash["plans"] += prompt.startswith("Before day 1")
+            if crash["plans"] == 1:  # the first attempt never writes plan.md, and is rejected for it
+                return
+            assert "was rejected: " in prompt and "write /task/notes/plan.md" in prompt, "a retry is told why"
             events = [Event(id="e1", storyline="s2", title="audit window", day=3, time="10:00"), Event(id="e2", storyline="s1", title="service restored", day=2, time="14:00")]  # fmt: skip
             facts = [
                 PlanFact(id="f1", storyline="s1", subject="Release 4.2", attribute="decision", value="rollback", anchor="rollback", channel_id=ops, author_id=a, day=1, summary="s"),
@@ -1608,12 +1618,17 @@ async def check_author(root):
                 await talk(ops, dict(author_id=a, text="Owen owns the audit at {at:e1}", conveys=["f4"]), dict(author_id=d, text="thanks"))  # fmt: skip
             if day == 4:
                 assert "message_ids" not in prompt, "a review's issues are delivered once"
-            if day == 4 and prompt.startswith(
-                "It is"
-            ):  # first turn: the day is closed, but no recap is written
-                await talk(ops, dict(author_id=d, text="quiet day"))
-                await close()
+            if day == 4 and "was rejected" not in prompt:
+                # The first attempt closes the day but never writes its recap, so all 3 of its turns end rejected.
+                if prompt.startswith("It is"):
+                    await talk(ops, dict(author_id=d, text="quiet day"))
+                    await close()
                 return
+            if day == 4:
+                assert "back at the start of the day: " in prompt and "recap.md" in prompt, (
+                    "a retry is told why"
+                )
+                await talk(ops, dict(author_id=d, text="quiet day"))
             await close()
             await runtime.write("/task/notes/recap.md", f"day {day}: done".encode())
         elif prompt.startswith("The last day is closed"):
@@ -1631,6 +1646,9 @@ async def check_author(root):
                 for message in issue.get("message_ids", []):
                     await call("revise", message_id=message, text="ok, the notes come tomorrow")
             seen.append(("fixed", [m for i in issues for m in i.get("message_ids", [])]))
+            category, level, *_ = json.loads(tools.config.context)["cells"][0]
+            task = scripted_task(settings, 9, category, level, a)  # t9 replaces t0 in its cell
+            await call("add_task", task=task.model_copy(update={"question": "Asked anew: " + task.question}))
 
     agents = SimpleNamespace(
         **{name: ScriptedAgent() for name in ("judge", "solver")},
@@ -1640,11 +1658,18 @@ async def check_author(root):
     store = TestStore(settings.output, manifest)
     env = AuthorEnv(settings, store)
     await env.setup(agents)
-    try:
-        await env.run(None, agents)
-        raise AssertionError("the simulated crash did not happen")
-    except KeyboardInterrupt:
-        pass
+    for _ in range(2):  # the review after day 2 is cut off, then day 3
+        try:
+            await AuthorEnv(settings, store).run(None, agents)
+            raise AssertionError("the simulated crash did not happen")
+        except KeyboardInterrupt:
+            pass
+        if store.state.phase == "review":
+            assert store.state.day == 2 and store.state.rounds["day-02"] == 1, (
+                "a cut-off review is redone, not its day"
+            )
+            store.close()
+            store = TestStore(settings.output, manifest)
     after_day_2 = World(store.root / "attempts" / store.state.restore_point / "world.sqlite").db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]  # fmt: skip
     assert store.world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == after_day_2 + 1, "the crash left a partial day"  # fmt: skip
     store.close()
@@ -1656,14 +1681,20 @@ async def check_author(root):
     env = AuthorEnv(settings, store)
     await env.run(None, agents)
     state = store.state
-    assert state.phase == "done" and state.rounds["day-03"] == 2, state.rounds
+    assert state.phase == "done" and state.rounds["day-03"] == 2 and state.rounds["review-02"] == 2, (
+        state.rounds
+    )
+    assert state.rounds["plan"] == 2 and not state.feedback
     assert not store.world.db.execute("SELECT 1 FROM messages WHERE text = 'morning'").fetchone(), (
         "the crashed day's start is gone"
     )
     assert [t[3][:6] for t in [s for s in seen if s[0] == "turn"] if t[1] == "day" and t[2] == 4] == [
         "It is ",
         "Day 4 ",
-    ], "a day needs its recap"
+        "Day 4 ",
+        "It is ",
+    ], "a day needs its recap, and one that never gets it is written again"
+    assert state.rounds["day-04"] == 2, state.rounds
     turns = [s for s in seen if s[0] == "turn"]
     assert [t[3][:6] for t in turns if t[1] == "day" and t[2] == 1] == ["It is ", "Day 1 "], "an open day is not accepted"  # fmt: skip
     first, second = [m for (m,) in store.world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")]
@@ -1672,18 +1703,20 @@ async def check_author(root):
     )
     assert store.world.db.execute("SELECT text FROM messages WHERE id = ?", (second,)).fetchone()[0] == "ok, the notes come tomorrow"  # fmt: skip
     assert "rollback" in store.world.db.execute("SELECT text FROM messages WHERE id = ?", (first,)).fetchone()[0], "the evidence stays"  # fmt: skip
-    assert state.probe_solves == 10 and len(state.probed) == 4, (state.probe_solves, state.probed)
-    stale = [
-        t for (t,) in store.world.db.execute("SELECT id FROM tasks") if state.probed.get(t) != env.task_key(t)
-    ]
-    assert stale == ["t2"], ("the budget left the second hardened task untried", stale)
-    assert ("review", "review-01", "world", True, True) in seen and (
-        "review",
-        "final-01",
-        "world",
-        False,
-        True,
-    ) in seen
+    assert state.probe_solves == 10, state.probe_solves
+    # The probes try every task, then the hardened t1 again (the budget leaves t2 untried); the final reviews solve
+    # only what changed since: t2, then t9, which a fix replaced t0 with.
+    assert solved == {("tasks-01", "t0"): 2, ("tasks-01", "t1"): 4, ("tasks-01", "t2"): 2, ("tasks-01", "t3"): 2, ("final-01", "t2"): 4, ("final-02", "t9"): 4}, solved  # fmt: skip
+    assert set(state.solves) == {"t1", "t2", "t3", "t9"}, "a replaced task's runs go with it"
+    assert ("review", "review-02-02", "world", True, True, False, ()) in seen
+    assert ("review", "final-01", "world", False, True, False, ()) in seen
+    assert ("review", "final-02", "world", False, True, True, ()) in seen, (
+        "the final review checks the last issues"
+    )
+    assert ("review", "final-02", "task", False, False, False, ("t9",)) in seen, (
+        "only the changed task is reviewed again"
+    )
+    assert any(e["event"] == "candidate_finished" and e["attempt"] == "tasks-01" and e["approved"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines())), "the tasks attempt is closed"  # fmt: skip
     assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"
     days = [json.loads(line) for line in (store.root / "progress.jsonl").read_text().splitlines()]
     assert [e["day"] for e in days if e["event"] == "day_closed"] == [1, 2, 3, 4]

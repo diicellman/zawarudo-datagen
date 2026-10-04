@@ -17,7 +17,7 @@ def main():
     assert (
         steps.index("plan-01")
         < steps.index("day-01-01")
-        < steps.index("review-01")
+        < steps.index("review-02-02")
         < steps.index("day-03-02")
     ), steps
     assert steps.index("day-04-01") < steps.index("tasks-01") < steps.index("final-02"), steps
