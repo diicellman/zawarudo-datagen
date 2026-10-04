@@ -20,9 +20,6 @@ path = "data/seeds/personas-usa.jsonl"
 typing = "data/seeds/typing-profiles.jsonl"
 gaps = "data/seeds/reply-gaps.json"
 
-[seed_data]
-path = "generators/worldgen_slack/seeds/slack-examples.json"
-
 [calendar]
 days = 2
 

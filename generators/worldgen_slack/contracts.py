@@ -19,60 +19,6 @@ from worldgen_slack.db import World, canonical, digest
 from worldgen_slack.db import words
 from worldgen_slack.dataset import NonEmptyText, SafeId, StrictModel
 
-SEED_MAX_BYTES = 262_144
-SEED_MAX_MESSAGES = 512
-SEED_MAX_TEXT_CHARS = 128_000
-
-
-class SeedMessage(StrictModel):
-    text: NonEmptyText
-    speaker: NonEmptyText | None = None
-    timestamp: NonEmptyText | None = None
-
-
-class SeedExample(StrictModel):
-    id: SafeId
-    dataset: NonEmptyText
-    revision: Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
-    rows: list[Annotated[int, Field(ge=0)]] = Field(min_length=1, max_length=100)
-    source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-    notes: NonEmptyText
-    messages: list[SeedMessage] = Field(min_length=1, max_length=101)
-
-    @model_validator(mode="after")
-    def ordered_rows(self) -> Self:
-        if self.rows != sorted(set(self.rows)):
-            raise ValueError("seed row indices must be unique and ascending")
-        return self
-
-
-class SeedPacket(StrictModel):
-    examples: list[SeedExample] = Field(min_length=1, max_length=48)
-
-    @model_validator(mode="after")
-    def bounded(self) -> Self:
-        if len({example.id for example in self.examples}) != len(self.examples):
-            raise ValueError("seed example IDs must be unique")
-        messages = [message for example in self.examples for message in example.messages]
-        if (
-            len(messages) > SEED_MAX_MESSAGES
-            or sum(len(message.text) for message in messages) > SEED_MAX_TEXT_CHARS
-        ):
-            raise ValueError("seed packet exceeds 512 messages or 128000 text characters")
-        if any(not message.text.strip() for message in messages):
-            raise ValueError("seed messages must not be blank")
-        if len(self.model_dump_json().encode()) + 1 > SEED_MAX_BYTES:
-            raise ValueError("seed packet exceeds 256 KiB")
-        return self
-
-
-def load_seed_packet(path: Path) -> SeedPacket:
-    with path.open("rb") as stream:
-        raw = stream.read(SEED_MAX_BYTES + 1)
-    if len(raw) > SEED_MAX_BYTES:
-        raise ValueError("seed packet exceeds 256 KiB")
-    return SeedPacket.model_validate_json(raw)
-
 
 def _meaningful_tokens(value: str) -> set[str]:
     normalized = unicodedata.normalize("NFKC", value).casefold()

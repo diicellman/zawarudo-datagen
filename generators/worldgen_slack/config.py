@@ -52,10 +52,6 @@ class Section(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class SeedDataConfig(Section):
-    path: RootedPath
-
-
 class PersonasConfig(Section):
     """The seeded cast and how real Slack users type and reply; all three files come from
     scripts/worldgen_slack/personas.sql."""
@@ -167,7 +163,6 @@ class Config(Section):
     language: Text = "English"
     premise_count: int = Field(default=12, ge=2, le=30)
     personas: PersonasConfig
-    seed_data: SeedDataConfig | None = None
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
     activity: ActivityConfig = Field(default_factory=ActivityConfig)
     tasks: TasksConfig
