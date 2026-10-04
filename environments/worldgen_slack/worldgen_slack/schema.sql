@@ -183,10 +183,10 @@ CREATE TABLE facts (
   CHECK (event_id IS NULL OR moment_us IS NOT NULL)
 );
 
-CREATE TABLE fact_relations (                        -- src <kind> dst: src comes after / supersedes / ... dst
+CREATE TABLE fact_relations (                        -- src <kind> dst: src comes after / supersedes dst
   src_fact TEXT NOT NULL REFERENCES facts(id),
   dst_fact TEXT NOT NULL REFERENCES facts(id),
-  kind     TEXT NOT NULL CHECK (kind IN ('after', 'supersedes', 'alias_of', 'split_part', 'contradicts')),
+  kind     TEXT NOT NULL CHECK (kind IN ('after', 'supersedes')),
   PRIMARY KEY (src_fact, dst_fact, kind),
   CHECK (src_fact <> dst_fact)
 );
@@ -194,7 +194,7 @@ CREATE TABLE fact_relations (                        -- src <kind> dst: src come
 CREATE TABLE evidence (
   fact_id      TEXT NOT NULL REFERENCES facts(id),
   message_id   INTEGER NOT NULL REFERENCES messages(id),
-  role         TEXT NOT NULL CHECK (role IN ('anchor', 'supporting', 'decoy')),
+  role         TEXT NOT NULL CHECK (role IN ('anchor', 'supporting')),
   anchor_token TEXT,                                 -- a surface form the text must contain, if any
   PRIMARY KEY (fact_id, message_id)
 );
@@ -210,11 +210,8 @@ CREATE TABLE tasks (
   gold_source  TEXT NOT NULL CHECK (gold_source IN ('sql', 'ledger', 'hybrid')),
   gold_sql     TEXT NOT NULL,                        -- run as the actor; returns answer (+ message_id, user_id)
   gold_json    TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(gold_json)),  -- its rows
-  min_calls    INTEGER,
-  bm25_rank    INTEGER,
-  distractors  INTEGER,
-  solve_rate   REAL,
-  status       TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'verified', 'dropped'))
+  min_calls    INTEGER,                              -- the fewest tool calls of a correct probe
+  solve_rate   REAL                                  -- the probes' solve rate
 );
 
 CREATE TABLE task_facts (

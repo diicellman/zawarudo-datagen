@@ -1,4 +1,4 @@
-"""The agentic judge: semantic review of the ledger, the tasks and the workspace, in a fresh runtime."""
+"""The agentic judge: semantic review of the tasks and the workspace, in a fresh runtime."""
 
 import json
 from pathlib import Path
@@ -28,17 +28,10 @@ COMMON_GUIDE = """Approve only after investigating. Call inspect_check before wr
 - blocking is true when a defect changes, contradicts, hides or hands over a task's answer, or breaks the ledger;
   otherwise it is false.
 - approved is true only when every task is valid and no issue blocks.
-- When input.json has previous_issues, check that each is resolved. When it has changed_messages, review those with
-  their surroundings; in content outside them, which was reviewed before, report only blocking issues.
+- When input.json has previous_issues, check that each is resolved.
 """
 
 PHASE_GUIDES = {
-    "ledger": """Ledger review: the facts fit the premise and each other; each fact's authority (its author and its
-summary) is plausible; each person's title and team fit their occupation, education and age (people in input.json).
-No message exists yet: the storylines' scenes are written from this ledger next, and each task is reviewed again on
-them. A task is valid when it asks one clear question that its gold rows answer exactly, no more and no less.
-A ledger review reports issues on the ledger or the tasks only.
-""",
     "task": """Task review. A task is valid when its actor can answer its question as asked from what they can read,
 and its gold rows are the complete, correct answer. Score each criterion of schemas.json from 0 to 1:
 - question_fit: each gold query answers its question as asked; test variants with inspect_sql.
@@ -85,7 +78,6 @@ class JudgeTask(vf.Task[WorldTaskData, ReviewState, JudgeConfig]):
     ) -> Self:
         """`world` is a host-side snapshot that stays unchanged while the judge works."""
         tools = ReviewToolsConfig(
-            phase=payload["phase"],
             db_path=str(world),
             db_hash=file_hash(world),
             task_ids=[t["id"] for t in payload["tasks"]],

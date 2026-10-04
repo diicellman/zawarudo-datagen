@@ -1,4 +1,4 @@
-"""The world written in time order (v7): one author plans the ledger and its events, posts each conversation at the
+"""The world written in time order: one author plans the ledger and its events, posts each conversation at the
 world's present, and moves the present forward. Code checks every step, owns every time, and never writes into the
 past. Pure functions over `World`; the author's tools (`agents/world.py`) call them inside `World.trial()`."""
 
@@ -25,7 +25,6 @@ from .contracts import (
     Zone,
     activity,
     at,
-    check_facts,
     clock,
     insert_lines,
     measures,
@@ -194,6 +193,27 @@ def posted(world, start_us: int, end_us: int) -> int:
 
 
 # ---------------------------------------------------------------------- the ledger, planned and re-planned
+
+
+def check_facts(facts: list, storylines: set[str]) -> None:
+    """A ledger's facts: a value with no time in it, a known storyline, an anchor made of words of the value, and
+    relations to facts of the same ledger."""
+    known = {f.id for f in facts}
+    for fact in facts:
+        if TIME_LITERAL.search(fact.value):
+            raise ValueError(
+                f"{fact.id}: a value has no time or date in it; its moment is planned apart from it"
+            )
+        if fact.storyline not in storylines:
+            raise ValueError(f"{fact.id}: storyline {fact.storyline} is not in storylines")
+        if fact.anchor and f" {normalized(fact.anchor)} " not in f" {normalized(fact.value)} ":
+            raise ValueError(
+                f"{fact.id}: an anchor is words of its value; {fact.anchor!r} is not in {fact.value!r}"
+            )
+        if unknown := set(fact.after) - known | ({fact.supersedes} - known - {None}):
+            raise ValueError(
+                f"{fact.id}: after and supersedes name facts of this ledger; unknown {sorted(unknown)}"
+            )
 
 
 def fact_row(fact: PlanFact, events: dict[str, Event], moment: dict[str, int], zone: str) -> dict:
@@ -587,7 +607,7 @@ def revise(world, message_id: int, text: str) -> dict:
 
 def add_task(world, task: Task, settings, cells: list[tuple]) -> dict:
     """One task for one of the world's cells, on the finished world; it replaces the cell's task, if any. Its gold
-    query is checked as v6 checks every task (T1-T7, readable facts, the level's spread). Returns its gold rows and
+    query is checked as every task is (T1-T7, readable facts, the level's spread). Returns its gold rows and
     code's measures of how hard it is."""
     if today(world) is not None:
         raise ValueError("tasks are written once the calendar is closed")

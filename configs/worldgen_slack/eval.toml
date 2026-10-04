@@ -6,4 +6,4 @@ rollouts_per_example = 1
 id = "worldgen-slack"
 
 [env.taskset.task]
-release_dir = "data/v2-09/software/release"
+release_dir = "data/v6-01/software/release"

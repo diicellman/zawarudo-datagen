@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Annotated, Literal
 import verifiers.v1 as vf
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
-from verifiers.v1.configs.agent import TimeoutConfig
 from verifiers.v1.configs.retries import RetryConfig
 from verifiers.v1.harnesses.null.harness import NullHarnessConfig
 from worldgen_slack.config import role
@@ -14,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def world_author(model: str) -> vf.AgentConfig:
-    """The world author (v7): an rlm coding agent in one VM for the whole world, with one interaction per block of
-    work (setup, plan, each day, tasks); each interaction gets these turn, token and time budgets."""
+    """The world author: an rlm coding agent in one VM for the whole world, with one interaction per block of work
+    (setup, plan, each day, tasks); each interaction gets these turn, token and time budgets."""
     base = role(model, author=True)
     return base.model_copy(
         update={
@@ -30,26 +29,14 @@ def world_author(model: str) -> vf.AgentConfig:
 class PipelineConfig(vf.EnvConfig):
     taskset: vf.TasksetConfig = vf.TasksetConfig(id="worldgen-slack")
     author: vf.AgentConfig = world_author("z-ai/glm-5.3")
-    synthesizer: vf.AgentConfig = role("z-ai/glm-5.3", author=True)
-    builder: vf.AgentConfig = role("z-ai/glm-5.3", author=True)
     judge: vf.AgentConfig = role("openai/gpt-6-sol")
-    # The solver and the writer execute no code (null harness; the solver's Slack tools are host-side servers),
-    # so a local process replaces the VM.
+    # The solver executes no code (null harness; its Slack tools are host-side servers), so a local process
+    # replaces the VM.
     solver: vf.AgentConfig = role("z-ai/glm-5.2", solver=True).model_copy(
         update={"runtime": vf.SubprocessConfig()}
     )
-    writer: vf.AgentConfig = vf.AgentConfig(
-        model="z-ai/glm-5.3",
-        harness=NullHarnessConfig(id="null"),
-        runtime=vf.SubprocessConfig(),
-        # Low effort is ~12x faster for scene writing (probe: 6 s vs 70-90 s) at similar length.
-        sampling=vf.Sampling(temperature=0.9, max_tokens=32_000, reasoning_effort="low"),
-        max_turns=3,
-        timeout=TimeoutConfig(setup=300, rollout=900, finalize=60),
-        retries=RetryConfig(max_retries=0),
-    )
     retries: RetryConfig = RetryConfig(max_retries=0)
-    # The GLM account allows 8 concurrent requests; GLM writing and GLM solving never overlap.
+    # The GLM account allows 8 concurrent requests.
     max_concurrent_agents: int | None = 8
 
 
@@ -89,7 +76,6 @@ class CalendarConfig(Section):
 class TasksConfig(Section):
     count: int = Field(gt=0, le=100)
     per_storyline: int = Field(default=5, gt=0, le=20)
-    messages_per_task: int = Field(default=15, ge=1, le=200)
     max_answer_rows: int = Field(default=5, ge=1, le=50)
     styles: list[Text] = Field(min_length=1)
 
@@ -140,10 +126,8 @@ class Category(Section):
 
 
 class ReviewRounds(Section):
-    """Separate, bounded allowances: ledger and final attempts per run; build attempts per storyline."""
+    """Bounded allowances: final reviews per run."""
 
-    ledger: int = Field(default=8, ge=1, le=20)
-    build: int = Field(default=8, ge=1, le=20)
     final: int = Field(default=4, ge=1, le=20)
 
 
@@ -154,9 +138,8 @@ class Acceptance(Section):
 
 
 class AuthorSettings(Section):
-    """The world author (v7): one agent writes the world in time order. Off, the v6 pipeline runs."""
+    """The world author: one agent writes the world in time order."""
 
-    enabled: bool = False
     tolerance: float = Field(default=0.3, ge=0, le=1)  # how far a day's message count may be from its quota
     weekend: float = Field(default=0.1, ge=0, le=1)  # a weekend day's share of a workday's messages
     share_tolerance: float = Field(
@@ -171,6 +154,7 @@ class AuthorSettings(Section):
     day_attempts: int = Field(
         default=2, ge=1, le=5
     )  # a day that cannot close is written again from its start
+    plan_attempts: int = Field(default=3, ge=1, le=10)  # a plan that cannot be recorded is written again
 
 
 class Config(Section):
@@ -200,7 +184,7 @@ class Config(Section):
     def secure(self):
         if self.env.retries.max_retries:
             raise ValueError("whole-pipeline retries would replay mutable work")
-        for name in ("author", "synthesizer", "builder", "judge", "solver"):
+        for name in ("author", "judge", "solver"):
             agent = getattr(self.env, name)
             runtime = agent.runtime
             if not isinstance(agent.harness, NullHarnessConfig) and (
@@ -215,8 +199,6 @@ class Config(Section):
                 )
             if not agent.model:
                 raise ValueError(f"{name} needs an explicit model")
-        if not isinstance(self.env.writer.harness, NullHarnessConfig) or not self.env.writer.model:
-            raise ValueError("writer must use the tool-less null harness with an explicit model")
         return self
 
 

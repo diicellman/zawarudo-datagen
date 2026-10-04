@@ -785,7 +785,7 @@ def check_contracts(root):
     }
     members = {(r[0], r[1]) for r in world.db.execute("SELECT channel_id, user_id FROM members")}
     assert plan == background_plan(world, org(), small, 7) and sum(s.length for s in plan) in (11, 12)
-    assert all(s.situation in {r.kind for r in routines} and s.day in workdays and not s.beats for s in plan)
+    assert all(s.situation in {r.kind for r in routines} and s.day in workdays for s in plan)
     assert all((s.channel_id, p) in members for s in plan for p in s.participants)
     assert background_plan(world, org(), small.model_copy(update={"messages": count}), 7) == []
     month = background_plan(world, org(), small.model_copy(update={"messages": count + 300}), 7)
@@ -1508,7 +1508,6 @@ async def check_author(root):
             "activity": base.activity.model_copy(update={"messages": 16}),
             "author": base.author.model_copy(
                 update={
-                    "enabled": True,
                     "tolerance": 1.0,
                     "share_tolerance": 1.0,
                     "review_days": [2],
@@ -1634,7 +1633,7 @@ async def check_author(root):
             seen.append(("fixed", [m for i in issues for m in i.get("message_ids", [])]))
 
     agents = SimpleNamespace(
-        **{name: ScriptedAgent() for name in ("synthesizer", "builder", "writer", "judge", "solver")},
+        **{name: ScriptedAgent() for name in ("judge", "solver")},
         author=ScriptedAuthor(script),
     )
     manifest = provenance(settings)

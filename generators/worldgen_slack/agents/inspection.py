@@ -13,7 +13,6 @@ from ..contracts import measures, style
 
 
 class ReviewToolsConfig(vf.ToolsetConfig):
-    phase: str = ""
     db_path: str = ""
     db_hash: str = ""
     task_ids: list[str] = Field(default_factory=list)
@@ -53,23 +52,23 @@ class ReviewTools(vf.Toolset[ReviewToolsConfig, ReviewState]):
     async def check(self) -> dict:
         """Run code's rules over the world, re-run each reviewed task's gold query as its actor, measure each task
         (how many read_channel pages deep its evidence sits for its actor, the tables its gold query reads, its
-        evidence's search rank for the question's own words), and report each author's style. In the ledger review
-        no message exists yet, so whether the reviewed tasks' facts are stated, and the measures, wait for the
-        written storylines."""
+        evidence's search rank for the question's own words), and report each author's style."""
         world = World(self.config.db_path)
-        written = self.config.phase != "ledger"
         tasks = {}
         for task_id in self.config.task_ids:
             row = world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             try:
                 gold = world.gold(row["actor_id"], row["gold_sql"], max_rows=self.config.max_rows)
-                tasks[task_id] = {"rows": gold["rows"]}
-                if written:
-                    tasks[task_id] |= measures(world, task_id, gold["rows"], gold["tables"])
+                tasks[task_id] = {"rows": gold["rows"]} | measures(
+                    world, task_id, gold["rows"], gold["tables"]
+                )
             except ValueError as error:
                 tasks[task_id] = {"error": str(error)}
-        due = self.config.task_ids if written else []
-        result = {"violations": world.violations(complete=due), "tasks": tasks, "style": style(world)}
+        result = {
+            "violations": world.violations(complete=self.config.task_ids),
+            "tasks": tasks,
+            "style": style(world),
+        }
         self.state.checked = True
         return json.loads(json.dumps(result, default=str))
 

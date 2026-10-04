@@ -10,7 +10,7 @@ from worldgen_slack.db import digest
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-QUIET = {"heartbeat", "agent_progress", "author_started"}
+QUIET = {"agent_progress", "author_started"}
 KIND = {"public": "public_channel", "private": "private_channel", "im": "dm", "mpim": "group_dm"}
 
 
@@ -108,7 +108,7 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict]:
         tasks.append(
             {"id": t["id"], "group_id": next((storyline_of[f] for f in fact_ids), "tasks"), "question": t["question"], "actor_id": t["actor_id"], "fact_ids": fact_ids, "reasoning": f"{t['category']} · level {t['level']} · {t['answer_type']}", "gold_sql": t["gold_sql"], "category": t["category"], "level": t["level"], "answer": {"canonical_answer": "; ".join(claims), "required_claims": claims}}
         )  # fmt: skip
-        bindings[t["id"]] = {"claims": [{"claim_index": k, "message_ids": sorted(evidence), "user_ids": []} for k in range(len(claims))], "gold_calls": []}  # fmt: skip
+        bindings[t["id"]] = {"claims": [{"claim_index": k, "message_ids": sorted(evidence), "user_ids": []} for k in range(len(claims))]}  # fmt: skip
     catalog = {
         "company": (db.execute("SELECT value FROM world_meta WHERE key = 'company'").fetchone() or [None])[0],
         "people": [{"id": u["id"], "name": u["real_name"], "display_name": u["display_name"], "team": json.loads(u["profile_json"]).get("Team")} for u in users],
@@ -125,7 +125,7 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict]:
         plan = json.loads(s["plan_json"])
         ids = [str(r[0]) for r in db.execute("SELECT sm.message_id FROM scene_messages sm JOIN messages m ON m.id = sm.message_id WHERE sm.scene_id = ? ORDER BY m.ts_us", (s["id"],))]  # fmt: skip
         owner.update(dict.fromkeys(ids, s["id"]))
-        # A v6 scene keeps its plan; a v7 conversation keeps its lines, whose authors, statements and promises it shows.
+        # A conversation keeps its lines, whose authors, statements and promises it shows; older runs' scenes keep a plan.
         lines = plan.get("lines", [])
         participants = plan.get("participants") or list(dict.fromkeys(line["author_id"] for line in lines))
         beats = [{"fact_id": b["fact"], "author_id": b["author_id"]} for b in plan.get("beats", [])] + [{"fact_id": f, "author_id": line["author_id"]} for line in lines for f in line.get("conveys", [])]  # fmt: skip
@@ -142,7 +142,7 @@ def load_run(path, full=False):
     run = path.resolve()
     state = read_json(run / "state.json")
     if state is None or not (run / "world.sqlite").exists():
-        raise ValueError(f"No v6 run (state.json and world.sqlite) in {run}")
+        raise ValueError(f"No run (state.json and world.sqlite) in {run}")
     catalog, bindings, scenes, owner = ledger(run / "world.sqlite", state)
     events = [json.loads(line) for line in (run / "progress.jsonl").read_text().splitlines()]
     order = {e["attempt"]: i for i, e in reversed(list(enumerate(events))) if e.get("attempt")}
@@ -170,7 +170,6 @@ def load_run(path, full=False):
                     label: {
                         "verdict": files[f"verdict-{label}"],
                         "solves": (files.get(f"review_input-{label}") or {}).get("solves"),
-                        "changed_messages": [str(m) for m in (files.get(f"review_input-{label}") or {}).get("changed_messages") or []],
                     }
                     for label in labels
                 },
@@ -185,7 +184,6 @@ def load_run(path, full=False):
         "catalog": catalog,
         "world": snapshot(run / "world.sqlite"),
         "bindings": bindings,
-        "chains": {},
         "task_reviews": state.get("task_reviews") or {},
         "scenes": scenes,
         "scene_of": owner,

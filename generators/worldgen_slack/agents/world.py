@@ -1,4 +1,4 @@
-"""The world author (v7): the memory code renders from the world before every turn, the author's tools over the world
+"""The world author: the memory code renders from the world before every turn, the author's tools over the world
 file, its task and its turns. The author writes the world in time order through these tools; code is the only
 writer, owns every time, and checks every write."""
 
@@ -36,7 +36,18 @@ from ..chronicle import (
 )
 from ..config import Config
 from ..contracts import Gaps, Part, Task, activity, channel_id, clock, user_id, window, world_meta
-from .synthesizer import GOLD_SQL
+
+GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor sees it: channels, members, messages,
+  message_mentions, reactions and thread_stats hold only what the actor can read; users, calendar, storylines, facts,
+  fact_relations and evidence are whole. local(us) writes a time on the actor's clock, local(us, zone) on another.
+  It returns the answer in a column named answer, and may name the evidence in message_id and user_id columns.
+- What the gold query reads follows the category's gold in `taxonomy`: a sql query reads only the workspace, a
+  ledger query reads the facts it answers from, a hybrid query reads both.
+- The gold query finds messages by what the question names (words, people, channels, threads, reactions, times),
+  never by a message id or by id order: code checks that it answers the same with the messages renumbered.
+- answer_type: text or number is one row; set is 1 to max_answer_rows rows; refusal is no rows as the actor.
+- question is what actor_id asks, in `language`; it does not contain its answer.
+"""
 
 AUTHOR_GUIDE = (
     """You write one company's Slack workspace, as its people live it, in time order: first the company and its
@@ -346,8 +357,7 @@ def task_page(world, task: dict) -> str:
     out = [
         f"- [[{task['id']}]] {task['category']} level {task['level']} ({task['concept']}), asked by [[{task['actor_id']}]]: "
         f"{task['question']}",
-        f"  gold {task['gold_json']}; solve rate {task['solve_rate']}, fewest calls {task['min_calls']}, "
-        f"search rank {task['bm25_rank']}",
+        f"  gold {task['gold_json']}; solve rate {task['solve_rate']}, fewest calls {task['min_calls']}",
     ]
     return "\n".join(out)
 

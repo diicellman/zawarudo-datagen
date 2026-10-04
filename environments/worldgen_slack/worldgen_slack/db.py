@@ -308,19 +308,6 @@ class World:
         out.execute("VACUUM")
         out.close()
 
-    def clear_scene(self, scene_id: str) -> None:
-        """Remove a scene and everything its messages carry, so a repair can write it again. Threads stay inside a
-        scene, so nothing outside it points at these messages."""
-        ids = [
-            r[0]
-            for r in self.db.execute("SELECT message_id FROM scene_messages WHERE scene_id = ?", (scene_id,))
-        ]
-        marks = ", ".join("?" * len(ids))
-        for table in ("evidence", "message_mentions", "reactions", "scene_messages"):
-            self.db.execute(f"DELETE FROM {table} WHERE message_id IN ({marks})", ids)
-        self.db.execute(f"DELETE FROM messages WHERE id IN ({marks})", ids)
-        self.db.execute("DELETE FROM scenes WHERE id = ?", (scene_id,))
-
     # ------------------------------------------------------------------ gold answers
     def gold(self, actor: str, sql: str, max_rows: int = 100, seconds: float = 2.0) -> dict:
         """Run a task's gold query exactly as `actor` sees the world: one read-only SELECT over the shadow views,

@@ -10,7 +10,7 @@ from collections import Counter, defaultdict
 from itertools import combinations
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Literal, Self, get_args
+from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
@@ -204,7 +204,7 @@ def channel_id(kind: str, name: str | None, members: list[str]) -> str:
 Clock = Annotated[str, Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]
 Zone = Annotated[str, AfterValidator(zone)]
 Part = Literal["early", "morning", "afternoon", "evening", "night"]
-# A part of the day on the company clock: [start hour, end hour). Quoted in the builder's guide in these words.
+# A part of the day on the company clock: [start hour, end hour).
 PARTS = {"early": (6, 9), "morning": (9, 12), "afternoon": (12, 17), "evening": (17, 21), "night": (21, 24)}
 
 
@@ -217,13 +217,7 @@ def listed(value):
     return value
 
 
-def noted(value):
-    """Notes are strings; models often write a note as an object such as {who, what, by}."""
-    return [", ".join(str(v) for v in n.values()) if isinstance(n, dict) else n for n in listed(value)]
-
-
 Ids = Annotated[list[SafeId], BeforeValidator(listed)]
-Notes = Annotated[list[NonEmptyText], BeforeValidator(noted)]
 
 
 class Moment(StrictModel):
@@ -265,35 +259,6 @@ class Storyline(StrictModel):
     summary: NonEmptyText
 
 
-class Place(StrictModel):
-    channel_id: SafeId
-    author_id: SafeId
-    probability: float = Field(gt=0, le=1)
-
-
-class Fact(StrictModel):
-    id: SafeId
-    storyline: SafeId
-    subject: NonEmptyText
-    attribute: NonEmptyText
-    value: NonEmptyText
-    anchor: str | None = None
-    places: list[Place] = Field(min_length=1, max_length=3)
-    day: int = Field(ge=1)
-    after: Ids = Field(default_factory=list)
-    supersedes: SafeId | None = None
-    happened_at: Moment | None = None
-    scheduled_for: Moment | None = None
-    decoy: bool = False
-    summary: NonEmptyText
-
-    @model_validator(mode="after")
-    def one_moment(self) -> Self:
-        if self.happened_at and self.scheduled_for:
-            raise ValueError(f"{self.id}: a fact has happened_at or scheduled_for, not both")
-        return self
-
-
 class Task(StrictModel):
     id: SafeId
     category: NonEmptyText
@@ -306,37 +271,17 @@ class Task(StrictModel):
     probability: float = Field(default=1.0, gt=0, le=1)
 
 
-class Ledger(StrictModel):
-    storylines: list[Storyline] = Field(min_length=1)
-    channels: list[Channel] = Field(default_factory=list)
-    facts: list[Fact] = Field(min_length=1)
-    tasks: list[Task] = Field(default_factory=list)
-
-
-class TaskSet(StrictModel):
-    tasks: list[Task] = Field(default_factory=list)
-
-
-class Beat(StrictModel):
-    fact: SafeId
-    author_id: SafeId
-
-
 class Scene(StrictModel):
+    """An everyday conversation code draws for the author's agenda: where, who, which part of which day, what kind,
+    about how many lines."""
+
     id: SafeId
     channel_id: SafeId
     participants: Ids = Field(min_length=1)
     day: int = Field(ge=1)
     part: Part
-    during: SafeId | None = None
     situation: NonEmptyText
     length: int = Field(ge=1, le=60)
-    beats: list[Beat] = Field(default_factory=list)
-    revision_note: str = ""
-
-
-class ScenePlan(StrictModel):
-    scenes: list[Scene] = Field(min_length=1)
 
 
 class Reaction(StrictModel):
@@ -344,70 +289,10 @@ class Reaction(StrictModel):
     emoji: Annotated[str, Field(pattern=r"^[a-z0-9_+'-]{1,40}$")]
 
 
-class Line(StrictModel):
-    author_id: SafeId
-    text: NonEmptyText
-    reply_to: int | None = Field(default=None, ge=0)
-    conveys: Ids = Field(default_factory=list)
-    pause: Literal["", "hours"] = ""
-    reactions: list[Reaction] = Field(default_factory=list)
-
-
 SHORT, LONG = (
     4,
     20,
 )  # words: a short line has at most 4, a long one more than 20, as the typing profiles measure
-
-
-class Layout(StrictModel):
-    """Code's part of a scene, sampled from the activity targets and people's typing: its thread shape, how many
-    of its lines carry reactions, which other members may react, at least how many lines are short and at most how
-    many are long. "free" and no length budget leave those to the writer."""
-
-    shape: Literal["flat", "thread", "free"] = "free"
-    reactions: int = Field(default=0, ge=0)
-    audience: Ids = Field(default_factory=list)
-    short: int = Field(default=0, ge=0)
-    long: int | None = Field(default=None, ge=0)
-
-
-def layout(world, scene: "Scene", activity, rng: random.Random, typing: dict | None = None) -> Layout:
-    """A scene's layout from the targets: a thread with the chance that makes replies `reply_share` of messages,
-    each line reacted to at `reaction_rate`, up to five other members of the conversation as its audience, and, when
-    every participant has a typing profile, a length budget: each line's author drawn among the participants and its
-    length from that author's short and long shares, counted."""
-    kind = world.db.execute("SELECT type FROM channels WHERE id = ?", (scene.channel_id,)).fetchone()[0]
-    lines = scene.length
-    threaded = kind not in ("im", "mpim") and rng.random() < activity.reply_share * lines / max(lines - 1, 1)
-    others = [
-        r[0]
-        for r in world.db.execute(
-            "SELECT user_id FROM members WHERE channel_id = ? AND left_us IS NULL ORDER BY user_id",
-            (scene.channel_id,),
-        )
-        if r[0] not in scene.participants
-    ]
-
-    def band(t):
-        u = rng.random()
-        return "short" if u < t.short_share else "long" if u < t.short_share + t.long_share else "medium"
-
-    budget = {}
-    if typing and all(p in typing for p in scene.participants):
-        bands = Counter(band(typing[rng.choice(scene.participants)]) for _ in range(lines))
-        budget = {"short": bands["short"], "long": bands["long"]}
-    return Layout(
-        shape="thread" if threaded else "flat",
-        reactions=sum(rng.random() < activity.reaction_rate for _ in range(lines)),
-        audience=rng.sample(others, min(5, len(others))),
-        **budget,
-    )
-
-
-class WrittenScene(StrictModel):
-    lines: list[Line] = Field(min_length=1)
-    introduces: Notes = Field(default_factory=list)
-    promises: Notes = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------- time: code owns every timestamp
@@ -842,130 +727,6 @@ def task_row(task: Task, settings) -> dict:
     }
 
 
-def record_ledger(world, ledger: Ledger, settings, cells: list[tuple[str, int]]) -> None:
-    """S2: storylines, any added channels, facts placed on the organization, and the ledger categories' tasks."""
-    storylines = -(-settings.tasks.count // settings.tasks.per_storyline)
-    if len(ledger.storylines) != storylines:
-        raise ValueError(f"plan exactly {storylines} storylines")
-    facts = {f.id: f for f in ledger.facts}
-    check_facts(ledger.facts, {s.id for s in ledger.storylines})
-    position = {s.id: i for i, s in enumerate(ledger.storylines)}
-    for fact in ledger.facts:
-        for earlier in [*fact.after, *([fact.supersedes] if fact.supersedes else [])]:
-            if position[facts[earlier].storyline] > position[fact.storyline]:
-                raise ValueError(
-                    f"{fact.id} comes after {earlier}, whose storyline is built later; list storylines in build order"
-                )
-    start = world.db.execute("SELECT start_us FROM calendar WHERE day = 1").fetchone()[0]
-    with world.batch():
-        rows, members = channel_rows(world, ledger.channels, start - 30 * DAY)
-        world.insert("channels", rows)
-        world.insert("members", members)
-        world.insert(
-            "storylines", [s.model_dump() | {"position": i} for i, s in enumerate(ledger.storylines, 1)]
-        )
-        placed = place_facts(world, ledger, settings)
-        world.insert(
-            "facts",
-            [
-                f.model_dump(include={"id", "storyline", "subject", "attribute", "value", "anchor"})
-                | dict(channel_id=placed[f.id].channel_id, author_id=placed[f.id].author_id, day=f.day)
-                | dict(is_decoy=int(f.decoy), summary=f.summary)
-                | moment_columns(world, f)
-                for f in ledger.facts
-            ],
-        )
-        world.insert(
-            "fact_relations",
-            [
-                dict(src_fact=f.id, dst_fact=d, kind="after")
-                for f in ledger.facts
-                for d in dict.fromkeys(f.after)
-            ]
-            + [
-                dict(src_fact=f.id, dst_fact=f.supersedes, kind="supersedes")
-                for f in ledger.facts
-                if f.supersedes
-            ],
-        )
-    record_tasks(world, ledger.tasks, settings, cells)
-
-
-def check_facts(facts: list, storylines: set[str]) -> None:
-    """A ledger's facts: a value with no time in it, a known storyline, an anchor made of words of the value, and
-    relations to facts of the same ledger."""
-    known = {f.id for f in facts}
-    for fact in facts:
-        if TIME_LITERAL.search(fact.value):
-            raise ValueError(
-                f"{fact.id}: a value has no time or date in it; its moment is planned apart from it"
-            )
-        if fact.storyline not in storylines:
-            raise ValueError(f"{fact.id}: storyline {fact.storyline} is not in storylines")
-        if fact.anchor and f" {normalized(fact.anchor)} " not in f" {normalized(fact.value)} ":
-            raise ValueError(
-                f"{fact.id}: an anchor is words of its value; {fact.anchor!r} is not in {fact.value!r}"
-            )
-        if unknown := set(fact.after) - known | ({fact.supersedes} - known - {None}):
-            raise ValueError(
-                f"{fact.id}: after and supersedes name facts of this ledger; unknown {sorted(unknown)}"
-            )
-
-
-def place_facts(world, ledger: Ledger, settings) -> dict[str, Place]:
-    """Code places each fact, as it draws routine kinds: one of the fact's stated places, drawn by their probabilities
-    with the seed, among those whose author is a member of the channel and whose channel every actor of a task
-    resting on the fact can read. A task whose level has a spread gets its facts drawn into distinct channels;
-    `record_tasks` refuses the task when its places did not allow enough."""
-    members = {
-        (r[0], r[1])
-        for r in world.db.execute("SELECT channel_id, user_id FROM members WHERE left_us IS NULL")
-    }
-    actors = defaultdict(set)
-    for task in ledger.tasks:
-        for fact in task.facts:
-            actors[fact].add(task.actor_id)
-    spread = {
-        t.id: (need, t)
-        for t in ledger.tasks
-        if (spec := settings.taxonomy.get(t.category))
-        and spec.spread
-        and (need := spec.spread[t.level - 1]) > 1
-    }
-    rng, placed, errors = random.Random(digest([settings.seed, "places"])), {}, []
-    for fact in ledger.facts:
-        options = [
-            p
-            for p in fact.places
-            if (p.channel_id, p.author_id) in members
-            and all(readable(world, a, p.channel_id) for a in actors[fact.id])
-        ]
-        if not options:
-            errors.append(
-                f"{fact.id}: a place's author is a member of its channel, and every actor of a task resting on the "
-                "fact can read it; none of its places is"
-            )
-            continue
-        used = set()
-        for need, task in spread.values():
-            if fact.id in task.facts:
-                taken = {placed[f].channel_id for f in task.facts if f in placed}
-                if len(taken) < need and sum(f not in placed for f in task.facts) <= need - len(taken):
-                    used |= taken
-        fresh = [p for p in options if p.channel_id not in used] or options
-        placed[fact.id] = rng.choices(fresh, [p.probability for p in fresh])[0]
-    if errors:
-        raise ValueError("; ".join(errors))
-    return placed
-
-
-def moment_columns(world, fact: Fact) -> dict:
-    moment, kind = (fact.happened_at, "happened") if fact.happened_at else (fact.scheduled_for, "scheduled")
-    if moment is None:
-        return {}
-    return dict(moment_us=at(world, moment), moment_zone=moment.zone, moment_kind=kind)
-
-
 def readable(world, actor: str, channel: str) -> bool:
     return bool(
         world.db.execute(
@@ -974,161 +735,6 @@ def readable(world, actor: str, channel: str) -> bool:
             (channel, actor),
         ).fetchone()
     )
-
-
-class PlanError(ValueError):
-    """A defect of the scene plan found while writing a scene; its builder, not its writer, fixes it."""
-
-
-TIMING_RULES = ("stated_off_day", "before_it_happened", "future_message")
-PART_ORDER = list(PARTS)
-
-
-def check_plan(world, plan: ScenePlan, storyline: str, frozen: dict[str, Scene]) -> ScenePlan:
-    """Deterministic plan rules: placement on the organization, each fact first stated where, by whom and on the
-    day the ledger says, and in the order its relations require. `frozen` scenes are approved: kept unchanged
-    except their revision_note."""
-    scenes = {s.id: s for s in plan.scenes}
-    if len(scenes) != len(plan.scenes):
-        raise ValueError("scene ids are unique")
-    for old in frozen.values():
-        if old.id not in scenes or scenes[old.id].model_copy(update={"revision_note": ""}) != old.model_copy(
-            update={"revision_note": ""}
-        ):
-            raise ValueError(
-                f"{old.id} is approved: keep it unchanged; set its revision_note to revise its text"
-            )
-    facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
-    members = {
-        (r[0], r[1])
-        for r in world.db.execute("SELECT channel_id, user_id FROM members WHERE left_us IS NULL")
-    }
-    days = {r[0] for r in world.db.execute("SELECT day FROM calendar")}
-    first: dict[str, tuple] = {}
-    for position, scene in enumerate(plan.scenes):
-        if scene.day not in days:
-            raise ValueError(f"{scene.id}: day {scene.day} is outside the calendar")
-        if outside := [p for p in scene.participants if (scene.channel_id, p) not in members]:
-            raise ValueError(f"{scene.id}: participants are members of {scene.channel_id}; not {outside}")
-        if scene.during and (facts.get(scene.during) or {}).get("moment_us") is None:
-            raise ValueError(f"{scene.id}: during names a fact with happened_at or scheduled_for")
-        if scene.during:
-            start, end = world.db.execute(
-                "SELECT start_us, end_us FROM calendar WHERE day = ?", (scene.day,)
-            ).fetchone()
-            if not start <= facts[scene.during]["moment_us"] < end:
-                raise ValueError(f"{scene.id}: a scene during {scene.during} is on the day of its moment")
-        for beat in scene.beats:
-            fact = facts.get(beat.fact)
-            if fact is None or fact["storyline"] != storyline:
-                raise ValueError(
-                    f"{scene.id}: beats place facts of storyline {storyline}; {beat.fact} is not one"
-                )
-            if beat.author_id not in scene.participants:
-                raise ValueError(f"{scene.id}: the author of beat {beat.fact} is a participant")
-            key = (scene.day, PART_ORDER.index(scene.part), position)
-            if beat.fact not in first or key < first[beat.fact][0]:
-                first[beat.fact] = (key, scene, beat)
-    for fact_id, fact in facts.items():
-        if fact["storyline"] != storyline:
-            continue
-        if fact_id not in first:
-            raise ValueError(f"{fact_id} needs a beat")
-        (day, part, _), scene, beat = first[fact_id]
-        placed = (scene.channel_id, beat.author_id, scene.day)
-        if placed != (fact["channel_id"], fact["author_id"], fact["day"]):
-            raise ValueError(
-                f"{fact_id} is first stated in {fact['channel_id']} by {fact['author_id']} on day {fact['day']}; its "
-                f"first beat is in {placed[0]} by {placed[1]} on day {placed[2]}"
-            )
-        if fact["moment_kind"] == "happened" and scene.during != fact_id:
-            if window(world, scene.day, scene.part)[0] < fact["moment_us"]:
-                raise ValueError(
-                    f"{fact_id} happens at {clock(world, fact['moment_us'])}: state it in a later part, or during it"
-                )
-    for src, dst in world.db.execute(
-        "SELECT src_fact, dst_fact FROM fact_relations WHERE kind IN ('after', 'supersedes')"
-    ):
-        if src not in first:
-            continue
-        (day, part, _), scene, _ = first[src]
-        if dst in first:
-            (other_day, other_part, _), other, _ = first[dst]
-            if scene is not other and (day, part) <= (other_day, other_part):
-                raise ValueError(
-                    f"{src} comes after {dst}: state it in a later part or day, or in the same scene"
-                )
-        elif (
-            said := world.db.execute(
-                """SELECT MIN(m.ts_us) FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?""",
-                (dst,),
-            ).fetchone()[0]
-        ) and window(world, day, PART_ORDER[part])[0] <= said:
-            raise ValueError(
-                f"{src} comes after {dst}, which is already stated; state it in a later part or day"
-            )
-    return plan
-
-
-def placed_lines(world, scene: Scene, written: WrittenScene, rng: random.Random, gaps: Gaps) -> list[int]:
-    """Timestamps for a scene's lines: it starts in its part of its day (or at the moment it is during), after any
-    other scene of its channel it would interleave with; each line follows the last after a real reply gap."""
-    early, late = window(world, scene.day, scene.part)
-    if scene.during:
-        start = world.db.execute("SELECT moment_us FROM facts WHERE id = ?", (scene.during,)).fetchone()[0]
-    else:
-        start = early + int(rng.random() * (late - early) / 2)
-    while True:
-        stamps = [start]
-        for line in written.lines[1:]:
-            stamps.append(stamps[-1] + gaps.sample(rng, line.pause))
-        clash = world.db.execute(
-            "SELECT MAX(ts_us) FROM messages WHERE channel_id = ? AND ts_us BETWEEN ? AND ?",
-            (scene.channel_id, stamps[0] - 60_000_000, stamps[-1] + 60_000_000),
-        ).fetchone()[0]
-        if clash is None:
-            return stamps
-        start = clash + gaps.sample(rng, "")
-
-
-def check_lines(world, scene: Scene, written: WrittenScene, layout: Layout) -> None:
-    """The writer's contract: participants speak, replies point back and keep the layout's shape, the layout's
-    reactions come from its people, beats are conveyed by their authors, times appear only as {at:fact}, mentions
-    name people."""
-    errors = []
-    if layout.shape == "flat" and (
-        replies := [i for i, x in enumerate(written.lines) if x.reply_to is not None]
-    ):
-        errors.append(f"this conversation is flat: no line replies in a thread; lines {replies} set reply_to")
-    if layout.shape == "thread" and (
-        tops := [i for i, x in enumerate(written.lines[1:], 1) if x.reply_to is None]
-    ):
-        errors.append(
-            f"this conversation is one thread: every line after the first replies; lines {tops} do not"
-        )
-    want = min(layout.reactions, len(written.lines))
-    if (reacted := sum(bool(x.reactions) for x in written.lines)) != want:
-        errors.append(f"exactly {want} lines carry reactions; {reacted} do")
-    reactors = set(scene.participants) | set(layout.audience)
-    sizes = [len(line.text.split()) for line in written.lines]
-    if (short := sum(n <= SHORT for n in sizes)) < min(layout.short, len(sizes)):
-        errors.append(f"at least {layout.short} lines are short, at most {SHORT} words; {short} are")
-    if layout.long is not None and (long := sum(n > LONG for n in sizes)) > layout.long:
-        errors.append(f"at most {layout.long} lines are long, more than {LONG} words; {long} are")
-    for i, line in enumerate(written.lines):
-        if wrong := sorted({r.user_id for r in line.reactions} - (reactors - {line.author_id})):
-            errors.append(
-                f"line {i}: participants and the audience react, never the line's author; not {wrong}"
-            )
-    if outside := {line.author_id for line in written.lines} - set(scene.participants):
-        errors.append(f"authors are participants; not {sorted(outside)}")
-    moments = {r[0] for r in world.db.execute("SELECT id FROM facts WHERE moment_us IS NOT NULL")}
-    errors += text_errors(world, written.lines, {b.fact for b in scene.beats}, moments)
-    for beat in scene.beats:
-        if not any(beat.fact in line.conveys and line.author_id == beat.author_id for line in written.lines):
-            errors.append(f"{beat.author_id} states fact {beat.fact} in a line that conveys it")
-    if errors:
-        raise ValueError("; ".join(errors))
 
 
 def text_errors(world, lines, conveyable: set[str], moments: set[str]) -> list[str]:
@@ -1158,64 +764,6 @@ def text_errors(world, lines, conveyable: set[str], moments: set[str]) -> list[s
         if strangers := set(MENTION.findall(line.text)) - people:
             errors.append(f"line {i}: <@...> names a person's user_id; not {sorted(strangers)}")
     return errors
-
-
-def unplanned(world, written: WrittenScene) -> None:
-    """A background conversation adds no evidence: it names no {at:} moment and states no planned fact's value or
-    anchor, so no task gains a second answer."""
-    facts = world.db.execute("SELECT subject, attribute, value, anchor FROM facts").fetchall()
-    errors = []
-    for i, line in enumerate(written.lines):
-        said = f" {normalized(line.text)} "
-        if PLACEHOLDER.search(line.text):
-            errors.append(f"line {i}: a background conversation names no {{at:...}} moment")
-        for fact in facts:
-            words_ = [normalized(t) for t in (fact["value"], fact["anchor"]) if t and normalized(t)]
-            if hit := next((w for w in words_ if f" {w} " in said), None):
-                errors.append(
-                    f"line {i}: a background conversation states no planned fact; "
-                    f"{hit!r} is {fact['subject']}'s {fact['attribute']}"
-                )
-    if errors:
-        raise ValueError("; ".join(errors))
-
-
-def write_scene(
-    world, storyline: str | None, scene: Scene, written: WrittenScene, key: str, rng, gaps: Gaps, layout=None
-) -> None:
-    """Insert a written scene: rendered text, code timestamps, evidence, mentions and reactions. Rule failures
-    about timing are the plan's (PlanError); the rest are the writer's (ValueError)."""
-    layout = layout or Layout()
-    check_lines(world, scene, written, layout)
-    if storyline is None:
-        unplanned(world, written)
-    stamps = placed_lines(world, scene, written, rng, gaps)
-    facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
-    # The ledger's placement makes the anchor: its channel and day, the first line of its author conveying it.
-    first = {
-        f
-        for f, fact in facts.items()
-        if (fact["channel_id"], fact["day"]) == (scene.channel_id, scene.day)
-        and any(f == b.fact and b.author_id == fact["author_id"] for b in scene.beats)
-    }
-    row = dict(
-        id=scene.id, channel_id=scene.channel_id, storyline=storyline, day=scene.day, part=scene.part
-    ) | dict(slot_start_us=stamps[0], slot_end_us=stamps[-1] + 1, situation=scene.situation, key=key)
-    plan = (
-        scene.model_dump()
-        | {"layout": layout.model_dump()}
-        | written.model_dump(include={"introduces", "promises"})
-    )
-    moments = {f: fact["moment_us"] for f, fact in facts.items()}
-    try:
-        with world.batch():
-            insert_lines(
-                world, row | {"plan_json": json.dumps(plan)}, written.lines, stamps, moments, first, rng, gaps
-            )
-    except ValueError as error:
-        if any(str(error).startswith(rule) or f"; {rule}" in str(error) for rule in TIMING_RULES):
-            raise PlanError(f"scene {scene.id}: {error}") from None
-        raise
 
 
 def insert_lines(
@@ -1334,8 +882,7 @@ def style(world) -> dict:
 
 
 class Issue(StrictModel):
-    """A defect a judge reports. Its artifact decides who repairs it: the ledger and tasks are the synthesizer's,
-    the workspace (messages) the builder's."""
+    """A defect a judge reports, on the ledger, a task or the workspace (messages); the author repairs it."""
 
     artifact: Literal["ledger", "tasks", "workspace"]
     task_ids: Ids = Field(default_factory=list)
@@ -1362,9 +909,6 @@ PHASE_CRITERIA = {
     "world": ("scenario_alignment", "world_coherence", "professional_realism"),
 }
 QUALITY_CRITERIA = tuple(name for names in PHASE_CRITERIA.values() for name in names)
-# The artifacts a review can route a repair to. Before the build, no message exists to repair.
-ARTIFACTS = get_args(Issue.model_fields["artifact"].annotation)
-PHASE_ARTIFACTS = {"ledger": ("ledger", "tasks")}
 
 
 class Verdict(StrictModel):
@@ -1395,7 +939,6 @@ def verdict_schema(phase: str, task_ids: list[str]) -> dict:
     schema["properties"]["tasks"] |= {"minItems": len(task_ids), "maxItems": len(task_ids)}
     if task_ids:
         schema["$defs"]["TaskReview"]["properties"]["task_id"]["enum"] = task_ids
-    schema["$defs"]["Issue"]["properties"]["artifact"]["enum"] = list(PHASE_ARTIFACTS.get(phase, ARTIFACTS))
     names = PHASE_CRITERIA.get(phase, ())
     schema["properties"]["criteria"] = {
         "type": "object",
@@ -1425,9 +968,6 @@ def validate_verdict(verdict: Verdict, payload: dict) -> None:
         raise ValueError("judge must review every requested task exactly once")
     if payload["phase"] == "task" and any(r.level_fit is None for r in verdict.tasks):
         raise ValueError("a task review scores each task's level_fit from 0 to 4")
-    allowed = PHASE_ARTIFACTS.get(payload["phase"], ARTIFACTS)
-    if any(i.artifact not in allowed for i in verdict.issues):
-        raise ValueError(f"a {payload['phase']} review reports issues on {' or '.join(allowed)} only")
 
 
 def deciding(verdict: Verdict, acceptance) -> list[Issue]:

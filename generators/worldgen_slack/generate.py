@@ -50,7 +50,7 @@ async def run(config: Config) -> dict:
     store = Store(config.output, provenance(config, seeds))
     try:
         if store.state.phase != "done":
-            env = GenerationEnv(config, store, seeds)
+            env = GenerationEnv(config, store)
             context = ModelContext(
                 model=config.env.solver.model, client=EvalClientConfig(), sampling=vf.Sampling()
             )
@@ -91,9 +91,8 @@ def main() -> int:
             "config": config.model_dump(mode="json"),
             "quota": quota(config.taxonomy, config.tasks.styles, config.seed, config.tasks.count),
         }
-        if config.author.enabled:  # the world author's days: each date's messages and their parts
-            dates = [d["date"] for d in calendar(config.seed, config.calendar, "UTC")]
-            plan["daily"] = dict(zip(dates, daily(dates, config)))
+        dates = [d["date"] for d in calendar(config.seed, config.calendar, "UTC")]
+        plan["daily"] = dict(zip(dates, daily(dates, config)))  # each date's messages and their parts
         print(json.dumps(plan, indent=1))
         return 0
     result = asyncio.run(run(config))

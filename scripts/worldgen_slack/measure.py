@@ -1,16 +1,17 @@
 """How generated worlds type and what they cost, against real Slack users: style overall and per author (each
 author beside the real typing profile it was given), the task mix, solve rates and spend.
 
-uv run --frozen python scripts/worldgen_slack/measure.py data/v6-01/software [more runs]
+uv run --frozen python scripts/worldgen_slack/measure.py data/v7-01/software [more runs]
 """
 
 import argparse
 import json
 import statistics
 from pathlib import Path
+from types import SimpleNamespace
 
 from generators.worldgen_slack.chronicle import bounds, posted, quotas
-from generators.worldgen_slack.config import ROOT, ActivityConfig, Config
+from generators.worldgen_slack.config import ROOT, ActivityConfig, AuthorSettings
 from generators.worldgen_slack.contracts import SeedPersona, activity, normalized, style, user_id
 from worldgen_slack.db import World
 
@@ -43,8 +44,13 @@ def scorecard(world: World, targets: ActivityConfig) -> dict:
     )
 
 
-def author(run: Path, world: World, settings: Config) -> dict | None:
-    """A v7 world, as its author wrote it: each day against its quota, the ledger and its events, promises, the
+def known(model, section: dict):
+    """A settings section of a run, read with today's model: keys it no longer has are left out."""
+    return model.model_validate({k: v for k, v in section.items() if k in model.model_fields})
+
+
+def author(run: Path, world: World, settings) -> dict | None:
+    """A world, as its author wrote it: each day against its quota, the ledger and its events, promises, the
     author's turns and tool calls, the solver's probes, the reviews, and how often a ledger task's answer sits in one
     message."""
     if not world.db.execute("SELECT 1 FROM world_meta WHERE key = 'chronological'").fetchone():
@@ -124,12 +130,9 @@ def measure(run: Path) -> dict:
         if author in cast
     }  # fmt: skip
     config = json.loads((run / "run.json").read_text())["config"]
-    targets = ActivityConfig.model_validate(config.get("activity", {}))
-    written = (
-        author(run, World(run / "world.sqlite"), Config.model_validate(config))
-        if "author" in config
-        else None
-    )
+    targets = known(ActivityConfig, config.get("activity", {}))
+    settings = SimpleNamespace(activity=targets, author=known(AuthorSettings, config.get("author", {})))
+    written = author(run, World(run / "world.sqlite"), settings)
     return {
         "run": str(run),
         "author": written,

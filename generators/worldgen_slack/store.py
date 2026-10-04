@@ -43,26 +43,20 @@ def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
 
 
 class RunState(StrictModel):
-    phase: Literal[
-        "premise", "organization", "ledger", "build", "background", "plan", "day", "tasks", "final", "done"
-    ] = "premise"
+    phase: Literal["premise", "organization", "plan", "day", "tasks", "final", "done"] = "premise"
     premise: Premise | None = None
     cast: list[SeedPersona] = Field(default_factory=list)
     quota: list[Cell] = Field(default_factory=list)
     organization: list[str] = Field(default_factory=list)  # the channels the organization made
-    drafts: dict[str, dict] = Field(default_factory=dict)  # each phase's last document, for its repair
-    plans: dict[str, dict] = Field(default_factory=dict)  # storyline (or "background") → its scene plan
-    notes: dict[str, str] = Field(default_factory=dict)  # scene → what a review asks to change in its text
-    built: list[str] = Field(default_factory=list)  # approved storylines, in build order
-    frozen: dict[str, str] = Field(default_factory=dict)  # approved scene → the key it was written from
+    drafts: dict[str, dict] = Field(default_factory=dict)  # each setup phase's last document
+    plans: dict[str, dict] = Field(default_factory=dict)  # "agenda": the everyday conversations code drew
     task_reviews: dict[str, dict] = Field(default_factory=dict)
     rounds: dict[str, int] = Field(default_factory=dict)
-    refunded: dict[str, int] = Field(default_factory=dict)  # rounds a cleared world gave back, per budget
     reviews: dict[str, dict] = Field(default_factory=dict)
     feedback: str = ""
     active_attempt: str | None = None
     last_verdict: Verdict | None = None
-    # The world author (v7): the day being written, the attempt whose world and notes it starts from, a review's
+    # The world author: the day being written, the attempt whose world and notes it starts from, a review's
     # issues waiting for the author's next turn, and the solver runs spent on probing tasks.
     day: int = 0
     restore_point: str = ""
@@ -116,7 +110,7 @@ class Store:
 
     def reserve(self, key, maximum):
         used = self.state.rounds.get(key, 0)
-        if used - self.state.refunded.get(key, 0) >= maximum:
+        if used >= maximum:
             raise ReviewLimit(f"review limit exhausted for {key}: {used}/{maximum}")
         self.state.rounds[key] = used + 1
         attempt = f"{key.replace(':', '-')}-{used + 1:02d}"
@@ -207,7 +201,6 @@ class Store:
             "phase": self.state.phase,
             "day": self.state.day,
             "rounds": self.state.rounds,
-            "built": self.state.built,
             "final_approved": "final" in self.state.reviews,
             "tasks": count("SELECT COUNT(*) FROM tasks"),
             "messages": count("SELECT COUNT(*) FROM messages"),
