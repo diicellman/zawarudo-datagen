@@ -55,58 +55,40 @@ from .contracts import (
     DAY,
     PHASE_CRITERIA,
     TIME_LITERAL,
-    Beat,
     Channel,
-    Fact,
     Gaps,
     Issue,
-    Ledger,
-    Line,
     Moment,
     Organization,
     Person,
-    Layout,
-    PlanError,
-    Place,
-    placed_lines,
     Reaction,
     Routine,
     Premise,
     Premises,
-    Scene,
-    ScenePlan,
     SeedPersona,
     Storyline,
     Task,
     TaskReview,
-    TaskSet,
     Typing,
     Verdict,
-    WrittenScene,
     accepted_task,
     at,
     background_plan,
     channel_id,
-    check_lines,
-    check_plan,
     check_task,
     deciding,
     direct_messages,
-    layout,
     measures,
     organize,
     pick_cast,
     quota,
-    record_ledger,
     record_tasks,
     render,
-    unplanned,
     user_id,
     validate_verdict,
     verdict_schema,
     window,
     world_meta,
-    write_scene,
 )
 
 
@@ -549,24 +531,7 @@ def check_tasks(root):
 
     scoped = World(world.path, actor="U2")
     assert scoped.rank("rollback release", [1]) == 1 and scoped.rank("zebra", [1]) is None
-    try:
-        with world.trial() as copy:
-            copy.clear_scene("s1")
-            assert copy.db.execute("SELECT COUNT(*) FROM messages WHERE id IN (1, 2, 6)").fetchone()[0] == 0
-            raise ValueError("drop the trial")
-    except ValueError:
-        pass
-    assert world.db.execute("SELECT COUNT(*) FROM messages WHERE id IN (1, 2)").fetchone()[0] == 2
-    with world.trial() as copy:
-        copy.clear_scene("s1")
-    assert world.db.execute("SELECT COUNT(*) FROM messages WHERE id IN (1, 2)").fetchone()[0] == 0
-    assert world.db.execute("SELECT COUNT(*) FROM scenes").fetchone()[0] == 0
-    assert [name for name, _ in world.checks(complete=True)] == ["unstated_fact"], (
-        "the cleared anchor is missed"
-    )
-    print(
-        "PASS tasks: gold as its actor, reads only, readable evidence, time limit, rank, trial, scene replace"
-    )
+    print("PASS tasks: gold as its actor, reads only, readable evidence, time limit, rank, trial")
 
 
 def seed_person(i, zone="America/Chicago"):
@@ -601,9 +566,26 @@ def contracts_settings(root):
     )
 
 
+def ledger_plan(ops, leads, a, b, **changes):
+    """Two storylines on an organized world: a rollback decided on day 1 (f1), service back at e2 on day 2 (f2), and
+    an audit's dry run and owner at e1 on day 3 (f3, f4)."""
+    events = [
+        Event(id="e1", storyline="s2", title="release window", day=3, time="10:00"),
+        Event(id="e2", storyline="s1", title="service restored", day=2, time="14:00"),
+    ]
+    facts = [
+        PlanFact(id="f1", storyline="s1", subject="Release 4.2", attribute="decision", value="rollback", anchor="rollback", channel_id=ops, author_id=a, day=1, summary="s"),
+        PlanFact(id="f2", storyline="s1", subject="Release 4.2", attribute="state", value="service back", channel_id=ops, author_id=b, day=2, after=["f1"], event="e2", kind="happened", summary="s"),
+        PlanFact(id="f3", storyline="s2", subject="Audit", attribute="window", value="dry run", anchor="dry run", channel_id=leads, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
+        PlanFact(id="f4", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=ops, author_id=a, day=3, after=["f3"], event="e1", kind="scheduled", summary="s"),
+    ]  # fmt: skip
+    document = dict(storylines=[Storyline(id="s1", summary="the 4.2 release"), Storyline(id="s2", summary="the audit")], events=events, facts=facts)  # fmt: skip
+    return Plan(**document | changes)
+
+
 def check_contracts(root):
-    """Documents become rows only through deterministic rules: the organization, the ledger and its tasks (T2-T6),
-    the scene plan, the written scene; time is code's (calendar, parts, gaps, {at:} rendering, no literal times)."""
+    """Documents become rows only through deterministic rules: the cast, the premise, the organization, the tasks
+    on a planned ledger (T2-T7), the agenda of everyday conversations; no literal times."""
     root.mkdir(parents=True)
     settings = contracts_settings(root)
     styles = settings.tasks.styles
@@ -704,33 +686,12 @@ def check_contracts(root):
         and world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0] == 10
     )
     ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
-
-    def fact(id, storyline, author, day, channel=ops, value=None, places=None, **extra):
-        places = places or [Place(channel_id=channel, author_id=author, probability=1.0)]
-        return Fact(id=id, storyline=storyline, subject=id, attribute="state", value=value or f"v-{id}", places=places, day=day, summary="s", **extra)  # fmt: skip
+    with world.trial() as copy:  # the ledger as the author plans it; tasks read its facts, not its messages
+        start_clock(copy)
+        record_plan(copy, ledger_plan(ops, leads, a, b), settings)
 
     def cell(category, level):
         return (category, level, "a concept", "a style")
-
-    def ledger(facts=None, tasks=None, storylines=("s1", "s2")):
-        return Ledger(
-            storylines=[Storyline(id=s, summary=s) for s in storylines],
-            facts=facts
-            or [
-                fact("f1", "s1", a, 1, anchor="rollback", value="rollback"),
-                fact(
-                    "f2",
-                    "s1",
-                    b,
-                    2,
-                    after=["f1"],
-                    happened_at=Moment(day=2, time="14:00", zone="America/Chicago"),
-                ),
-                fact("f3", "s2", a, 3, channel=leads),
-                fact("f4", "s1", a, 1, after=["f1"]),
-            ],
-            tasks=tasks if tasks is not None else [search],
-        )
 
     def task(
         id="t1",
@@ -741,81 +702,57 @@ def check_contracts(root):
     ):
         return Task(id=id, category=category, level=1, actor_id=c, question="Which way did the release go?", answer_type="text", gold_sql=sql, facts=list(facts)) .model_copy(update=extra)  # fmt: skip
 
+    def picked(candidates, cells_, seed=3):
+        """The tasks recorded from these candidates, on a dropped trial."""
+        try:
+            with world.trial() as copy:
+                record_tasks(copy, candidates, settings.model_copy(update={"seed": seed}), cells_)
+                raise LookupError([r[0] for r in copy.db.execute("SELECT id FROM tasks ORDER BY id")])
+        except LookupError as out:
+            return out.args[0]
+
     search = task()
     found = [cell("search", 1)]
     rejected = {
-        "storylines": (ledger(storylines=("s1", "s2", "s3")), found),
-        "author not a member": (ledger(facts=[fact("f1", "s1", c, 1, channel=leads)], tasks=[]), []),
-        "after a later storyline": (
-            ledger(facts=[fact("f1", "s1", a, 1, after=["f3"]), fact("f3", "s2", a, 3)]),
-            found,
-        ),
-        "T6 cells": (ledger(), [cell("search", 2)]),
-        "T2 sql reads facts": (ledger(tasks=[task(category="lookup")]), [cell("lookup", 1)]),
-        "T2 ledger reads no facts": (
-            ledger(tasks=[task(sql="SELECT real_name AS answer FROM users LIMIT 1")]),
-            found,
-        ),
-        "T2 hybrid reads no workspace": (ledger(tasks=[task(category="hybrid")]), [cell("hybrid", 1)]),
-        "T4 no facts": (ledger(tasks=[task(facts=())]), found),
+        "T6 cells": ([search], [cell("search", 2)]),
+        "T2 sql reads facts": ([task(category="lookup")], [cell("lookup", 1)]),
+        "T2 ledger reads no facts": ([task(sql="SELECT real_name AS answer FROM users LIMIT 1")], found),
+        "T2 hybrid reads no workspace": ([task(category="hybrid")], [cell("hybrid", 1)]),
+        "T4 no facts": ([task(facts=())], found),
         "T3 refusal with rows": (
-            ledger(
-                tasks=[task(category="robustness", answer_type="refusal", sql="SELECT 1 AS answer", facts=())]
-            ),
+            [task(category="robustness", answer_type="refusal", sql="SELECT 1 AS answer", facts=())],
             [cell("robustness", 1)],
         ),
-        "T3 too many rows": (
-            ledger(tasks=[task(answer_type="set", sql="SELECT value AS answer FROM facts")]),
-            found,
-        ),
-        "T3 text answer of 2 rows": (
-            ledger(tasks=[task(sql="SELECT value AS answer FROM facts LIMIT 2")]),
-            found,
-        ),
-        "T3 no answer column": (ledger(tasks=[task(sql="SELECT value FROM facts WHERE id = 'f1'")]), found),
-        "T5 giveaway": (ledger(tasks=[task(question="Was it a rollback for the release?")]), found),
-        "anchor not in the value": (
-            ledger(facts=[fact("f1", "s1", a, 1, anchor="Release 4.2")], tasks=[]),
-            [],
-        ),
+        "T3 too many rows": ([task(answer_type="set", sql="SELECT value AS answer FROM facts")], found),
+        "T3 text answer of 2 rows": ([task(sql="SELECT value AS answer FROM facts LIMIT 2")], found),
+        "T3 no answer column": ([task(sql="SELECT value FROM facts WHERE id = 'f1'")], found),
+        "T5 giveaway": ([task(question="Was it a rollback for the release?")], found),
         "T6 four candidates": (
-            ledger(tasks=[task(id=f"t{i}", question=f"Which way did release {i} go?") for i in range(4)]),
+            [task(id=f"t{i}", question=f"Which way did release {i} go?") for i in range(4)],
             found,
         ),  # fmt: skip
-        "T6 candidate ids": (ledger(tasks=[task(), task(question="Where did the release go?")]), found),
+        "T6 candidate ids": ([task(), task(question="Where did the release go?")], found),
         "unreadable fact": (
-            ledger(tasks=[task(sql="SELECT value AS answer FROM facts WHERE id = 'f3'", facts=("f3",))]),
+            [task(sql="SELECT value AS answer FROM facts WHERE id = 'f3'", facts=("f3",))],
             found,
-        ),
+        ),  # fmt: skip
     }
-    for name, (bad, cells_) in rejected.items():
+    for name, (candidates, cells_) in rejected.items():
         try:
-            with world.trial() as copy:
-                record_ledger(copy, bad, settings, cells_)
-            raise AssertionError(f"ledger accepted: {name}")
+            picked(candidates, cells_)
+            raise AssertionError(f"tasks accepted: {name}")
         except ValueError:
             pass
-    assert world.db.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
     invalid = task(id="bad", sql="SELECT value FROM facts WHERE id = 'f1'")  # no answer column
     rare = task(id="rare", question="Where did the release go?", probability=0.05)
-    for candidates, picked, least in (
+    for candidates, kept, least in (
         ([invalid, task(id="good", question="Where did the release go?")], "good", 20),
         ([task(id="usual", probability=1.0), rare], "rare", 16),
-    ):
-        chosen = []
-        for seed in range(20):  # the run seed picks: only valid candidates, mostly the less likely
-            try:
-                with world.trial() as copy:
-                    record_ledger(
-                        copy, ledger(tasks=candidates), settings.model_copy(update={"seed": seed}), found
-                    )
-                    chosen += [r[0] for r in copy.db.execute("SELECT id FROM tasks")]
-                    raise LookupError("drop the trial")
-            except LookupError:
-                pass
-        assert chosen.count(picked) >= least, (picked, chosen)
+    ):  # the run seed picks: only valid candidates, mostly the less likely
+        chosen = [t for seed in range(20) for t in picked(candidates, found, seed)]
+        assert chosen.count(kept) >= least, (kept, chosen)
     with world.trial() as copy:
-        record_ledger(copy, ledger(), settings, [cell("search", 1)])
+        record_tasks(copy, [search], settings, found)
     assert json.loads(world.db.execute("SELECT gold_json FROM tasks").fetchone()[0]) == [
         {"answer": "rollback"}
     ]
@@ -828,223 +765,16 @@ def check_contracts(root):
         return Task(id="t9", category="semantic", level=3, actor_id=a, question="What did the review settle?", answer_type="text", gold_sql=sql, facts=facts)  # fmt: skip
 
     fails(record_tasks, world, [settled(["f1", "f4"])], settings, [cell("semantic", 3)])  # both in #ops
-    try:
-        with world.trial() as copy:
-            record_tasks(copy, [settled(["f1", "f3"])], settings, [cell("semantic", 3)])  # #ops and #leads
-            raise LookupError("drop the trial")
-    except LookupError:
-        pass
-    here, there = Place(channel_id=ops, author_id=a, probability=0.5), Place(channel_id=leads, author_id=a, probability=0.5)  # fmt: skip
-    outsider = Place(channel_id=leads, author_id=c, probability=1.0)
-
-    def placed(facts, tasks=(), cells=(), seed=3):
-        """Where code places each fact, on a dropped trial."""
-        try:
-            with world.trial() as copy:
-                copy.db.execute("DELETE FROM task_facts")
-                copy.db.execute("DELETE FROM tasks")
-                for table in ("fact_relations", "facts", "storylines"):
-                    copy.db.execute(f"DELETE FROM {table}")
-                record_ledger(copy, ledger(facts=facts, tasks=list(tasks)), settings.model_copy(update={"seed": seed}), list(cells))  # fmt: skip
-                where = {f: ch for f, ch in copy.db.execute("SELECT id, channel_id FROM facts")}
-                raise LookupError(where)
-        except LookupError as out:
-            return out.args[0]
-
-    assert placed([fact("f1", "s1", a, 1, places=[outsider, here])]) == {"f1": ops}, (
-        "a place's author is a member"
-    )
-    spread_out = {placed([fact("f1", "s1", a, 1, places=[here, there])], seed=s)["f1"] for s in range(20)}
-    assert spread_out == {ops, leads}, "the seed draws among valid places"
-    reader = task(facts=("f1",))  # its actor c reads ops, not leads
-    likely = Place(channel_id=leads, author_id=a, probability=1.0)
-    unlikely = Place(channel_id=ops, author_id=a, probability=0.01)
-    assert placed([fact("f1", "s1", a, 1, places=[likely, unlikely])], [reader], found) == {"f1": ops}, "the actor reads it"  # fmt: skip
-    hard = Task(id="t3", category="semantic", level=3, actor_id=a, question="What was finally settled?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f2'", facts=["f1", "f2"])  # fmt: skip
-    pair = [fact("f1", "s1", a, 1, places=[here, there]), fact("f2", "s1", a, 2, places=[here, there], supersedes="f1")]  # fmt: skip
-    assert all(
-        len(set(placed(pair, [hard], [cell("semantic", 3)], seed=s).values())) == 2 for s in range(10)
-    ), "spread"
-    stuck = [fact("f1", "s1", a, 1, places=[here]), fact("f2", "s1", a, 2, places=[here], supersedes="f1")]
-    try:
-        placed(stuck, [hard], [cell("semantic", 3)])
-        raise AssertionError("a level-3 task's facts were left in one channel")
-    except ValueError as error:
-        assert "at least 2 channels" in str(error), error
-
-    def scene(id, day, part, beats, participants=(a, b, c), channel=ops, **extra):
-        return Scene(id=id, channel_id=channel, participants=list(participants), day=day, part=part, situation="work", length=3, beats=[Beat(fact=f, author_id=u) for f, u in beats], **extra)  # fmt: skip
-
-    first = scene("sc1", 1, "morning", [("f1", a), ("f4", a)])
-    second = scene("sc2", 2, "afternoon", [("f2", b)], during="f2")
-    for bad in (
-        [first, scene("sc2", 2, "afternoon", [("f2", b)])],  # happened at 14:00, stated from 12:00
-        [scene("sc0", 1, "early", [("f4", a)]), first, second],  # f4 comes after f1, stated a part earlier
-        [scene("sc1", 1, "morning", [("f1", c), ("f4", a)]), second],  # f1 is the ledger's: a's
-        [
-            scene("sc1", 1, "morning", [("f1", a), ("f4", a)], participants=(b, c)),
-            second,
-        ],  # a is no participant
-        [
-            first,
-            second,
-            scene("sc4", 1, "evening", [], participants=(a, c), channel=leads),
-        ],  # c is not in #leads
-        [first, second, scene("sc5", 3, "morning", [], during="f2")],  # f2 happens on day 2
-        [first],  # f2 has no beat
-        [first, second, scene("sc3", 3, "morning", [("f3", a)], channel=leads, participants=(a, b))],
-    ):
-        fails(check_plan, world, ScenePlan(scenes=bad), "s1", {})
-    plan = check_plan(world, ScenePlan(scenes=[first, second]), "s1", {})
-    fails(
-        check_plan,
-        world,
-        ScenePlan(scenes=[first.model_copy(update={"part": "evening"}), second]),
-        "s1",
-        {"sc1": first},
-    )
-    check_plan(
-        world,
-        ScenePlan(scenes=[first.model_copy(update={"revision_note": "shorter"}), second]),
-        "s1",
-        {"sc1": first},
-    )
-
-    gaps, rng = Gaps(settings.personas.gaps), random.Random(1)
-    assert all(gaps.sample(rng, "") < 3_600_000_000 <= gaps.sample(rng, "hours") for _ in range(200))
-    one = WrittenScene(
-        lines=[
-            Line(author_id=a, text="rollback it is, <@" + c + "> fyi", conveys=["f1"]),
-            Line(author_id=b, text="ok, rollback", reply_to=0, conveys=["f1"]),
-            Line(author_id=a, text="and the other part is settled", conveys=["f4"]),
-        ]
-    )
-    for bad in (
-        one.model_copy(
-            update={"lines": [one.lines[0].model_copy(update={"text": "rollback at 3pm"}), *one.lines[1:]]}
-        ),
-        one.model_copy(
-            update={"lines": [one.lines[0].model_copy(update={"text": "rollback {at:f1}"}), *one.lines[1:]]}
-        ),
-        one.model_copy(update={"lines": [one.lines[0].model_copy(update={"conveys": []}), *one.lines[1:]]}),
-        one.model_copy(
-            update={"lines": [one.lines[0], one.lines[1].model_copy(update={"reply_to": 1}), one.lines[2]]}
-        ),
-        one.model_copy(
-            update={"lines": [one.lines[0], one.lines[1].model_copy(update={"author_id": d}), one.lines[2]]}
-        ),
-        one.model_copy(
-            update={"lines": [one.lines[0].model_copy(update={"text": "we go back"}), *one.lines[1:]]}
-        ),
-        one.model_copy(
-            update={"lines": [one.lines[0].model_copy(update={"conveys": ["f1", "f2"]}), *one.lines[1:]]}
-        ),
-    ):
-        try:
-            with world.trial() as copy:
-                write_scene(copy, "s1", plan.scenes[0], bad, "k1", random.Random(1), gaps)
-            raise AssertionError("scene accepted")
-        except PlanError:
-            raise
-        except ValueError:
-            pass
-    with world.trial() as copy:
-        write_scene(copy, "s1", plan.scenes[0], one, "k1", random.Random(1), gaps)
-    rows = world.db.execute("SELECT * FROM messages ORDER BY ts_us").fetchall()
-    early, late = window(world, 1, "morning")
-    assert [r["text"] for r in rows] == [line.text for line in one.lines] and early <= rows[0]["ts_us"] < late
-    assert rows[1]["parent_id"] == rows[0]["id"] and rows[1]["ts_us"] > rows[0]["ts_us"]
-    roles = [tuple(r) for r in world.db.execute("SELECT fact_id, role FROM evidence ORDER BY message_id")]
-    assert roles == [("f1", "anchor"), ("f1", "supporting"), ("f4", "anchor")], (
-        "the ledger's placement is the anchor"
-    )
-    assert world.db.execute("SELECT user_id FROM message_mentions").fetchone()[0] == c
-    stamps = placed_lines(world, plan.scenes[0], one, random.Random(1), gaps)  # where sc1 went: now taken
-    assert stamps[0] > rows[-1]["ts_us"], "a scene never interleaves with another of its channel"
-    two = WrittenScene(lines=[Line(author_id=b, text="restored at {at:f2}", conveys=["f2"])])
-    with world.trial() as copy:
-        write_scene(copy, "s1", plan.scenes[1], two, "k2", random.Random(2), gaps)
-    text, ts = world.db.execute(
-        "SELECT text, ts_us FROM messages WHERE user_id = ? AND text LIKE 'restored%'", (b,)
-    ).fetchone()
-    moment = world.db.execute("SELECT moment_us FROM facts WHERE id = 'f2'").fetchone()[0]
-    assert text == "restored at 14:00 CDT" and ts >= moment
-    assert render(moment, "UTC", moment) == "19:00 UTC" and render(moment, "UTC", moment + DAY).startswith(
-        f"{datetime.fromtimestamp(moment / 1e6, ZoneInfo('UTC')):%a}"
-    )
-    late_night = scene("sc3", 3, "night", [("f3", a)], channel=leads, participants=(a, b))
-    three = WrittenScene(
-        lines=[Line(author_id=b, text="still here", pause="hours") for _ in range(4)]
-        + [Line(author_id=a, text="decided", conveys=["f3"], pause="hours")]
-    )
-    try:
-        with world.trial() as copy:
-            write_scene(copy, "s2", late_night, three, "k3", random.Random(3), gaps)
-        raise AssertionError("a statement past midnight was accepted")
-    except PlanError as error:
-        assert "stated_off_day" in str(error)
-    talk = scene("sc9", 2, "afternoon", [], participants=(a, b))
-    chat = WrittenScene(
-        lines=[
-            Line(author_id=a, text="lunch?"),
-            Line(author_id=b, text="yes", reply_to=0, reactions=[Reaction(user_id=a, emoji="thumbsup")]),
-        ]
-    )
-    thread = Layout(shape="thread", reactions=1)
-    check_lines(world, talk, chat, thread)
-    fails(check_lines, world, talk, chat.model_copy(update={"lines": [chat.lines[0], chat.lines[1].model_copy(update={"reply_to": None})]}), thread)  # fmt: skip
-    for wrong in (
-        Layout(shape="flat", reactions=1),
-        Layout(reactions=0),
-        Layout(shape="thread", reactions=2),
-    ):
-        fails(check_lines, world, talk, chat, wrong)
-    first_reacted = chat.lines[0].model_copy(update={"reactions": [Reaction(user_id=b, emoji="eyes")]})
-    fails(check_lines, world, talk, chat.model_copy(update={"lines": [first_reacted, chat.lines[1].model_copy(update={"reply_to": None})]}), Layout(shape="flat", reactions=1))  # fmt: skip
-    check_lines(world, talk, chat.model_copy(update={"lines": [first_reacted, chat.lines[1].model_copy(update={"reply_to": None, "reactions": []})]}), Layout(shape="flat", reactions=1))  # fmt: skip
-    own = chat.lines[1].model_copy(update={"reactions": [Reaction(user_id=b, emoji="eyes")]})
-    fails(check_lines, world, talk, chat.model_copy(update={"lines": [chat.lines[0], own]}), thread)
-    outsider = chat.lines[1].model_copy(update={"reactions": [Reaction(user_id=c, emoji="eyes")]})
-    fails(check_lines, world, talk, chat.model_copy(update={"lines": [chat.lines[0], outsider]}), thread)
-    check_lines(world, talk, chat.model_copy(update={"lines": [chat.lines[0], outsider]}), thread.model_copy(update={"audience": [c]}))  # fmt: skip
-    with world.trial() as copy:
-        write_scene(copy, None, talk, chat, "k9", random.Random(9), gaps, thread)
-    reacted = world.db.execute(
-        "SELECT r.user_id, r.emoji, r.created_us > m.ts_us FROM reactions r JOIN messages m ON m.id = r.message_id"
-    ).fetchall()
-    assert [tuple(r) for r in reacted] == [(a, "thumbsup", 1)], "a reaction is stored after its message"
-    assert world.db.execute("SELECT storyline FROM scenes WHERE id = 'sc9'").fetchone()[0] is None
-    quiet = settings.activity.model_copy(update={"reply_share": 0.0, "reaction_rate": 0.0})
-    busy = settings.activity.model_copy(update={"reply_share": 0.95, "reaction_rate": 1.0})
-    calm, lively = layout(world, talk, quiet, random.Random(1)), layout(world, talk, busy, random.Random(1))
-    assert (calm.shape, calm.reactions, lively.shape, lively.reactions) == ("flat", 0, "thread", talk.length)
-    assert set(calm.audience) == {c, d}, "the audience is the conversation's other members"
-    voices = {a: seed_person(0).typing.model_copy(update={"short_share": 1.0, "long_share": 0.0}), b: seed_person(1).typing.model_copy(update={"short_share": 0.0, "long_share": 1.0})}  # fmt: skip
-    talky = talk.model_copy(update={"length": 40})
-    terse_voices, wordy_voices = {p: voices[a] for p in (a, b)}, {p: voices[b] for p in (a, b)}
-    assert layout(world, talky, quiet, random.Random(1), terse_voices).short == 40, (
-        "the budget follows typing"
-    )
-    assert layout(world, talky, quiet, random.Random(1), wordy_voices).long == 40, "the budget follows typing"
-    banded = layout(world, talky, quiet, random.Random(1), voices)
-    assert banded.short + banded.long == 40 and banded.short and banded.long, "each line's author is drawn"
-    assert layout(world, talk, quiet, random.Random(1), {a: voices[a]}).long is None, (
-        "no budget without every typing"
-    )
-    terse = Layout(short=1, long=0)
-    lunch = Line(author_id=a, text="lunch?")
-    check_lines(world, talk, WrittenScene(lines=[lunch, Line(author_id=b, text="yes please, the usual place")]), terse)  # fmt: skip
-    for wrong in (
-        [
-            Line(author_id=a, text="lunch somewhere close by today?"),
-            Line(author_id=b, text="yes please, the usual place"),
-        ],  # fmt: skip
-        [lunch, Line(author_id=b, text=" ".join(["word"] * 21))],
-    ):
-        fails(check_lines, world, talk, WrittenScene(lines=wrong), terse)
-    check_lines(world, talk, WrittenScene(lines=[lunch, Line(author_id=b, text=" ".join(["word"] * 21))]), Layout(short=1, long=1))  # fmt: skip
-    direct = scene("sc10", 2, "afternoon", [], participants=(a, c), channel=channel_id("im", None, [a, c]))
-    assert layout(world, direct, busy, random.Random(1)).shape == "flat", "a DM is never threaded"
+    assert "t9" in picked([settled(["f1", "f3"])], [cell("semantic", 3)])  # #ops and #leads
+    hybrid = dict(category="hybrid", level=1, actor_id=c, answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages m, facts f WHERE f.id = 'f1'")  # fmt: skip
+    unread = Task(
+        id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
+    )  # in leads
+    read = Task(id="h2", question="How many messages surround the rollback?", facts=["f1"], **hybrid)
+    picks = [
+        t for seed in range(20) for t in picked([unread, read], [cell("hybrid", 1)], seed) if t[0] == "h"
+    ]
+    assert picks == ["h2"] * 20, ("a candidate whose actor cannot read its facts is never picked", picks)
     count = world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     small = settings.activity.model_copy(update={"messages": count + 12, "conversation_lines": 4})
     plan = background_plan(world, org(), small, 7)
@@ -1066,38 +796,6 @@ def check_contracts(root):
     skewed = background_plan(world, org(), small.model_copy(update={"dm_share": 0.0, "channel_skew": 4.0, "messages": count + 60}), 7)  # fmt: skip
     places = Counter(kinds[s.channel_id] for s in skewed)
     assert places["public"] > 3 * places["private"], "busier channels draw more conversations"
-    try:
-        with world.trial() as copy:  # a planned value, said in a background conversation
-            copy.db.execute("INSERT INTO facts (id, storyline, subject, attribute, value, channel_id, author_id, day, summary) VALUES ('f9', 's1', 'Lunch', 'place', 'taco stand', ?, ?, 1, 's')", (ops, a))  # fmt: skip
-            for text in ("lunch at the Taco Stand?", "see you at {at:f2}"):
-                fails(unplanned, copy, WrittenScene(lines=[Line(author_id=a, text=text)]))
-            said = WrittenScene(lines=[Line(author_id=a, text="taco stand it is")])
-            idle, story = scene("sc11", 3, "morning", [], participants=(a, b)), scene("sc12", 4, "morning", [], participants=(a, b))  # fmt: skip
-            fails(write_scene, copy, None, idle, said, "k11", random.Random(1), gaps)
-            write_scene(copy, "s1", story, said, "k12", random.Random(1), gaps)  # a storyline may discuss it
-            unplanned(copy, WrittenScene(lines=[Line(author_id=a, text="lunch somewhere tacos?")]))
-            raise LookupError("drop the trial")
-    except LookupError:
-        pass
-    hybrid = dict(category="hybrid", level=1, actor_id=c, answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages m, facts f WHERE f.id = 'f1'")  # fmt: skip
-    unread = Task(
-        id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
-    )  # in leads
-    read = Task(id="h2", question="How many messages surround the rollback?", facts=["f1"], **hybrid)
-    picks = []
-    for seed in range(
-        20
-    ):  # on the written world: a candidate whose actor cannot read its facts is never picked
-        try:
-            with world.trial() as copy:
-                record_tasks(
-                    copy, [unread, read], settings.model_copy(update={"seed": seed}), [cell("hybrid", 1)]
-                )
-                picks += [r[0] for r in copy.db.execute("SELECT id FROM tasks WHERE category = 'hybrid'")]
-                raise LookupError("drop the trial")
-        except LookupError:
-            pass
-    assert picks == ["h2"] * 20, picks
     assert TIME_LITERAL.findall("at 3pm, 15:00, 2026-06-15 or Jun 15") == [
         "3pm",
         "15:00",
@@ -1105,7 +803,9 @@ def check_contracts(root):
         "Jun 15",
     ]
     assert TIME_LITERAL.findall("release 8.14 on v2.10, maybe 2 people") == []
-    print("PASS contracts: organization, ledger and task gold (T2-T6), plan, written scenes, code-owned time")
+    print(
+        "PASS contracts: cast, premise, organization, task gold (T2-T7) on a planned ledger, agenda, no literal times"
+    )
 
 
 def organized(root, settings):
@@ -1167,20 +867,11 @@ def check_clock(root):
     assert sum(q["messages"] for q in shares.values()) == 12 and all(sum(q["parts"].values()) == q["messages"] for q in shares.values())  # fmt: skip
     assert shares[6]["messages"] == shares[7]["messages"] == 0 < shares[1]["messages"], "weekends are quiet"
     zone = "America/Chicago"
+    sampler = random.Random(1)
+    assert all(gaps.sample(sampler, "") < 3_600_000_000 <= gaps.sample(sampler, "hours") for _ in range(200))
 
     def plan(**changes):
-        events = [
-            Event(id="e1", storyline="s2", title="release window", day=3, time="10:00"),
-            Event(id="e2", storyline="s1", title="service restored", day=2, time="14:00"),
-        ]
-        facts = [
-            PlanFact(id="f1", storyline="s1", subject="Release 4.2", attribute="decision", value="rollback", anchor="rollback", channel_id=ops, author_id=a, day=1, summary="s"),
-            PlanFact(id="f2", storyline="s1", subject="Release 4.2", attribute="state", value="service back", channel_id=ops, author_id=b, day=2, after=["f1"], event="e2", kind="happened", summary="s"),
-            PlanFact(id="f3", storyline="s2", subject="Audit", attribute="window", value="dry run", anchor="dry run", channel_id=leads, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
-            PlanFact(id="f4", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=ops, author_id=a, day=3, after=["f3"], event="e1", kind="scheduled", summary="s"),
-        ]  # fmt: skip
-        document = dict(storylines=[Storyline(id="s1", summary="the 4.2 release"), Storyline(id="s2", summary="the audit")], events=events, facts=facts)  # fmt: skip
-        return Plan(**document | changes)
+        return ledger_plan(ops, leads, a, b, **changes)
 
     def recorded(document):
         with world.trial() as copy:
@@ -1196,6 +887,7 @@ def check_clock(root):
         (f"is a member of {leads}", plan(facts=[*facts[:2], facts[2].model_copy(update={"author_id": c}), facts[3]])),
         ("on or after the day of e2", plan(facts=[facts[0], facts[1].model_copy(update={"day": 1}), *facts[2:]])),
         ("on a later day", plan(facts=[facts[0].model_copy(update={"day": 3}), *facts[1:]])),  # f2 follows f1
+        ("an anchor is words of its value", plan(facts=[facts[0].model_copy(update={"anchor": "Release 4.2"}), *facts[1:]])),
     ):  # fmt: skip
         refused(expected, recorded, bad)
     recorded(first_plan)
@@ -1229,11 +921,15 @@ def check_clock(root):
         )
 
     decided = talk(
-        dict(author_id=a, text="we go with the rollback", conveys=["f1"]),
+        dict(author_id=a, text=f"we go with the rollback, <@{c}> fyi", conveys=["f1"]),
         dict(author_id=b, text="ok, I'll post the notes", reply_to=0, commits=[Commit(id="c1", text="post the notes", due_day=2)], reactions=[Reaction(user_id=a, emoji="eyes")]),
+        dict(author_id=b, text="rollback noted", reply_to=0, conveys=["f1"]),
     )  # fmt: skip
     for expected, bad in (
         ("write times and dates only", talk(dict(author_id=a, text="rollback at 3pm", conveys=["f1"]))),
+        ("reply_to names an earlier line", talk(dict(author_id=a, text="ok", reply_to=0))),
+        ("conveys lists only facts", talk(dict(author_id=a, text="rollback is decided", conveys=["f1", "f9"]))),
+        ("{at:...} names a moment", talk(dict(author_id=a, text="see you at {at:lunch}"))),
         ("list them in conveys", talk(dict(author_id=a, text="rollback is decided"))),
         ("f1 is first stated by", talk(dict(author_id=b, text="rollback is decided", conveys=["f1"]))),
         ("f3 is first stated by", talk(dict(author_id=a, text="dry run it is", conveys=["f3"]), channel=leads)),
@@ -1248,8 +944,15 @@ def check_clock(root):
     out = posted_(decided)
     rows = world.db.execute("SELECT id, ts_us, parent_id FROM messages ORDER BY id").fetchall()
     assert rows[0]["ts_us"] > before and present(world) == rows[-1]["ts_us"] and rows[1]["parent_id"] == rows[0]["id"]  # fmt: skip
-    assert out["conversation"] == "d01-001" and len(out["messages"]) == 2
-    assert world.db.execute("SELECT role FROM evidence WHERE fact_id = 'f1'").fetchone()[0] == "anchor"
+    assert out["conversation"] == "d01-001" and len(out["messages"]) == 3
+    roles = [
+        r[0] for r in world.db.execute("SELECT role FROM evidence WHERE fact_id = 'f1' ORDER BY message_id")
+    ]
+    assert roles == ["anchor", "supporting"], (
+        "the planned author states it, a second speaker supports it",
+        roles,
+    )
+    assert world.db.execute("SELECT user_id FROM message_mentions").fetchone()[0] == c
     assert world.db.execute("SELECT status, owner_id FROM commitments WHERE id = 'c1'").fetchone()[:] == (
         "open",
         b,
@@ -1287,7 +990,7 @@ def check_clock(root):
     advanced(to="night")
     strict = settings.model_copy(update={"author": settings.author.model_copy(update={"tolerance": 0.0})})
     assert shares[1]["messages"] == 2 and any("messages today" in e for e in close_day(world, strict, 1)), (
-        "3 posted"
+        "4 posted"
     )
     assert advanced()["closed_day"] == 1 and today(world) == 2
     advanced(to="morning")
@@ -1302,6 +1005,10 @@ def check_clock(root):
     assert restored["messages"][0]["text"] == "service back at 14:00 CDT, notes are up", (
         "{at:} on the author's clock"
     )
+    moment = at(world, Moment(day=2, time="14:00", zone=zone))
+    assert render(moment, "UTC", moment) == "19:00 UTC" and render(moment, "UTC", moment + DAY).startswith(
+        f"{datetime.fromtimestamp(moment / 1e6, ZoneInfo('UTC')):%a}"
+    ), "the day is named when it is not the day of writing"
     assert world.db.execute("SELECT status, closed_by FROM commitments").fetchone()[:] == ("kept", restored["messages"][0]["id"])  # fmt: skip
     refused("only its summary may change", recorded, plan(facts=[facts[0].model_copy(update={"value": "roll forward", "anchor": None}), *facts[1:]]))  # fmt: skip
     refused("only its summary may change", recorded, plan(facts=[facts[0], facts[1].model_copy(update={"after": []}), *facts[2:]]))  # fmt: skip
@@ -1586,18 +1293,7 @@ async def check_reviews(root):
     assert "level_fit" in verdict_schema("task", ["t1"])["$defs"]["TaskReview"]["required"]
     workspace = Issue(artifact="workspace", defect="d", requested_change="c")
     validate_verdict(verdict(approved=False, issues=[workspace]), payload)
-    ledger = review_payload(world, "ledger", ["t1"])
-
-    def ledger_verdict(issue):
-        tasks = [TaskReview(task_id="t1", valid=False, reason="r")]
-        return Verdict(approved=False, tasks=tasks, issues=[issue], summary="s")
-
-    fails(validate_verdict, ledger_verdict(workspace), ledger)  # no message exists to repair yet
-    validate_verdict(ledger_verdict(workspace.model_copy(update={"artifact": "ledger"})), ledger)
-    assert verdict_schema("ledger", ["t1"])["$defs"]["Issue"]["properties"]["artifact"]["enum"] == [
-        "ledger",
-        "tasks",
-    ] and "workspace" in str(schema["$defs"]["Issue"]["properties"]["artifact"])
+    assert "workspace" in str(schema["$defs"]["Issue"]["properties"]["artifact"])
     issue = Issue(artifact="tasks", task_ids=["t2"], defect="d", requested_change="c")
     fails(verdict, issues=[issue])
     fails(verdict, approved=False)
@@ -1614,7 +1310,7 @@ async def check_reviews(root):
     )
 
     world.snapshot(root / "review.sqlite")
-    judge = JudgeTask.create(payload, root / "review.sqlite", "build-s1-01", 5)
+    judge = JudgeTask.create(payload, root / "review.sqlite", "final-01", 5)
     assert judge.config.tools.actors == ["U2"] and "rollback" not in judge.config.tools.model_dump_json()
     (tools,) = judge.toolsets(judge.config)
     await tools.setup()
@@ -1672,23 +1368,11 @@ async def check_reviews(root):
         return judge, await tools._with_state(tools.check)()
 
     _, due = await inspected("task", ["t1"])
-    ledger_judge, unwritten = await inspected("ledger", ["t1"])
     _, untasked = await inspected("world", [])
     assert [v.split(":")[0] for v in due["violations"]] == ["unstated_fact"] and "bm25_rank" in due["tasks"][
         "t1"
     ]
-    assert unwritten["violations"] == untasked["violations"] == [], (
-        "completion is due for reviewed, written tasks"
-    )
-    assert unwritten["tasks"]["t1"] == {"rows": due["tasks"]["t1"]["rows"]}, (
-        "a ledger review ranks no evidence"
-    )
-    files["/task/verdict.json"] = ledger_verdict(workspace).model_dump_json().encode()
-    try:
-        await ledger_judge.finalize(checked, runtime)
-        raise AssertionError("a ledger review routed a repair to messages that do not exist")
-    except ValueError as error:
-        assert "reports issues on ledger or tasks only" in str(error), error
+    assert untasked["violations"] == [], "completion is due for reviewed tasks"
 
     world.solver_copy(root / "solver.sqlite")
     task = PublicTask(
@@ -1764,348 +1448,6 @@ def flow_settings(root, seed):
             "corpus": root / "corpus",
             "activity": activity,
         }
-    )
-
-
-async def check_flow(root):
-    """One scripted episode through the real control flow: every author's correction turn, ledger review and a
-    tasks-only ledger repair, a scene repair from a storyline review, a crash and resume, the tasks phase, the final
-    review, publish and the release."""
-    root.mkdir(parents=True)
-    # A seed whose 4 quota cells mix ledger and workspace categories.
-    probe = contracts_settings(root)
-    seed = next(s for s in range(100) if len({probe.taxonomy[c].gold == "ledger" for c, *_ in quota(probe.taxonomy, probe.tasks.styles, s, 4)}) == 2)  # fmt: skip
-    settings = flow_settings(root, seed)
-    log, turns = [], []
-    crash = {"armed": True}
-
-    def task_for(i, cell, facts=("f1",), sql=None):
-        category, level = cell["category"], cell["level"]
-        gold, kind = settings.taxonomy[category].gold, None
-        if gold == "ledger":
-            sql, kind = sql or "SELECT value AS answer FROM facts WHERE id = 'f1'", "text"
-        elif category == "robustness":
-            sql, kind, facts = "SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", "refusal", ()
-        elif gold == "hybrid":
-            sql, kind = (
-                "SELECT COUNT(*) AS answer FROM messages m JOIN evidence e ON e.message_id = m.id WHERE e.fact_id = 'f1'",
-                "number",
-            )
-        else:
-            sql, kind, facts = "SELECT COUNT(*) AS answer FROM messages", "number", ()
-        return Task(id=f"t{i}", category=category, level=level, actor_id=crash["reader"], question=f"Question {i} about the work?", answer_type=kind, gold_sql=sql, facts=list(facts))  # fmt: skip
-
-    class ScriptedEnv(GenerationEnv):
-        async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
-            phase, fed = context["phase"], bool(context.get("feedback"))
-            turns.append((attempt, phase, fed))
-            if phase == "premise":
-                return Premises(premises=[Premise(company=f"{w} Software", niche="n", region="r", size="s", culture="c", cast="x", staffing={"software_developer": 4}) for w in ("Lattice", "Birch")]).model_dump_json()  # fmt: skip
-            if phase == "organization":
-                ids = [c["user_id"] for c in context["candidates"]]
-                crash["reader"] = ids[2]
-                a, b, c, d = ids
-                kinds = [Routine(kind=k, probability=0.5) for k in ("standup", "handoff", "lunch")]
-                channels = [
-                    Channel(name="ops", type="public", members=ids, routines=kinds),
-                    Channel(name="leads", type="private", members=[a, b], routines=kinds),
-                ]
-                channels.append(
-                    Channel(type="im", members=[a, c] if fed else [a, c, d])
-                )  # first: a 3-person DM
-                return Organization(people=[Person(user_id=u, title="Engineer", team="Platform") for u in ids], channels=channels, dm_routines=kinds).model_dump_json()  # fmt: skip
-            if phase == "ledger":
-                ops = channel_id("public", "ops", [])
-                a, b = [r[0] for r in self.world.db.execute("SELECT id FROM users ORDER BY id")][:2]
-                zone = world_meta(self.world, "zone")
-                facts = [
-                    Fact(id="f1", storyline="s1", subject="Release 4.2", attribute="decision", value="rollback", anchor="rollback", places=[Place(channel_id=ops, author_id=a, probability=1.0)], day=1, summary="s"),
-                    Fact(id="f2", storyline="s1", subject="Release 4.2", attribute="restored", value="service back", places=[Place(channel_id=ops, author_id=b, probability=1.0)], day=2, after=["f1"], happened_at=Moment(day=2, time="14:00", zone=zone), summary="s"),
-                    Fact(id="f3", storyline="s2", subject="Audit", attribute="owner", value="Owen", places=[Place(channel_id=ops, author_id=a, probability=1.0)], day=3, summary="s"),
-                ]  # fmt: skip
-                cells = context["cells"]
-                tasks = [task_for(i, cell) for i, cell in enumerate(cells)]
-                if not fed and attempt.endswith("01"):
-                    tasks = tasks[:-1]  # first: one task short of the quota
-                elif fed and attempt.endswith("02"):
-                    tasks = [
-                        t.model_copy(update={"question": t.question.replace("Question", "Clearer question")})
-                        for t in tasks
-                    ]
-                storylines = [
-                    Storyline(id="s1", summary="the 4.2 release"),
-                    Storyline(id="s2", summary="the audit"),
-                ]
-                return Ledger(storylines=storylines, facts=facts, tasks=tasks).model_dump_json()
-            if phase == "scenes":
-                if context["storyline"] == "s2" and crash["armed"]:
-                    crash["armed"] = False
-                    raise KeyboardInterrupt("simulated crash")
-                ops = channel_id("public", "ops", [])
-                a, b, c = [r[0] for r in self.world.db.execute("SELECT id FROM users ORDER BY id")][:3]
-                if context["storyline"] == "s2":
-                    scenes = [Scene(id="sc4", channel_id=ops, participants=[a, b], day=3, part="morning", situation="audit", length=2, beats=[Beat(fact="f3", author_id=a)])]  # fmt: skip
-                else:
-                    restored = Scene(id="sc2", channel_id=ops, participants=[b, c], day=2, part="afternoon", situation="restore", length=2, beats=[Beat(fact="f2", author_id=b)], during="f2")  # fmt: skip
-                    scenes = [
-                        Scene(id="sc1", channel_id=ops, participants=[a, b, c], day=1, part="morning", situation="decide", length=3, beats=[Beat(fact="f1", author_id=a)]),
-                        restored if fed else restored.model_copy(update={"during": None}),  # first: stated before it happened
-                        Scene(id="sc3", channel_id=ops, participants=[b, c], day=1, part="evening", situation="wrap up", length=2),
-                    ]  # fmt: skip
-                return ScenePlan(scenes=scenes).model_dump_json()
-            cells = context["cells"]
-            tasks = [task_for(10 + i, cell) for i, cell in enumerate(cells)]
-            if not fed:  # first: a question a ledger task already asks
-                tasks[0] = tasks[0].model_copy(update={"question": context["existing_questions"][0]})
-            return TaskSet(tasks=tasks).model_dump_json()
-
-        async def compose(self, agents, scene_id, prompt, accept):
-            brief_ = json.loads(prompt)
-            beats = brief_["scene"]["beats"]
-            speakers = [p["user_id"] for p in brief_["participants"]]
-            if scene_id.startswith("bg-") and not crash.get(
-                "dropped"
-            ):  # first: a background line that names a moment
-                crash["dropped"] = scene_id
-                try:
-                    accept(WrittenScene(lines=[Line(author_id=speakers[0], text="see you at {at:f2}")]))
-                except ValueError as error:
-                    return None, [str(error)]
-            lines = [Line(author_id=speakers[0], text="morning all")]
-            for beat in beats:
-                text = f"{beat['anchor'] or 'it is settled'}, {beat['value']}"
-                if beat["fact_id"] == "f2":
-                    text = "service back at {at:f2}"
-                lines.append(Line(author_id=beat["author_id"], text=text, conveys=[beat["fact_id"]]))
-            lines.append(Line(author_id=speakers[-1], text="noted" if "revision_note" not in brief_ else "noted, thanks", reply_to=0))  # fmt: skip
-            shape, reacted = brief_["layout"]["shape"], brief_["layout"]["reactions"]
-            reactors = speakers + [a["user_id"] for a in brief_["layout"]["audience"]]
-            if shape != "free":
-                lines = [x.model_copy(update={"reply_to": None if shape == "flat" or i == 0 else 0}) for i, x in enumerate(lines)]  # fmt: skip
-            for i in range(min(reacted, len(lines))):
-                who = next(u for u in reactors if u != lines[i].author_id)
-                lines[i] = lines[i].model_copy(update={"reactions": [Reaction(user_id=who, emoji="eyes")]})
-            written = WrittenScene(lines=lines)
-            log.append(("write", brief_["scene"]["situation"]))
-            if brief_["scene"]["situation"] == "decide" and ("write", "decide") not in log[:-1]:
-                try:  # first: a literal time, sent back as a correction turn
-                    accept(
-                        written.model_copy(
-                            update={
-                                "lines": [
-                                    lines[0].model_copy(update={"text": "morning all, 9:30 sync"}),
-                                    *lines[1:],
-                                ]
-                            }
-                        )
-                    )
-                    raise AssertionError("a literal time was accepted")
-                except PlanError:
-                    raise
-                except ValueError:
-                    log.append(("corrected", "decide"))
-            accept(written)
-            return written, []
-
-        async def solve(self, agents, task):
-            path = Path(task.config.tools.db_path)
-            assert path.name == "solver.sqlite" and not World(path).db.execute("SELECT name FROM sqlite_master WHERE name = 'tasks'").fetchone()  # fmt: skip
-            result = {"task_id": task.data.task_id, "semantic_correctness": 1.0, "correct": True, "grounded": True, "execution_ok": True, "calls": 2}  # fmt: skip
-            return result, SimpleNamespace(to_record=lambda: {"nodes": []})
-
-        async def review(self, agents, payload, attempt, files=None, label=""):
-            log.append(("review", attempt, label, [t["id"] for t in payload["tasks"]]))
-            issues = []
-            if payload["phase"] == "ledger" and attempt == "ledger-01":
-                issues = [
-                    Issue(
-                        artifact="tasks",
-                        task_ids=[payload["tasks"][0]["id"]],
-                        defect="vague",
-                        requested_change="sharpen",
-                    )
-                ]
-            if payload["phase"] == "world" and payload.get("storyline") == "s1" and attempt == "build-s1-01":
-                sc3 = [
-                    m
-                    for (m,) in self.world.db.execute(
-                        "SELECT message_id FROM scene_messages WHERE scene_id = 'sc3'"
-                    )
-                ]
-                issues = [
-                    Issue(artifact="workspace", message_ids=sc3[:1], defect="flat", requested_change="warmer")
-                ]
-            if payload["phase"] == "world" and "storyline" not in payload and attempt == "final-01":
-                (first,) = self.world.db.execute("SELECT MIN(sm.message_id) FROM scene_messages sm JOIN scenes s ON s.id = sm.scene_id WHERE s.storyline IS NULL").fetchone()  # fmt: skip
-                issues = [
-                    Issue(
-                        artifact="workspace", message_ids=[first], defect="stiff", requested_change="looser"
-                    )
-                ]
-            criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
-            verdict = Verdict(approved=not issues, tasks=[TaskReview(task_id=t["id"], valid=True, reason="r", level_fit=4 if payload["phase"] == "task" else None) for t in payload["tasks"]], issues=issues, criteria=criteria, summary="s")  # fmt: skip
-            validate_verdict(verdict, payload)
-            self.store.artifact(
-                attempt, "verdict-" + (label or payload["phase"]), verdict.model_dump(mode="json")
-            )
-            return verdict
-
-    agents = SimpleNamespace(
-        **{
-            name: ScriptedAgent()
-            for name in ("author", "synthesizer", "builder", "writer", "judge", "solver")
-        }
-    )
-    manifest = provenance(settings)
-    store = TestStore(settings.output, manifest)
-    env = ScriptedEnv(settings, store)
-    await env.setup(agents)
-    try:
-        await env.run(None, agents)
-        raise AssertionError("the simulated crash did not happen")
-    except KeyboardInterrupt:
-        pass
-    store.close()
-    fails(Store, settings.output, manifest | {"lock_hash": "changed"})
-    store = TestStore(settings.output, manifest)
-    assert store.state.built == ["s1"] and store.state.phase == "build", (
-        "the checkpoint keeps the approved storyline"
-    )
-    env = ScriptedEnv(settings, store)
-    await env.run(None, agents)
-    state = store.state
-    assert state.phase == "done" and state.built == ["s1", "s2"]
-    background = store.world.db.execute(
-        "SELECT c.type, COUNT(DISTINCT s.id) FROM scenes s JOIN channels c ON c.id = s.channel_id WHERE s.storyline IS NULL GROUP BY 1"
-    ).fetchall()
-    assert {kind for kind, _ in background} >= {"public", "im"}, ("everyday conversations fill channels and DMs", background)  # fmt: skip
-    assert store.world.db.execute("SELECT COUNT(*) FROM reactions").fetchone()[0], (
-        "the layouts' reactions are written"
-    )
-    assert (
-        any(
-            e["event"] == "background_dropped" and e["scene_ids"] == [crash["dropped"]]
-            for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines())
-        )
-        and store.world.db.execute("SELECT 1 FROM scenes WHERE id = ?", (crash["dropped"],)).fetchone()
-    ), (  # fmt: skip
-        "a background conversation its writer could not write is dropped, then written on the next pass"
-    )
-    notes = [json.loads(p)["revision_note"] for (p,) in store.world.db.execute("SELECT plan_json FROM scenes WHERE storyline IS NULL")]  # fmt: skip
-    assert notes.count("stiff Requested change: looser") == 1 and state.rounds["final"] == 2, (
-        "a final-review issue on a background message rewrites only that conversation"
-    )
-    retried = SimpleNamespace(
-        ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]
-    )
-    limit = SimpleNamespace(type="ReviewLimit", message="no valid ledger")
-    assert failure("done", SimpleNamespace(errors=[], traces=[retried])) is None, (
-        "a judge failure the review loop retried does not fail a finished run"
-    )
-    assert failure("build", SimpleNamespace(errors=[], traces=[retried])) == "TaskError: malformed verdict"
-    assert failure("done", SimpleNamespace(errors=[limit], traces=[])) == "ReviewLimit: no valid ledger"
-    assert [(a, p, f) for a, p, f in turns if p == "organization"] == [
-        ("organization", "organization", False),
-        ("organization", "organization", True),
-    ]
-    assert [(a, f) for a, p, f in turns if p == "ledger"] == [
-        ("ledger-01", False),
-        ("ledger-01", True),
-        ("ledger-02", True),
-    ]
-    assert [(a, f) for a, p, f in turns if p == "scenes"][:2] == [
-        ("build-s1-01", False),
-        ("build-s1-01", True),
-    ]
-    assert ("corrected", "decide") in log and [p for _, p, f in turns if p == "tasks"] == ["tasks", "tasks"]
-    events = [json.loads(line) for line in (store.root / "progress.jsonl").read_text().splitlines()]
-    routed = [(e["attempt"], e["route"]) for e in events if e["event"] == "attempt_routed"]
-    assert routed[:2] == [("build-s1-01", "plan"), ("build-s1-02", "repair")], routed
-    assert not any(e["event"] == "approvals_invalidated" for e in events), (
-        "a tasks-only ledger repair keeps the world"
-    )
-    assert any(e["event"] == "interrupted" for e in events)
-    rewritten = [e[1] for e in log if e[0] == "write"]
-    assert rewritten.count("wrap up") == 2 and rewritten.count("decide") == 1, (
-        "the repair rewrote only the named scene"
-    )
-    reviewed = {tuple(e[3]) for e in log if e[0] == "review" and e[2] == "tasks"}
-    assert all(len(ids) for ids in reviewed) and set(state.task_reviews) == {
-        t for (t,) in store.world.db.execute("SELECT id FROM tasks")
-    }
-    assert store.world.violations(complete=True) == []
-    assert not state.notes, "every note was consumed by writing its scene"
-    difficulty = store.summary("complete")["difficulty"]
-    assert set(difficulty) == set(state.task_reviews) and all(
-        d["level_fit"] == 4 and "evidence_pages" in d and d["concept"] for d in difficulty.values()
-    ), "the summary reports each task's measured difficulty beside its level"
-    assert set(state.frozen) == {
-        s for (s,) in store.world.db.execute("SELECT id FROM scenes WHERE storyline IS NOT NULL")
-    }, "approved scenes are frozen"
-    ledger_ids = {t for (t,) in store.world.db.execute("SELECT id FROM tasks WHERE gold_source = 'ledger'")}
-    final = next(e[3] for e in log if e[0] == "review" and e[1] == "final-01" and e[2] == "tasks")
-    assert set(final) == set(state.task_reviews) - ledger_ids, "the final review re-reviews only stale tasks"
-    saved = state.model_copy(deep=True)
-    sql_task = next(iter(set(state.task_reviews) - ledger_ids))
-    for issue, phase in (
-        (
-            Issue(artifact="tasks", task_ids=[sorted(ledger_ids)[0]], defect="d", requested_change="c"),
-            "ledger",
-        ),
-        (Issue(artifact="tasks", task_ids=[sql_task], defect="d", requested_change="c"), "tasks"),
-        (Issue(artifact="ledger", defect="d", requested_change="c"), "ledger"),
-    ):
-        env.route_rejection(Verdict(approved=False, tasks=[], issues=[issue], summary="s"))
-        assert state.phase == phase and not env.repairs("s1"), (issue, state.phase)
-    sc3 = [
-        m for (m,) in store.world.db.execute("SELECT message_id FROM scene_messages WHERE scene_id = 'sc3'")
-    ]
-    env.route_rejection(Verdict(approved=False, tasks=[], issues=[Issue(artifact="workspace", message_ids=sc3[:1], defect="d", requested_change="c")], summary="s"))  # fmt: skip
-    assert state.phase == "build" and state.built == ["s2"] and set(env.repairs("s1")) == {"sc3"}
-    state.notes = {}
-    ledger_issue = Issue(artifact="ledger", defect="d", requested_change="c")
-    sc3_issue = Issue(artifact="workspace", message_ids=sc3[:1], defect="stiff", requested_change="looser")
-    env.route_rejection(Verdict(approved=False, tasks=[], issues=[ledger_issue, sc3_issue], summary="s"))
-    assert state.phase == "ledger" and env.repairs("s1") == {"sc3": "stiff Requested change: looser"}, (
-        "a workspace issue behind a ledger repair waits for its scene"
-    )
-    assert "s1" not in state.built, "its storyline is built again after the ledger"
-    used = state.rounds["build:s1"]
-    state.refunded = {}
-    try:
-        with (
-            store.world.trial() as copy
-        ):  # a ledger whose facts changed clears the world and refunds the builds
-            changed = Ledger.model_validate_json(json.dumps(state.drafts["ledger"]))
-            changed.facts[0] = changed.facts[0].model_copy(update={"value": "roll forward", "anchor": None})
-            env.replace_ledger(copy, changed)
-            raise LookupError("drop the trial")
-    except LookupError:
-        pass
-    assert state.refunded["build:s1"] == used and store.reserve("build:s1", used).endswith(
-        f"-{used + 1:02d}"
-    ), "a cleared world gives its storylines their rounds back, under new attempt ids"
-    store.state = state = saved
-    review = state.task_reviews.pop(sql_task)
-    fails(store.publish)
-    state.task_reviews[sql_task] = review
-    store.world.insert("facts", [dict(id="f9", storyline="s2", subject="x", attribute="y", value="z", channel_id=channel_id("public", "ops", []), author_id=crash["reader"], day=3, summary="s")])  # fmt: skip
-    store.world.insert("task_facts", [dict(task_id=sql_task, fact_id="f9")])
-    fails(store.publish)
-    store.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
-    store.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
-    store.publish()
-    world, rows, answers = load_release(store.root / "release")
-    assert {r.task_id for r in rows} == set(state.task_reviews) and World(world).db.execute(
-        "SELECT COUNT(*) FROM messages"
-    ).fetchone()[0]
-    assert all(a.rows or a.answer_type == "refusal" for a in answers.values())
-    ledger = next(r for r in rows if settings.taxonomy[r.category].gold == "ledger")
-    assert answers[ledger.task_id].rows == [{"answer": "rollback"}] and answers[ledger.task_id].messages
-    store.publish()  # idempotent
-    store.close()
-    print(
-        "PASS flow: corrections, ledger review and tasks-only repair, scene repair, crash and resume, tasks, final, publish"
     )
 
 
@@ -2307,6 +1649,9 @@ async def check_author(root):
     after_day_2 = World(store.root / "attempts" / store.state.restore_point / "world.sqlite").db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]  # fmt: skip
     assert store.world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == after_day_2 + 1, "the crash left a partial day"  # fmt: skip
     store.close()
+    fails(
+        Store, settings.output, manifest | {"lock_hash": "changed"}
+    )  # a run resumes only with its own config
     store = TestStore(settings.output, manifest)
     assert store.state.phase == "day" and store.state.day == 3 and store.state.restore_point == "day-02-01"
     env = AuthorEnv(settings, store)
@@ -2343,14 +1688,41 @@ async def check_author(root):
     assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"
     days = [json.loads(line) for line in (store.root / "progress.jsonl").read_text().splitlines()]
     assert [e["day"] for e in days if e["event"] == "day_closed"] == [1, 2, 3, 4]
+    assert any(e["event"] == "interrupted" for e in days)
     assert store.world.violations(complete=True) == [] and set(state.task_reviews) == {t for (t,) in store.world.db.execute("SELECT id FROM tasks")}  # fmt: skip
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
+    difficulty = store.summary("complete")["difficulty"]
+    assert set(difficulty) == set(state.task_reviews) and all(
+        d["level_fit"] == 3 and "evidence_pages" in d and d["concept"] for d in difficulty.values()
+    ), "the summary reports each task's measured difficulty beside its level"
+    some = sorted(state.task_reviews)[0]
+    review = state.task_reviews.pop(some)
+    fails(store.publish)  # a task nobody reviewed
+    state.task_reviews[some] = review
+    store.world.insert("facts", [dict(id="f9", storyline="s2", subject="x", attribute="y", value="z", channel_id=channel_id("public", "ops", []), author_id=store.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], day=3, summary="s")])  # fmt: skip
+    store.world.insert("task_facts", [dict(task_id=some, fact_id="f9")])
+    fails(store.publish)  # a task resting on a fact no message states
+    store.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
+    store.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
     store.publish()
     world, rows, answers = load_release(store.root / "release")
     assert len(rows) == 4 and World(world).db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert all(a.rows or a.answer_type == "refusal" for a in answers.values())
+    ledger = [r for r in rows if settings.taxonomy[r.category].gold == "ledger"]
+    assert ledger and all(answers[r.task_id].rows == [{"answer": "Owen"}] and answers[r.task_id].messages for r in ledger)  # fmt: skip
+    store.publish()  # idempotent
     assert (store.root / "world-calls.jsonl").exists()
     store.close()
+    retried = SimpleNamespace(
+        ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]
+    )
+    limit = SimpleNamespace(type="ReviewLimit", message="no valid ledger")
+    assert failure("done", SimpleNamespace(errors=[], traces=[retried])) is None, (
+        "a judge failure the review loop retried does not fail a finished run"
+    )
+    assert failure("day", SimpleNamespace(errors=[], traces=[retried])) == "TaskError: malformed verdict"
+    assert failure("done", SimpleNamespace(errors=[limit], traces=[])) == "ReviewLimit: no valid ledger"
     print(
         "PASS author: plan, days closed only when done, review issues delivered, crash and resume, tasks, probes, fix"
     )
@@ -2380,6 +1752,5 @@ if __name__ == "__main__":
         check_clock(Path(directory) / "clock")
         asyncio.run(check_tools(Path(directory) / "tools"))
         asyncio.run(check_reviews(Path(directory) / "reviews"))
-        asyncio.run(check_flow(Path(directory) / "flow"))
         asyncio.run(check_author(Path(directory) / "author"))
     print("All generation checks passed.")
