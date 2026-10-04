@@ -71,9 +71,9 @@ Memory and notes
 
 Time
 - The world has a present. world_post writes a conversation at the present and moves it to its last line;
-  world_advance() moves it to the next part of the day: early 06-09, morning 09-12, afternoon 12-17, evening 17-21,
-  night 21-24. From the night it closes the day, once the day's checks pass, and moves to the next morning. Nothing
-  is ever written before the present, so write the day in the order it happens.
+  world_advance(to=part) moves it to a later part of the day: early 06-09, morning 09-12, afternoon 12-17, evening
+  17-21, night 21-24. From the night, world_advance(to="tomorrow") closes the day, once the day's checks pass, and
+  moves to the next morning. Nothing is ever written before the present, so write the day in the order it happens.
 - A message never contains a clock time or a date. It writes {at:id} for an event, or for a fact about one; code
   renders it on the author's clock. Relative words (tomorrow, Friday, this morning) are fine when true at the present.
 
@@ -595,6 +595,9 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         except (ValueError, LookupError) as caught:
             error = str(caught)
             raise ValueError(error) from None
+        except Exception as caught:  # a fault, not a refusal: logged as failed, and raised as it is
+            error = f"{type(caught).__name__}: {caught}"
+            raise
         finally:
             self._log(tool, arguments, error)
 
@@ -695,9 +698,10 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         return self._logged("post", {"conversation": document}, act, "day")
 
     @vf.tool
-    async def advance(self, to: Part | None = None) -> dict:
-        """Move the present to the next part of today, or to the part `to`; from the night, close the day and move
-        to the next morning. Reports what keeps a day open, and the day's style drift once it closes."""
+    async def advance(self, to: Part | Literal["tomorrow"]) -> dict:
+        """Move the present to the part `to` of today; from the night, "tomorrow" closes the day and moves to the
+        next morning. The present's own part leaves it where it is. Reports what keeps a day open, and the day's style
+        drift once it closes."""
 
         def act():
             day = today(self._world())
@@ -796,7 +800,8 @@ def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") 
         f"It is {clock(world, present(world))}, day {day} of {total}.{review}"
         f"{rejected(feedback, ', and the world and your notes are back at the start of the day')}\nRead world_now() and your notes, and "
         "write today: post its conversations in the order they happen with world_post, and move on with "
-        "world_advance(); from the night it closes the day once today's checks pass. Then write /task/notes/recap.md "
+        'world_advance(to=part); from the night, to="tomorrow" closes the day once today\'s checks pass. Then write '
+        "/task/notes/recap.md "
         "(what happened today, what is open), update plan.md, and end your turn."
     )
 

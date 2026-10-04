@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from verifiers.v1.dialects.base import append_user_notice
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.mcp.launch import serve
 from worldgen_slack.dataset import PrivateAnswer, PublicTask, load_release, sha256, write_release
@@ -66,6 +67,7 @@ from .store import Store
 from .config import ROOT, Acceptance, Category, Config
 from .contracts import (
     DAY,
+    PARTS,
     PHASE_CRITERIA,
     TIME_LITERAL,
     Channel,
@@ -894,6 +896,12 @@ def refused(expected, function, *args, **kwargs):
     raise AssertionError(f"not refused: {expected}")
 
 
+def onward(world) -> str:
+    """Where advance moves next: the next part of today, or from the night, tomorrow."""
+    part, order = part_of(world, present(world)), list(PARTS)
+    return "tomorrow" if part == "night" else order[order.index(part) + 1]
+
+
 def check_clock(root):
     """The world in time order (v7): a plan whose events never move and whose facts share their event's moment;
     conversations posted only at the present, their statements tagged and first made where the plan says; promises
@@ -1044,15 +1052,21 @@ def check_clock(root):
         with world.trial() as copy:
             return advance(copy, settings, **kwargs)
 
-    assert advanced()["closed_day"] is None and part_of(world, present(world)) != "early"
+    assert advanced(to=onward(world))["closed_day"] is None and part_of(world, present(world)) != "early"
     refused("a later part of today", advanced, to="early")
     advanced(to="night")
+    held = present(world)
+    assert advanced(to="night")["closed_day"] is None and present(world) == held, (
+        "the present's own part: no move"
+    )
     strict = settings.model_copy(update={"author": settings.author.model_copy(update={"tolerance": 0.0})})
     assert shares[1]["messages"] == 2 and any("messages today" in e for e in close_day(world, strict, 1)), (
         "4 posted"
     )
-    assert advanced()["closed_day"] == 1 and today(world) == 2
+    assert advanced(to="tomorrow")["closed_day"] == 1 and today(world) == 2
+    refused("the day closes from the night", advanced, to="tomorrow")  # a repeat never closes a second day
     advanced(to="morning")
+    refused("advance to night first", advanced, to="tomorrow")
     # Shares are checked per day, and a day stays closable: with a day of about 15 messages, f2 still owed.
     assert band(0.3, 0.1, 2) == (0, 1) and band(0.3, 0.1, 40) == (8, 16) and band(0.25, 0.1, 10) == (1, 4)
     big = settings.model_copy(update={"activity": settings.activity.model_copy(update={"messages": 120}), "author": settings.author.model_copy(update={"tolerance": 0.3, "share_tolerance": 0.1})})  # fmt: skip
@@ -1113,7 +1127,7 @@ def check_clock(root):
     notes = PlanFact(id="f5", storyline="s1", subject="Release 4.2", attribute="notes", value="notes posted", channel_id=ops, author_id=b, day=2, event="e2", kind="scheduled", summary="s")  # fmt: skip
     refused("e2 is past", recorded, plan(facts=[*facts, notes]))  # it is evening; e2 was at 14:00
     advanced(to="night")
-    advanced()  # day 3, early: e1 at 10:00 is ahead, and f3 and f4 are to be told before it
+    advanced(to="tomorrow")  # day 3, early: e1 at 10:00 is ahead, and f3 and f4 are to be told before it
     refused("are scheduled before", advanced, to="night")
     assert {e.split()[0] for e in close_day(world, settings, 3)} == {"f3", "f4"}, (
         "planned for day 3, unstated"
@@ -1131,11 +1145,11 @@ def check_clock(root):
 
     def advanced_with(cfg):
         with world.trial() as copy:
-            return advance(copy, cfg)
+            return advance(copy, cfg, "tomorrow")
 
     refused("day 3 stays open", advanced_with, strict)
     while today(world) is not None:
-        advanced(to="night") if part_of(world, present(world)) != "night" else advanced()
+        advanced(to=onward(world))
     refused("the calendar is closed", posted_, talk(dict(author_id=a, text="late")))
     refused("the calendar is closed", recorded, first_plan)
     measured = close_day(world, settings.model_copy(update={"author": settings.author.model_copy(update={"share_tolerance": 0.0})}), 1)  # fmt: skip
@@ -1281,8 +1295,13 @@ async def check_tools(root):
         except ValueError:
             pass
     assert (await call(day1, "read", actor_id=c, tool="read_channel", arguments={"channel_id": ops}))["items"]
+    try:
+        await call(day1, "read", actor_id=c, tool="read_channel", arguments={"nope": 1})
+        raise AssertionError("a read with unknown arguments went through")
+    except TypeError:
+        pass
     while today(world) == 1:
-        await call(day1, "advance")
+        await call(day1, "advance", to=onward(world))
     try:
         await call(day1, "post", conversation=Conversation(channel_id=ops, about="x", lines=[PostLine(author_id=a, text="hi")]))  # fmt: skip
         raise AssertionError("day 1's tools posted on day 2")
@@ -1292,6 +1311,9 @@ async def check_tools(root):
     assert {e["tool"] for e in log} >= {"plan", "post", "view", "sql", "read", "advance", "now"}
     assert any(not e["ok"] and "conveys" in e["error"] for e in log)
     assert [e["ok"] for e in log if e["tool"] == "plan"] == [True], "one plan went through"
+    assert any(e["tool"] == "read" and not e["ok"] and e["error"].startswith("TypeError") for e in log), (
+        "a fault is logged as failed"
+    )
     assert any(e["tool"] == "post" and e["args"]["conversation"]["about"] == "decision" for e in log), (
         "with its arguments"
     )
@@ -1341,7 +1363,7 @@ async def check_tools(root):
                 continue
             except ValueError:
                 pass
-        advance(world, settings)
+        advance(world, settings, onward(world))
     assert world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] > 300
     memory = files(world, settings, context, "tasks")
     raw = re.compile(r"\b1\d{15}\b")
@@ -1715,7 +1737,7 @@ async def check_author(root):
 
         async def close():
             while today(world) == tools.config.day:
-                await call("advance")
+                await call("advance", to=onward(world))
 
         if tools.config.mode == "plan":
             crash["plans"] += prompt.startswith("Before day 1")
@@ -1808,6 +1830,11 @@ async def check_author(root):
     store = TestStore(settings.output, manifest)
     env = AuthorEnv(settings, store)
     await env.setup(agents)
+    asked = [{"role": "user", "content": "write today"}]
+    append_user_notice(asked)
+    assert "call it again" in asked[0]["content"] and "do not retry" not in asked[0]["content"], (
+        "a dropped tool call is called again, not given up"
+    )
     for _ in range(2):  # the review after day 2 is cut off, then day 3
         try:
             await AuthorEnv(settings, store).run(None, agents)

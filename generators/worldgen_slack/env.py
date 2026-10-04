@@ -12,6 +12,7 @@ import time
 
 import verifiers.v1 as vf
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
+from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
 from worldgen_slack.db import digest
 from worldgen_slack.taskset import SolverTask
@@ -54,6 +55,14 @@ SETUP_FILES = ("input.json", "guide.md", "schemas.json", "schema.sql", "world.sq
 
 
 ARCHIVE = "/tmp/task-files.tgz"
+# What verifiers tells every agent on a restricted network, on the first user message of each request: by default,
+# "do not retry the blocked provider-side operation", even when nothing was removed (to fix upstream: only when a
+# capability was). Our VMs block every host and reach their tools through a tunnel, where the true thing to say is
+# that a dropped call never arrived; the authors stopped their turns on the default instead of calling again.
+NETWORK_NOTICE = (
+    "This machine has no network. Its world_* and inspect_* functions reach the host through a tunnel; one that "
+    'raises "is unavailable" never arrived: call it again.'
+)
 
 
 async def upload(runtime, files: dict[str, str | bytes], clear: str) -> None:
@@ -89,6 +98,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
     def __init__(self, settings: Config, store: Store):
         self.settings, self.store = settings, store
         self.used = used_names(settings.corpus, store.root)
+        dialects.CAPABILITY_NOTICE = NETWORK_NOTICE  # read by append_user_notice on every request
         super().__init__(settings.env)
 
     @property
@@ -415,7 +425,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 await self.author_step(interaction, runtime, prompt, attempt, "day")
                 errors = []
                 if today(self.world) == day:
-                    errors = close_day(self.world, cfg, day) or ["advance through the night to close it"]
+                    errors = close_day(self.world, cfg, day) or [
+                        'advance to the night, then to "tomorrow", to close it'
+                    ]
                 if await self.note(runtime, "recap.md") in (None, before):
                     errors.append("write /task/notes/recap.md: what happened today and what is open")
                 if not errors:

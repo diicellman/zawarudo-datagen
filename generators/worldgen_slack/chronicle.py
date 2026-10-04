@@ -665,23 +665,27 @@ def close_day(world, settings, day: int) -> list[str]:
     return errors
 
 
-def advance(world, settings, to: str | None = None) -> dict:
-    """Move the present to the start of the next part of today, or of the part `to`. From the night it closes the
-    day, if the day can close, and moves to the next day's early part, or past the calendar's end."""
+def advance(world, settings, to: str) -> dict:
+    """Move the present to the start of the part `to` of today; "tomorrow", from the night, closes the day, if it can
+    close, and moves to the next day's early part, or past the calendar's end. The part the present is in already
+    leaves it where it is, and "tomorrow" again is refused, so a call repeated after a lost response never moves
+    twice."""
     day = today(world)
     if day is None:
         raise ValueError("the calendar is closed")
     now, order = present(world), list(PARTS)
     part = part_of(world, now)
-    closed = False
-    if to is not None:
-        if to not in order[order.index(part) + 1 :]:
-            raise ValueError(
-                f"advance moves to a later part of today: one of {order[order.index(part) + 1 :]}"
-            )
+    closed, later = False, order[order.index(part) + 1 :]
+    if to == part:
+        target = now
+    elif to in later:
         target = window(world, day, to)[0]
+    elif to != "tomorrow":
+        raise ValueError(
+            f"advance moves to a later part of today, one of {later}, or from the night to tomorrow"
+        )
     elif part != "night":
-        target = window(world, day, order[order.index(part) + 1])[0]
+        raise ValueError(f"the day closes from the night: it is the {part}; advance to night first")
     else:
         if errors := close_day(world, settings, day):
             raise ValueError(f"day {day} stays open: " + "; ".join(errors))
