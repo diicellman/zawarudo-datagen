@@ -14,7 +14,7 @@ from typing import Literal, Self
 from zoneinfo import ZoneInfo
 
 import verifiers.v1 as vf
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 from worldgen_slack.db import World, digest
 from worldgen_slack.tools import WorldTaskData, file_hash, watch_parent
 
@@ -491,11 +491,10 @@ class AuthoringToolsConfig(vf.ToolsetConfig):
     )
 
 
-class AuthorState(vf.State):
-    calls: int = 0  # calls that went through; world-calls.jsonl logs every call
+class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
+    """The author's world tools. They keep no state of their own: with the base state, a call makes no state round
+    trip through the tunnel. world-calls.jsonl logs every call, its arguments and its outcome."""
 
-
-class WorldTools(vf.Toolset[AuthoringToolsConfig, AuthorState]):
     TOOL_PREFIX = "world"
 
     async def setup(self) -> None:
@@ -506,6 +505,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, AuthorState]):
         self.settings = Config.model_validate(self.context["settings"])
         self.cells = [tuple(c) for c in self.context.get("cells", [])]
         self.gaps = Gaps(self.settings.personas.gaps)
+        self.posted = None  # the last post: its conversation, the present it left, and its result
 
     def _with_state(self, fn):
         synced = super()._with_state(fn)
@@ -518,9 +518,36 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, AuthorState]):
 
         return serialized
 
-    def _logged(self, tool: str, act, *modes: str):
-        """Run one call, refused when it is not this turn's, and log it with its outcome."""
-        self.state.calls += 1
+    def register(self, mcp) -> None:
+        """Arguments the tools' schemas refuse never reach a tool: log them too, with a short reason."""
+        super().register(mcp)
+        call = mcp.call_tool
+
+        async def call_tool(name, arguments, context=None):
+            try:
+                return await call(name, arguments, context)
+            except Exception as error:
+                if not isinstance(error.__cause__, ValidationError):
+                    raise
+                reason = "; ".join(
+                    f"{'.'.join(map(str, e['loc']))}: {e['msg']}"
+                    for e in error.__cause__.errors(include_url=False)
+                )
+                self._log(name, arguments, f"invalid arguments: {reason}")
+                raise ValueError(f"{name}: invalid arguments: {reason}") from None
+
+        mcp.call_tool = call_tool
+
+    def _log(self, tool: str, arguments: dict, error: str | None) -> None:
+        if log := self.context.get("log"):
+            entry = {"time": time.time(), "mode": self.config.mode, "day": self.config.day, "tool": tool}
+            with open(log, "a") as stream:
+                stream.write(
+                    json.dumps(entry | {"ok": error is None, "error": error, "args": arguments}) + "\n"
+                )
+
+    def _logged(self, tool: str, arguments: dict, act, *modes: str):
+        """Run one call, refused when it is not this turn's, and log it with its arguments and outcome."""
         error = None
         try:
             if modes:
@@ -530,15 +557,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, AuthorState]):
             error = str(caught)
             raise ValueError(error) from None
         finally:
-            if log := self.context.get("log"):
-                with open(log, "a") as stream:
-                    entry = {
-                        "time": time.time(),
-                        "mode": self.config.mode,
-                        "day": self.config.day,
-                        "tool": tool,
-                    }
-                    stream.write(json.dumps(entry | {"ok": error is None, "error": error}) + "\n")
+            self._log(tool, arguments, error)
 
     def _world(self, writable: bool = False) -> World:
         return World(self.config.db_path, writable=writable)
@@ -569,13 +588,13 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, AuthorState]):
     async def now(self) -> str:
         """The one-pager: the present, today's quota and drawn conversations, each storyline's facts, events, open
         promises, task cells and style drift."""
-        return self._logged("now", lambda: now_page(self._world(), self.settings, self.context))
+        return self._logged("now", {}, lambda: now_page(self._world(), self.settings, self.context))
 
     @vf.tool
     async def view(self, ref: str) -> str:
         """One page: a person (id, handle or name), a channel (id or #name), a storyline, an event, a fact, a task, a
         conversation (dNN-NNN) or a message (m123), with its latest messages and links."""
-        return self._logged("view", lambda: view(self._world(), ref, self.context))
+        return self._logged("view", {"ref": ref}, lambda: view(self._world(), ref, self.context))
 
     @vf.tool
     async def sql(self, sql: str, actor_id: str | None = None) -> dict:
@@ -586,13 +605,17 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, AuthorState]):
             world = self._world()
             return world.gold(actor_id, sql, max_rows=200) if actor_id else world.select(sql, max_rows=200)
 
-        return self._logged("sql", act)
+        return self._logged("sql", {"sql": sql, "actor_id": actor_id}, act)
 
     @vf.tool
     async def read(self, actor_id: str, tool: str, arguments: dict[str, JsonValue]) -> dict:
         """A Slack read tool as any person: search_messages, search_users, search_channels, list_user_channels,
         read_channel, read_thread, get_user, list_channel_members or get_reactions."""
-        return self._logged("read", lambda: World(self.config.db_path, actor=actor_id).call(tool, arguments))
+        return self._logged(
+            "read",
+            {"actor_id": actor_id, "tool": tool, "arguments": arguments},
+            lambda: World(self.config.db_path, actor=actor_id).call(tool, arguments),
+        )
 
     @vf.tool
     async def plan(self, ledger: Plan) -> str:
@@ -608,22 +631,29 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, AuthorState]):
             ]
             return f"the ledger holds {counts[0]} storylines, {counts[1]} events and {counts[2]} facts"
 
-        return self._logged("plan", act, "plan", "day")
+        return self._logged("plan", {"ledger": ledger.model_dump(mode="json")}, act, "plan", "day")
 
     @vf.tool
     async def post(self, conversation: Conversation) -> dict:
         """Post one conversation at the present: its lines, timed by code after the present, the facts they state,
         their reactions and promises. Returns the messages as written and the new present."""
 
+        document = conversation.model_dump(mode="json")
+
         def act():
-            seed = digest(
-                [self.settings.seed, "post", present(self._world()), conversation.model_dump(mode="json")]
-            )
-            return self._write(
+            now = present(self._world())
+            if self.posted and self.posted[:2] == (document, now):
+                # The same conversation again, and nothing written since: a retry after a lost response, not a
+                # second conversation.
+                return self.posted[2]
+            seed = digest([self.settings.seed, "post", now, document])
+            result = self._write(
                 lambda copy: post(copy, conversation, self.settings, random.Random(seed), self.gaps)
             )
+            self.posted = (document, present(self._world()), result)
+            return result
 
-        return self._logged("post", act, "day")
+        return self._logged("post", {"conversation": document}, act, "day")
 
     @vf.tool
     async def advance(self, to: Part | None = None) -> dict:
@@ -639,14 +669,18 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, AuthorState]):
                 moved["drift"] = {who[user]["real_name"]: note for user, note in notes.items()}
             return moved
 
-        return self._logged("advance", act, "day")
+        return self._logged("advance", {"to": to}, act, "day")
 
     @vf.tool
     async def revise(self, message_id: int, text: str) -> dict:
         """Rewrite one message's text where it stands: same author, time, thread and statements; no task's gold
         answer may change."""
         return self._logged(
-            "revise", lambda: self._write(lambda copy: revise(copy, message_id, text)), "day", "tasks"
+            "revise",
+            {"message_id": message_id, "text": text},
+            lambda: self._write(lambda copy: revise(copy, message_id, text)),
+            "day",
+            "tasks",
         )
 
     @vf.tool
@@ -655,6 +689,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, AuthorState]):
         measures returned."""
         return self._logged(
             "add_task",
+            {"task": task.model_dump(mode="json")},
             lambda: self._write(lambda copy: add_task(copy, task, self.settings, self.cells)),
             "tasks",
         )
@@ -667,7 +702,7 @@ class WorldAuthorConfig(vf.TaskConfig):
     tools: AuthoringToolsConfig
 
 
-class WorldAuthorTask(vf.Task[WorldTaskData, AuthorState, WorldAuthorConfig]):
+class WorldAuthorTask(vf.Task[WorldTaskData, vf.State, WorldAuthorConfig]):
     """One block of the author's work in its VM (the plan, a day, the tasks): the env opens it with the turn's prompt,
     and the author works through the world tools."""
 

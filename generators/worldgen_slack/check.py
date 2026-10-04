@@ -1209,7 +1209,7 @@ async def check_tools(root):
 
     planner = tools_for("plan", 0)
     await planner.setup()
-    stored = with_state(planner)
+    with_state(planner)
     assert "ledger holds 2 storylines, 1 events and 2 facts" in await planner._with_state(planner.plan)(
         ledger=ledger
     )
@@ -1229,8 +1229,14 @@ async def check_tools(root):
     )
     assert "everyday conversations code drew for today" in page and agenda[1]
     assert "- today: 0 messages today (thread replies 0, reacted to 0, in DMs 0); it closes with" in page
-    out = await call(day1, "post", conversation=Conversation(channel_id=ops, about="decision", lines=[PostLine(author_id=a, text="rollback it is", conveys=["f1"]), PostLine(author_id=b, text="ok", reply_to=0)]))  # fmt: skip
+    decision = Conversation(channel_id=ops, about="decision", lines=[PostLine(author_id=a, text="rollback it is", conveys=["f1"]), PostLine(author_id=b, text="ok", reply_to=0)])  # fmt: skip
+    out = await call(day1, "post", conversation=decision)
     assert len(out["messages"]) == 2 and out["now"].endswith("CDT"), out
+    count = world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert await call(day1, "post", conversation=decision) == out, (
+        "a retry after a lost response returns the post"
+    )
+    assert world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == count, "and posts nothing more"
     try:
         await call(day1, "post", conversation=Conversation(channel_id=ops, about="x", lines=[PostLine(author_id=c, text="rollback again")]))  # fmt: skip
         raise AssertionError("an untagged anchor was posted")
@@ -1272,8 +1278,10 @@ async def check_tools(root):
         assert "day 1 is closed" in str(error), error
     log = [json.loads(line) for line in (root / "world-calls.jsonl").read_text().splitlines()]
     assert {e["tool"] for e in log} >= {"plan", "post", "view", "sql", "read", "advance", "now"}
-    assert any(not e["ok"] and "conveys" in e["error"] for e in log) and stored["state"].calls == 1, (
-        "one plan went through"
+    assert any(not e["ok"] and "conveys" in e["error"] for e in log)
+    assert [e["ok"] for e in log if e["tool"] == "plan"] == [True], "one plan went through"
+    assert any(e["tool"] == "post" and e["args"]["conversation"]["about"] == "decision" for e in log), (
+        "with its arguments"
     )
     served = tools_for("day", 2)  # a tool server checks the world file's hash when it starts
     with_state(served)
@@ -1288,6 +1296,8 @@ async def check_tools(root):
         await client.initialize()
         refused = await client.call_tool("post", {"conversation": {"channel_id": ops, "about": "x", "lines": [{"author_id": a, "text": "hi", "commits": [{"id": "c1", "text": "t", "due_day": 2.5}]}]}})  # fmt: skip
         assert refused.is_error and "due_day" in str(refused.content), refused
+    invalid = [json.loads(line) for line in (root / "world-calls.jsonl").read_text().splitlines()][-1]
+    assert invalid["tool"] == "post" and invalid["error"].startswith("invalid arguments: conversation.lines.0.commits.0.due_day"), invalid  # fmt: skip
     bad = WorldAuthorTask.create("day", 2, world.path, context, "day-02-01")
     world.db.execute("UPDATE storylines SET summary = 'changed' WHERE id = 's1'")
     try:
