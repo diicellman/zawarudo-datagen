@@ -4,17 +4,20 @@ writer, owns every time, and checks every write."""
 
 import asyncio
 import functools
+import inspect
 import json
 import random
 import re
 import time
+import typing
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Self
 from zoneinfo import ZoneInfo
 
 import verifiers.v1 as vf
-from pydantic import JsonValue, ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
+from verifiers.v1.utils.decorators import discover_decorated
 from worldgen_slack.db import World, digest
 from worldgen_slack.tools import WorldTaskData, file_hash, watch_parent
 
@@ -491,6 +494,38 @@ class AuthoringToolsConfig(vf.ToolsetConfig):
     )
 
 
+TYPES = {"string": "str", "integer": "int", "number": "float", "boolean": "bool", "object": "object"}
+
+
+def shape(schema: dict, defs: dict) -> str:
+    """One JSON schema, compact: a document's fields with ? when optional, a list's bounds, a choice's values."""
+    if "$ref" in schema:
+        return shape(defs[schema["$ref"].rsplit("/", 1)[1]], defs)
+    if "anyOf" in schema:
+        return " | ".join(shape(s, defs) for s in schema["anyOf"] if s.get("type") != "null")
+    if "enum" in schema:
+        return "|".join(json.dumps(v) for v in schema["enum"])
+    if schema.get("type") == "array":
+        lo, hi = schema.get("minItems"), schema.get("maxItems")
+        bound = f"{lo or 0}-{hi} × " if hi else (f"{lo}+ × " if lo else "")
+        return f"[{bound}{shape(schema.get('items', {}), defs)}]"
+    if "properties" in schema:
+        required = set(schema.get("required", []))
+        return "{" + ", ".join(f"{k}{'' if k in required else '?'}: {shape(v, defs)}" for k, v in schema["properties"].items()) + "}"  # fmt: skip
+    return TYPES.get(schema.get("type"), "any")
+
+
+def arguments(fn) -> str:
+    """A tool's arguments as the author passes them, rendered from the types that check the call: the author's
+    help() shows only a tool's description."""
+    hints, out = typing.get_type_hints(fn), []
+    for name, param in inspect.signature(fn).parameters.items():
+        schema = TypeAdapter(hints[name]).json_schema()
+        optional = "?" if param.default is not inspect.Parameter.empty else ""
+        out.append(f"{name}{optional}: {shape(schema, schema.get('$defs', {}))}")
+    return ", ".join(out) or "none"
+
+
 class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
     """The author's world tools. They keep no state of their own: with the base state, a call makes no state round
     trip through the tunnel. world-calls.jsonl logs every call, its arguments and its outcome."""
@@ -519,8 +554,12 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         return serialized
 
     def register(self, mcp) -> None:
-        """Arguments the tools' schemas refuse never reach a tool: log them too, with a short reason."""
-        super().register(mcp)
+        """Each tool's description ends with its arguments, so the author reads what a call takes before making one.
+        Arguments the tools' schemas refuse never reach a tool: log them too, with a short reason."""
+        for fn in discover_decorated(self, "tool"):
+            doc = (fn.__doc__ or "").strip()
+            name = getattr(fn, "tool_name", None) or fn.__name__
+            mcp.add_tool(self._with_state(fn), name=name, description=f"{doc}\n\nArguments: {arguments(fn)}")
         call = mcp.call_tool
 
         async def call_tool(name, arguments, context=None):

@@ -1287,8 +1287,18 @@ async def check_tools(root):
     )
     served = tools_for("day", 2)  # a tool server checks the world file's hash when it starts
     with_state(served)
-    names = await served_tools(served)
-    assert names == {"now", "view", "sql", "read", "plan", "post", "advance", "revise", "add_task"} and served.server_name == "world"  # fmt: skip
+    described = await served_tools(served)
+    assert set(described) == {"now", "view", "sql", "read", "plan", "post", "advance", "revise", "add_task"} and served.server_name == "world"  # fmt: skip
+    # help() in the author's IPython shows a tool's description alone: it names every field of every document a
+    # call takes, nested ones too, with ? when optional.
+    for tool, models in {"post": (Conversation, PostLine, Reaction, Commit, Close), "plan": (Plan, PlanFact, Event, Storyline), "add_task": (Task,)}.items():  # fmt: skip
+        for model in models:
+            for field, info in model.model_fields.items():
+                marked = f"{field}{'' if info.is_required() else '?'}: "
+                assert marked in described[tool].split("Arguments: ", 1)[1], (tool, marked)
+    assert "lines: [1-40 × {author_id: str" in described["post"] and described["now"].endswith(
+        "Arguments: none"
+    )
     async with (
         asyncio.timeout(30),
         serve(served) as url,
@@ -1344,7 +1354,7 @@ async def served_tools(toolset):
         ClientSession(reader, writer_) as client,
     ):
         await client.initialize()
-        return {t.name for t in (await client.list_tools()).tools}
+        return {t.name: t.description for t in (await client.list_tools()).tools}
 
 
 def with_state(toolset):
@@ -1446,7 +1456,7 @@ async def check_reviews(root):
             actor_id="U2", sql="SELECT COUNT(*) AS n FROM messages WHERE channel_id = 'G1'"
         )
     )["rows"] == [{"n": 0}]
-    assert await served_tools(tools) == {"check", "read", "sql"} and tools.server_name == "inspect"
+    assert set(await served_tools(tools)) == {"check", "read", "sql"} and tools.server_name == "inspect"
     files = {"/task/verdict.json": verdict().model_dump_json().encode()}
     runtime = SimpleNamespace(read=lambda path, max_bytes: asyncio.sleep(0, files[path]))
     unchecked = SimpleNamespace(state=ReviewState(), info={}, record_metric=lambda *a: None)
