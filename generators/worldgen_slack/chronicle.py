@@ -339,6 +339,10 @@ def record_plan(world, plan: Plan, settings) -> None:
             raise ValueError(f"{f.id}: an unstated fact is planned for today (day {day}) or later")
         if f.kind == "happened" and f.day < events[f.event].day:
             raise ValueError(f"{f.id}: what happened is first stated on or after the day of {f.event}")
+        if f.kind == "scheduled" and f.day > events[f.event].day:
+            raise ValueError(f"{f.id}: what is scheduled is first stated on or before the day of {f.event}")
+        if f.kind == "scheduled" and f.day == day and moment[f.event] <= present(world):
+            raise ValueError(f"{f.id}: {f.event} is past; what is scheduled for it is told before it happens")
         earlier = [*f.after, *([f.supersedes] if f.supersedes else [])]
         if later := [d for d in earlier if planned[d].day > f.day]:
             raise ValueError(f"{f.id} comes after {later}, which are first stated on a later day")
@@ -465,6 +469,15 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
             f"this conversation would run past midnight ({clock(world, stamps[-1])}); post fewer lines or pauses "
             "today, or carry it on tomorrow"
         )
+    told = {}
+    for stamp, line in zip(stamps, lines):
+        for f in line.conveys:
+            told.setdefault(f, stamp)
+    if late := [f for f, moment_us in owed_moments(world, day) if moment_us <= stamps[-1] and not told.get(f, moment_us) < moment_us]:  # fmt: skip
+        raise ValueError(
+            f"this conversation would run to {clock(world, stamps[-1])}, past the moment of {late}, which are "
+            "scheduled and still to be told before it: tell them first, or post less now"
+        )
     number = world.db.execute("SELECT COUNT(*) FROM scenes WHERE day = ?", (day,)).fetchone()[0] + 1
     conveyed = [f for line in lines for f in line.conveys]
     scene = dict(
@@ -511,6 +524,15 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
 
 
 # ---------------------------------------------------------------------- moving the present, closing a day
+
+
+def owed_moments(world, day: int) -> list[tuple[str, int]]:
+    """The scheduled facts planned for `day` and not stated yet, with their moments: each must be told before it."""
+    return world.db.execute(
+        """SELECT id, moment_us FROM facts f WHERE day = ? AND moment_kind = 'scheduled'
+        AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.fact_id = f.id AND e.role = 'anchor') ORDER BY id""",
+        (day,),
+    ).fetchall()
 
 
 def close_day(world, settings, day: int) -> list[str]:
@@ -561,6 +583,10 @@ def advance(world, settings, to: str | None = None) -> dict:
             raise ValueError(f"day {day} stays open: " + "; ".join(errors))
         last = world.db.execute("SELECT MAX(day) FROM calendar").fetchone()[0]
         target, closed = (window(world, day + 1, "early")[0] if day < last else bounds(world, day)[1]), True
+    if late := [f for f, moment_us in owed_moments(world, day) if moment_us <= target]:
+        raise ValueError(
+            f"{late} are scheduled before {clock(world, target)} and still to be told: post them before moving on"
+        )
     world.db.execute("UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(max(target, now)),))
     return {
         "now": clock(world, max(target, now)),

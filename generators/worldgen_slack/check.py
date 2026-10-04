@@ -282,6 +282,22 @@ async def check_world(root):
         evidence=[dict(fact_id="f2", message_id=4, role="anchor")],
     )
     rejects(
+        "told_late",
+        facts=[
+            fact
+            | dict(
+                id="f2",
+                subject="a",
+                attribute="b",
+                day=1,
+                moment_us=at(1, 9),
+                moment_zone="UTC",
+                moment_kind="scheduled",
+            )
+        ],
+        evidence=[dict(fact_id="f2", message_id=4, role="anchor")],
+    )
+    rejects(
         "out_of_order",
         facts=[fact | dict(id="f2", subject="a", attribute="b", day=1)],
         fact_relations=[dict(src_fact="f1", dst_fact="f2", kind="after")],
@@ -1026,22 +1042,31 @@ def check_clock(root):
     refused(
         "today (day 2) or later", recorded, plan(facts=[*facts[:3], facts[3].model_copy(update={"day": 1})])
     )
+    refused("on or before the day of e1", recorded, plan(facts=[*facts[:2], facts[2].model_copy(update={"day": 4}), facts[3]]))  # fmt: skip
+    notes = PlanFact(id="f5", storyline="s1", subject="Release 4.2", attribute="notes", value="notes posted", channel_id=ops, author_id=b, day=2, event="e2", kind="scheduled", summary="s")  # fmt: skip
+    refused("e2 is past", recorded, plan(facts=[*facts, notes]))  # it is evening; e2 was at 14:00
     advanced(to="night")
-    advanced()
-    advanced(to="night")
-    refused("day 3 stays open", advanced)
+    advanced()  # day 3, early: e1 at 10:00 is ahead, and f3 and f4 are to be told before it
+    refused("are scheduled before", advanced, to="night")
     assert {e.split()[0] for e in close_day(world, settings, 3)} == {"f3", "f4"}, (
         "planned for day 3, unstated"
     )
     refused("comes after ['f3']", posted_, talk(dict(author_id=a, text="Owen owns the audit at {at:e1}", conveys=["f4"])))  # fmt: skip
-    # Late, but on their day: a scheduled fact may be stated after its event.
-    posted_(
+    refused("past the moment of ['f3', 'f4']", posted_, talk(*[dict(author_id=a, text="still here", pause="hours")] * 5, channel=leads))  # fmt: skip
+    posted_(  # a scheduled fact is told before its moment
         talk(
             dict(author_id=a, text="dry run for the release window at {at:e1}", conveys=["f3"]), channel=leads
         )
     )
     # A fact about an event and with no anchor of its own is stated with the event's time.
     posted_(talk(dict(author_id=a, text="Owen owns the audit at {at:e1}", conveys=["f4"]), dict(author_id=d, text="thanks")))  # fmt: skip
+    advanced(to="night")
+
+    def advanced_with(cfg):
+        with world.trial() as copy:
+            return advance(copy, cfg)
+
+    refused("day 3 stays open", advanced_with, strict)
     while today(world) is not None:
         advanced(to="night") if part_of(world, present(world)) != "night" else advanced()
     refused("the calendar is closed", posted_, talk(dict(author_id=a, text="late")))

@@ -91,7 +91,8 @@ Conversations (world_post)
   index of an earlier line whose thread the line joins; thread continues an earlier thread of the channel.
   reactions come from other members. pause is "hours" when an hour or more passes before the line.
 - conveys lists the facts a line states. A fact's first statement is by its author, in its channel, on its day; a
-  happened fact is stated only after it happens; after and supersedes keep their order. Anyone may repeat a stated
+  happened fact is stated only after it happens, a scheduled one before it happens; after and supersedes keep their
+  order. Anyone may repeat a stated
   fact later, listing it in conveys.
 - commits opens a promise with the day it is due; closes ends one: kept, changed or dropped. Every promise ends by
   its due day.

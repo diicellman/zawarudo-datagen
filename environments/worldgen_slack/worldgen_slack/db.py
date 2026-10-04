@@ -92,6 +92,11 @@ RULES = {
         WHERE f.moment_kind = 'happened' AND e.role IN ('anchor', 'supporting') AND m.ts_us < f.moment_us""",
         "message {message} states fact {fact} before it happened",
     ),
+    "told_late": (
+        f"""WITH {FIRST} SELECT f.id AS fact FROM facts f JOIN first ON first.fact_id = f.id
+        WHERE f.moment_kind = 'scheduled' AND first.ts_us >= f.moment_us""",
+        "fact {fact} is scheduled: it is first stated before its moment",
+    ),
     "out_of_order": (
         f"""WITH {FIRST} SELECT r.src_fact AS fact, r.dst_fact AS other, r.kind FROM fact_relations r
         JOIN first a ON a.fact_id = r.src_fact JOIN first b ON b.fact_id = r.dst_fact
