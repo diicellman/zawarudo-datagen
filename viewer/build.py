@@ -36,7 +36,9 @@ def snapshot(path: Path) -> dict:
         "SELECT channel_id, user_id FROM members WHERE left_us IS NULL ORDER BY user_id"
     ):
         members.setdefault(channel, []).append(user)
+    zone = db.execute("SELECT value FROM world_meta WHERE key = 'zone'").fetchone()
     world = {
+        "zone": zone[0] if zone else None,
         "users": [
             {"id": r["id"], "name": r["real_name"], "display_name": r["display_name"], "team": json.loads(r["profile_json"]).get("Team")}
             for r in db.execute("SELECT * FROM users ORDER BY id")

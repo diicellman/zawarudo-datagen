@@ -507,7 +507,7 @@ function messageRow(m, compact) {
   return h('div', {class: 'msg' + (ev.length ? ' ev' : '') + (S.message === m.id ? ' flash' : ''), id: 'm-' + m.id},
     h('div', {class: 'av', text: initials(personName(m.author_id))}),
     h('div', {}, h('span', {class: 'who', text: personName(m.author_id)}),
-      h('span', {class: 'when', title: zone ? 'author local: ' + utc(m.timestamp, zone) + ' (' + zone + ')' : '', text: utc(m.timestamp)}),
+      h('span', {class: 'when', title: zone ? 'author local: ' + utc(m.timestamp, zone) + ' (' + zone + ')' : '', text: utc(m.timestamp, V().world?.zone)}),
       persona ? h('span', {class: 'when', text: persona.role}) : null,
       h('div', {class: 'text', text: m.text}),
       h('div', {}, !compact && n ? h('button', {class: 'linkish', type: 'button', text: `${n} repl${n > 1 ? 'ies' : 'y'}`, onclick: () => { S.message = m.id; renderThread(); renderMessages(); }}) : null,
