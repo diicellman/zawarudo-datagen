@@ -7,7 +7,7 @@ import json
 import verifiers.v1 as vf
 from pydantic import Field, JsonValue
 from worldgen_slack.db import World
-from worldgen_slack.tools import Call, file_hash
+from worldgen_slack.tools import Call, file_hash, watch_parent
 
 from ..contracts import measures, style
 
@@ -87,4 +87,5 @@ class ReviewTools(vf.Toolset[ReviewToolsConfig, ReviewState]):
 
 
 if __name__ == "__main__":
+    watch_parent()
     ReviewTools.run()

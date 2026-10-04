@@ -19,7 +19,8 @@ def world_author(model: str) -> vf.AgentConfig:
     return base.model_copy(
         update={
             "harness": base.harness.model_copy(update={"max_total_tokens": 600_000}),
-            "runtime": base.runtime.model_copy(update={"idle_timeout": 7200}),
+            # Idle between interactions only while the judge or the solver works; a VM left behind ends in 30 min.
+            "runtime": base.runtime.model_copy(update={"idle_timeout": 1800}),
             "max_turns": 200,
             "timeout": base.timeout.model_copy(update={"rollout": 5400}),
         }

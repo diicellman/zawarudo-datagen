@@ -4,11 +4,14 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
 import verifiers.v1 as vf
 from verifiers.v1.clients import EvalClientConfig, ModelContext
+from verifiers.v1.runtimes.prime import set_base_sandbox_labels
+from verifiers.v1.utils.interrupt import install_interrupt
 from worldgen_slack.dataset import atomic_json
 
 from .chronicle import daily
@@ -37,7 +40,13 @@ def failure(phase: str, episode) -> str | None:
     return reason or "; ".join(f"{e.type}: {e.message}" for t in episode.traces for e in t.errors) or phase
 
 
+def run_label(output: Path) -> str:
+    """The label every sandbox of a run carries, so one left behind is found by it: prime sandbox list."""
+    return "worldgen-" + re.sub(r"[^a-z0-9]+", "-", f"{output.parent.name}-{output.name}".lower()).strip("-")
+
+
 async def run(config: Config) -> dict:
+    set_base_sandbox_labels([run_label(config.output)])
     store = Store(config.output, provenance(config))
     try:
         if store.state.phase != "done":
@@ -82,7 +91,14 @@ def main() -> int:
         plan["daily"] = dict(zip(dates, daily(dates, config)))  # each date's messages and their parts
         print(json.dumps(plan, indent=1))
         return 0
-    result = asyncio.run(run(config))
+    # The first Ctrl-C or SIGTERM unwinds the run: its interactions close, its tool servers and tunnels stop and its
+    # VM is deleted; signals during that cleanup are ignored. The checkpoint stays for a resume.
+    install_interrupt()
+    try:
+        result = asyncio.run(run(config))
+    except KeyboardInterrupt:
+        print("interrupted: the run is stopped and its sandboxes deleted; rerun to resume", file=sys.stderr)
+        return 130
     print(json.dumps(result, indent=2))
     return 0 if result["status"] == "complete" else 2
 

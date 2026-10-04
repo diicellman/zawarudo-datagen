@@ -3,6 +3,9 @@
 import asyncio
 import functools
 import hashlib
+import os
+import threading
+import time
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -43,6 +46,21 @@ class WorldToolsConfig(vf.ToolsetConfig):
 def file_hash(path: Path | str) -> str:
     with open(path, "rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def watch_parent() -> None:
+    """A tool server lives as long as the process that started it: once that process is gone, the server exits.
+    Verifiers' own guard is Linux-only, and a stopped generator left its server running on macOS."""
+    parent = os.getppid()
+    if parent == 1:  # the parent was gone before the server started watching it
+        os._exit(0)
+
+    def watch():
+        while os.getppid() == parent:
+            time.sleep(1)
+        os._exit(0)
+
+    threading.Thread(target=watch, daemon=True).start()
 
 
 def stage_world(config: WorldToolsConfig, path: Path | str) -> None:
@@ -153,4 +171,5 @@ class SlackTools(vf.Toolset[WorldToolsConfig, CallState]):
 
 
 if __name__ == "__main__":
+    watch_parent()
     SlackTools.run()

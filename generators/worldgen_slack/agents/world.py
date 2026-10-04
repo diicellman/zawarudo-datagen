@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import verifiers.v1 as vf
 from pydantic import JsonValue
 from worldgen_slack.db import World, digest
-from worldgen_slack.tools import WorldTaskData, file_hash
+from worldgen_slack.tools import WorldTaskData, file_hash, watch_parent
 
 from ..chronicle import (
     Conversation,
@@ -776,4 +776,5 @@ def context_of(settings, state, store_root: Path, organization: dict | None) -> 
 
 
 if __name__ == "__main__":
+    watch_parent()  # the server process ends with the generator that started it
     WorldTools.run()

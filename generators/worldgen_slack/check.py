@@ -1,7 +1,12 @@
 """Offline invariant checks, one per rule group the pipeline relies on: uv run --frozen python -m generators.worldgen_slack.check"""
 
 import asyncio
+import inspect
 import json
+import os
+import subprocess
+import sys
+import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -20,7 +25,7 @@ from verifiers.v1.mcp.launch import serve
 from worldgen_slack.dataset import PrivateAnswer, PublicTask, load_release, sha256, write_release
 from worldgen_slack.db import ANSWER_KEY, World
 from worldgen_slack.taskset import SolverTask
-from worldgen_slack.tools import SlackTools, WorldToolsConfig, file_hash, stage_world
+from worldgen_slack.tools import SlackTools, WorldToolsConfig, file_hash, stage_world, watch_parent
 from .agents.inspection import ReviewState
 from .agents.judge import JudgeTask, review_payload
 from .agents.synthesizer import parse_premise
@@ -51,7 +56,7 @@ from .chronicle import (
     today,
 )
 from .env import GenerationEnv
-from .generate import failure, provenance
+from .generate import failure, provenance, run_label
 from .store import Store
 from .config import ROOT, Acceptance, Category, Config
 from .contracts import (
@@ -459,8 +464,28 @@ async def check_world(root):
         raise AssertionError("a changed world file was served")
     except ValueError:
         pass
+    # A tool server exits with the process that started it: killed while the server watches, or gone before it could.
+    watcher = "import os, threading, time\n" + inspect.getsource(watch_parent)
+    for late, then in ((False, "watch_parent(); print('watching', flush=True)"), (True, "time.sleep(0.5); watch_parent()")):  # fmt: skip
+        server_code = f"{watcher}\n{then}\ntime.sleep(60)"
+        wait = "" if late else "s.stdout.readline(); "
+        parent_code = f"import subprocess, sys, time; s = subprocess.Popen([sys.executable, '-c', {server_code!r}], stdout=subprocess.PIPE, text=True); {wait}print(s.pid, flush=True); time.sleep(0 if {late} else 60)"  # fmt: skip
+        parent = subprocess.Popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
+        server = int(parent.stdout.readline())
+        parent.kill()
+        parent.wait()
+        for _ in range(40):
+            try:
+                os.kill(server, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(server, 9)
+            raise AssertionError(f"a tool server outlived the process that started it (gone before: {late})")
     print(
-        "PASS world: triggers, rules with rollback, completion, solver copy, visibility, search, paging, tools"
+        "PASS world: triggers, rules with rollback, completion, solver copy, visibility, search, paging, tools, "
+        "servers end with their parent"
     )
 
 
@@ -1814,6 +1839,9 @@ async def check_author(root):
     assert ledger and all(answers[r.task_id].rows == [{"answer": "Owen"}] and answers[r.task_id].messages for r in ledger)  # fmt: skip
     store.publish()  # idempotent
     assert (store.root / "world-calls.jsonl").exists()
+    assert run_label(Path("/x/data/v7-01/software")) == "worldgen-v7-01-software", (
+        "a run's sandboxes are findable"
+    )
     store.close()
     retried = SimpleNamespace(
         ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]

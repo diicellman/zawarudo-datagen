@@ -27,6 +27,8 @@ uv run --frozen worldgen-slack --config configs/worldgen_slack/worldgen.toml > r
 - **Spend:** `research_budget_usd` stops new calls once the reported spend reaches it.
 - **GLM limit:** the account allows 8 concurrent GLM requests, so run **one world at a time**.
 - **Follow a run:** `tail -F runs/world.log | grep -E '"event": "(day_closed|probe|candidate_finished|workspace_frozen)"|Traceback'`.
+- **Stop a run** with Ctrl-C or `kill <pid>`: it unwinds, deletes its VM and keeps its checkpoint; rerun to resume.
+  Its sandboxes carry the label `worldgen-<run>-<world>` (`prime sandbox list`), in case one is left behind.
 - **Inspect:**
   - `uv run --frozen python scripts/worldgen_slack/measure.py data/<run>` for the scorecard, style, the author's
     days and tool calls, probes and cost;
