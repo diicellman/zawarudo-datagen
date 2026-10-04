@@ -1686,7 +1686,10 @@ async def check_author(root):
                 ]
                 issues = [Issue(artifact="workspace", message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser")]  # fmt: skip
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
-            verdict = Verdict(approved=not issues, tasks=[TaskReview(task_id=t["id"], valid=True, reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]], issues=issues, criteria=criteria, summary="s")  # fmt: skip
+            # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
+            reviews = [TaskReview(task_id=t["id"], valid=(attempt, t["id"]) != ("tasks-01", "t3"), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
+            issues += [Issue(artifact="tasks", task_ids=[r.task_id], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
+            verdict = Verdict(approved=not any(i.blocking for i in issues) and all(r.valid for r in reviews), tasks=reviews, issues=issues, criteria=criteria, summary="s")  # fmt: skip
             validate_verdict(verdict, payload)
             return verdict
 
@@ -1778,7 +1781,10 @@ async def check_author(root):
         elif prompt.startswith("The last day is closed"):
             for i, (category, level, *_) in enumerate(json.loads(tools.config.context)["cells"]):
                 await call("add_task", task=scripted_task(settings, i, category, level, a))
-        elif prompt.startswith("The solver's tries"):
+        elif prompt.startswith("Each task's cell"):
+            assert '"level_fit": 3' in prompt and '"evidence_pages"' in prompt and '"concept"' in prompt, (
+                "hardening reads the judge's level fit and code's measures"
+            )
             for i, (category, level, *_) in list(enumerate(json.loads(tools.config.context)["cells"]))[1:3]:
                 task = scripted_task(settings, i, category, level, a)
                 await call(
@@ -1859,6 +1865,11 @@ async def check_author(root):
     )
     assert ("review", "final-02", "task", False, False, False, ("t9",)) in seen, (
         "only the changed task is reviewed again"
+    )
+    probed = [s[6] for s in seen if s[:3] == ("review", "tasks-01", "task")]
+    assert probed == [("t0", "t1", "t2", "t3"), ("t1",)], "the judge reviews each probe's tasks"
+    assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [("t2", "t3")], (
+        "the final review judges only what changed or failed since its probe's review"
     )
     assert any(e["event"] == "candidate_finished" and e["attempt"] == "tasks-01" and e["approved"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines())), "the tasks attempt is closed"  # fmt: skip
     assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"

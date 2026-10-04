@@ -296,36 +296,14 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         previous = state.last_verdict.issues if state.last_verdict else []
         people = cards(state.cast)
 
-        async def check():
-            # The solver's runs of a task as it is now are reused, a probe's included; only changed tasks are solved.
-            fresh = [t for t in due if state.solves.get(t, {}).get("key") != keys[t]]
-            for task_id, task_runs in (await self.solves(agents, fresh, attempt, n)).items():
-                self.keep_solves(task_id, keys[task_id], task_runs)
-            runs = {t: state.solves[t] for t in due}
-            payload = review_payload(
-                self.world, "task", due, self.settings.taxonomy,
-                solves=[result for t in due for result in runs[t]["results"]],
-                previous_issues=[i.model_dump(mode="json") for i in previous if set(i.task_ids) & runs.keys()],
-            )  # fmt: skip
-            files = {f"solver_{t}_{k}.json": record for t in due for k, trace_id in enumerate(runs[t]["traces"], 1) if (record := self.saved_trace(trace_id))}  # fmt: skip
-            return runs, payload, await self.review(agents, payload, attempt, files, "tasks")
-
         workspace = [i.model_dump(mode="json") for i in previous if i.artifact == "workspace"]
         world_payload = review_payload(self.world, "world", [], people=people, ledger=ledger_digest(self.world), **({"previous_issues": workspace} if workspace else {}))  # fmt: skip
         async with asyncio.TaskGroup() as group:
             world = group.create_task(self.review(agents, world_payload, attempt, {}, "world"))
-            checked = group.create_task(check()) if due else None
-        runs, payload, judged = checked.result() if checked else ({}, None, None)
+            checked = group.create_task(self.judge_tasks(agents, due, keys, attempt, n, previous)) if due else None  # fmt: skip
+        runs, judged = checked.result() if checked else ({}, None)
         verdicts = [v for v in (judged, world.result()) if v is not None]
         rejected = [v for v in verdicts if not v.approved]
-        for task_id, cached in runs.items():
-            results = cached["results"]
-            rate = sum(r["semantic_correctness"] for r in results) / len(results)
-            approved = accepted_task(judged, self.settings.acceptance, task_id)
-            fit = next(r.level_fit for r in judged.tasks if r.task_id == task_id)
-            if approved:
-                state.task_reviews[task_id] = {"key": keys[task_id], "solve_rate": rate, "level_fit": fit, "results": results}  # fmt: skip
-            self.store.event("task_reviewed", attempt=attempt, task_id=task_id, approved=approved, solve_rate=rate, learnability=4 * rate * (1 - rate))  # fmt: skip
         merged = Verdict.model_construct(
             approved=not rejected,
             tasks=[r for v in verdicts for r in v.tasks],
@@ -475,6 +453,32 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         state.day, state.phase = state.day + 1, "day"
         self.store.finish_attempt(verdict.approved)
 
+    async def judge_tasks(self, agents, due, keys, attempt, n, previous=()) -> tuple[dict, Verdict]:
+        """The judge's review of the `due` tasks, on the solver's runs of each as it is now: runs kept from earlier
+        are reused, and only changed tasks are solved. A valid review is kept with its task's key, so a later review
+        skips the task until it changes."""
+        state = self.store.state
+        fresh = [t for t in due if state.solves.get(t, {}).get("key") != keys[t]]
+        for task_id, task_runs in (await self.solves(agents, fresh, attempt, n)).items():
+            self.keep_solves(task_id, keys[task_id], task_runs)
+        runs = {t: state.solves[t] for t in due}
+        payload = review_payload(
+            self.world, "task", due, self.settings.taxonomy,
+            solves=[result for t in due for result in runs[t]["results"]],
+            previous_issues=[i.model_dump(mode="json") for i in previous if set(i.task_ids) & runs.keys()],
+        )  # fmt: skip
+        files = {f"solver_{t}_{k}.json": record for t in due for k, trace_id in enumerate(runs[t]["traces"], 1) if (record := self.saved_trace(trace_id))}  # fmt: skip
+        judged = await self.review(agents, payload, attempt, files, "tasks")
+        for task_id in due:
+            results = runs[task_id]["results"]
+            rate = sum(r["semantic_correctness"] for r in results) / len(results)
+            approved = accepted_task(judged, self.settings.acceptance, task_id)
+            fit = next(r.level_fit for r in judged.tasks if r.task_id == task_id)
+            if approved:
+                state.task_reviews[task_id] = {"key": keys[task_id], "solve_rate": rate, "level_fit": fit, "results": results}  # fmt: skip
+            self.store.event("task_reviewed", attempt=attempt, task_id=task_id, approved=approved, solve_rate=rate, learnability=4 * rate * (1 - rate))  # fmt: skip
+        return runs, judged
+
     def keep_solves(self, task_id: str, key: str, runs: list) -> None:
         """A task's solver runs, kept with what the task was when they ran."""
         self.store.state.solves[task_id] = {"key": key, "results": [r for r, _ in runs], "traces": [t.id for _, t in runs]}  # fmt: skip
@@ -485,8 +489,10 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         return observable(json.loads(path.read_text())) if path.exists() else None
 
     async def probe(self, agents, attempt: str) -> dict:
-        """The solver tries each task that changed since its last runs, within the world's probe budget; each task's
-        solve rate and fewest calls are kept on it, and its runs are kept for the final review."""
+        """The solver tries each task that changed since its last runs, within the world's probe budget, and the
+        judge reviews them on those runs. Each task's solve rate and fewest calls are kept on it; its runs and a valid
+        review are kept for the final review. Returns, per task, what hardening reads: its cell, the tries, the
+        judge's level fit and reason, and code's measures."""
         state, cfg = self.store.state, self.settings
         self.refresh_gold()
         keys = {t: self.task_key(t) for (t,) in self.world.db.execute("SELECT id FROM tasks ORDER BY id")}
@@ -495,16 +501,23 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         due = due[: max(0, cfg.author.probe_budget - state.probe_solves) // n]
         if not due:
             return {}
+        runs, judged = await self.judge_tasks(agents, due, keys, attempt, n)
+        measured = self.store.difficulty()
         results = {}
-        for task_id, runs in (await self.solves(agents, due, attempt, n)).items():
-            self.keep_solves(task_id, keys[task_id], runs)
-            outcomes = [outcome for outcome, _ in runs]
+        for task_id in due:
+            outcomes = runs[task_id]["results"]
             rate = sum(o["semantic_correctness"] for o in outcomes) / n
             fewest = min((o["calls"] for o in outcomes if o["correct"]), default=None)
             self.world.db.execute(
                 "UPDATE tasks SET solve_rate = ?, min_calls = ? WHERE id = ?", (rate, fewest, task_id)
             )
-            results[task_id] = {"solve_rate": rate, "tries": [{k: o.get(k) for k in ("correct", "calls", "reason")} for o in outcomes]}  # fmt: skip
+            review = next(r for r in judged.tasks if r.task_id == task_id)
+            results[task_id] = (
+                {k: v for k, v in measured[task_id].items() if k not in ("level_fit", "solve_rate")}
+                | {"solve_rate": rate, "tries": [{k: o.get(k) for k in ("correct", "calls", "reason")} for o in outcomes]}
+                | {"level_fit": review.level_fit, "valid": review.valid, "review": review.reason}
+                | {"issues": [f"{i.defect} {i.requested_change}" for i in judged.issues if task_id in i.task_ids]}
+            )  # fmt: skip
         state.probe_solves += n * len(due)
         self.store.event("probe", attempt=attempt, rates={t: r["solve_rate"] for t, r in results.items()})
         self.store.save()

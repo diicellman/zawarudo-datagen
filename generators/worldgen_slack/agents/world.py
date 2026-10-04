@@ -811,9 +811,12 @@ def tasks_prompt(settings) -> str:
 
 def harden_prompt(results: dict, left: int) -> str:
     return (
-        f"The solver's tries, per task: {json.dumps(results, ensure_ascii=False)}\nKeep each task, or replace it in its "
-        "cell to fit its level: reword it, or rest it on other evidence; world_revise can remove a giveaway from a "
-        f"message. Changed tasks are tried again ({left} tries left). End your turn when the tasks stand."
+        "Each task's cell, the solver's tries, the judge's review (level_fit from 0 to 4: how fully answering it needs "
+        "its level and concept) and code's measures (evidence pages, tables read, search rank): "
+        f"{json.dumps(results, ensure_ascii=False)}\nKeep each task, or replace it in its cell to fit its level, so "
+        "that answering it needs its level and concept with no easier route: reword it, or rest it on other evidence; "
+        "world_revise can remove a giveaway from a message. Changed tasks are tried and reviewed again "
+        f"({left} tries left). End your turn when the tasks stand."
     )
 
 
