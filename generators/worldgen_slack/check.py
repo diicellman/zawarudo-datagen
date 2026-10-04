@@ -35,6 +35,7 @@ from .chronicle import (
     PostLine,
     add_task,
     advance,
+    agenda_budget,
     band,
     bounds,
     close_day,
@@ -793,25 +794,19 @@ def check_contracts(root):
         t for seed in range(20) for t in picked([unread, read], [cell("hybrid", 1)], seed) if t[0] == "h"
     ]
     assert picks == ["h2"] * 20, ("a candidate whose actor cannot read its facts is never picked", picks)
-    count = world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    small = settings.activity.model_copy(update={"messages": count + 12, "conversation_lines": 4})
-    plan = background_plan(world, org(), small, 7)
-    workdays = {
-        d
-        for d, x in world.db.execute("SELECT day, date FROM calendar")
-        if date.fromisoformat(x).weekday() < 5
-    }
+    small = settings.activity.model_copy(update={"conversation_lines": 4})
+    plan = background_plan(world, org(), small, 7, 2, 12)  # a day's agenda: 12 messages of everyday talk
     members = {(r[0], r[1]) for r in world.db.execute("SELECT channel_id, user_id FROM members")}
-    assert plan == background_plan(world, org(), small, 7) and sum(s.length for s in plan) in (11, 12)
-    assert all(s.situation in {r.kind for r in routines} and s.day in workdays for s in plan)
+    assert plan == background_plan(world, org(), small, 7, 2, 12) and sum(s.length for s in plan) in (11, 12)
+    drawn = lambda scenes: [(x.channel_id, x.part, x.situation, x.length) for x in scenes]  # noqa: E731
+    assert drawn(plan) != drawn(background_plan(world, org(), small, 7, 3, 12)), "each day draws its own"
+    assert all(s.situation in {r.kind for r in routines} and s.day == 2 for s in plan)
     assert all((s.channel_id, p) in members for s in plan for p in s.participants)
-    assert background_plan(world, org(), small.model_copy(update={"messages": count}), 7) == []
-    month = background_plan(world, org(), small.model_copy(update={"messages": count + 300}), 7)
-    assert {s.day for s in month} == workdays, "a large plan covers every workday and no weekend"
-    direct = background_plan(world, org(), small.model_copy(update={"dm_share": 1.0}), 7)
+    assert background_plan(world, org(), small, 7, 2, 0) == []
+    direct = background_plan(world, org(), small.model_copy(update={"dm_share": 1.0}), 7, 2, 12)
     kinds = {r[0]: r[1] for r in world.db.execute("SELECT id, type FROM channels")}
     assert {kinds[s.channel_id] for s in direct} == {"im"}, "dm_share places conversations in DMs"
-    skewed = background_plan(world, org(), small.model_copy(update={"dm_share": 0.0, "channel_skew": 4.0, "messages": count + 60}), 7)  # fmt: skip
+    skewed = background_plan(world, org(), small.model_copy(update={"dm_share": 0.0, "channel_skew": 4.0}), 7, 2, 60)  # fmt: skip
     places = Counter(kinds[s.channel_id] for s in skewed)
     assert places["public"] > 3 * places["private"], "busier channels draw more conversations"
     assert TIME_LITERAL.findall("at 3pm, 15:00, 2026-06-15 or Jun 15") == [
@@ -1024,6 +1019,7 @@ def check_clock(root):
     # Shares are checked per day, and a day stays closable: with a day of about 15 messages, f2 still owed.
     assert band(0.3, 0.1, 2) == (0, 1) and band(0.3, 0.1, 40) == (8, 16) and band(0.25, 0.1, 10) == (1, 4)
     big = settings.model_copy(update={"activity": settings.activity.model_copy(update={"messages": 120}), "author": settings.author.model_copy(update={"tolerance": 0.3, "share_tolerance": 0.1})})  # fmt: skip
+    assert agenda_budget(world, big, 1) == quotas(world, big)[1]["messages"] - 6, "f1's conversation in #ops"
     ways = room(world, big, 2)
     assert (
         ways["owed"] == 1 and ways["closes"][0] <= quotas(world, big)[2]["messages"] <= ways["closes"][1]
@@ -1129,11 +1125,15 @@ def check_clock(root):
 
 
 def author_context(settings, cast, org, root, agenda=None):
-    """What WorldTools are configured with, as the driver builds it."""
+    """What WorldTools are configured with, as the driver builds it; `agenda` maps a day to its drawn scenes."""
     state = SimpleNamespace(
         quota=[("semantic", 3, "a concept", "a style"), ("lookup", 1, "a concept", "a style")],
         cast=cast,
-        plans={"agenda": {"scenes": [s.model_dump(mode="json") for s in agenda or []]}},
+        plans={
+            "agenda": {
+                str(d): [s.model_dump(mode="json") for s in scenes] for d, scenes in (agenda or {}).items()
+            }
+        },
     )
     return context_of(settings, state, root, org.model_dump(mode="json"))
 
@@ -1159,7 +1159,7 @@ async def check_tools(root):
     ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
     with world.trial() as copy:
         start_clock(copy)
-    agenda = background_plan(world, org, settings.activity, settings.seed)
+    agenda = {d: background_plan(world, org, settings.activity, settings.seed, d, agenda_budget(world, settings, d)) for d in quotas(world, settings)}  # fmt: skip
     context = author_context(settings, cast, org, root, agenda)
     ledger = Plan(
         storylines=[Storyline(id="s1", summary="the 4.2 release"), Storyline(id="s2", summary="the audit")],
@@ -1195,7 +1195,7 @@ async def check_tools(root):
     assert (
         page.startswith("# Now: ") and "day 1 of 10" in page and "[[f1]]" in page and "## Task cells" in page
     )
-    assert "everyday conversations code drew for today" in page or not [s for s in agenda if s.day == 1]
+    assert "everyday conversations code drew for today" in page and agenda[1]
     assert "- today: 0 messages today (thread replies 0, reacted to 0, in DMs 0); it closes with" in page
     out = await call(day1, "post", conversation=Conversation(channel_id=ops, about="decision", lines=[PostLine(author_id=a, text="rollback it is", conveys=["f1"]), PostLine(author_id=b, text="ok", reply_to=0)]))  # fmt: skip
     assert len(out["messages"]) == 2 and out["now"].endswith("CDT"), out

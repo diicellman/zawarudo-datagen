@@ -763,11 +763,12 @@ def context_of(settings, state, store_root: Path, organization: dict | None) -> 
         for c in organization["channels"]:
             if c.get("routines"):
                 routines[channel_id(c["type"], c.get("name"), c["members"])] = c["routines"]
-    agenda = {}
-    for scene in (state.plans.get("agenda") or {}).get("scenes", []):
-        agenda.setdefault(str(scene["day"]), []).append(
-            {k: scene[k] for k in ("channel_id", "part", "situation", "participants", "length")}
-        )
+    agenda = {
+        day: [
+            {k: s[k] for k in ("channel_id", "part", "situation", "participants", "length")} for s in scenes
+        ]
+        for day, scenes in (state.plans.get("agenda") or {}).items()
+    }
     return {
         "settings": json.loads(settings.model_dump_json()),
         "cells": state.quota,

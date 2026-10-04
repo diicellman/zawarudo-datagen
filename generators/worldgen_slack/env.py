@@ -27,7 +27,7 @@ from .agents.world import (
     plan_prompt,
     tasks_prompt,
 )
-from .chronicle import bounds, close_day, posted, present, start_clock, today
+from .chronicle import agenda_budget, bounds, close_day, posted, present, start_clock, today
 from .config import Config, PipelineConfig
 from .contracts import (
     PHASE_CRITERIA,
@@ -367,10 +367,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         if not self.world.db.execute("SELECT 1 FROM world_meta WHERE key = 'chronological'").fetchone():
             with self.world.trial() as copy:
                 start_clock(copy)
-            organization = Organization.model_validate_json(json.dumps(state.drafts["organization"]))
-            agenda = background_plan(self.world, organization, cfg.activity, cfg.seed)
-            state.plans["agenda"] = {"scenes": [s.model_dump(mode="json") for s in agenda]}
-            self.store.save()
         attempt = self.store.reserve("plan", cfg.author.plan_attempts)
         task = WorldAuthorTask.create("plan", 0, self.world.path, self.author_context(), attempt)
         count = -(-cfg.tasks.count // cfg.tasks.per_storyline)
@@ -402,6 +398,13 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         attempt = self.store.reserve(f"day-{day:02d}", cfg.author.day_attempts)
         self.store.restore(state.restore_point)
         await self.bring_notes(runtime, state.restore_point)
+        agenda = state.plans.setdefault("agenda", {})
+        if str(day) not in agenda:  # drawn once, around the plan as it stands; a retried day keeps its draw
+            organization = Organization.model_validate_json(json.dumps(state.drafts["organization"]))
+            budget = agenda_budget(self.world, cfg, day)
+            drawn = background_plan(self.world, organization, cfg.activity, cfg.seed, day, budget)
+            agenda[str(day)] = [s.model_dump(mode="json") for s in drawn]
+            self.store.save()
         before = await self.note(runtime, "recap.md")
         issues = [i.model_dump(mode="json") for i in state.issues]
         if issues:

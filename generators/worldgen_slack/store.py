@@ -49,7 +49,9 @@ class RunState(StrictModel):
     quota: list[Cell] = Field(default_factory=list)
     organization: list[str] = Field(default_factory=list)  # the channels the organization made
     drafts: dict[str, dict] = Field(default_factory=dict)  # each setup phase's last document
-    plans: dict[str, dict] = Field(default_factory=dict)  # "agenda": the everyday conversations code drew
+    plans: dict[str, dict] = Field(
+        default_factory=dict
+    )  # "agenda": day → the everyday conversations code drew
     task_reviews: dict[str, dict] = Field(default_factory=dict)
     rounds: dict[str, int] = Field(default_factory=dict)
     reviews: dict[str, dict] = Field(default_factory=dict)

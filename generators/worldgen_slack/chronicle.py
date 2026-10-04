@@ -266,6 +266,17 @@ def today_line(world, settings, day: int) -> str:
     )
 
 
+def agenda_budget(world, settings, day: int) -> int:
+    """The messages of a day's everyday conversations: its quota, less a conversation's worth of lines for each
+    channel a fact planned for the day is first stated in."""
+    channels = world.db.execute(
+        "SELECT COUNT(DISTINCT channel_id) FROM facts WHERE day = ?", (day,)
+    ).fetchone()[0]
+    return max(
+        0, quotas(world, settings)[day]["messages"] - round(settings.activity.conversation_lines * channels)
+    )
+
+
 def posted(world, start_us: int, end_us: int) -> int:
     return world.db.execute(
         "SELECT COUNT(*) FROM messages WHERE ts_us >= ? AND ts_us < ?", (start_us, end_us)

@@ -435,13 +435,11 @@ def direct_messages(org: Organization, settings) -> list[Channel]:
     return [Channel(type="im", members=list(p)) for p in picked]
 
 
-def background_plan(world, org: Organization, activity, seed: int) -> list[Scene]:
-    """The company's other conversations, placed by code from the activity targets: the messages the storylines
-    left of the budget, in conversations of about `conversation_lines` lines, in channels by Zipf weight on their
-    members and in DMs by `dm_share`, on workdays by the parts' rhythm. Each takes its kind from its conversation's
-    routines, drawn by their stated probabilities."""
-    rng = random.Random(digest([seed, "background"]))
-    budget = activity.messages - world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+def background_plan(world, org: Organization, activity, seed: int, day: int, budget: int) -> list[Scene]:
+    """A day's everyday conversations, drawn by code from the activity targets: `budget` messages in conversations of
+    about `conversation_lines` lines, in channels by Zipf weight on their members and in DMs by `dm_share`, in parts
+    by the day's rhythm. Each takes its kind from its conversation's routines, drawn by their stated probabilities."""
+    rng = random.Random(digest([seed, "agenda", day]))
     routines = {channel_id(c.type, c.name, c.members): c.routines for c in org.channels if c.routines}
     named = sorted(
         routines,
@@ -457,13 +455,8 @@ def background_plan(world, org: Organization, activity, seed: int) -> list[Scene
         dms
     ) * bool(org.dm_routines)
     places = named + dms * bool(org.dm_routines)
-    workdays = [
-        d
-        for d, day in world.db.execute("SELECT day, date FROM calendar")
-        if date.fromisoformat(day).weekday() < 5
-    ]
     scenes = []
-    while places and workdays and budget >= 2:
+    while places and budget >= 2:
         length = min(20, budget, 2 + int(rng.expovariate(1 / max(activity.conversation_lines - 2, 0.5))))
         place = rng.choices(places, weights)[0]
         kinds = routines.get(place, org.dm_routines)
@@ -477,10 +470,10 @@ def background_plan(world, org: Organization, activity, seed: int) -> list[Scene
         talkers = min(len(members), 2 + min(int(rng.expovariate(1.0)), 2))
         scenes.append(
             Scene(
-                id=f"bg-{len(scenes) + 1:03d}",
+                id=f"bg-{day:02d}-{len(scenes) + 1:03d}",
                 channel_id=place,
                 participants=rng.sample(members, talkers),
-                day=rng.choice(workdays),
+                day=day,
                 part=rng.choices(list(activity.parts), list(activity.parts.values()))[0],
                 situation=rng.choices([k.kind for k in kinds], [k.probability for k in kinds])[0],
                 length=length,
