@@ -615,6 +615,13 @@ def check_contracts(root):
     assert all(concept in settings.taxonomy[c].concepts[level - 1] and style in styles for c, level, concept, style in cells), "concepts come from their own level"  # fmt: skip
     for wrong in ({"concepts": [["x"]]}, {"spread": [1]}, {"concepts": [["x"], [], ["y"]]}):
         fails(Category.model_validate, settings.taxonomy["semantic"].model_dump() | wrong)
+    whole = settings.model_dump(mode="json")
+    assert (
+        Config.model_validate(whole | {"tasks": whole["tasks"] | {"count": 17}}).tasks.storylines == 9
+    )  # 2 per storyline
+    fails(
+        Config.model_validate, whole | {"tasks": whole["tasks"] | {"count": 18}}
+    )  # one task per cell, 17 cells
     jobs = ["software_developer"] * 3 + ["accountant_or_auditor"] * 2 + ["manager"]
     people = [seed_person(i).model_copy(update={"occupation": job}) for i, job in enumerate(jobs)]
     (root / "p.jsonl").write_text("".join(p.model_dump_json() + "\n" for p in people))

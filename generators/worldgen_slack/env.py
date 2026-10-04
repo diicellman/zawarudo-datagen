@@ -36,13 +36,13 @@ from .contracts import (
     accepted,
     accepted_task,
     background_plan,
+    cards,
     clock,
     deciding,
     organize,
     pick_cast,
     quality,
     quota,
-    user_id,
 )
 from .store import ReviewLimit, Store, used_names
 
@@ -272,7 +272,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         state.solves = {t: r for t, r in state.solves.items() if t in keys}
         due = [t for t, key in keys.items() if state.task_reviews.get(t, {}).get("key") != key]
         previous = state.last_verdict.issues if state.last_verdict else []
-        people = {user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) for p in state.cast}
+        people = cards(state.cast)
 
         async def check():
             # The solver's runs of a task as it is now are reused, a probe's included; only changed tasks are solved.
@@ -369,7 +369,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 start_clock(copy)
         attempt = self.store.reserve("plan", cfg.author.plan_attempts)
         task = WorldAuthorTask.create("plan", 0, self.world.path, self.author_context(), attempt)
-        count = -(-cfg.tasks.count // cfg.tasks.per_storyline)
+        count = cfg.tasks.storylines
         async with agents.author.interaction(task, runtime=runtime) as interaction:
             prompt, errors = plan_prompt(self.world, cfg, state.feedback), []
             for _ in range(3):
@@ -437,11 +437,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             state.day, state.phase = (day + 1, "day") if day < total else (day, "tasks")
         self.store.save()
 
-    def people_typing(self) -> dict:
-        return {
-            user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) for p in self.store.state.cast
-        }
-
     async def review_so_far(self, agents) -> None:
         """The judge reviews the world written so far; its issues open the author's next day."""
         state, cfg = self.store.state, self.settings
@@ -450,7 +445,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             self.world,
             "world",
             [],
-            people=self.people_typing(),
+            people=cards(state.cast),
             written_through=clock(self.world, present(self.world)),
             ledger=ledger_digest(self.world),
         )

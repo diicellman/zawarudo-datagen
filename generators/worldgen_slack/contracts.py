@@ -136,6 +136,11 @@ def quota(taxonomy: dict, styles: list[str], seed: int, count: int) -> list[tupl
     ]
 
 
+def cards(cast: list) -> dict[str, dict]:
+    """Each person's typing card, by user id: how they write, as the author and the judge read it."""
+    return {user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) for p in cast if p.typing}
+
+
 def user_id(seed_uuid: str) -> str:
     return "U" + digest(["user", seed_uuid])[:10].upper()
 
@@ -235,10 +240,8 @@ class Reaction(StrictModel):
     emoji: Annotated[str, Field(pattern=r"^[a-z0-9_+'-]{1,40}$")]
 
 
-SHORT, LONG = (
-    4,
-    20,
-)  # words: a short line has at most 4, a long one more than 20, as the typing profiles measure
+# Words: a short line has at most SHORT, a long one more than LONG, as the typing profiles measure.
+SHORT, LONG = 4, 20
 
 
 # ---------------------------------------------------------------------- time: code owns every timestamp
@@ -802,8 +805,8 @@ def style(world) -> dict:
         return {
             "messages": len(texts),
             "median_words": statistics.median(len(t.split()) for t in texts),
-            "short": share([len(t.split()) <= 4 for t in texts]),
-            "long": share([len(t.split()) > 20 for t in texts]),
+            "short": share([len(t.split()) <= SHORT for t in texts]),
+            "long": share([len(t.split()) > LONG for t in texts]),
             "question": share(["?" in t for t in texts]),
             "lowercase_start": share([t[:1].islower() for t in texts]),
             "off_hours": share([t.hour < 7 or t.hour >= 20 or t.weekday() >= 5 for t in local]),

@@ -13,6 +13,8 @@ from pydantic import Field, model_validator
 from worldgen_slack.dataset import NonEmptyText, SafeId, StrictModel
 
 from .contracts import (
+    LONG,
+    SHORT,
     MENTION,
     PARTS,
     PLACEHOLDER,
@@ -366,7 +368,7 @@ def record_plan(world, plan: Plan, settings) -> None:
     """The ledger in time order. Storylines are fixed once planned (summaries may change); an event, once planned,
     never moves or goes; a stated fact keeps everything but its summary, while an unstated one may change or go and is
     planned for today or later. A fact about an event carries the event's moment."""
-    count = -(-settings.tasks.count // settings.tasks.per_storyline)
+    count = settings.tasks.storylines
     if len(plan.storylines) != count:
         raise ValueError(f"plan exactly {count} storylines")
     ids = [x.id for x in (*plan.storylines, *plan.events, *plan.facts)]
@@ -704,8 +706,8 @@ def drift(world, cards: dict[str, dict], since_us: int = 0) -> dict[str, str]:
             continue
         share = lambda flags: sum(flags) / len(flags)  # noqa: E731
         measured = {
-            "short_share": share([len(t.split()) <= 4 for t in texts]),
-            "long_share": share([len(t.split()) > 20 for t in texts]),
+            "short_share": share([len(t.split()) <= SHORT for t in texts]),
+            "long_share": share([len(t.split()) > LONG for t in texts]),
             "question_share": share(["?" in t for t in texts]),
             "lowercase_share": share([t[:1].islower() for t in texts]),
         }

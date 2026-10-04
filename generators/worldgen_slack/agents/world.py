@@ -36,7 +36,7 @@ from ..chronicle import (
     today_line,
 )
 from ..config import Config
-from ..contracts import Gaps, Part, Task, channel_id, clock, user_id, window, world_meta
+from ..contracts import Gaps, Part, Task, cards, channel_id, clock, window, world_meta
 
 GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor sees it: channels, members, messages,
   message_mentions, reactions and thread_stats hold only what the actor can read; users, calendar, storylines, facts,
@@ -122,10 +122,6 @@ Reviews
 # ---------------------------------------------------------------------- memory: rendered from the world
 
 
-def when(world, moment_us: int) -> str:
-    return clock(world, moment_us)
-
-
 def people(world) -> dict[str, dict]:
     return {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM users ORDER BY real_name")}
 
@@ -162,7 +158,7 @@ def card(typing: dict) -> str:
 
 def line_of(world, row, who: dict) -> str:
     thread = f" (in the thread of [[m{row['parent_id']}]])" if row["parent_id"] else ""
-    return f"- {when(world, row['ts_us'])} [[m{row['id']}]] {who[row['user_id']]['real_name']}{thread}: {row['text']}"
+    return f"- {clock(world, row['ts_us'])} [[m{row['id']}]] {who[row['user_id']]['real_name']}{thread}: {row['text']}"
 
 
 def fact_line(world, fact: dict, who: dict) -> str:
@@ -173,11 +169,11 @@ def fact_line(world, fact: dict, who: dict) -> str:
     ).fetchone()
     where = f"in {label(world, fact['channel_id'])} by {who[fact['author_id']]['real_name']}"
     if first:
-        status = f"stated {when(world, first['ts_us'])} {where} ([[m{first['id']}]])"
+        status = f"stated {clock(world, first['ts_us'])} {where} ([[m{first['id']}]])"
     else:
-        status = f"planned for day {fact['day']} ({when(world, bounds(world, fact['day'])[0])[:14]}) {where}"
+        status = f"planned for day {fact['day']} ({clock(world, bounds(world, fact['day'])[0])[:14]}) {where}"
     about = (
-        f"; {fact['moment_kind']} [[{fact['event_id']}]] {when(world, fact['moment_us'])}"
+        f"; {fact['moment_kind']} [[{fact['event_id']}]] {clock(world, fact['moment_us'])}"
         if fact["event_id"]
         else ""
     )
@@ -196,10 +192,10 @@ def now_page(world, settings, context: dict) -> str:
     out = []
     if day is None:
         out.append(
-            f"# Now: the calendar is closed; its {total} days ended {when(world, now)}. Tasks are written now."
+            f"# Now: the calendar is closed; its {total} days ended {clock(world, now)}. Tasks are written now."
         )
     else:
-        out.append(f"# Now: {when(world, now)}, day {day} of {total}, {part_of(world, now)}")
+        out.append(f"# Now: {clock(world, now)}, day {day} of {total}, {part_of(world, now)}")
         start, end = bounds(world, day)
         quota = quotas(world, settings)[day]
         parts = ", ".join(
@@ -237,7 +233,7 @@ def now_page(world, settings, context: dict) -> str:
     if events:
         out += ["", "## Events"]
         out += [
-            f"- [[{e['id']}]] {e['title']}: {when(world, e['moment_us'])}"
+            f"- [[{e['id']}]] {e['title']}: {clock(world, e['moment_us'])}"
             + (" (past)" if e["moment_us"] <= now else "")
             for e in events
         ]
@@ -245,7 +241,7 @@ def now_page(world, settings, context: dict) -> str:
     if promises:
         out += ["", "## Open promises"]
         out += [
-            f"- [[{c['id']}]] {who[c['owner_id']]['real_name']}: {c['text']}; due by {when(world, c['due_us'] - 1)[:14]} "
+            f"- [[{c['id']}]] {who[c['owner_id']]['real_name']}: {c['text']}; due by {clock(world, c['due_us'] - 1)[:14]} "
             f"(made in [[m{c['message_id']}]])"
             for c in promises
         ]
@@ -286,7 +282,7 @@ def person_page(world, user_id: str, context: dict) -> str:
         "SELECT * FROM commitments WHERE owner_id = ? AND status = 'open'", (user_id,)
     )
     out += [
-        f"- open promise [[{c['id']}]]: {c['text']}; due by {when(world, c['due_us'] - 1)[:14]}"
+        f"- open promise [[{c['id']}]]: {c['text']}; due by {clock(world, c['due_us'] - 1)[:14]}"
         for c in promises
     ]
     return "\n".join(out) + "\n"
@@ -319,7 +315,7 @@ def storyline_page(world, storyline: str) -> str:
     out = [frontmatter(storyline, "storyline", []), f"# {row['summary']}"]
     out += [fact_line(world, dict(f), who) for f in world.db.execute("SELECT * FROM facts WHERE storyline = ? ORDER BY day, id", (storyline,))]  # fmt: skip
     out += [
-        f"- event [[{e['id']}]] {e['title']}: {when(world, e['moment_us'])}"
+        f"- event [[{e['id']}]] {e['title']}: {clock(world, e['moment_us'])}"
         for e in world.db.execute("SELECT * FROM events WHERE storyline = ? ORDER BY moment_us", (storyline,))
     ]
     return "\n".join(out) + "\n"
@@ -328,7 +324,7 @@ def storyline_page(world, storyline: str) -> str:
 def event_page(world, event: str) -> str:
     who = people(world)
     row = world.db.execute("SELECT * FROM events WHERE id = ?", (event,)).fetchone()
-    out = [frontmatter(event, "event", [row["title"]]), f"# {row['title']}: {when(world, row['moment_us'])}"]
+    out = [frontmatter(event, "event", [row["title"]]), f"# {row['title']}: {clock(world, row['moment_us'])}"]
     out.append(f"- storyline [[{row['storyline']}]]")
     out += [fact_line(world, dict(f), who) for f in world.db.execute("SELECT * FROM facts WHERE event_id = ?", (event,))]  # fmt: skip
     return "\n".join(out) + "\n"
@@ -452,7 +448,7 @@ def ledger_digest(world) -> dict:
     who = people(world)
     return {
         "events": [
-            f"{e['id']}: {e['title']}, {when(world, e['moment_us'])}"
+            f"{e['id']}: {e['title']}, {clock(world, e['moment_us'])}"
             for e in world.db.execute("SELECT * FROM events ORDER BY moment_us")
         ],
         "facts": [
@@ -705,9 +701,9 @@ def rejected(feedback: str, restored: str = "") -> str:
 
 
 def plan_prompt(world, settings, feedback: str = "") -> str:
-    count = -(-settings.tasks.count // settings.tasks.per_storyline)
+    count = settings.tasks.storylines
     return (
-        f"Before day 1 ({when(world, bounds(world, 1)[0])[:14]}): plan the ledger with world_plan: exactly {count} "
+        f"Before day 1 ({clock(world, bounds(world, 1)[0])[:14]}): plan the ledger with world_plan: exactly {count} "
         "storylines, their events and their facts, over the calendar in now.md. Then write /task/notes/plan.md: each "
         "storyline's arc day by day, and a board of what each task cell in now.md will rest on. End your turn when the "
         f"ledger is planned.{rejected(feedback)}"
@@ -723,7 +719,7 @@ def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") 
         else ""
     )
     return (
-        f"It is {when(world, present(world))}, day {day} of {total}.{review}"
+        f"It is {clock(world, present(world))}, day {day} of {total}.{review}"
         f"{rejected(feedback, ', and the world and your notes are back at the start of the day')}\nRead world_now() and your notes, and "
         "write today: post its conversations in the order they happen with world_post, and move on with "
         "world_advance(); from the night it closes the day once today's checks pass. Then write /task/notes/recap.md "
@@ -772,9 +768,7 @@ def context_of(settings, state, store_root: Path, organization: dict | None) -> 
     return {
         "settings": json.loads(settings.model_dump_json()),
         "cells": state.quota,
-        "cards": {
-            user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) for p in state.cast if p.typing
-        },
+        "cards": cards(state.cast),
         "agenda": agenda,
         "routines": routines,
         "log": str(store_root / "world-calls.jsonl"),

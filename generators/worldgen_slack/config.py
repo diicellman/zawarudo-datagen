@@ -75,6 +75,11 @@ class TasksConfig(Section):
     max_answer_rows: int = Field(default=5, ge=1, le=50)
     styles: list[Text] = Field(min_length=1)
 
+    @property
+    def storylines(self) -> int:
+        """How many storylines a world plans: one for every `per_storyline` tasks."""
+        return -(-self.count // self.per_storyline)
+
 
 class ActivityConfig(Section):
     """Reference targets for the workspace's shape. One table drives where code places conversations and
@@ -174,6 +179,14 @@ class Config(Section):
     research_budget_usd: float = Field(default=900.0, gt=0)
     env: PipelineConfig = Field(default_factory=PipelineConfig)
     answer_judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
+
+    @model_validator(mode="after")
+    def cells(self):
+        """Each task fills its own (category, level) cell, so a world has at most as many tasks as the taxonomy has
+        cells."""
+        if self.tasks.count > (cells := sum(len(c.levels) for c in self.taxonomy.values())):
+            raise ValueError(f"tasks.count is at most the taxonomy's {cells} cells, not {self.tasks.count}")
+        return self
 
     @model_validator(mode="after")
     def secure(self):
