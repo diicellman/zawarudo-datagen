@@ -1366,6 +1366,14 @@ async def check_tools(root):
         advance(world, settings, onward(world))
     assert world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] > 300
     memory = files(world, settings, context, "tasks")
+    # A person's page says who they are beyond their title and how they type, in words; the guide says how Slack sounds.
+    page = memory["memory/people/alicia.rao.md"]
+    assert "## Who they are" in page and "calm" in page and "midwest" in page and "chess" in page, page
+    assert "20% of their messages are short (4 words or fewer)" in page, page
+    assert (
+        "\nVoice\n- This is Slack"
+        in WorldAuthorTask.create("day", 1, world.path, context, "day-01-01").data.system_prompt
+    )
     raw = re.compile(r"\b1\d{15}\b")
     assert not [p for p, text in memory.items() if raw.search(text)], "no raw microseconds reach the author"
     assert len(memory["memory/now.md"].encode()) < 20_000, len(memory["memory/now.md"].encode())

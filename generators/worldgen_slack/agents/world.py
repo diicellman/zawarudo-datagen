@@ -39,7 +39,7 @@ from ..chronicle import (
     today_line,
 )
 from ..config import Config
-from ..contracts import Gaps, Part, Task, cards, channel_id, clock, window, world_meta
+from ..contracts import LONG, SHORT, Gaps, Part, Task, cards, channel_id, clock, selves, window, world_meta
 
 GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor sees it: channels, members, messages,
   message_mentions, reactions and thread_stats hold only what the actor can read; users, calendar, storylines, facts,
@@ -106,6 +106,19 @@ Conversations (world_post)
   conversations code drew for the day from the channels' routines; the storylines happen among them. Each person
   writes like their typing card; now.md reports who drifts from it.
 
+Voice
+- This is Slack, not email and not a status report. People type quickly: fragments, contractions (I'll, can't,
+  it's), dropped subjects ("on it", "looks good"), lowercase starts, the odd typo, a question when they don't know
+  something, a one-word reply when that is all it takes.
+- Each person sounds like themselves. Their page says who they are and how they type: how long they write, how often
+  they ask, start lowercase or use emoji. A director and a new engineer, a careful analyst and a chatty support lead,
+  do not sound alike.
+- Address people as <@USERID> when a line is aimed at them; a reaction often replaces a "thanks" line; emoji in text
+  like :tada: or 🙏 where the person would use them.
+- Work talk is concrete and uneven: names of systems, versions, ticket numbers, links, half-formed ideas, mild
+  complaints, jokes, side topics, disagreement. Not every line moves the story; not every line is an update.
+- A line that states a fact contains the fact's anchor words; the rest of the line is still in its author's voice.
+
 Tasks (after the last day, world_add_task)
 - One task for each cell of now.md: a question an actor asks, as hard as its level and concept say, in its style.
   Nothing can be posted after the last day, so plan from day 1 what each cell will rest on: facts in several
@@ -152,10 +165,12 @@ def slug(world, channel_id: str) -> str:
 
 
 def card(typing: dict) -> str:
+    """A typing card in words: the shares as the typing profiles measure them, short and long by SHORT and LONG."""
     return (
-        f"median {typing['median_words']:g} words; short {typing['short_share']:.2f}, long {typing['long_share']:.2f}, "
-        f"questions {typing['question_share']:.2f}, lowercase starts {typing['lowercase_share']:.2f}, "
-        f"emoji {typing['emoji_share']:.2f}"
+        f"usually about {typing['median_words']:g} words; {typing['short_share']:.0%} of their messages are short "
+        f"({SHORT} words or fewer) and {typing['long_share']:.0%} long (more than {LONG}); "
+        f"{typing['question_share']:.0%} ask something; {typing['lowercase_share']:.0%} start lowercase; "
+        f"{typing['emoji_share']:.0%} carry an emoji"
     )
 
 
@@ -273,7 +288,7 @@ def person_page(world, user_id: str, context: dict) -> str:
     out = [frontmatter(user_id, "person", [me["handle"], me["display_name"], me["real_name"]])]
     out.append(f"# {me['real_name']}: {me['title']}, {team} ({me['tz']})")
     if typing := context.get("cards", {}).get(user_id):
-        out.append(f"- typing: {card(typing)}")
+        out.append(f"- how they type: {card(typing)}")
     channels = [r[0] for r in world.db.execute("SELECT channel_id FROM members WHERE user_id = ? AND left_us IS NULL", (user_id,))]  # fmt: skip
     out.append("- conversations: " + ", ".join(f"{label(world, c)} [[{c}]]" for c in channels))
     lines = world.db.execute(
@@ -288,6 +303,15 @@ def person_page(world, user_id: str, context: dict) -> str:
         f"- open promise [[{c['id']}]]: {c['text']}; due by {clock(world, c['due_us'] - 1)[:14]}"
         for c in promises
     ]
+    if self := context.get("selves", {}).get(user_id):
+        out += [
+            "",
+            "## Who they are",
+            f"- {self['age']}, from {self['home']}; {self['education']}",
+            f"- as a person (any job named here was before this one): {self['persona']}",
+            f"- background: {self['background']}",
+            f"- outside work: {', '.join(self['hobbies'])}",
+        ]
     return "\n".join(out) + "\n"
 
 
@@ -834,8 +858,8 @@ def fix_prompt(issues: list) -> str:
 
 
 def context_of(settings, state, store_root: Path, organization: dict | None) -> dict:
-    """What the author's tools are configured with: the settings, the world's task cells, each person's typing card,
-    the conversations code drew per day, the channels' routines, and the call log."""
+    """What the author's tools are configured with: the settings, the world's task cells, each person's typing card
+    and seeded self, the conversations code drew per day, the channels' routines, and the call log."""
     routines = {}
     if organization:
         for c in organization["channels"]:
@@ -851,6 +875,7 @@ def context_of(settings, state, store_root: Path, organization: dict | None) -> 
         "settings": json.loads(settings.model_dump_json()),
         "cells": state.quota,
         "cards": cards(state.cast),
+        "selves": selves(state.cast),
         "agenda": agenda,
         "routines": routines,
         "log": str(store_root / "world-calls.jsonl"),

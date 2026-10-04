@@ -141,6 +141,18 @@ def cards(cast: list) -> dict[str, dict]:
     return {user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) for p in cast if p.typing}
 
 
+def selves(cast: list) -> dict[str, dict]:
+    """Each person as their seed draws them, by user id: who they are beyond their title, as the author reads it. The
+    seed's own job was drawn for another occupation, so its professional persona is left out."""
+    return {
+        user_id(p.uuid): {
+            "age": p.age, "home": f"{p.city}, {p.state}", "education": p.education_level.replace("_", " "),
+            "persona": p.persona, "background": p.cultural_background, "hobbies": p.hobbies[:6],
+        }
+        for p in cast
+    }  # fmt: skip
+
+
 def user_id(seed_uuid: str) -> str:
     return "U" + digest(["user", seed_uuid])[:10].upper()
 
