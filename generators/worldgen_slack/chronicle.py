@@ -196,8 +196,10 @@ def posted(world, start_us: int, end_us: int) -> int:
 
 
 def check_facts(facts: list, storylines: set[str]) -> None:
-    """A ledger's facts: a value with no time in it, a known storyline, an anchor made of words of the value, and
-    relations to facts of the same ledger."""
+    """A ledger's facts: a value with no time in it, a known storyline, an anchor made of words of the value,
+    relations to facts of the same ledger and no fact that comes after itself, and anchors a line can tell apart:
+    a line containing a fact's anchor states that fact, so two facts with one anchor could never be first stated
+    apart, and a fact whose anchor contains another's comes after it."""
     known = {f.id for f in facts}
     for fact in facts:
         if TIME_LITERAL.search(fact.value):
@@ -214,6 +216,35 @@ def check_facts(facts: list, storylines: set[str]) -> None:
             raise ValueError(
                 f"{fact.id}: after and supersedes name facts of this ledger; unknown {sorted(unknown)}"
             )
+    earlier = {f.id: {*f.after, *([f.supersedes] if f.supersedes else [])} for f in facts}
+    before = {}  # each fact's earlier facts, through after and supersedes
+
+    def reach(fact: str, path: tuple = ()) -> set[str]:
+        if fact in path:
+            raise ValueError(
+                f"{fact} comes after itself, through {' > '.join((*path[path.index(fact) :], fact))}"
+            )
+        if fact not in before:
+            before[fact] = set().union(*({d} | reach(d, (*path, fact)) for d in earlier[fact]))
+        return before[fact]
+
+    for fact in facts:
+        reach(fact.id)
+    anchors = {f.id: (f.anchor, f" {normalized(f.anchor)} ") for f in facts if f.anchor}
+    for f, (word, padded) in anchors.items():
+        for g, (other, inside) in anchors.items():
+            if f == g or inside not in padded:
+                continue
+            if inside == padded and f < g:
+                raise ValueError(
+                    f"{f} and {g} have one anchor, {word!r}: a line that states one states both. A repeat of a value is "
+                    "the same fact conveyed again; plan it once, or give each fact words of its own"
+                )
+            if inside != padded and g not in before[f]:
+                raise ValueError(
+                    f"{f}'s anchor {word!r} contains {g}'s, {other!r}: a line that states {f} states {g} too, so {f} "
+                    f"comes after {g}"
+                )
 
 
 def fact_row(fact: PlanFact, events: dict[str, Event], moment: dict[str, int], zone: str) -> dict:
@@ -397,7 +428,7 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
     anchored = {r[0] for r in world.db.execute("SELECT fact_id FROM evidence WHERE role = 'anchor'")}
     follows = {}
     for src, dst in world.db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind IN ('after', 'supersedes')"):  # fmt: skip
-        follows.setdefault(src, []).append(dst)
+        follows.setdefault(src, {})[dst] = None  # a fact may both follow and supersede another
     first = set()
     for i, line in enumerate(lines):
         for f in line.conveys:

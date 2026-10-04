@@ -577,7 +577,7 @@ def ledger_plan(ops, leads, a, b, **changes):
         PlanFact(id="f1", storyline="s1", subject="Release 4.2", attribute="decision", value="rollback", anchor="rollback", channel_id=ops, author_id=a, day=1, summary="s"),
         PlanFact(id="f2", storyline="s1", subject="Release 4.2", attribute="state", value="service back", channel_id=ops, author_id=b, day=2, after=["f1"], event="e2", kind="happened", summary="s"),
         PlanFact(id="f3", storyline="s2", subject="Audit", attribute="window", value="dry run", anchor="dry run", channel_id=leads, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
-        PlanFact(id="f4", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=ops, author_id=a, day=3, after=["f3"], event="e1", kind="scheduled", summary="s"),
+        PlanFact(id="f4", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=ops, author_id=a, day=3, after=["f3"], supersedes="f3", event="e1", kind="scheduled", summary="s"),
     ]  # fmt: skip
     document = dict(storylines=[Storyline(id="s1", summary="the 4.2 release"), Storyline(id="s2", summary="the audit")], events=events, facts=facts)  # fmt: skip
     return Plan(**document | changes)
@@ -888,8 +888,17 @@ def check_clock(root):
         ("on or after the day of e2", plan(facts=[facts[0], facts[1].model_copy(update={"day": 1}), *facts[2:]])),
         ("on a later day", plan(facts=[facts[0].model_copy(update={"day": 3}), *facts[1:]])),  # f2 follows f1
         ("an anchor is words of its value", plan(facts=[facts[0].model_copy(update={"anchor": "Release 4.2"}), *facts[1:]])),
+        ("f3 and f4 have one anchor, 'dry run'", plan(facts=[*facts[:3], facts[3].model_copy(update={"value": "dry run", "anchor": "dry run"})])),
+        ("contains f3's, 'dry run'", plan(facts=[*facts[:3], facts[3].model_copy(update={"value": "the dry run owner", "anchor": "dry run owner", "after": [], "supersedes": None})])),
+        ("f1 comes after itself, through f1 > f2 > f1", plan(facts=[facts[0].model_copy(update={"after": ["f2"]}), *facts[1:]])),
     ):  # fmt: skip
         refused(expected, recorded, bad)
+    try:  # an anchor may contain another's when its fact comes after that one
+        with world.trial() as copy:
+            record_plan(copy, plan(facts=[*facts[:3], facts[3].model_copy(update={"value": "the dry run owner", "anchor": "dry run owner"})]), settings)  # fmt: skip
+            raise LookupError("drop the trial")
+    except LookupError:
+        pass
     recorded(first_plan)
     shared = world.db.execute("SELECT DISTINCT f.moment_us, e.moment_us FROM facts f JOIN events e ON e.id = f.event_id WHERE e.id = 'e1'").fetchall()  # fmt: skip
     assert len(shared) == 1 and shared[0][0] == shared[0][1] == at(world, Moment(day=3, time="10:00", zone=zone)), "facts share their event's moment"  # fmt: skip

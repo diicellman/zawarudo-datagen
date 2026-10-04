@@ -81,7 +81,9 @@ The ledger (world_plan)
   the day it is first stated; event and kind (happened or scheduled) when it is about an event, and it then carries
   the event's time; after and supersedes, facts it follows or replaces; decoy, a value that is wrong; summary, what it
   means and on whose authority. anchor: distinctive words of the value. Every line that contains a fact's anchor
-  states that fact; a fact about an event with no anchor is stated with its time, {at:...}.
+  states that fact, so each fact has words of its own: no two facts share an anchor, and a fact whose anchor contains
+  another's comes after it. A value said again is the same fact conveyed again, not a new fact. A fact about an event
+  with no anchor is stated with its time, {at:...}.
 - A stated fact never changes; an unstated one may be re-planned for today or later.
 
 Conversations (world_post)
