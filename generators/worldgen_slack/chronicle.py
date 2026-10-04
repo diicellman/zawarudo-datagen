@@ -3,6 +3,7 @@ world's present, and moves the present forward. Code checks every step, owns eve
 past. Pure functions over `World`; the author's tools (`agents/world.py`) call them inside `World.trial()`."""
 
 import json
+import math
 import statistics
 from datetime import date, datetime
 from typing import Literal, Self
@@ -23,7 +24,6 @@ from .contracts import (
     Storyline,
     Task,
     Zone,
-    activity,
     at,
     clock,
     insert_lines,
@@ -184,6 +184,86 @@ def daily(dates: list[str], settings) -> list[dict]:
 def quotas(world, settings) -> dict[int, dict]:
     days = world.db.execute("SELECT day, date FROM calendar ORDER BY day").fetchall()
     return {day: quota for (day, _), quota in zip(days, daily([d for _, d in days], settings))}
+
+
+# A day's shares, each checked on that day's own messages at its close, and named as the author reads them.
+SHARES = {"reply_share": "thread replies", "reaction_rate": "reacted to", "dm_share": "in DMs"}
+
+
+def band(target: float, slack: float, n: int) -> tuple[int, int]:
+    """How many of n messages may have a property whose share is target ± slack, rounded outward so that every count
+    of messages has a range."""
+    return max(0, math.floor(round((target - slack) * n, 9))), min(
+        n, math.ceil(round((target + slack) * n, 9))
+    )
+
+
+def tally(world, day: int) -> dict[str, int]:
+    """Today's messages, and how many are thread replies, carry a reaction, sit in DMs."""
+    row = world.db.execute(
+        """SELECT COUNT(*), COALESCE(SUM(m.parent_id IS NOT NULL), 0),
+        COALESCE(SUM(EXISTS (SELECT 1 FROM reactions r WHERE r.message_id = m.id)), 0),
+        COALESCE(SUM(c.type IN ('im', 'mpim')), 0)
+        FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.ts_us >= ? AND m.ts_us < ?""",
+        bounds(world, day),
+    ).fetchone()
+    return dict(zip(("messages", *SHARES), row))
+
+
+def owed(world, day: int) -> tuple[int, int]:
+    """The lines today still needs, at least, in DMs and elsewhere: one for each channel and author with a fact planned
+    for today still unstated, or one for the promises due today if there is no such line."""
+    groups = world.db.execute(
+        """SELECT DISTINCT c.type IN ('im', 'mpim') AS dm, f.channel_id, f.author_id FROM facts f
+        JOIN channels c ON c.id = f.channel_id WHERE f.day = ?
+        AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.fact_id = f.id AND e.role = 'anchor')""",
+        (day,),
+    ).fetchall()
+    due = world.db.execute(
+        "SELECT 1 FROM commitments WHERE status = 'open' AND due_us <= ?", (bounds(world, day)[1],)
+    ).fetchone()
+    in_dms = sum(g[0] for g in groups)
+    return in_dms, len(groups) - in_dms + (1 if due and not groups else 0)
+
+
+def room(world, settings, day: int) -> dict | None:
+    """Whether today can still close from where it stands, and how: None when no count of messages within its quota,
+    with the lines it still owes, puts all three shares in their bands at once (past messages never change; each
+    later line may be a reply, reacted to, in a DM or not). Otherwise the counts it can close at, and, at the count
+    nearest its quota, how many more lines of each kind it needs."""
+    quota, slack = quotas(world, settings)[day]["messages"], settings.author.tolerance
+    lo, hi = math.ceil(round(quota * (1 - slack), 9)), math.floor(round(quota * (1 + slack), 9))
+    have, (in_dms, elsewhere) = tally(world, day), owed(world, day)
+    fits = {}
+    for n in range(max(lo, have["messages"] + in_dms + elsewhere), hi + 1):
+        more, extra = {}, n - have["messages"]
+        for share in SHARES:
+            low, high = band(getattr(settings.activity, share), settings.author.share_tolerance, n)
+            least = have[share] + (in_dms if share == "dm_share" else 0)
+            most = have[share] + extra - (elsewhere if share == "dm_share" else 0)
+            if max(low, least) > min(high, most):
+                break
+            more[share] = (max(low, least) - have[share], min(high, most) - have[share])
+        else:
+            fits[n] = more
+    if not fits:
+        return None
+    best = min(fits, key=lambda n: (abs(n - quota), n))
+    return {"closes": (min(fits), max(fits)), "owed": in_dms + elsewhere, "at": best, "more": fits[best]}
+
+
+def today_line(world, settings, day: int) -> str:
+    """Today's count and shares against their bands, and what closing it still takes."""
+    have, ways = tally(world, day), room(world, settings, day)
+    shares = ", ".join(f"{SHARES[s]} {have[s]}" for s in SHARES)
+    if ways is None:
+        return f"{have['messages']} messages today ({shares}); today can no longer close within its quota and shares"
+    lo, hi = ways["closes"]
+    needs = ", ".join(f"{a}-{b} {SHARES[s]}" for s, (a, b) in ways["more"].items())
+    return (
+        f"{have['messages']} messages today ({shares}); it closes with {lo}-{hi} messages. At {ways['at']}: "
+        f"{ways['at'] - have['messages']} more lines, of them {needs}"
+    )
 
 
 def posted(world, start_us: int, end_us: int) -> int:
@@ -383,6 +463,8 @@ def record_plan(world, plan: Plan, settings) -> None:
                 if f.supersedes
             ],
         )
+        if room(world, settings, day) is None:  # inside the batch: the refusal takes the plan back
+            raise ValueError(f"this plan leaves today no way to close: {today_line(world, settings, day)}")
 
 
 # ---------------------------------------------------------------------- conversations, at the present
@@ -458,7 +540,7 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
                 errors.append(f"line {i}: {c.id} is no open commitment")
     if errors:
         raise ValueError("; ".join(errors))
-    now = present(world)
+    now, before = present(world), today_line(world, settings, day)
     stamps = [
         now + (gaps.sample(rng, "hours") if lines[0].pause else opening(world, settings, rng, now, day))
     ]
@@ -510,8 +592,12 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
                 world.db.execute(
                     "UPDATE commitments SET status = ?, closed_by = ? WHERE id = ?", (c.status, message, c.id)
                 )
+        if room(world, settings, day) is None:  # inside the batch: the refusal takes the conversation back
+            raise ValueError(
+                f"after this conversation today could not close: {today_line(world, settings, day)}. Before it, "
+                f"{before}"
+            )
     texts = {r[0]: r[1] for r in world.db.execute(f"SELECT id, text FROM messages WHERE id IN ({', '.join('?' * len(ids))})", ids)}  # fmt: skip
-    quota = quotas(world, settings)[day]["messages"]
     return {
         "conversation": scene["id"],
         "messages": [
@@ -519,7 +605,7 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
             for m, ts, line in zip(ids, stamps, lines)
         ],
         "now": clock(world, stamps[-1]),
-        "today": f"{posted(world, start, end)} of about {quota} messages",
+        "today": today_line(world, settings, day),
     }
 
 
@@ -536,8 +622,8 @@ def owed_moments(world, day: int) -> list[tuple[str, int]]:
 
 
 def close_day(world, settings, day: int) -> list[str]:
-    """Why the day cannot close yet: its message count outside its quota's tolerance, a fact planned for it still
-    unstated, a promise due by its end still open, and, on the last day, the workspace's shares off their targets."""
+    """Why the day cannot close yet: its message count outside its quota's tolerance, its shares outside their bands
+    on its own messages, a fact planned for it still unstated, a promise due by its end still open."""
     start, end = bounds(world, day)
     quota, slack, errors = quotas(world, settings)[day]["messages"], settings.author.tolerance, []
     count = posted(world, start, end)
@@ -552,12 +638,11 @@ def close_day(world, settings, day: int) -> list[str]:
         "SELECT id FROM commitments WHERE status = 'open' AND due_us <= ?", (end,)
     ):
         errors.append(f"{promise} is due by today's end: keep it, change it or drop it in a message")
-    if day == world.db.execute("SELECT MAX(day) FROM calendar").fetchone()[0]:
-        measured = activity(world)
-        for share in ("reply_share", "reaction_rate", "dm_share"):
-            target = getattr(settings.activity, share)
-            if abs(measured[share] - target) > settings.author.share_tolerance:
-                errors.append(f"the workspace's {share} is {measured[share]}; its target is {target}")
+    have = tally(world, day)
+    for share, name in SHARES.items():
+        low, high = band(getattr(settings.activity, share), settings.author.share_tolerance, count)
+        if not low <= have[share] <= high:
+            errors.append(f"{have[share]} of today's {count} messages are {name}; the day holds {low}-{high}")
     return errors
 
 

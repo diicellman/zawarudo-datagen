@@ -33,9 +33,10 @@ from ..chronicle import (
     record_plan,
     revise,
     today,
+    today_line,
 )
 from ..config import Config
-from ..contracts import Gaps, Part, Task, activity, channel_id, clock, user_id, window, world_meta
+from ..contracts import Gaps, Part, Task, channel_id, clock, user_id, window, world_meta
 
 GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor sees it: channels, members, messages,
   message_mentions, reactions and thread_stats hold only what the actor can read; users, calendar, storylines, facts,
@@ -96,7 +97,9 @@ Conversations (world_post)
   fact later, listing it in conveys.
 - commits opens a promise with the day it is due; closes ends one: kept, changed or dropped. Every promise ends by
   its due day.
-- Each day holds about the number of messages now.md gives, spread by the parts' rhythm. now.md lists the everyday
+- Each day holds about the number of messages now.md gives, spread by the parts' rhythm, and its own shares of thread
+  replies, reacted messages and DMs; now.md's today line shows them, and what closing the day still takes. A
+  conversation or a plan after which the day could no longer close is refused. now.md lists the everyday
   conversations code drew for the day from the channels' routines; the storylines happen among them. Each person
   writes like their typing card; now.md reports who drifts from it.
 
@@ -202,16 +205,11 @@ def now_page(world, settings, context: dict) -> str:
         parts = ", ".join(
             f"{p} {posted(world, *window(world, day, p))} of {n}" for p, n in quota["parts"].items()
         )
-        shares = activity(world)
         out += [
             "",
             "## Today",
             f"- messages: {posted(world, start, end)} posted of about {quota['messages']} ({parts})",
-            "- the workspace so far: "
-            + ", ".join(
-                f"{k} {shares[k]} (target {getattr(settings.activity, k)})"
-                for k in ("reply_share", "reaction_rate", "dm_share")
-            ),
+            f"- today: {today_line(world, settings, day)}",
         ]
         for f in world.db.execute(
             """SELECT * FROM facts f WHERE day = ? AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.fact_id = f.id

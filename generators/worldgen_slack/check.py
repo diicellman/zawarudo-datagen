@@ -35,6 +35,7 @@ from .chronicle import (
     PostLine,
     add_task,
     advance,
+    band,
     bounds,
     close_day,
     part_of,
@@ -44,6 +45,7 @@ from .chronicle import (
     quotas,
     record_plan,
     revise,
+    room,
     start_clock,
     today,
 )
@@ -1019,6 +1021,31 @@ def check_clock(root):
     )
     assert advanced()["closed_day"] == 1 and today(world) == 2
     advanced(to="morning")
+    # Shares are checked per day, and a day stays closable: with a day of about 15 messages, f2 still owed.
+    assert band(0.3, 0.1, 2) == (0, 1) and band(0.3, 0.1, 40) == (8, 16) and band(0.25, 0.1, 10) == (1, 4)
+    big = settings.model_copy(update={"activity": settings.activity.model_copy(update={"messages": 120}), "author": settings.author.model_copy(update={"tolerance": 0.3, "share_tolerance": 0.1})})  # fmt: skip
+    ways = room(world, big, 2)
+    assert (
+        ways["owed"] == 1 and ways["closes"][0] <= quotas(world, big)[2]["messages"] <= ways["closes"][1]
+    ), ways
+
+    def posted_with(cfg, conversation):
+        with world.trial() as copy:
+            return post(copy, conversation, cfg, rng, gaps)
+
+    replies = talk(*[dict(author_id=c, text=f"noted {i}") for i in range(12)], thread=rows[0]["id"])
+    refused("today could not close", posted_with, big, replies)  # 12 replies: more than any day of 19 holds
+    tight = settings.model_copy(update={"author": settings.author.model_copy(update={"tolerance": 0.0})})
+    more = [  # with f2, three lines owed in three places today, on a day of at most two messages
+        PlanFact(id="f6", storyline="s1", subject="Release 4.2", attribute="owner", value="Mia", channel_id=leads, author_id=a, day=2, summary="s"),
+        PlanFact(id="f7", storyline="s1", subject="Release 4.2", attribute="reviewer", value="Raj", channel_id=ops, author_id=c, day=2, summary="s"),
+    ]  # fmt: skip
+
+    def recorded_with(cfg, document):
+        with world.trial() as copy:
+            record_plan(copy, document, cfg)
+
+    refused("leaves today no way to close", recorded_with, tight, plan(facts=[*facts, *more]))
     refused(
         "before_it_happened", posted_, talk(dict(author_id=b, text="service back at {at:e2}", conveys=["f2"]))
     )
@@ -1071,8 +1098,8 @@ def check_clock(root):
         advanced(to="night") if part_of(world, present(world)) != "night" else advanced()
     refused("the calendar is closed", posted_, talk(dict(author_id=a, text="late")))
     refused("the calendar is closed", recorded, first_plan)
-    measured = close_day(world, settings.model_copy(update={"author": settings.author.model_copy(update={"share_tolerance": 0.0})}), 10)  # fmt: skip
-    assert any("reply_share" in e for e in measured), measured
+    measured = close_day(world, settings.model_copy(update={"author": settings.author.model_copy(update={"share_tolerance": 0.0})}), 1)  # fmt: skip
+    assert any("3 of today's 4 messages are thread replies" in e for e in measured), measured
     refused("at least 2 channels", tasked, owner.model_copy(update={"facts": ["f1", "f4"]}))  # both in #ops
     refused("fills one of the cells", tasked, owner.model_copy(update={"level": 2}))
     result = tasked(owner)
@@ -1169,6 +1196,7 @@ async def check_tools(root):
         page.startswith("# Now: ") and "day 1 of 10" in page and "[[f1]]" in page and "## Task cells" in page
     )
     assert "everyday conversations code drew for today" in page or not [s for s in agenda if s.day == 1]
+    assert "- today: 0 messages today (thread replies 0, reacted to 0, in DMs 0); it closes with" in page
     out = await call(day1, "post", conversation=Conversation(channel_id=ops, about="decision", lines=[PostLine(author_id=a, text="rollback it is", conveys=["f1"]), PostLine(author_id=b, text="ok", reply_to=0)]))  # fmt: skip
     assert len(out["messages"]) == 2 and out["now"].endswith("CDT"), out
     try:
