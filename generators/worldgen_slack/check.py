@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import io
 import json
+import math
 import os
 import subprocess
 import sys
@@ -46,6 +47,7 @@ from .chronicle import (
     band,
     bounds,
     close_day,
+    opening,
     part_of,
     post,
     posted,
@@ -56,6 +58,7 @@ from .chronicle import (
     room,
     start_clock,
     today,
+    today_line,
 )
 from .env import GenerationEnv
 from .generate import failure, provenance, run_label
@@ -1058,6 +1061,13 @@ def check_clock(root):
     assert (
         ways["owed"] == 1 and ways["closes"][0] <= quotas(world, big)[2]["messages"] <= ways["closes"][1]
     ), ways
+    # A day behind at night is not spaced by the night's own small quota: its next conversation starts while the
+    # rest of the day still holds the conversations it needs to close.
+    night, end = window(world, 2, "night")[0], bounds(world, 2)[1]
+    still = math.ceil(ways["closes"][0] / big.activity.conversation_lines)
+    waits = [opening(world, big, random.Random(i), night, 2) for i in range(200)]
+    assert max(waits) <= (end - night) // (still + 1) + 60_000_000, (max(waits), still)
+    assert today_line(world, big, 2).endswith("15 h 0 min left today"), today_line(world, big, 2)
 
     def posted_with(cfg, conversation):
         with world.trial() as copy:

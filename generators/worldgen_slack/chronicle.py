@@ -255,16 +255,19 @@ def room(world, settings, day: int) -> dict | None:
 
 
 def today_line(world, settings, day: int) -> str:
-    """Today's count and shares against their bands, and what closing it still takes."""
+    """Today's count and shares against their bands, what closing it still takes, and the time left for it."""
     have, ways = tally(world, day), room(world, settings, day)
     shares = ", ".join(f"{SHARES[s]} {have[s]}" for s in SHARES)
+    start, end = bounds(world, day)
+    minutes = max(end - max(present(world), start), 0) // 60_000_000
+    left = f"{minutes // 60} h {minutes % 60} min left today"
     if ways is None:
-        return f"{have['messages']} messages today ({shares}); today can no longer close within its quota and shares"
+        return f"{have['messages']} messages today ({shares}); today can no longer close within its quota and shares; {left}"  # fmt: skip
     lo, hi = ways["closes"]
     needs = ", ".join(f"{a}-{b} {SHARES[s]}" for s, (a, b) in ways["more"].items())
     return (
         f"{have['messages']} messages today ({shares}); it closes with {lo}-{hi} messages. At {ways['at']}: "
-        f"{ways['at'] - have['messages']} more lines, of them {needs}"
+        f"{ways['at'] - have['messages']} more lines, of them {needs}; {left}"
     )
 
 
@@ -485,14 +488,17 @@ def record_plan(world, plan: Plan, settings) -> None:
 
 def opening(world, settings, rng, now: int, day: int) -> int:
     """How long the present waits before a conversation starts: the part's remaining time, spread over the
-    conversations its quota still holds."""
+    conversations its quota still holds; never longer than the day can spare, the rest of the day spread over the
+    conversations it still needs to close."""
     part = part_of(world, now)
     start, end = window(world, day, part)
     left = max(quotas(world, settings)[day]["parts"][part] - posted(world, start, now), 1)
     conversations = max(1, round(left / settings.activity.conversation_lines))
-    return int(rng.random() * 2 * max(end - now, 0) / (conversations + 1)) + rng.randrange(
-        1_000_000, 60_000_000
-    )
+    wait = int(rng.random() * 2 * max(end - now, 0) / (conversations + 1))
+    if (ways := room(world, settings, day)) is not None and (need := ways["closes"][0] - tally(world, day)["messages"]) > 0:  # fmt: skip
+        still = math.ceil(need / settings.activity.conversation_lines)
+        wait = min(wait, max(bounds(world, day)[1] - now, 0) // (still + 1))
+    return wait + rng.randrange(1_000_000, 60_000_000)
 
 
 def stated_anchors(facts: dict[str, dict], text: str) -> list[str]:
