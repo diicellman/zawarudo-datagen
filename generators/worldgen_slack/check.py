@@ -2,10 +2,12 @@
 
 import asyncio
 import inspect
+import io
 import json
 import os
 import subprocess
 import sys
+import tarfile
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -1570,8 +1572,20 @@ class FakeRuntime:
         return self.files[path]
 
     async def run(self, argv, env):
-        for path in argv[2:] if argv[:2] == ["rm", "-f"] else []:
-            self.files.pop(path, None)
+        if argv[:2] == ["rm", "-f"]:
+            for path in argv[2:]:
+                self.files.pop(path, None)
+        elif argv[:2] == [
+            "sh",
+            "-c",
+        ]:  # the env's upload: empty a directory, then unpack an archive into /task
+            if cleared := re.match(r"rm -rf (\S+) && ", argv[2]):
+                for path in [p for p in self.files if p.startswith(cleared.group(1) + "/")]:
+                    del self.files[path]
+            (archive,) = re.findall(r"tarfile -e (\S+) /task", argv[2])
+            with tarfile.open(fileobj=io.BytesIO(self.files.pop(archive)), mode="r:gz") as unpacked:
+                for member in unpacked.getmembers():
+                    self.files["/task/" + member.name] = unpacked.extractfile(member).read()
         return SimpleNamespace(exit_code=0, stdout="", stderr="")
 
 
@@ -1666,6 +1680,10 @@ async def check_author(root):
             "memory is rendered before every turn"
         )
         assert "/task/input.json" not in runtime.files, "the setup files are gone, after a resume too"
+        assert "/task/memory/stale.md" not in runtime.files, (
+            "memory is rendered whole: a page that is gone is gone"
+        )
+        runtime.files["/task/memory/stale.md"] = b"a page code no longer renders"
         seen.append(("turn", tools.config.mode, tools.config.day, prompt.split(":")[0][:40]))
 
         def talk(channel, *lines):
@@ -1727,8 +1745,10 @@ async def check_author(root):
                 if prompt.startswith("It is"):
                     await talk(ops, dict(author_id=d, text="quiet day"))
                     await close()
+                    await runtime.write("/task/notes/scratch.md", b"day 4, first try")
                 return
             if day == 4:
+                assert "/task/notes/scratch.md" not in runtime.files, "a rejected attempt's notes are gone"
                 assert "back at the start of the day: " in prompt and "recap.md" in prompt, (
                     "a retry is told why"
                 )

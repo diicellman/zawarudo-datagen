@@ -5,7 +5,10 @@ The rules live in `chronicle` and `contracts`, the author's tools in `agents/wor
 file, written only through `World.trial()`."""
 
 import asyncio
+import io
 import json
+import tarfile
+import time
 
 import verifiers.v1 as vf
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
@@ -48,6 +51,25 @@ from .store import ReviewLimit, Store, used_names
 
 NOTES = ("plan.md", "recap.md")  # the world author's own files in /task/notes
 SETUP_FILES = ("input.json", "guide.md", "schemas.json", "schema.sql", "world.sqlite", "premise.json", "organization.json")  # fmt: skip
+
+
+ARCHIVE = "/tmp/task-files.tgz"
+
+
+async def upload(runtime, files: dict[str, str | bytes], clear: str) -> None:
+    """Files into /task in one archive: one upload and one command, not one upload per file. `clear` is emptied
+    first, so a file that is gone from the set is gone from the VM too."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, data in files.items():
+            data = data.encode() if isinstance(data, str) else data
+            info = tarfile.TarInfo(name)
+            info.size, info.mtime, info.mode = len(data), int(time.time()), 0o644
+            archive.addfile(info, io.BytesIO(data))
+    await runtime.write(ARCHIVE, buffer.getvalue())
+    script = f"rm -rf {clear} && mkdir -p /task && python3 -m tarfile -e {ARCHIVE} /task && rm -f {ARCHIVE}"
+    if (result := await runtime.run(["sh", "-c", script], {})).exit_code:
+        raise SandboxError(f"the author's files could not be unpacked: {result.stderr}")
 
 
 def require_trace(trace):
@@ -327,8 +349,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         """One author turn: code's memory of the world, rendered fresh, then the turn; the author works through its
         tools, and the world file is code's again when the turn ends."""
         self.budget_check()
-        for name, text in files(self.world, self.settings, self.author_context(), mode).items():
-            await runtime.write("/task/" + name, text.encode())
+        await upload(runtime, files(self.world, self.settings, self.author_context(), mode), "/task/memory")
         self.store.event("author_turn", attempt=attempt, mode=mode, day=self.store.state.day)
         segment = await interaction.turn(prompt)
         self.store.trace(interaction.trace)
@@ -348,11 +369,11 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 self.store.path(attempt, "notes/" + name).write_text(text)
 
     async def bring_notes(self, runtime, attempt: str) -> None:
-        """The notes an attempt kept, back in the author's workspace: a day starts from where the last one closed."""
-        for name in NOTES:
-            path = self.store.root / "attempts" / attempt / "notes" / name
-            if path.exists():
-                await runtime.write("/task/notes/" + name, path.read_bytes())
+        """The notes an attempt kept, and only those, back in the author's workspace: a day starts from where the
+        last one closed, and a failed attempt's notes are gone."""
+        kept = self.store.root / "attempts" / attempt / "notes"
+        notes = {f"notes/{name}": (kept / name).read_bytes() for name in NOTES if (kept / name).exists()}
+        await upload(runtime, notes, "/task/notes")
 
     async def setup_world(self, agents, runtime, task) -> None:
         """The premise and the organization, as documents, in the author's own session."""
