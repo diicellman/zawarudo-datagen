@@ -1,372 +1,1574 @@
-"""Run: uv run python -m generators.worldgen_slack.check"""
+"""Offline invariant checks, one per rule group the pipeline relies on: uv run --frozen python -m generators.worldgen_slack.check"""
 
 import asyncio
+import inspect
+import io
 import json
-import tempfile
+import math
+import os
+import subprocess
+import sys
+import tarfile
+import time
+from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
+import random
+import re
+import tempfile
+import tomllib
+from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from verifiers.v1.dialects.base import append_user_notice
+from verifiers.v1.errors import SandboxError
 from verifiers.v1.mcp.launch import serve
-from worldgen_slack.slack.models import QUALITY_CRITERIA, AnswerSpec, Conversation, Message, SlackWorld, User
-from worldgen_slack.slack.api import SlackAPI, ReadCall, digest
-from worldgen_slack.slack.tools import ReadRecord, ReadState, SlackTaskData, stage_tool_data
-from worldgen_slack.taskset import (
-    SolverTask,
-    EvaluationTask,
-    EvaluationConfig,
-    SlackTaskset,
-    SlackTasksetConfig,
-)
-from worldgen_slack.dataset import atomic_json, load_release
+from worldgen_slack.dataset import PrivateAnswer, PublicTask, load_release, sha256, write_release
+from worldgen_slack.db import ANSWER_KEY, World
+from worldgen_slack.taskset import SolverTask
+from worldgen_slack.tools import SlackTools, WorldToolsConfig, file_hash, stage_world, watch_parent
+from .agents.inspection import ReviewState
 from .agents.judge import JudgeTask, review_payload
-from .agents.inspection import missing_evidence
-from .config import Acceptance, Config
-from .env import GenerationEnv, reference_for
-from .store import Store, ReviewLimit
-from .agents.writer import brief, excerpts, observed, visible
-from .store import used_names
-from .contracts import (
-    Beat,
-    BindOutput,
-    Binding,
-    Candidate,
-    Catalog,
-    ClaimEvidence,
-    Detail,
-    Fact,
-    Issue,
-    Line,
-    Persona,
+from .agents.synthesizer import parse_premise
+from .agents.world import WorldAuthorTask, context_of, files, ledger_digest
+from .chronicle import (
+    Close,
+    Commit,
+    Conversation,
+    Event,
     Plan,
-    PlannedTask,
+    PlanFact,
+    PostLine,
+    add_task,
+    advance,
+    agenda_budget,
+    band,
+    bounds,
+    close_day,
+    opening,
+    part_of,
+    post,
+    posted,
+    present,
+    quotas,
+    record_plan,
+    revise,
+    room,
+    start_clock,
+    today,
+    today_line,
+)
+from .env import GenerationEnv
+from .generate import failure, provenance, run_label
+from .store import Store
+from .config import ROOT, Acceptance, Category, Config
+from .contracts import (
+    DAY,
+    PARTS,
+    PHASE_CRITERIA,
+    TIME_LITERAL,
+    Channel,
+    Gaps,
+    Issue,
+    Moment,
+    Organization,
+    Person,
+    Reaction,
+    Routine,
     Premise,
     Premises,
-    Rewrite,
-    ScenePlan,
-    SeedExample,
-    SeedMessage,
-    SeedPacket,
+    SeedPersona,
+    Storyline,
+    Task,
     TaskReview,
+    Typing,
     Verdict,
-    WorkGroup,
-    WrittenScene,
-    accepted,
-    assemble,
-    check_plan,
-    check_scene,
-    first_mentions,
-    listed,
-    pick_premise,
-    reveals_answer,
-    timed,
-    style,
-    to_utc,
-    validate_candidate,
+    accepted_task,
+    at,
+    background_plan,
+    channel_id,
+    check_task,
+    deciding,
+    direct_messages,
+    measures,
+    organize,
+    pick_cast,
+    quota,
+    record_tasks,
+    render,
+    user_id,
     validate_verdict,
+    verdict_schema,
+    window,
+    world_meta,
 )
 
 
 def fails(function, *args, **kwargs):
     try:
         function(*args, **kwargs)
-    except (ValueError, TypeError, LookupError, ReviewLimit):
+    except (ValueError, TypeError, LookupError):
         return
     raise AssertionError("expected rejection")
 
 
-def fixture():
-    users = [User(id="u1", name="Alicia Rao"), User(id="u2", name="Owen Sato")]
-    facts = [
-        Fact(
-            id=f"f{i}",
-            subject=f"work-{i}",
-            predicate="approved destination",
-            value=f"region-{i}",
-            valid_from="2026-01-01T00:00:00Z",
-            description=f"Approved region is region-{i}.",
+def world_fixture(path):
+    """Three people on Chicago time: #releases (public: U1, U2), #exec (private: U1), a DM (U1, U2)."""
+    world = World.create(path)
+    zone = ZoneInfo("America/Chicago")
+
+    def at(day, hour, minute=0):
+        return int(datetime(2026, 6, 14 + day, hour, minute, tzinfo=zone).timestamp() * 1e6)
+
+    def message(id, channel, user, day, hour, text, parent=None, minute=0):
+        return dict(
+            id=id, channel_id=channel, user_id=user, ts_us=at(day, hour, minute), text=text, parent_id=parent
         )
-        for i in (1, 2)
-    ]
-    tasks = [
-        PlannedTask(
-            id=f"t{i}",
-            group_id=f"g{i}",
-            actor_id=f"u{i}",
-            question=f"Which region was approved for work-{i}?",
-            answer=AnswerSpec(
-                kind="fact_summary",
-                canonical_answer=f"region-{i}",
-                required_claims=[f"region-{i}"],
-            ),
-            fact_ids=[f"f{i}"],
-            reasoning="lookup",
+
+    with world.batch():
+        world.insert("world_meta", [{"key": "now_us", "value": str(at(4, 0))}])
+        world.insert(
+            "calendar",
+            [
+                dict(day=d, date=f"2026-06-{14 + d}", start_us=at(d, 0), end_us=at(d + 1, 0))
+                for d in (1, 2, 3)
+            ],
         )
-        for i in (1, 2)
-    ]
-    catalog = Catalog(
-        workspace_id="ws1",
-        sector="IT",
-        company="Harbor",
-        overview="Two related infrastructure workstreams.",
-        people=users,
-        groups=[WorkGroup(id=f"g{i}", description=f"work-{i}") for i in (1, 2)],
-        facts=facts,
-        tasks=tasks,
-    )
-    start = datetime(2026, 1, 1, tzinfo=UTC)
-    messages = [
-        Message(
-            id=f"m{i}",
-            conversation_id="c1",
-            author_id="u1",
-            text=f"Deployment observation {i}",
-            timestamp=(start + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        world.insert(
+            "users",
+            [
+                dict(
+                    id=u,
+                    handle=u.lower(),
+                    real_name=n,
+                    display_name=n.split()[0],
+                    email=f"{u}@example.com",
+                    tz="America/Chicago",
+                    created_us=at(1, 0) - 1,
+                )
+                for u, n in (("U1", "Alicia Rao"), ("U2", "Owen Sato"), ("U3", "Mia Chen"))
+            ],
         )
-        for i in range(160)
-    ]
-    messages[0].text = "Approved destination for work-1 is region-1."
-    messages += [
-        Message(
-            id=f"r{i}",
-            conversation_id="c1",
-            author_id="u1",
-            thread_root_id="m0",
-            text=f"Rollout check {i}",
-            timestamp=(start + timedelta(hours=4, minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        world.insert(
+            "channels",
+            [
+                dict(id="C1", name="releases", type="public", created_us=at(1, 0) - 1),
+                dict(id="G1", name="exec", type="private", created_us=at(1, 0) - 1),
+                dict(id="D1", name=None, type="im", created_us=at(1, 0) - 1),
+            ],
         )
-        for i in range(70)
-    ]
-    messages.append(
-        Message(
-            id="secret",
-            conversation_id="c2",
-            author_id="u2",
-            text="work-2 is approved for region-2.",
-            timestamp="2026-01-01T00:00:00Z",
+        world.insert(
+            "members",
+            [
+                dict(channel_id=c, user_id=u, joined_us=at(1, 0) - 1)
+                for c, u in (("C1", "U1"), ("C1", "U2"), ("G1", "U1"), ("D1", "U1"), ("D1", "U2"))
+            ]
+            + [dict(channel_id="G1", user_id="U3", joined_us=at(1, 0) - 1, left_us=at(1, 1))],
         )
-    )
-    world = SlackWorld(
-        users=users,
-        conversations=[
-            Conversation(id="c1", name="platform", kind="public_channel", member_ids=["u1", "u2"]),
-            Conversation(id="c2", name="restricted", kind="private_channel", member_ids=["u2"]),
-        ],
-        messages=messages,
-    )
-    bindings = [
-        Binding(
-            task_id=f"t{i}",
-            claims=[ClaimEvidence(claim_index=0, message_ids=[message])],
-            gold_calls=[ReadCall(action="search_messages", arguments={"query": f"work-{i}"})],
+        world.insert(
+            "messages",
+            [
+                message(1, "C1", "U1", 1, 10, "Release 4.2 rollback: release blocked, rollback decided"),
+                message(3, "C1", "U2", 2, 9, "notes posted for release 4.2"),
+                message(4, "G1", "U1", 1, 11, "private: rollback budget approved"),
+                message(5, "D1", "U2", 1, 12, "can you check the rollback"),
+                message(6, "C1", "U1", 1, 11, "deleted rollback note", parent=1) | {"is_deleted": 1},
+            ],
         )
-        for i, message in ((1, "m0"), (2, "secret"))
-    ]
-    return catalog, Candidate(snapshot=world, bindings=bindings)
+        world.insert("messages", [message(2, "C1", "U2", 1, 10, "ack, rolling back now", parent=1, minute=5)])
+        world.insert("storylines", [dict(id="r", summary="the 4.2 release", position=1)])
+        world.insert(
+            "scenes",
+            [
+                dict(
+                    id="s1",
+                    channel_id="C1",
+                    storyline="r",
+                    day=1,
+                    part="morning",
+                    slot_start_us=at(1, 9),
+                    slot_end_us=at(1, 12),
+                    situation="decide",
+                )
+            ],
+        )
+        world.insert("scene_messages", [dict(message_id=m, scene_id="s1") for m in (1, 2, 6)])
+        world.insert(
+            "facts",
+            [
+                dict(
+                    id="f1",
+                    storyline="r",
+                    subject="Release 4.2",
+                    attribute="decision",
+                    value="rollback",
+                    channel_id="C1",
+                    author_id="U1",
+                    day=1,
+                    summary="rollback decided",
+                )
+            ],
+        )
+        world.insert("evidence", [dict(fact_id="f1", message_id=1, role="anchor", anchor_token="rollback")])
+        world.insert(
+            "tasks",
+            [
+                dict(
+                    id="t1",
+                    category="lookup",
+                    level=1,
+                    actor_id="U2",
+                    question="What was decided for 4.2?",
+                    answer_type="text",
+                    gold_source="ledger",
+                    gold_sql="SELECT value AS answer FROM facts WHERE id = 'f1'",
+                )
+            ],
+        )
+        world.insert("task_facts", [dict(task_id="t1", fact_id="f1")])
+    return world, at, message
 
 
-def approval(payload):
-    return Verdict(
-        reviewed_hash=digest(payload),
-        approved=True,
-        tasks=[
-            TaskReview(
-                task_id=t["id"],
-                valid=True,
-                answer_complete=True,
-                supported_claims=list(range(len(t["answer"]["required_claims"]))),
-                reason="checked",
+async def check_world(root):
+    """The world file: triggers and rules reject defects at insert and roll back; reads are Slack as one actor."""
+    root.mkdir(parents=True)
+    world, at, message = world_fixture(root / "world.sqlite")
+    assert world.violations(complete=True) == []
+    tables = [
+        "messages",
+        "facts",
+        "evidence",
+        "reactions",
+        "fact_relations",
+        "tasks",
+        "events",
+        "commitments",
+    ]
+
+    def rejects(expected, **rows):
+        before = [world.db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables]
+        try:
+            with world.batch():
+                for table, items in rows.items():
+                    world.insert(table, items)
+        except ValueError as error:
+            assert expected in str(error), (expected, str(error))
+        else:
+            raise AssertionError(f"not rejected: {expected}")
+        assert before == [world.db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables], (
+            "rolled back"
+        )
+
+    fact = dict(storyline="r", value="v", summary="s", channel_id="C1", author_id="U1")
+    rejects("not a member", messages=[message(9, "C1", "U3", 1, 13, "hi")])
+    rejects("earlier top-level", messages=[message(9, "C1", "U1", 1, 13, "re", parent=2)])
+    rejects("earlier top-level", messages=[message(9, "C1", "U1", 1, 9, "re", parent=1)])
+    rejects("earlier top-level", messages=[message(9, "G1", "U1", 1, 13, "re", parent=1)])
+    rejects(
+        "member of its channel",
+        reactions=[dict(message_id=1, user_id="U3", emoji="eyes", created_us=at(1, 13))],
+    )
+    rejects(
+        "member of its channel",
+        reactions=[dict(message_id=1, user_id="U2", emoji="eyes", created_us=at(1, 9))],
+    )
+    rejects(
+        "stated_off_day",
+        facts=[fact | dict(id="f2", subject="a", attribute="b", day=1)],
+        evidence=[dict(fact_id="f2", message_id=3, role="anchor")],
+    )
+    rejects(
+        "before_it_happened",
+        facts=[
+            fact
+            | dict(
+                id="f2",
+                subject="a",
+                attribute="b",
+                day=1,
+                moment_us=at(1, 15),
+                moment_zone="UTC",
+                moment_kind="happened",
             )
-            for t in payload["tasks"]
         ],
-        issues=[],
-        criteria=dict.fromkeys(QUALITY_CRITERIA, 1.0) if payload["phase"] == "world" else {},
-        summary="checked",
+        evidence=[dict(fact_id="f2", message_id=4, role="anchor")],
+    )
+    rejects(
+        "told_late",
+        facts=[
+            fact
+            | dict(
+                id="f2",
+                subject="a",
+                attribute="b",
+                day=1,
+                moment_us=at(1, 9),
+                moment_zone="UTC",
+                moment_kind="scheduled",
+            )
+        ],
+        evidence=[dict(fact_id="f2", message_id=4, role="anchor")],
+    )
+    rejects(
+        "out_of_order",
+        facts=[fact | dict(id="f2", subject="a", attribute="b", day=1)],
+        fact_relations=[dict(src_fact="f1", dst_fact="f2", kind="after")],
+        evidence=[dict(fact_id="f2", message_id=4, role="anchor")],
+    )
+    rejects(
+        "anchor_token_missing",
+        evidence=[dict(fact_id="f1", message_id=3, role="supporting", anchor_token="budget")],
+    )
+    rejects(
+        "ambiguous_value",
+        facts=[fact | dict(id="f2", subject="release 4.2 ", attribute="Decision", value="hold", day=1)],
+    )
+    rejects(
+        "unreadable_evidence",
+        facts=[fact | dict(id="f2", subject="a", attribute="b", day=1)],
+        evidence=[dict(fact_id="f2", message_id=4, role="anchor")],
+        task_facts=[dict(task_id="t1", fact_id="f2")],
+    )
+    rejects("future_message", messages=[message(9, "C1", "U1", 4, 1, "late")])
+    rejects(
+        "outside_slot",
+        messages=[message(9, "C1", "U1", 1, 13, "late")],
+        scene_messages=[dict(message_id=9, scene_id="s1")],
+    )
+    window_event = dict(id="e1", title="release window", moment_us=at(2, 10), zone="America/Chicago")
+    on_event = fact | dict(subject="a", attribute="b", day=1, event_id="e1", moment_zone="America/Chicago", moment_kind="scheduled")  # fmt: skip
+    rejects("event_moment", events=[window_event], facts=[on_event | dict(id="f2", moment_us=at(2, 11))])
+    # The fixture was written storyline by storyline: message 4 (day 1) has a later id than message 3 (day 2).
+    rejects("written_out_of_order", world_meta=[{"key": "chronological", "value": "1"}])
+    rejects(
+        "commitment_order",
+        commitments=[
+            dict(
+                id="c1",
+                owner_id="U2",
+                text="post notes",
+                message_id=3,
+                due_us=at(3, 0),
+                status="kept",
+                closed_by=1,
+            )
+        ],  # fmt: skip
+    )
+    with world.batch():  # facts about one event share its moment; a promise is closed after it is made
+        world.insert("events", [window_event])
+        world.insert("facts", [on_event | dict(id="f8", moment_us=at(2, 10))])
+        world.insert("commitments", [dict(id="c1", owner_id="U1", text="post notes", message_id=1, due_us=at(3, 0), status="kept", closed_by=3)])  # fmt: skip
+    world.db.execute("DELETE FROM commitments")
+    world.db.execute("DELETE FROM facts WHERE id = 'f8'")
+    world.db.execute("DELETE FROM events")
+    with world.batch():  # a supersedes chain disambiguates transitively; a reaction after its message is fine
+        world.insert(
+            "facts",
+            [
+                fact | dict(id=f"f{i}", subject="Release 4.2", attribute="decision", value=f"v{i}", day=1)
+                for i in (2, 3)
+            ],
+        )
+        world.insert(
+            "fact_relations",
+            [
+                dict(src_fact="f2", dst_fact="f1", kind="supersedes"),
+                dict(src_fact="f3", dst_fact="f2", kind="supersedes"),
+            ],
+        )
+        world.insert("reactions", [dict(message_id=1, user_id="U2", emoji="eyes", created_us=at(1, 13))])
+    with world.batch():  # a planned task fact is a completion defect, not an insert defect
+        world.insert("facts", [fact | dict(id="f4", subject="c", attribute="d", day=2)])
+        world.insert("task_facts", [dict(task_id="t1", fact_id="f4")])
+    assert [r for r, _ in world.checks(complete=True)] == ["unstated_fact"] and world.violations() == []
+    assert (
+        world.checks(complete=["t1"]) == world.checks(complete=True) and world.checks(complete=["t2"]) == []
+    ), "completion is due only for the named tasks"
+
+    world.solver_copy(root / "solver.sqlite")
+    solver = World(root / "solver.sqlite", actor="U2")
+    names = {r[0] for r in solver.db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert not names & set(ANSWER_KEY) and {"messages", "messages_fts"} <= names
+
+    def texts(reader, query, **kwargs):
+        return [i["text"] for i in reader.search_messages(query, **kwargs)["items"]]
+
+    u1, u3 = World(root / "solver.sqlite", actor="U1"), World(root / "solver.sqlite", actor="U3")
+    fails(solver.read_channel, "G1")
+    fails(u3.read_channel, "G1")
+    assert u3.list_user_channels()["items"] == [] and texts(solver, "deleted") == []
+    assert texts(solver, "rollback budget") == [] and texts(u1, "rollback budget") == [
+        "private: rollback budget approved"
+    ]
+    assert "can you check the rollback" in texts(
+        solver, "rollback"
+    ) and "can you check the rollback" not in texts(u3, "rollback")
+    assert [c["id"] for c in solver.list_user_channels()["items"]] == ["D1", "C1"]
+    assert solver.list_user_channels(types="im")["items"][0]["users"] == ["U1"]
+    assert [m["text"] for m in u3.read_channel("C1")["items"]] == [
+        "notes posted for release 4.2",
+        texts(u3, "blocked")[0],
+    ]
+    assert u3.read_channel("C1")["items"][1]["reply_count"] == 1
+    root_ts = u3.read_channel("C1")["items"][1]["ts"]
+    assert [m["text"] for m in u3.read_thread("C1", root_ts)["items"]][1] == "ack, rolling back now"
+    assert texts(solver, "release")[0].startswith("Release 4.2 rollback"), (
+        "BM25 ranks the denser, older match first"
+    )
+    assert texts(solver, "release", sort="timestamp")[0] == "notes posted for release 4.2"
+    assert texts(solver, '"rolling back"') == ["ack, rolling back now"]
+    assert (
+        texts(solver, "release from:@u2")
+        == ["notes posted for release 4.2"]
+        == texts(solver, "4.2 in:#releases on:2026-06-16")
+    )
+    assert texts(solver, "4.2 before:2026-06-16") == texts(solver, "blocked") and texts(
+        solver, "4.2 after:2026-06-15"
+    ) == texts(solver, "notes")
+    assert texts(solver, "rollback in:#exec") == []
+    page = solver.search_messages("release", limit=1)
+    assert (
+        solver.search_messages("release", cursor=page["next_cursor"], limit=1)["items"][0]["text"]
+        == "notes posted for release 4.2"
+    )
+    fails(solver.search_messages, "rollback", cursor=page["next_cursor"])
+    fails(solver.search_messages, "release", limit=101)
+    assert solver.get_reactions("C1", root_ts)["reactions"] == [{"name": "eyes", "count": 1, "users": ["U2"]}]
+    assert solver.get_user("U1")["name"] == "u1" and solver.search_users("ali")["items"][0]["id"] == "U1"
+    assert solver.search_channels("e")["items"][0]["name"] == "releases", "private channels stay unlisted"
+
+    fails(stage_world, WorldToolsConfig(actor_id="U2", colocated=True), root / "solver.sqlite")
+    config = WorldToolsConfig(actor_id="U2")
+    stage_world(config, root / "solver.sqlite")
+    toolset = SlackTools(config)
+    await toolset.setup()
+    stored = {"state": toolset._state_cls()}
+
+    async def pull():
+        return stored["state"].model_copy(deep=True)
+
+    async def push(before):
+        stored["state"] = toolset.state.model_copy(deep=True)
+
+    toolset._pull_state, toolset._push_state = pull, push
+    search = toolset._with_state(toolset.search_messages)
+    await asyncio.gather(*(search(query="rollback") for _ in range(10)))
+    assert len(stored["state"].calls) == 10 and stored["state"].calls[0].tool == "search_messages"
+    async with (
+        asyncio.timeout(30),
+        serve(toolset) as url,
+        streamable_http_client(url) as (reader, writer_),
+        ClientSession(reader, writer_) as client,
+    ):
+        await client.initialize()
+        assert len((await client.list_tools()).tools) == 9
+    bad = WorldToolsConfig(actor_id="U2", db_path=config.db_path, db_hash="0" * 64)
+    try:
+        await SlackTools(bad).setup()
+        raise AssertionError("a changed world file was served")
+    except ValueError:
+        pass
+    # A tool server exits with the process that started it: killed while the server watches, or gone before it could.
+    watcher = "import os, threading, time\n" + inspect.getsource(watch_parent)
+    for late, then in ((False, "watch_parent(); print('watching', flush=True)"), (True, "time.sleep(0.5); watch_parent()")):  # fmt: skip
+        server_code = f"{watcher}\n{then}\ntime.sleep(60)"
+        wait = "" if late else "s.stdout.readline(); "
+        parent_code = f"import subprocess, sys, time; s = subprocess.Popen([sys.executable, '-c', {server_code!r}], stdout=subprocess.PIPE, text=True); {wait}print(s.pid, flush=True); time.sleep(0 if {late} else 60)"  # fmt: skip
+        parent = subprocess.Popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
+        server = int(parent.stdout.readline())
+        parent.kill()
+        parent.wait()
+        for _ in range(40):
+            try:
+                os.kill(server, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(server, 9)
+            raise AssertionError(f"a tool server outlived the process that started it (gone before: {late})")
+    print(
+        "PASS world: triggers, rules with rollback, completion, solver copy, visibility, search, paging, tools, "
+        "servers end with their parent"
     )
 
 
-def collect(api, action, **arguments):
-    seen = []
-    cursor = None
-    while True:
-        result = getattr(api, action)(**arguments, cursor=cursor, limit=7)
-        seen.extend(result["items"])
-        cursor = result["next_cursor"]
-        if cursor is None:
-            return seen
+def check_tasks(root):
+    """Gold queries run as their actor: what the actor cannot see does not exist for them, nothing but a single
+    read is allowed, returned evidence must be readable, and a document is applied on a trial copy."""
+    root.mkdir(parents=True)
+    world, at, message = world_fixture(root / "world.sqlite")
 
+    def answers(actor, sql, **kwargs):
+        return [r["answer"] for r in world.gold(actor, sql, **kwargs)["rows"]]
 
-def check_contracts_and_reads():
-    catalog, candidate = fixture()
-    assert validate_candidate(catalog, candidate, ["t1", "t2"])["ok"]
-    answer = "Jon Bell approves Cedar privileged-access exceptions as of 2026-10-21."
-    question = "As of 2026-10-21, who approves Cedar privileged-access exceptions?"
-    assert not reveals_answer("cnv_cedar_rollout", answer, question)
-    assert not reveals_answer("cnv_access_ops", answer, question)
-    assert reveals_answer("usr_jon_bell", answer, question)
-    assert reveals_answer("msg_20260915", "2026-09-15", "When does enforcement begin?")
-    assert reveals_answer("m_2026_10_14", "2026-10-14", "When is launch?")
-    assert not reveals_answer("m_rel_ops_10", "2026-10-14", "When is launch?")
-    assert not reveals_answer("m_rel_ops_14", "2026-10-14", "When is launch?")
-    activity = validate_candidate(catalog, candidate, ["t1"])["activity"]
-    assert activity["replies"] == 70 and activity["threads_by_reply_count"] == {70: 1}
-    assert activity["duplicate_message_excess"] == 0
-    route = candidate.model_copy(deep=True)
-    route.bindings[0].gold_calls[0].arguments["conversation_id"] = "c1"
-    report = validate_candidate(catalog, route, ["t1"])
-    assert not report["ok"] and "undiscovered conversation_id" in report["errors"][0]
-    route.bindings[0].gold_calls.insert(0, ReadCall(action="list_conversations"))
-    assert validate_candidate(catalog, route, ["t1"])["ok"]
-    route.bindings[0].claims[0].user_ids = ["u1"]
-    report = validate_candidate(catalog, route, ["t1"])
-    assert not report["ok"] and "user_ids=['u1']" in report["errors"][0]
-    route.bindings[0].gold_calls.append(ReadCall(action="get_user", arguments={"user_id": "u1"}))
-    assert validate_candidate(catalog, route, ["t1"])["ok"]
+    every = "SELECT text AS answer FROM messages ORDER BY ts_us"
+    assert "private: rollback budget approved" not in answers("U2", every)
+    assert "private: rollback budget approved" in answers("U1", every)
+    assert "deleted rollback note" not in answers("U1", every)
+    assert answers("U2", "SELECT COUNT(*) AS answer FROM members WHERE channel_id = 'G1'") == [0]
+    assert answers("U3", "SELECT reply_count AS answer FROM thread_stats") == [1]
+    assert answers("U2", "SELECT local(ts_us) AS answer FROM messages WHERE id = 1") == [
+        "2026-06-15 10:00 CDT"
+    ]
+    assert answers("U2", "SELECT local(ts_us, 'UTC') AS answer FROM messages WHERE id = 1") == [
+        "2026-06-15 15:00 UTC"
+    ]
+    assert world.gold("U2", "SELECT value AS answer FROM facts WHERE id = 'f1'")["tables"] == ["facts"]
+    assert "messages" in world.gold("U2", every)["tables"]
+    assert len(world.gold("U1", every, max_rows=2)["rows"]) == 3, "one row past the cap shows the cap was hit"
+    settings = contracts_settings(root)
+    who = "SELECT u.real_name AS answer, m.id AS message_id FROM messages m JOIN users u ON u.id = m.user_id"
+
+    def lookup(sql):
+        return Task(id="tw", category="lookup", level=1, actor_id="U2", question="Who answered the decision?", answer_type="text", gold_sql=sql)  # fmt: skip
+
+    with world.renumbered() as again:
+        assert check_task(world, lookup(who + " WHERE m.text LIKE 'ack%'"), settings, again) == [
+            {"answer": "Owen Sato", "message_id": 2}
+        ]
+        for pinned in (who + " WHERE m.id = 2", who + " WHERE m.channel_id = 'C1' ORDER BY m.id LIMIT 1"):
+            fails(check_task, world, lookup(pinned), settings, again)  # T7: a message found by its id
+    assert measures(world, "t1", [], ["facts"])["evidence_pages"] == 1
+    try:
+        with (
+            world.trial() as copy
+        ):  # 50 newer top-level messages push the evidence to read_channel's second page
+            with copy.batch():
+                copy.insert("messages", [dict(channel_id="C1", ts_us=at(1, 11, 7) + 1009 * (i + 1), user_id="U1", text=f"note {i}") for i in range(50)])  # fmt: skip
+            assert measures(copy, "t1", [], ["facts"])["evidence_pages"] == 2
+            raise LookupError("drop the trial")
+    except LookupError:
+        pass
+    for bad in (
+        "SELECT text AS answer FROM main.messages",
+        "SELECT * FROM main.members",
+        "DELETE FROM facts",
+        "SELECT 1; SELECT 2",
+        "SELECT * FROM tasks",
+        "SELECT * FROM scenes",
+        "SELECT docid FROM messages_fts",
+        "SELECT 'U9' AS user_id",
+        "PRAGMA table_info(tasks)",
+        "ATTACH DATABASE ':memory:' AS other",
+    ):
+        fails(world.gold, "U2", bad)
+    # Unscoped, as the world's author reads it: every table, still one read-only statement, on the company clock.
+    assert world.select("SELECT COUNT(*) AS n FROM tasks JOIN scenes")["rows"] == [{"n": 1}]
+    assert world.select("SELECT local(ts_us) AS t FROM messages WHERE id = 1")["rows"] == [{"t": "2026-06-15 15:00 UTC"}]  # fmt: skip
+    for bad in ("DELETE FROM tasks", "SELECT 1; SELECT 2", "PRAGMA table_info(tasks)"):
+        fails(world.select, bad)
+    world.insert("evidence", [dict(fact_id="f1", message_id=4, role="supporting")])
+    world.insert("reactions", [dict(message_id=4, user_id="U1", emoji="eyes", created_us=at(1, 12))])
+    world.insert("message_mentions", [dict(message_id=4, user_id="U2")])
+    for table in ("reactions", "message_mentions"):
+        assert (
+            answers("U2", f"SELECT COUNT(*) AS answer FROM {table}")
+            == [0]
+            != answers("U1", f"SELECT COUNT(*) AS answer FROM {table}")
+        )
+    fails(world.gold, "U2", "SELECT message_id FROM evidence WHERE fact_id = 'f1'")
+    assert len(world.gold("U1", "SELECT message_id FROM evidence WHERE fact_id = 'f1'")["rows"]) == 2
     fails(
-        Issue,
-        owner="synthesizer",
-        artifact="bindings",
-        defect="Undiscovered ID",
-        requested_change="Discover it",
+        world.gold,
+        "U2",
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT COUNT(*) FROM c",
+        seconds=0.2,
     )
-    directory_catalog = catalog.model_dump(mode="json")
-    directory_catalog["people"][0]["id"] = "usr_alicia"
-    directory_catalog["tasks"][0].update(
-        actor_id="usr_alicia",
-        question="Who approved work-1?",
-        answer={
-            "kind": "entity",
-            "canonical_answer": "Alicia Rao",
-            "required_claims": ["Alicia Rao approved work-1."],
+    fails(World(world.path, actor="U1").checks)
+
+    scoped = World(world.path, actor="U2")
+    assert scoped.rank("rollback release", [1]) == 1 and scoped.rank("zebra", [1]) is None
+    print("PASS tasks: gold as its actor, reads only, readable evidence, time limit, rank, trial")
+
+
+def seed_person(i, zone="America/Chicago"):
+    names = ["Alicia Rao", "Owen Sato", "Mia Chen", "Raj Patel", "Lena Ortiz", "Tom Berg"]
+    return SeedPersona(
+        uuid=f"p{i}", name=names[i], sex="F", age=30 + i, marital_status="single", education_level="bachelors",
+        bachelors_field="cs", occupation="software_developer", city="Austin", state="TX", country="USA",
+        timezone=zone, persona="calm", professional_persona="engineer", cultural_background="midwest",
+        skills=["go"], hobbies=["chess"],
+        typing=Typing(id=f"t{i}", messages=40, median_words=8, short_share=0.2, long_share=0.1, question_share=0.2, lowercase_share=0.3, emoji_share=0.1),
+    )  # fmt: skip
+
+
+def contracts_settings(root):
+    gaps = root / "gaps.json"
+    gaps.write_text(json.dumps({"quantiles": [i * 7.2 for i in range(1001)]}) + "\n")
+    spec = tomllib.loads((ROOT / "configs/worldgen_slack/worldgen.toml").read_text())
+    return Config.model_validate(
+        {
+            "sector": "software",
+            "seed": 3,
+            "output": str(root / "run"),
+            "personas": {"path": str(root / "p.jsonl"), "typing": str(root / "t.jsonl"), "gaps": str(gaps)},
+            "tasks": {
+                "count": 4,
+                "per_storyline": 2,
+                "max_answer_rows": 2,
+                "styles": spec["tasks"]["styles"],
+            },
+            "taxonomy": spec["taxonomy"],
+        }
+    )
+
+
+def ledger_plan(ops, leads, a, b, **changes):
+    """Two storylines on an organized world: a rollback decided on day 1 (f1), service back at e2 on day 2 (f2), and
+    an audit's dry run and owner at e1 on day 3 (f3, f4)."""
+    events = [
+        Event(id="e1", storyline="s2", title="release window", day=3, time="10:00"),
+        Event(id="e2", storyline="s1", title="service restored", day=2, time="14:00"),
+    ]
+    facts = [
+        PlanFact(id="f1", storyline="s1", subject="Release 4.2", attribute="decision", value="rollback", anchor="rollback", channel_id=ops, author_id=a, day=1, summary="s"),
+        PlanFact(id="f2", storyline="s1", subject="Release 4.2", attribute="state", value="service back", channel_id=ops, author_id=b, day=2, after=["f1"], event="e2", kind="happened", summary="s"),
+        PlanFact(id="f3", storyline="s2", subject="Audit", attribute="window", value="dry run", anchor="dry run", channel_id=leads, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
+        PlanFact(id="f4", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=ops, author_id=a, day=3, after=["f3"], supersedes="f3", event="e1", kind="scheduled", summary="s"),
+    ]  # fmt: skip
+    document = dict(storylines=[Storyline(id="s1", summary="the 4.2 release"), Storyline(id="s2", summary="the audit")], events=events, facts=facts)  # fmt: skip
+    return Plan(**document | changes)
+
+
+def check_contracts(root):
+    """Documents become rows only through deterministic rules: the cast, the premise, the organization, the tasks
+    on a planned ledger (T2-T7), the agenda of everyday conversations; no literal times."""
+    root.mkdir(parents=True)
+    settings = contracts_settings(root)
+    styles = settings.tasks.styles
+    cells = quota(settings.taxonomy, styles, 3, 17)
+    order = [c[:2] for c in cells]
+    assert cells == quota(settings.taxonomy, styles, 3, 17) and order != [c[:2] for c in quota(settings.taxonomy, styles, 4, 17)]  # fmt: skip
+    assert len({(c, level) for c, level, *_ in cells}) == 17, "every (category, level) once"
+    assert all(concept in settings.taxonomy[c].concepts[level - 1] and style in styles for c, level, concept, style in cells), "concepts come from their own level"  # fmt: skip
+    for wrong in ({"concepts": [["x"]]}, {"spread": [1]}, {"concepts": [["x"], [], ["y"]]}):
+        fails(Category.model_validate, settings.taxonomy["semantic"].model_dump() | wrong)
+    whole = settings.model_dump(mode="json")
+    assert (
+        Config.model_validate(whole | {"tasks": whole["tasks"] | {"count": 17}}).tasks.storylines == 9
+    )  # 2 per storyline
+    fails(
+        Config.model_validate, whole | {"tasks": whole["tasks"] | {"count": 18}}
+    )  # one task per cell, 17 cells
+    jobs = ["software_developer"] * 3 + ["accountant_or_auditor"] * 2 + ["manager"]
+    people = [seed_person(i).model_copy(update={"occupation": job}) for i, job in enumerate(jobs)]
+    (root / "p.jsonl").write_text("".join(p.model_dump_json() + "\n" for p in people))
+    (root / "t.jsonl").write_text("".join(p.typing.model_dump_json() + "\n" for p in people))
+    personas = settings.personas.model_copy(update={"pool": 3})
+    staffing = {"software_developer": 2, "accountant_or_auditor": 1}
+    drawn = pick_cast(personas, 3, ["Owen Sato"], staffing)
+    assert Counter(p.occupation for p in drawn) == staffing and "Owen Sato" not in {p.name for p in drawn}
+    assert drawn == pick_cast(personas, 3, ["Owen Sato"], staffing), "the seed decides the cast"
+    fails(pick_cast, personas, 3, ["Owen Sato", "Alicia Rao"], staffing)  # one unused developer is left
+
+    def premises(staffing):  # raw, as the synthesizer writes it
+        return json.dumps({"premises": [dict(company=f"{w} Co", niche="n", region="r", size="s", culture="c", cast="x", staffing=s) for w, s in (("Birch", {"software_developer": 2, "manager": 1}), ("Cedar", staffing))]})  # fmt: skip
+
+    hiring = settings.model_copy(update={"personas": personas, "premise_count": 2})
+    used = {"companies": [], "people": ["Owen Sato"]}
+    assert parse_premise(premises(staffing), hiring, used).staffing in (
+        staffing,
+        {"software_developer": 2, "manager": 1},
+    )
+    for bad in (
+        {"software_developer": 2},  # adds up to 2, not 3
+        {"software_developer": 2, "lawyer": 1},  # not an occupation of the persona file
+        {"software_developer": 3},  # only 2 unused developers
+        {"software_developer": 2, "manager": 1, "accountant_or_auditor": 0},
+    ):
+        fails(parse_premise, premises(bad), hiring, used)
+
+    cast = [seed_person(i, "America/New_York" if i == 3 else "America/Chicago") for i in range(4)]
+    a, b, c, d = (user_id(p.uuid) for p in cast)
+    premise = Premise(
+        company="Lattice Creek", niche="n", region="r", size="s", culture="c", cast="x", staffing={}
+    )
+    world = World.create(root / "world.sqlite")
+
+    routines = [
+        Routine(kind=k, probability=p) for k, p in (("standup", 0.5), ("review", 0.3), ("lunch", 0.2))
+    ]
+
+    def org(people=(a, b, c, d), channels=None, dm_routines=routines):
+        return Organization(
+            people=[Person(user_id=u, title="Engineer", team="Platform") for u in people],
+            channels=channels
+            or [
+                Channel(name="ops", type="public", members=[a, b, c, d], routines=routines),
+                Channel(name="leads", type="private", members=[a, b], routines=routines),
+                Channel(type="im", members=[a, c]),
+            ],
+            dm_routines=dm_routines,
+        )
+
+    for bad in (
+        org(people=(a, a, b, c, d)),
+        org(people=(a, b, c, d, "Uxyz")),
+        org(
+            people=(a, b, c),
+            channels=[Channel(name="ops", type="public", members=[a, b, c], routines=routines)],
+        ),  # d left out  # fmt: skip
+        org(channels=[Channel(name="ops", type="public", members=[a, b, c, d], routines=routines[:2])]),
+        org(dm_routines=routines[:2]),
+        org(channels=[Channel(type="im", members=[a, b, c])]),
+    ):
+        try:
+            with world.trial() as copy:
+                organize(copy, bad, cast, premise, settings)
+            raise AssertionError("organization accepted")
+        except ValueError:
+            pass
+    assert world.db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0, (
+        "a failed trial leaves the world untouched"
+    )
+    with world.trial() as copy:
+        organize(copy, org(), cast, premise, settings)
+    dms = [sorted(m.members) for m in direct_messages(org(), settings)]
+    assert dms == [sorted(m.members) for m in direct_messages(org(), settings)] and len(dms) == 1, (
+        "code tops the author's DM up to dms_per_person, drawn by the seed"
+    )
+    assert sorted([a, c]) not in dms and world.db.execute("SELECT COUNT(*) FROM channels WHERE type = 'im'").fetchone()[0] == 2  # fmt: skip
+    users = {r["id"]: r for r in world.db.execute("SELECT * FROM users")}
+    assert users[a]["tz"] == "America/Chicago" and users[a]["display_name"] == "Alicia"
+    assert (
+        users[a]["email"] == "alicia.rao@latticecreek.example"
+        and world_meta(world, "zone") == "America/Chicago"
+    )
+    day1 = world.db.execute("SELECT date FROM calendar WHERE day = 1").fetchone()[0]
+    assert (
+        date.fromisoformat(day1).weekday() == 0
+        and world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0] == 10
+    )
+    ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
+    with world.trial() as copy:  # the ledger as the author plans it; tasks read its facts, not its messages
+        start_clock(copy)
+        record_plan(copy, ledger_plan(ops, leads, a, b), settings)
+
+    def cell(category, level):
+        return (category, level, "a concept", "a style")
+
+    def task(
+        id="t1",
+        category="search",
+        sql="SELECT value AS answer FROM facts WHERE id = 'f1'",
+        facts=("f1",),
+        **extra,
+    ):
+        return Task(id=id, category=category, level=1, actor_id=c, question="Which way did the release go?", answer_type="text", gold_sql=sql, facts=list(facts)) .model_copy(update=extra)  # fmt: skip
+
+    def picked(candidates, cells_, seed=3):
+        """The tasks recorded from these candidates, on a dropped trial."""
+        try:
+            with world.trial() as copy:
+                record_tasks(copy, candidates, settings.model_copy(update={"seed": seed}), cells_)
+                raise LookupError([r[0] for r in copy.db.execute("SELECT id FROM tasks ORDER BY id")])
+        except LookupError as out:
+            return out.args[0]
+
+    search = task()
+    found = [cell("search", 1)]
+    rejected = {
+        "T6 cells": ([search], [cell("search", 2)]),
+        "T2 sql reads facts": ([task(category="lookup")], [cell("lookup", 1)]),
+        "T2 ledger reads no facts": ([task(sql="SELECT real_name AS answer FROM users LIMIT 1")], found),
+        "T2 hybrid reads no workspace": ([task(category="hybrid")], [cell("hybrid", 1)]),
+        "T4 no facts": ([task(facts=())], found),
+        "T3 refusal with rows": (
+            [task(category="robustness", answer_type="refusal", sql="SELECT 1 AS answer", facts=())],
+            [cell("robustness", 1)],
+        ),
+        "T3 too many rows": ([task(answer_type="set", sql="SELECT value AS answer FROM facts")], found),
+        "T3 text answer of 2 rows": ([task(sql="SELECT value AS answer FROM facts LIMIT 2")], found),
+        "T3 no answer column": ([task(sql="SELECT value FROM facts WHERE id = 'f1'")], found),
+        "T5 giveaway": ([task(question="Was it a rollback for the release?")], found),
+        "T6 four candidates": (
+            [task(id=f"t{i}", question=f"Which way did release {i} go?") for i in range(4)],
+            found,
+        ),  # fmt: skip
+        "T6 candidate ids": ([task(), task(question="Where did the release go?")], found),
+        "unreadable fact": (
+            [task(sql="SELECT value AS answer FROM facts WHERE id = 'f3'", facts=("f3",))],
+            found,
+        ),  # fmt: skip
+    }
+    for name, (candidates, cells_) in rejected.items():
+        try:
+            picked(candidates, cells_)
+            raise AssertionError(f"tasks accepted: {name}")
+        except ValueError:
+            pass
+    invalid = task(id="bad", sql="SELECT value FROM facts WHERE id = 'f1'")  # no answer column
+    rare = task(id="rare", question="Where did the release go?", probability=0.05)
+    for candidates, kept, least in (
+        ([invalid, task(id="good", question="Where did the release go?")], "good", 20),
+        ([task(id="usual", probability=1.0), rare], "rare", 16),
+    ):  # the run seed picks: only valid candidates, mostly the less likely
+        chosen = [t for seed in range(20) for t in picked(candidates, found, seed)]
+        assert chosen.count(kept) >= least, (kept, chosen)
+    with world.trial() as copy:
+        record_tasks(copy, [search], settings, found)
+    assert json.loads(world.db.execute("SELECT gold_json FROM tasks").fetchone()[0]) == [
+        {"answer": "rollback"}
+    ]
+    assert world.db.execute("SELECT concept FROM tasks").fetchone()[0] == "a concept", (
+        "the cell's concept is stored"
+    )
+
+    def settled(facts):  # a level-3 semantic task needs its facts first stated in 2 channels
+        sql = f"SELECT value AS answer FROM facts WHERE id = '{facts[-1]}'"
+        return Task(id="t9", category="semantic", level=3, actor_id=a, question="What did the review settle?", answer_type="text", gold_sql=sql, facts=facts)  # fmt: skip
+
+    fails(record_tasks, world, [settled(["f1", "f4"])], settings, [cell("semantic", 3)])  # both in #ops
+    assert "t9" in picked([settled(["f1", "f3"])], [cell("semantic", 3)])  # #ops and #leads
+    hybrid = dict(category="hybrid", level=1, actor_id=c, answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages m, facts f WHERE f.id = 'f1'")  # fmt: skip
+    unread = Task(
+        id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
+    )  # in leads
+    read = Task(id="h2", question="How many messages surround the rollback?", facts=["f1"], **hybrid)
+    picks = [
+        t for seed in range(20) for t in picked([unread, read], [cell("hybrid", 1)], seed) if t[0] == "h"
+    ]
+    assert picks == ["h2"] * 20, ("a candidate whose actor cannot read its facts is never picked", picks)
+    small = settings.activity.model_copy(update={"conversation_lines": 4})
+    plan = background_plan(world, org(), small, 7, 2, 12)  # a day's agenda: 12 messages of everyday talk
+    members = {(r[0], r[1]) for r in world.db.execute("SELECT channel_id, user_id FROM members")}
+    assert plan == background_plan(world, org(), small, 7, 2, 12) and sum(s.length for s in plan) in (11, 12)
+    drawn = lambda scenes: [(x.channel_id, x.part, x.situation, x.length) for x in scenes]  # noqa: E731
+    assert drawn(plan) != drawn(background_plan(world, org(), small, 7, 3, 12)), "each day draws its own"
+    assert all(s.situation in {r.kind for r in routines} and s.day == 2 for s in plan)
+    assert all((s.channel_id, p) in members for s in plan for p in s.participants)
+    assert background_plan(world, org(), small, 7, 2, 0) == []
+    direct = background_plan(world, org(), small.model_copy(update={"dm_share": 1.0}), 7, 2, 12)
+    kinds = {r[0]: r[1] for r in world.db.execute("SELECT id, type FROM channels")}
+    assert {kinds[s.channel_id] for s in direct} == {"im"}, "dm_share places conversations in DMs"
+    skewed = background_plan(world, org(), small.model_copy(update={"dm_share": 0.0, "channel_skew": 4.0}), 7, 2, 60)  # fmt: skip
+    places = Counter(kinds[s.channel_id] for s in skewed)
+    assert places["public"] > 3 * places["private"], "busier channels draw more conversations"
+    assert TIME_LITERAL.findall("at 3pm, 15:00, 2026-06-15 or Jun 15") == [
+        "3pm",
+        "15:00",
+        "2026-06-15",
+        "Jun 15",
+    ]
+    assert TIME_LITERAL.findall("release 8.14 on v2.10, maybe 2 people") == []
+    print(
+        "PASS contracts: cast, premise, organization, task gold (T2-T7) on a planned ledger, agenda, no literal times"
+    )
+
+
+def organized(root, settings):
+    """An organized world on Chicago time: people a, b, c (and d, in New York), #ops (public: everyone), #leads
+    (private: a, b), DMs a-c and code's own, a 10-day calendar from a Monday."""
+    cast = [seed_person(i, "America/New_York" if i == 3 else "America/Chicago") for i in range(4)]
+    a, b, c, d = (user_id(p.uuid) for p in cast)
+    routines = [
+        Routine(kind=k, probability=p) for k, p in (("standup", 0.5), ("review", 0.3), ("lunch", 0.2))
+    ]
+    org = Organization(
+        people=[Person(user_id=u, title="Engineer", team="Platform") for u in (a, b, c, d)],
+        channels=[
+            Channel(name="ops", type="public", members=[a, b, c, d], routines=routines),
+            Channel(name="leads", type="private", members=[a, b], routines=routines),
+            Channel(type="im", members=[a, c]),
+        ],
+        dm_routines=routines,
+    )
+    premise = Premise(
+        company="Lattice Creek", niche="n", region="r", size="s", culture="c", cast="x", staffing={}
+    )
+    world = World.create(root / "world.sqlite")
+    with world.trial() as copy:
+        organize(copy, org, cast, premise, settings)
+    return world, cast, org, (a, b, c, d)
+
+
+def refused(expected, function, *args, **kwargs):
+    """The call is refused, for the reason given."""
+    try:
+        function(*args, **kwargs)
+    except ValueError as error:
+        assert expected in str(error), (expected, str(error))
+        return
+    raise AssertionError(f"not refused: {expected}")
+
+
+def onward(world) -> str:
+    """Where advance moves next: the next part of today, or from the night, tomorrow."""
+    part, order = part_of(world, present(world)), list(PARTS)
+    return "tomorrow" if part == "night" else order[order.index(part) + 1]
+
+
+def check_clock(root):
+    """The world in time order (v7): a plan whose events never move and whose facts share their event's moment;
+    conversations posted only at the present, their statements tagged and first made where the plan says; promises
+    opened and closed; days closed only when their quota, facts and promises are settled; fixes that change no task;
+    tasks written once the calendar is closed."""
+    root.mkdir(parents=True)
+    base = contracts_settings(root)
+    settings = base.model_copy(
+        update={
+            "activity": base.activity.model_copy(update={"messages": 12}),
+            "author": base.author.model_copy(update={"tolerance": 1.0, "share_tolerance": 1.0}),
+        }
+    )
+    gaps = Gaps(settings.personas.gaps)
+    world, cast, org, (a, b, c, d) = organized(root, settings)
+    ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
+    with world.trial() as copy:
+        start_clock(copy)
+    assert today(world) == 1 and present(world) == window(world, 1, "early")[0]
+    shares = quotas(world, settings)
+    assert sum(q["messages"] for q in shares.values()) == 12 and all(sum(q["parts"].values()) == q["messages"] for q in shares.values())  # fmt: skip
+    assert shares[6]["messages"] == shares[7]["messages"] == 0 < shares[1]["messages"], "weekends are quiet"
+    zone = "America/Chicago"
+    sampler = random.Random(1)
+    assert all(gaps.sample(sampler, "") < 3_600_000_000 <= gaps.sample(sampler, "hours") for _ in range(200))
+
+    def plan(**changes):
+        return ledger_plan(ops, leads, a, b, **changes)
+
+    def recorded(document):
+        with world.trial() as copy:
+            record_plan(copy, document, settings)
+
+    first_plan = plan()
+    events, facts = first_plan.events, first_plan.facts
+    for expected, bad in (
+        ("plan exactly 2 storylines", plan(storylines=first_plan.storylines[:1])),
+        ("repeated ['f1']", plan(events=[*events, Event(id="f1", storyline="s1", title="clash", day=1, time="09:00")])),
+        ("a title has no time", plan(events=[events[0].model_copy(update={"title": "window at 10:00"}), events[1]])),
+        ("event e9 is not in events", plan(facts=[*facts[:3], facts[3].model_copy(update={"event": "e9"})])),
+        (f"is a member of {leads}", plan(facts=[*facts[:2], facts[2].model_copy(update={"author_id": c}), facts[3]])),
+        ("on or after the day of e2", plan(facts=[facts[0], facts[1].model_copy(update={"day": 1}), *facts[2:]])),
+        ("on a later day", plan(facts=[facts[0].model_copy(update={"day": 3}), *facts[1:]])),  # f2 follows f1
+        ("an anchor is words of its value", plan(facts=[facts[0].model_copy(update={"anchor": "Release 4.2"}), *facts[1:]])),
+        ("f3 and f4 have one anchor, 'dry run'", plan(facts=[*facts[:3], facts[3].model_copy(update={"value": "dry run", "anchor": "dry run"})])),
+        ("contains f3's, 'dry run'", plan(facts=[*facts[:3], facts[3].model_copy(update={"value": "the dry run owner", "anchor": "dry run owner", "after": [], "supersedes": None})])),
+        ("f1 comes after itself, through f1 > f2 > f1", plan(facts=[facts[0].model_copy(update={"after": ["f2"]}), *facts[1:]])),
+    ):  # fmt: skip
+        refused(expected, recorded, bad)
+    try:  # an anchor may contain another's when its fact comes after that one
+        with world.trial() as copy:
+            record_plan(copy, plan(facts=[*facts[:3], facts[3].model_copy(update={"value": "the dry run owner", "anchor": "dry run owner"})]), settings)  # fmt: skip
+            raise LookupError("drop the trial")
+    except LookupError:
+        pass
+    recorded(first_plan)
+    shared = world.db.execute("SELECT DISTINCT f.moment_us, e.moment_us FROM facts f JOIN events e ON e.id = f.event_id WHERE e.id = 'e1'").fetchall()  # fmt: skip
+    assert len(shared) == 1 and shared[0][0] == shared[0][1] == at(world, Moment(day=3, time="10:00", zone=zone)), "facts share their event's moment"  # fmt: skip
+    refused(
+        "an event never moves",
+        recorded,
+        plan(events=[events[0].model_copy(update={"time": "11:00"}), events[1]]),
+    )
+    refused("planned events stay", recorded, plan(events=events[:1]))
+    refused("keep ['s1', 's2']", recorded, plan(storylines=[Storyline(id="s3", summary="x"), Storyline(id="s2", summary="y")]))  # fmt: skip
+    rng = random.Random(5)
+
+    cells = [("semantic", 3, "a concept", "a style"), ("lookup", 1, "a concept", "a style")]
+    owner = Task(id="t1", category="semantic", level=3, actor_id=a, question="Who owns the audit after the dry run?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f4'", facts=["f3", "f4"])  # fmt: skip
+
+    def tasked(task):
+        with world.trial() as copy:
+            return add_task(copy, task, settings, cells)
+
+    refused("once the calendar is closed", tasked, owner)
+
+    def posted_(conversation):
+        with world.trial() as copy:
+            return post(copy, conversation, settings, rng, gaps)
+
+    def talk(*lines, channel=ops, **extra):
+        return Conversation(
+            channel_id=channel, about="work", lines=[PostLine(**line) for line in lines], **extra
+        )
+
+    decided = talk(
+        dict(author_id=a, text=f"we go with the rollback, <@{c}> fyi", conveys=["f1"]),
+        dict(author_id=b, text="ok, I'll post the notes", reply_to=0, commits=[Commit(id="c1", text="post the notes", due_day=2)], reactions=[Reaction(user_id=a, emoji="eyes")]),
+        dict(author_id=b, text="rollback noted", reply_to=0, conveys=["f1"]),
+    )  # fmt: skip
+    for expected, bad in (
+        ("write times and dates only", talk(dict(author_id=a, text="rollback at 3pm", conveys=["f1"]))),
+        ("reply_to names an earlier line", talk(dict(author_id=a, text="ok", reply_to=0))),
+        ("conveys lists only facts", talk(dict(author_id=a, text="rollback is decided", conveys=["f1", "f9"]))),
+        ("{at:...} names a moment", talk(dict(author_id=a, text="see you at {at:lunch}"))),
+        ("list them in conveys", talk(dict(author_id=a, text="rollback is decided"))),
+        ("f1 is first stated by", talk(dict(author_id=b, text="rollback is decided", conveys=["f1"]))),
+        ("f3 is first stated by", talk(dict(author_id=a, text="dry run it is", conveys=["f3"]), channel=leads)),
+        ("nobody reacts to their own line", talk(dict(author_id=a, text="ok", reactions=[Reaction(user_id=a, emoji="eyes")]))),
+        ("from a member of its channel", talk(dict(author_id=a, text="ok", reactions=[Reaction(user_id=c, emoji="eyes")]), channel=leads)),
+        ("not a member of the channel", talk(dict(author_id=c, text="hi"), channel=leads)),
+        ("c9 is no open commitment", talk(dict(author_id=a, text="ok", closes=[Close(id="c9", status="kept")]))),
+        ("due today or on a later day", talk(dict(author_id=a, text="ok", commits=[Commit(id="c2", text="t", due_day=11)]))),
+    ):  # fmt: skip
+        refused(expected, posted_, bad)
+    before = present(world)
+    out = posted_(decided)
+    rows = world.db.execute("SELECT id, ts_us, parent_id FROM messages ORDER BY id").fetchall()
+    assert rows[0]["ts_us"] > before and present(world) == rows[-1]["ts_us"] and rows[1]["parent_id"] == rows[0]["id"]  # fmt: skip
+    assert out["conversation"] == "d01-001" and len(out["messages"]) == 3
+    roles = [
+        r[0] for r in world.db.execute("SELECT role FROM evidence WHERE fact_id = 'f1' ORDER BY message_id")
+    ]
+    assert roles == ["anchor", "supporting"], (
+        "the planned author states it, a second speaker supports it",
+        roles,
+    )
+    assert world.db.execute("SELECT user_id FROM message_mentions").fetchone()[0] == c
+    assert world.db.execute("SELECT status, owner_id FROM commitments WHERE id = 'c1'").fetchone()[:] == (
+        "open",
+        b,
+    )
+    refused(
+        "UNIQUE",
+        posted_,
+        talk(dict(author_id=a, text="ok", commits=[Commit(id="c1", text="again", due_day=2)])),
+    )
+    reaction = world.db.execute("SELECT created_us FROM reactions").fetchone()[0]
+    assert rows[0]["ts_us"] < reaction < bounds(world, 1)[1], "a reaction stays within its message's day"
+    again = posted_(talk(dict(author_id=c, text="noted"), thread=rows[0]["id"]))
+    noted = world.db.execute("SELECT ts_us, parent_id FROM messages WHERE id = ?", (again["messages"][0]["id"],)).fetchone()  # fmt: skip
+    assert noted["ts_us"] > rows[-1]["ts_us"] and noted["parent_id"] == rows[0]["id"], (
+        "a later post comes later"
+    )
+    refused("earlier top-level message", posted_, talk(dict(author_id=c, text="noted"), thread=rows[1]["id"]))
+    refused("leave reply_to empty", posted_, talk(dict(author_id=c, text="a"), dict(author_id=a, text="b", reply_to=0), thread=rows[0]["id"]))  # fmt: skip
+    refused("past midnight", posted_, talk(*[dict(author_id=a, text="still here", pause="hours")] * 20))
+    try:  # code's clock is the only way forward: a message dated before the present is refused
+        with world.batch():
+            world.insert(
+                "messages", [dict(channel_id=ops, ts_us=rows[0]["ts_us"] - 1, user_id=a, text="late")]
+            )
+        raise AssertionError("a message was written into the past")
+    except ValueError as error:
+        assert "written_out_of_order" in str(error), error
+
+    def advanced(**kwargs):
+        with world.trial() as copy:
+            return advance(copy, settings, **kwargs)
+
+    assert advanced(to=onward(world))["closed_day"] is None and part_of(world, present(world)) != "early"
+    refused("a later part of today", advanced, to="early")
+    advanced(to="night")
+    held = present(world)
+    assert advanced(to="night")["closed_day"] is None and present(world) == held, (
+        "the present's own part: no move"
+    )
+    strict = settings.model_copy(update={"author": settings.author.model_copy(update={"tolerance": 0.0})})
+    assert shares[1]["messages"] == 2 and any("messages today" in e for e in close_day(world, strict, 1)), (
+        "4 posted"
+    )
+    assert advanced(to="tomorrow")["closed_day"] == 1 and today(world) == 2
+    refused("the day closes from the night", advanced, to="tomorrow")  # a repeat never closes a second day
+    advanced(to="morning")
+    refused("advance to night first", advanced, to="tomorrow")
+    # Shares are checked per day, and a day stays closable: with a day of about 15 messages, f2 still owed.
+    assert band(0.3, 0.1, 2) == (0, 1) and band(0.3, 0.1, 40) == (8, 16) and band(0.25, 0.1, 10) == (1, 4)
+    big = settings.model_copy(update={"activity": settings.activity.model_copy(update={"messages": 120}), "author": settings.author.model_copy(update={"tolerance": 0.3, "share_tolerance": 0.1})})  # fmt: skip
+    assert agenda_budget(world, big, 1) == quotas(world, big)[1]["messages"] - 6, "f1's conversation in #ops"
+    ways = room(world, big, 2)
+    assert (
+        ways["owed"] == 1 and ways["closes"][0] <= quotas(world, big)[2]["messages"] <= ways["closes"][1]
+    ), ways
+    # A day behind at night is not spaced by the night's own small quota: its next conversation starts while the
+    # rest of the day still holds the conversations it needs to close.
+    night, end = window(world, 2, "night")[0], bounds(world, 2)[1]
+    still = math.ceil(ways["closes"][0] / big.activity.conversation_lines)
+    waits = [opening(world, big, random.Random(i), night, 2) for i in range(200)]
+    assert max(waits) <= (end - night) // (still + 1) + 60_000_000, (max(waits), still)
+    assert today_line(world, big, 2).endswith("15 h 0 min left today"), today_line(world, big, 2)
+
+    def posted_with(cfg, conversation):
+        with world.trial() as copy:
+            return post(copy, conversation, cfg, rng, gaps)
+
+    replies = talk(*[dict(author_id=c, text=f"noted {i}") for i in range(12)], thread=rows[0]["id"])
+    refused("today could not close", posted_with, big, replies)  # 12 replies: more than any day of 19 holds
+    tight = settings.model_copy(update={"author": settings.author.model_copy(update={"tolerance": 0.0})})
+    more = [  # with f2, three lines owed in three places today, on a day of at most two messages
+        PlanFact(id="f6", storyline="s1", subject="Release 4.2", attribute="owner", value="Mia", channel_id=leads, author_id=a, day=2, summary="s"),
+        PlanFact(id="f7", storyline="s1", subject="Release 4.2", attribute="reviewer", value="Raj", channel_id=ops, author_id=c, day=2, summary="s"),
+    ]  # fmt: skip
+
+    def recorded_with(cfg, document):
+        with world.trial() as copy:
+            record_plan(copy, document, cfg)
+
+    refused("leaves today no way to close", recorded_with, tight, plan(facts=[*facts, *more]))
+    refused(
+        "before_it_happened", posted_, talk(dict(author_id=b, text="service back at {at:e2}", conveys=["f2"]))
+    )
+    advanced(to="evening")
+    assert any(e.startswith("c1 is due") for e in close_day(world, settings, 2)), (
+        "the promise due today is open"
+    )
+    restored = posted_(talk(dict(author_id=b, text="service back at {at:e2}, notes are up", conveys=["f2"], closes=[Close(id="c1", status="kept")])))  # fmt: skip
+    assert restored["messages"][0]["text"] == "service back at 14:00 CDT, notes are up", (
+        "{at:} on the author's clock"
+    )
+    moment = at(world, Moment(day=2, time="14:00", zone=zone))
+    assert render(moment, "UTC", moment) == "19:00 UTC" and render(moment, "UTC", moment + DAY).startswith(
+        f"{datetime.fromtimestamp(moment / 1e6, ZoneInfo('UTC')):%a}"
+    ), "the day is named when it is not the day of writing"
+    assert world.db.execute("SELECT status, closed_by FROM commitments").fetchone()[:] == ("kept", restored["messages"][0]["id"])  # fmt: skip
+    refused("only its summary may change", recorded, plan(facts=[facts[0].model_copy(update={"value": "roll forward", "anchor": None}), *facts[1:]]))  # fmt: skip
+    refused("only its summary may change", recorded, plan(facts=[facts[0], facts[1].model_copy(update={"after": []}), *facts[2:]]))  # fmt: skip
+    recorded(plan(facts=[facts[0].model_copy(update={"summary": "decided early"}), *facts[1:]]))
+    assert world.db.execute("SELECT summary FROM facts WHERE id = 'f1'").fetchone()[0] == "decided early"
+    refused(
+        "today (day 2) or later", recorded, plan(facts=[*facts[:3], facts[3].model_copy(update={"day": 1})])
+    )
+    refused("on or before the day of e1", recorded, plan(facts=[*facts[:2], facts[2].model_copy(update={"day": 4}), facts[3]]))  # fmt: skip
+    notes = PlanFact(id="f5", storyline="s1", subject="Release 4.2", attribute="notes", value="notes posted", channel_id=ops, author_id=b, day=2, event="e2", kind="scheduled", summary="s")  # fmt: skip
+    refused("e2 is past", recorded, plan(facts=[*facts, notes]))  # it is evening; e2 was at 14:00
+    advanced(to="night")
+    advanced(to="tomorrow")  # day 3, early: e1 at 10:00 is ahead, and f3 and f4 are to be told before it
+    refused("are scheduled before", advanced, to="night")
+    assert {e.split()[0] for e in close_day(world, settings, 3)} == {"f3", "f4"}, (
+        "planned for day 3, unstated"
+    )
+    refused("comes after ['f3']", posted_, talk(dict(author_id=a, text="Owen owns the audit at {at:e1}", conveys=["f4"])))  # fmt: skip
+    refused("past the moment of ['f3', 'f4']", posted_, talk(*[dict(author_id=a, text="still here", pause="hours")] * 5, channel=leads))  # fmt: skip
+    posted_(  # a scheduled fact is told before its moment
+        talk(
+            dict(author_id=a, text="dry run for the release window at {at:e1}", conveys=["f3"]), channel=leads
+        )
+    )
+    # A fact about an event and with no anchor of its own is stated with the event's time.
+    posted_(talk(dict(author_id=a, text="Owen owns the audit at {at:e1}", conveys=["f4"]), dict(author_id=d, text="thanks")))  # fmt: skip
+    advanced(to="night")
+
+    def advanced_with(cfg):
+        with world.trial() as copy:
+            return advance(copy, cfg, "tomorrow")
+
+    refused("day 3 stays open", advanced_with, strict)
+    while today(world) is not None:
+        advanced(to=onward(world))
+    refused("the calendar is closed", posted_, talk(dict(author_id=a, text="late")))
+    refused("the calendar is closed", recorded, first_plan)
+    measured = close_day(world, settings.model_copy(update={"author": settings.author.model_copy(update={"share_tolerance": 0.0})}), 1)  # fmt: skip
+    assert any("3 of today's 4 messages are thread replies" in e for e in measured), measured
+    refused("at least 2 channels", tasked, owner.model_copy(update={"facts": ["f1", "f4"]}))  # both in #ops
+    refused("fills one of the cells", tasked, owner.model_copy(update={"level": 2}))
+    result = tasked(owner)
+    assert result["gold"] == [{"answer": "Owen"}] and "bm25_rank" in result
+    replier = Task(id="t2", category="lookup", level=1, actor_id=c, question="Who said thanks in #ops?", answer_type="text", gold_sql="SELECT u.real_name AS answer FROM messages m JOIN users u ON u.id = m.user_id WHERE m.text = 'thanks'")  # fmt: skip
+    tasked(replier)
+    tasked(replier.model_copy(update={"id": "t3"}))  # the cell's task is replaced
+    assert [r[0] for r in world.db.execute("SELECT id FROM tasks ORDER BY id")] == ["t1", "t3"]
+    thanks = world.db.execute("SELECT id FROM messages WHERE text = 'thanks'").fetchone()[0]
+    stated = world.db.execute("SELECT message_id FROM evidence WHERE fact_id = 'f4'").fetchone()[0]
+
+    def revised(message, text):
+        with world.trial() as copy:
+            return revise(copy, message, text)
+
+    refused("changes task t3", revised, thanks, "thank you")  # t3's gold answer reads that text
+    refused(
+        "anchor_token_missing", revised, stated, "the audit has an owner"
+    )  # f4's evidence keeps its token
+    refused("states nothing new", revised, thanks, "thanks, rollback noted")
+    assert revised(stated, "Owen owns the audit from {at:e1}")["text"] == "Owen owns the audit from 10:00 CDT"
+    ids = [r[0] for r in world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
+    assert ids == sorted(ids) and world.violations(complete=True) == []
+    print(
+        "PASS clock: plan and events, posts at the present, tagging, first statements, promises, day close, revise, tasks"
+    )
+
+
+def author_context(settings, cast, org, root, agenda=None):
+    """What WorldTools are configured with, as the driver builds it; `agenda` maps a day to its drawn scenes."""
+    state = SimpleNamespace(
+        quota=[("semantic", 3, "a concept", "a style"), ("lookup", 1, "a concept", "a style")],
+        cast=cast,
+        plans={
+            "agenda": {
+                str(d): [s.model_dump(mode="json") for s in scenes] for d, scenes in (agenda or {}).items()
+            }
         },
     )
-    fails(Catalog.model_validate_json, json.dumps(directory_catalog))
-    api = SlackAPI(candidate.snapshot, "u1")
-    history = collect(api, "get_conversation_history", conversation_id="c1")
-    assert len(history) == 160 and len({m["message_id"] for m in history}) == 160
-    assert len(collect(api, "get_thread", conversation_id="c1", root_message_id="m0")) == 71
-    assert len(collect(api, "search_messages", query="Deployment")) == 159
-    assert {r["conversation_id"] for r in collect(api, "list_conversations")} == {"c1"}
-    assert "secret" not in {m["message_id"] for m in api.search_messages("region-2")["items"]}
-    fails(api.get_conversation_history, "c2")
-    fails(api.get_thread, "c2", "secret")
-    fails(api.search_messages, "work", conversation_id="c2")
-    result = api.get_conversation_history("c1", limit=1)
-    cursor = result["next_cursor"]
-    fails(api.search_messages, "work", cursor=cursor)
-    fails(
-        SlackAPI(candidate.snapshot, "u2").get_conversation_history,
-        "c1",
-        cursor=cursor,
+    return context_of(settings, state, root, org.model_dump(mode="json"))
+
+
+async def check_tools(root):
+    """The author's tools (v7): nine, served host-side over the world file; each turn's tools act only in their turn
+    and on their day; writes are checked and logged, reads are live; the memory renders every time on the company
+    clock, never as raw microseconds, and the one-pager stays small on a full world."""
+    root.mkdir(parents=True)
+    base = contracts_settings(root)
+    quick = root / "quick-gaps.json"  # most replies within ten minutes, as in real channels
+    quick.write_text(
+        json.dumps({"quantiles": [i * 0.6 for i in range(900)] + [600 + i * 138 for i in range(101)]}) + "\n"
     )
-    changed = candidate.model_copy(deep=True)
-    changed.snapshot.messages[-2].text = "A different rollout check"
-    fails(
-        SlackAPI(changed.snapshot, "u1").get_conversation_history,
-        "c1",
-        cursor=cursor,
+    settings = base.model_copy(
+        update={
+            "activity": base.activity.model_copy(update={"messages": 400}),
+            "author": base.author.model_copy(update={"tolerance": 1.0, "share_tolerance": 1.0}),
+            "personas": base.personas.model_copy(update={"gaps": quick}),
+        }
     )
-    fails(api.get_conversation_history, "c1", limit=True)
-    fails(api.search_messages, "work", before="nonsense")
+    world, cast, org, (a, b, c, d) = organized(root, settings)
+    ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
+    with world.trial() as copy:
+        start_clock(copy)
+    agenda = {d: background_plan(world, org, settings.activity, settings.seed, d, agenda_budget(world, settings, d)) for d in quotas(world, settings)}  # fmt: skip
+    context = author_context(settings, cast, org, root, agenda)
+    ledger = Plan(
+        storylines=[Storyline(id="s1", summary="the 4.2 release"), Storyline(id="s2", summary="the audit")],
+        events=[Event(id="e1", storyline="s2", title="audit window", day=3, time="10:00")],
+        facts=[
+            PlanFact(id="f1", storyline="s1", subject="Release 4.2", attribute="decision", value="rollback", anchor="rollback", channel_id=ops, author_id=a, day=1, summary="s"),
+            PlanFact(id="f2", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=leads, author_id=a, day=3, after=["f1"], event="e1", kind="scheduled", summary="s"),
+        ],
+    )  # fmt: skip
+
+    def tools_for(mode, day):
+        task = WorldAuthorTask.create(mode, day, world.path, context, f"{mode}-{day:02d}")
+        (tools,) = task.toolsets(task.config)
+        return tools
+
+    planner = tools_for("plan", 0)
+    await planner.setup()
+    with_state(planner)
+    assert "ledger holds 2 storylines, 1 events and 2 facts" in await planner._with_state(planner.plan)(
+        ledger=ledger
+    )
+    for name, kwargs in (("post", {"conversation": Conversation(channel_id=ops, about="x", lines=[PostLine(author_id=a, text="hi")])}), ("add_task", {"task": Task(id="t", category="lookup", level=1, actor_id=a, question="q?", answer_type="text", gold_sql="SELECT 1 AS answer")})):  # fmt: skip
+        try:
+            await planner._with_state(getattr(planner, name))(**kwargs)
+            raise AssertionError(f"{name} ran in the plan turn")
+        except ValueError as error:
+            assert "turn" in str(error), error
+    day1 = tools_for("day", 1)
+    await day1.setup()
+    with_state(day1)
+    call = lambda tools, name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
+    page = await call(day1, "now")
     assert (
-        len(
-            api.search_messages(
-                "Deployment",
-                after="2026-01-01T02:00:00Z",
-                before="2026-01-01T02:10:00Z",
-            )["items"]
-        )
-        == 9
+        page.startswith("# Now: ") and "day 1 of 10" in page and "[[f1]]" in page and "## Task cells" in page
     )
-    assert not api.search_messages("Deployment", author_id="u2")["items"]
-    corrupted = catalog.model_dump(mode="json")
-    corrupted["tasks"][1]["question"] = corrupted["tasks"][0]["question"]
-    fails(Catalog.model_validate_json, json.dumps(corrupted))
-    corrupted = catalog.model_dump(mode="json")
-    other = dict(corrupted["facts"][0], id="conflict", value="different")
-    corrupted["facts"].append(other)
-    fails(Catalog.model_validate_json, json.dumps(corrupted))
-    changed = candidate.model_copy(deep=True)
-    changed.snapshot.messages = [m for m in changed.snapshot.messages if m.id != "secret"]
-    assert not validate_candidate(catalog, changed, ["t1", "t2"])["ok"]
-    changed = candidate.model_copy(deep=True)
-    changed.bindings[0].gold_calls[0].arguments["limit"] = 1
-    assert validate_candidate(catalog, changed, ["t1"])["ok"]
-    changed.snapshot.messages.append(
-        Message(
-            id="later_update",
-            conversation_id="c1",
-            author_id="u2",
-            timestamp="2026-01-02T00:00:00Z",
-            text="work-1 monitoring continues; the approved destination is unchanged.",
-        )
+    assert "everyday conversations code drew for today" in page and agenda[1]
+    assert "- today: 0 messages today (thread replies 0, reacted to 0, in DMs 0); it closes with" in page
+    decision = Conversation(channel_id=ops, about="decision", lines=[PostLine(author_id=a, text="rollback it is", conveys=["f1"]), PostLine(author_id=b, text="ok", reply_to=0)])  # fmt: skip
+    out = await call(day1, "post", conversation=decision)
+    assert len(out["messages"]) == 2 and out["now"].endswith("CDT"), out
+    count = world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert await call(day1, "post", conversation=decision) == out, (
+        "a retry after a lost response returns the post"
     )
-    regression = validate_candidate(catalog, changed, ["t1"])
-    assert not regression["ok"] and any("gold route" in error for error in regression["errors"])
-    changed = candidate.model_copy(deep=True)
-    changed.bindings[0].gold_calls = [
-        ReadCall(
-            action="get_conversation_history",
-            arguments={"conversation_id": "c1", "limit": 1},
-        )
+    assert world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == count, "and posts nothing more"
+    try:
+        await call(day1, "post", conversation=Conversation(channel_id=ops, about="x", lines=[PostLine(author_id=c, text="rollback again")]))  # fmt: skip
+        raise AssertionError("an untagged anchor was posted")
+    except ValueError as error:
+        assert "conveys" in str(error), error
+    for ref in (
+        "#ops",
+        a,
+        "alicia.rao",
+        "f1",
+        "e1",
+        "s1",
+        f"m{out['messages'][0]['id']}",
+        out["conversation"],
+    ):
+        assert (await call(day1, "view", ref=ref)).strip(), ref
+    try:
+        await call(day1, "view", ref="nobody")
+        raise AssertionError("an unknown page was shown")
+    except ValueError:
+        pass
+    assert (await call(day1, "sql", sql="SELECT COUNT(*) AS n FROM facts"))["rows"] == [{"n": 2}]
+    assert (await call(day1, "sql", sql="SELECT COUNT(*) AS n FROM messages", actor_id=c))["rows"] == [
+        {"n": 2}
     ]
-    assert not validate_candidate(catalog, changed, ["t1"])["ok"]
-    payload = review_payload(catalog, candidate, ["t1", "t2"], "world")
-    assert set(missing_evidence(payload, [])) == {"t1", "t2"}
-    clean = approval(payload)
-    minor = Issue(owner="builder", artifact="workspace", defect="x", requested_change="y", blocking=False)
-    assert accepted(clean.model_copy(update={"issues": [minor]}), payload, Acceptance()), (
-        "minor issues do not block"
+    for bad in ({"sql": "DELETE FROM facts"}, {"sql": "SELECT * FROM tasks", "actor_id": c}):
+        try:
+            await call(day1, "sql", **bad)
+            raise AssertionError(f"sql ran {bad}")
+        except ValueError:
+            pass
+    assert (await call(day1, "read", actor_id=c, tool="read_channel", arguments={"channel_id": ops}))["items"]
+    try:
+        await call(day1, "read", actor_id=c, tool="read_channel", arguments={"nope": 1})
+        raise AssertionError("a read with unknown arguments went through")
+    except TypeError:
+        pass
+    while today(world) == 1:
+        await call(day1, "advance", to=onward(world))
+    try:
+        await call(day1, "post", conversation=Conversation(channel_id=ops, about="x", lines=[PostLine(author_id=a, text="hi")]))  # fmt: skip
+        raise AssertionError("day 1's tools posted on day 2")
+    except ValueError as error:
+        assert "day 1 is closed" in str(error), error
+    log = [json.loads(line) for line in (root / "world-calls.jsonl").read_text().splitlines()]
+    assert {e["tool"] for e in log} >= {"plan", "post", "view", "sql", "read", "advance", "now"}
+    assert any(not e["ok"] and "conveys" in e["error"] for e in log)
+    assert [e["ok"] for e in log if e["tool"] == "plan"] == [True], "one plan went through"
+    assert any(e["tool"] == "read" and not e["ok"] and e["error"].startswith("TypeError") for e in log), (
+        "a fault is logged as failed"
     )
-    assert not accepted(
-        clean.model_copy(update={"issues": [minor.model_copy(update={"blocking": True})]}),
-        payload,
-        Acceptance(),
+    assert any(e["tool"] == "post" and e["args"]["conversation"]["about"] == "decision" for e in log), (
+        "with its arguments"
     )
-    low = clean.model_copy(update={"criteria": {**clean.criteria, "world_coherence": 0.6}})
-    assert not accepted(low, payload, Acceptance()), "a criterion under its floor rejects"
-    assert not accepted(
-        clean.model_copy(update={"issues": [minor]}), payload, Acceptance(minor_issues_block=True)
+    served = tools_for("day", 2)  # a tool server checks the world file's hash when it starts
+    with_state(served)
+    described = await served_tools(served)
+    assert set(described) == {"now", "view", "sql", "read", "plan", "post", "advance", "revise", "add_task"} and served.server_name == "world"  # fmt: skip
+    # help() in the author's IPython shows a tool's description alone: it names every field of every document a
+    # call takes, nested ones too, with ? when optional.
+    for tool, models in {"post": (Conversation, PostLine, Reaction, Commit, Close), "plan": (Plan, PlanFact, Event, Storyline), "add_task": (Task,)}.items():  # fmt: skip
+        for model in models:
+            for field, info in model.model_fields.items():
+                marked = f"{field}{'' if info.is_required() else '?'}: "
+                assert marked in described[tool].split("Arguments: ", 1)[1], (tool, marked)
+    assert "lines: [1-40 × {author_id: str" in described["post"] and described["now"].endswith(
+        "Arguments: none"
     )
-    inspected = []
-    for task, binding in zip(catalog.tasks, candidate.bindings):
-        api = SlackAPI(candidate.snapshot, task.actor_id)
-        inspected.extend(
-            ReadRecord(actor_id=task.actor_id, call=call, output=api.execute(call))
-            for call in binding.gold_calls
+    async with (
+        asyncio.timeout(30),
+        serve(served) as url,
+        streamable_http_client(url) as (reader, writer_),
+        ClientSession(reader, writer_) as client,
+    ):  # nested documents cross the wire as strict models, and a refused write carries its reason
+        await client.initialize()
+        refused = await client.call_tool("post", {"conversation": {"channel_id": ops, "about": "x", "lines": [{"author_id": a, "text": "hi", "commits": [{"id": "c1", "text": "t", "due_day": 2.5}]}]}})  # fmt: skip
+        assert refused.is_error and "due_day" in str(refused.content), refused
+    invalid = [json.loads(line) for line in (root / "world-calls.jsonl").read_text().splitlines()][-1]
+    assert invalid["tool"] == "post" and invalid["error"].startswith("invalid arguments: conversation.lines.0.commits.0.due_day"), invalid  # fmt: skip
+    bad = WorldAuthorTask.create("day", 2, world.path, context, "day-02-01")
+    world.db.execute("UPDATE storylines SET summary = 'changed' WHERE id = 's1'")
+    try:
+        await bad.toolsets(bad.config)[0].setup()
+        raise AssertionError("a changed world file was served")
+    except ValueError:
+        pass
+    world.db.execute("UPDATE storylines SET summary = 'the 4.2 release' WHERE id = 's1'")
+    rng, gaps, lines = random.Random(3), Gaps(settings.personas.gaps), 0
+    while today(world) is not None:  # a full world: about 400 messages over ten days, written at the present
+        day = today(world)
+        quota = quotas(world, settings)[day]["messages"]
+        if day == 3 and not world.db.execute("SELECT 1 FROM evidence WHERE fact_id = 'f2'").fetchone():
+            post(world, Conversation(channel_id=leads, about="audit", lines=[PostLine(author_id=a, text="Owen owns it from {at:e1}", conveys=["f2"])]), settings, rng, gaps)  # fmt: skip
+        if posted(world, *bounds(world, day)) < quota and part_of(world, present(world)) != "night":
+            try:
+                post(world, Conversation(channel_id=rng.choice([ops, leads]), about="work", lines=[PostLine(author_id=rng.choice([a, b]), text=f"note {lines + i} on the work", reply_to=0 if i else None) for i in range(4)]), settings, rng, gaps)  # fmt: skip
+                lines += 4
+                continue
+            except ValueError:
+                pass
+        advance(world, settings, onward(world))
+    assert world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] > 300
+    memory = files(world, settings, context, "tasks")
+    # A person's page says who they are beyond their title and how they type, in words; the guide says how Slack sounds.
+    page = memory["memory/people/alicia.rao.md"]
+    assert "## Who they are" in page and "calm" in page and "midwest" in page and "chess" in page, page
+    assert "20% of their messages are short (4 words or fewer)" in page, page
+    assert (
+        "\nVoice\n- This is Slack"
+        in WorldAuthorTask.create("day", 1, world.path, context, "day-01-01").data.system_prompt
+    )
+    raw = re.compile(r"\b1\d{15}\b")
+    assert not [p for p, text in memory.items() if raw.search(text)], "no raw microseconds reach the author"
+    assert len(memory["memory/now.md"].encode()) < 20_000, len(memory["memory/now.md"].encode())
+    assert Plan.model_validate(json.loads(memory["memory/ledger.json"])) == ledger, (
+        "ledger.json is world_plan's input"
+    )
+    assert not raw.search(json.dumps(ledger_digest(world))), "the judge's ledger is rendered too"
+    print(
+        "PASS tools: nine served, scoped by turn and day, checked and logged; memory rendered, small, round-trips"
+    )
+
+
+async def served_tools(toolset):
+    async with (
+        asyncio.timeout(30),
+        serve(toolset) as url,
+        streamable_http_client(url) as (reader, writer_),
+        ClientSession(reader, writer_) as client,
+    ):
+        await client.initialize()
+        return {t.name: t.description for t in (await client.list_tools()).tools}
+
+
+def with_state(toolset):
+    """Serve calls against an in-memory state, as the framework's state channel would."""
+    stored = {"state": toolset._state_cls()}
+
+    async def pull():
+        return stored["state"].model_copy(deep=True)
+
+    async def push(before):
+        stored["state"] = toolset.state.model_copy(deep=True)
+
+    toolset._pull_state, toolset._push_state = pull, push
+    return stored
+
+
+async def check_reviews(root):
+    """Reviews bind to what they reviewed, decide on blocking issues per task, and inspect the world as its tasks'
+    actors; solvers get the solver copy and no answer; a release holds exactly what was approved."""
+    root.mkdir(parents=True)
+    world, at, message = world_fixture(root / "world.sqlite")
+    rows = world.gold("U2", "SELECT value AS answer FROM facts WHERE id = 'f1'")["rows"]
+    world.db.execute("UPDATE tasks SET gold_json = ? WHERE id = 't1'", (json.dumps(rows),))
+    payload = review_payload(world, "task", ["t1"])
+    taxonomy = contracts_settings(root).taxonomy
+    assert review_payload(world, "task", ["t1"], taxonomy)["tasks"][0]["means"].startswith(
+        taxonomy["lookup"].definition
+    )
+    assert payload["tasks"][0]["gold"] == [{"answer": "rollback"}] and payload["world_hash"] == file_hash(
+        world.path
+    )
+    schema = verdict_schema("task", ["t1"])
+    assert schema["properties"]["tasks"]["maxItems"] == 1 and schema["$defs"]["TaskReview"]["properties"][
+        "task_id"
+    ]["enum"] == ["t1"]
+    assert verdict_schema("world", [])["properties"]["tasks"]["maxItems"] == 0
+
+    def verdict(approved=True, issues=(), tasks=(("t1", True),), criteria=None):
+        return Verdict(
+            approved=approved,
+            tasks=[TaskReview(task_id=t, valid=v, reason="r", level_fit=3) for t, v in tasks],
+            issues=list(issues),
+            criteria=criteria if criteria is not None else dict.fromkeys(PHASE_CRITERIA["task"], 1.0),
+            summary="s",
         )
-    assert not missing_evidence(payload, inspected)
-    directory_payload = json.loads(json.dumps(payload))
-    directory_payload["candidate"]["bindings"][0]["claims"][0]["user_ids"] = ["u2"]
-    assert missing_evidence(directory_payload, inspected)["t1"]["user_ids"] == ["u2"]
-    call = ReadCall(action="get_user", arguments={"user_id": "u2"})
-    inspected.append(
-        ReadRecord(actor_id="u1", call=call, output=SlackAPI(candidate.snapshot, "u1").execute(call))
+
+    validate_verdict(verdict(), payload)
+    fails(validate_verdict, verdict(criteria={"question_fit": 1.0}), payload)
+    fails(validate_verdict, verdict(tasks=()), payload)
+    unscored = verdict().model_copy(update={"tasks": [TaskReview(task_id="t1", valid=True, reason="r")]})
+    fails(validate_verdict, unscored, payload)  # a task review scores each task's level_fit
+    assert "level_fit" in verdict_schema("task", ["t1"])["$defs"]["TaskReview"]["required"]
+    workspace = Issue(artifact="workspace", defect="d", requested_change="c")
+    validate_verdict(verdict(approved=False, issues=[workspace]), payload)
+    assert "workspace" in str(schema["$defs"]["Issue"]["properties"]["artifact"])
+    issue = Issue(artifact="tasks", task_ids=["t2"], defect="d", requested_change="c")
+    fails(verdict, issues=[issue])
+    fails(verdict, approved=False)
+    batch = verdict(approved=False, issues=[issue], tasks=(("t1", True), ("t2", True)))
+    strict, lenient = Acceptance(minor_issues_block=True), Acceptance()
+    assert accepted_task(batch, lenient, "t1") and not accepted_task(batch, lenient, "t2")
+    general = batch.model_copy(update={"issues": [issue.model_copy(update={"task_ids": []})]})
+    assert not accepted_task(general, lenient, "t1"), "an issue naming no task blocks every task"
+    minor = batch.model_copy(update={"issues": [issue.model_copy(update={"blocking": False})]})
+    assert (
+        accepted_task(minor, lenient, "t2")
+        and not accepted_task(minor, strict, "t2")
+        and not deciding(minor, lenient)
     )
-    assert not missing_evidence(directory_payload, inspected)
-    inspected[1].actor_id = "u1"
-    assert "t2" in missing_evidence(payload, inspected)
-    verdict = approval(payload)
-    validate_verdict(verdict, payload)
-    incomplete = verdict.model_copy(deep=True)
-    incomplete.tasks[0].supported_claims = []
-    fails(validate_verdict, incomplete, payload)
-    altered = dict(payload, candidate=changed.model_dump(mode="json"))
-    fails(validate_verdict, verdict, altered)
-    first = SolverTask.create(
-        catalog.tasks[0], candidate.snapshot, "ws1", reference_for(catalog.tasks[0], candidate)
+
+    world.snapshot(root / "review.sqlite")
+    judge = JudgeTask.create(payload, root / "review.sqlite", "final-01", 5)
+    assert judge.config.tools.actors == ["U2"] and "rollback" not in judge.config.tools.model_dump_json()
+    (tools,) = judge.toolsets(judge.config)
+    await tools.setup()
+    stored = with_state(tools)
+    result = await tools._with_state(tools.check)()
+    assert (
+        stored["state"].checked
+        and result["tasks"]["t1"]["rows"] == [{"answer": "rollback"}]
+        and result["violations"] == []
     )
-    second = SolverTask.create(
-        catalog.tasks[1], candidate.snapshot, "ws1", reference_for(catalog.tasks[1], candidate)
+    rank = World(root / "review.sqlite", actor="U2").rank(payload["tasks"][0]["question"], [1])
+    assert result["tasks"]["t1"]["bm25_rank"] == rank == 2 and "U1" in result["style"]["authors"]
+    assert (
+        await tools._with_state(tools.read)(
+            actor_id="U2", tool="read_channel", arguments={"channel_id": "C1"}
+        )
+    )["items"]
+    try:
+        await tools._with_state(tools.read)(
+            actor_id="U1", tool="read_channel", arguments={"channel_id": "G1"}
+        )
+        raise AssertionError("a reviewer read as someone outside the review")
+    except ValueError:
+        pass
+    assert (
+        await tools._with_state(tools.sql)(
+            actor_id="U2", sql="SELECT COUNT(*) AS n FROM messages WHERE channel_id = 'G1'"
+        )
+    )["rows"] == [{"n": 0}]
+    assert set(await served_tools(tools)) == {"check", "read", "sql"} and tools.server_name == "inspect"
+    files = {"/task/verdict.json": verdict().model_dump_json().encode()}
+    runtime = SimpleNamespace(read=lambda path, max_bytes: asyncio.sleep(0, files[path]))
+    unchecked = SimpleNamespace(state=ReviewState(), info={}, record_metric=lambda *a: None)
+    try:
+        await judge.finalize(unchecked, runtime)
+        raise AssertionError("a verdict without inspect_check was accepted")
+    except ValueError:
+        pass
+    checked = SimpleNamespace(state=ReviewState(checked=True), info={}, record_metric=lambda *a: None)
+    await judge.finalize(checked, runtime)
+    assert checked.info["verdict"]["approved"]
+
+    world.snapshot(root / "planted.sqlite")
+    planted = World(root / "planted.sqlite", writable=True)
+    with planted.batch():  # a fact t1 needs that no message states yet
+        fact = dict(id="f9", storyline="r", subject="c", attribute="d", value="v", summary="s", day=2)
+        planted.insert("facts", [fact | dict(channel_id="C1", author_id="U1")])
+        planted.insert("task_facts", [dict(task_id="t1", fact_id="f9")])
+
+    async def inspected(phase, task_ids):
+        judge = JudgeTask.create(review_payload(planted, phase, task_ids), planted.path, phase, 5)
+        (tools,) = judge.toolsets(judge.config)
+        await tools.setup()
+        with_state(tools)
+        return judge, await tools._with_state(tools.check)()
+
+    _, due = await inspected("task", ["t1"])
+    _, untasked = await inspected("world", [])
+    assert [v.split(":")[0] for v in due["violations"]] == ["unstated_fact"] and "bm25_rank" in due["tasks"][
+        "t1"
+    ]
+    assert untasked["violations"] == [], "completion is due for reviewed tasks"
+
+    world.solver_copy(root / "solver.sqlite")
+    task = PublicTask(
+        task_id="t1",
+        question="q?",
+        actor_id="U2",
+        category="search",
+        level=1,
+        answer_type="text",
+        world_hash=sha256(root / "solver.sqlite"),
     )
-    assert first is not second and first.config.tools.actor_id != second.config.tools.actor_id
-    assert "answer" not in first.data.model_dump() and "fact_ids" not in first.data.model_dump()
-    assert first.config.tools.colocated is False
-    assert "snapshot_json" not in first.data.model_dump()
-    print("PASS contracts, regression checks, pagination, cursor binding, privacy, stale/incomplete verdicts")
+    answer = PrivateAnswer(
+        answer_type="text",
+        rows=rows,
+        gold_sql="SELECT 1",
+        messages=[["C1", world.db.execute("SELECT ts FROM messages WHERE id = 1").fetchone()[0]]],
+        users=["U1"],
+    )
+    solve = SolverTask.create(task, root / "solver.sqlite", answer, network_policy=False)
+    assert "rollback" not in solve.data.model_dump_json() + solve.config.tools.model_dump_json()
+    assert solve.config.tools.db_hash == sha256(root / "solver.sqlite")
+    write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})
+    assert load_release(root / "release")[1:] == ([task], {"t1": answer})
+    write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})  # idempotent
+    fails(
+        write_release,
+        root / "release",
+        root / "solver.sqlite",
+        [task],
+        {"t1": answer.model_copy(update={"rows": []})},
+    )
+    tampered = json.loads((root / "release" / "answers.json").read_text())
+    tampered["t1"]["rows"] = [{"answer": "something else"}]
+    (root / "release" / "answers.json").write_text(json.dumps(tampered))
+    fails(load_release, root / "release")
+    hidden = answer.model_copy(
+        update={"messages": [["G1", world.db.execute("SELECT ts FROM messages WHERE id = 4").fetchone()[0]]]}
+    )
+    fails(write_release, root / "release2", root / "solver.sqlite", [task], {"t1": hidden})
+    print("PASS reviews: verdict contracts, per-task acceptance, judge tools as actors, solver copy, release")
 
 
 class TestStore(Store):
@@ -375,912 +1577,406 @@ class TestStore(Store):
 
 
 class ScriptedAgent:
+    trainable = False
+
     @asynccontextmanager
     async def provision(self, task):
-        assert set(json.loads(task.config.files["schemas.json"])) in (
-            {"premise", "catalog"},
-            {"plan", "bind"},
-        )
         yield None
 
     @asynccontextmanager
     async def interaction(self, task, runtime):
-        yield SimpleNamespace(trace=SimpleNamespace(ok=True, info={}, record_reward=lambda *args: None))
+        yield SimpleNamespace(trace=SimpleNamespace(ok=True, info={}, to_record=lambda: {"nodes": []}))
 
 
-def premises(count=12):
-    return Premises(
-        premises=[
-            Premise(
-                company=f"{name} Freight",
-                niche="cold-chain logistics IT",
-                region="Poland",
-                size="400 people",
-                culture="direct, hybrid",
-                cast="Polish and Ukrainian engineers",
-            )
-            for name in (
-                "Harbor",
-                "Kestrel",
-                "Wawel",
-                "Odra",
-                "Lynx",
-                "Bora",
-                "Tatra",
-                "Vistula",
-                "Amber",
-                "Mazur",
-                "Sokol",
-                "Brda",
-            )[:count]
-        ]
+def flow_settings(root, seed):
+    settings = contracts_settings(root)
+    (root / "p.jsonl").write_text("".join(seed_person(i).model_dump_json() + "\n" for i in range(6)))
+    (root / "t.jsonl").write_text("".join(seed_person(i).typing.model_dump_json() + "\n" for i in range(6)))
+    personas = settings.personas.model_copy(update={"pool": 4})
+    activity = settings.activity.model_copy(
+        update={"messages": 45, "conversation_lines": 3, "dm_share": 0.4, "reaction_rate": 0.3}
     )
-
-
-def personas(catalog):
-    return [
-        Persona(
-            id=p.id, role="engineer", seniority="senior", timezone="Europe/Warsaw", voice="terse, lowercase"
-        )
-        for p in catalog.people
-    ]
-
-
-def plan_fixture(catalog):
-    conversations = fixture()[1].snapshot.conversations
-    return Plan(
-        conversations=conversations,
-        scenes=[
-            ScenePlan(
-                id="s_route",
-                conversation_id="c1",
-                participant_ids=["u1", "u2"],
-                start="2026-01-02T09:00:00Z",
-                end="2026-01-02T09:45:00Z",
-                situation="Choosing a destination",
-                beats=[Beat(fact_id="f1", author_id="u1")],
-                length=2,
-            ),
-            ScenePlan(
-                id="s_private",
-                conversation_id="c2",
-                participant_ids=["u2"],
-                start="2026-01-02T10:00:00Z",
-                end="2026-01-02T10:45:00Z",
-                situation="Private approval",
-                beats=[Beat(fact_id="f2", author_id="u2")],
-                length=1,
-            ),
-            ScenePlan(
-                id="s_chat",
-                conversation_id="c1",
-                participant_ids=["u1", "u2"],
-                start="2026-01-02T11:00:00Z",
-                end="2026-01-02T11:45:00Z",
-                situation="Lunch plans",
-                length=2,
-            ),
-        ],
-    )
-
-
-ZONES = {"u1": "Europe/Warsaw", "u2": "Europe/Warsaw"}
-
-
-def scripted_scene(scene, recent, previous):
-    base = datetime.fromisoformat(scene.start).astimezone(ZoneInfo("Europe/Warsaw"))
-
-    def at(minutes, seconds):
-        return (base + timedelta(minutes=minutes, seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
-
-    texts = {"f1": "ok so work-1 goes to region-1", "f2": "work-2 is approved for region-2"}
-    lines = [
-        Line(author_id=b.author_id, text=texts[b.fact_id], local_time=at(0, 17), conveys=[b.fact_id])
-        for b in scene.beats
-    ] or [Line(author_id=scene.participant_ids[0], text="lunch?", local_time=at(0, 5))]
-    lines.append(
-        Line(
-            author_id=scene.participant_ids[-1],
-            text="rewritten" if scene.revision_note else f"seen {len(recent)}",
-            local_time=at(30, 41),
-            reply_to=0 if previous is None else None,
-        )
-    )
-    promises = {"s_route": ["u1 posts the region map"], "s_chat": ["u2 books the lunch table by noon"]}.get(
-        scene.id
-    )
-    written = WrittenScene(lines=lines, introduces=[f"{scene.id} detail"], promises=promises)
-    assert not check_scene(scene, written, ZONES)
-    return written
-
-
-def check_scenes(root):
-    catalog, candidate = fixture()
-    chosen = pick_premise(premises(), 12, ["Northstar Systems"], seed=7)
-    assert chosen == pick_premise(premises(), 12, [], seed=7)
-    fails(pick_premise, premises(11), 12, [], 7)
-    fails(pick_premise, premises(), 12, ["Harbor Cloud Systems"], 7)
-    duplicated = premises()
-    duplicated.premises[1].company = "Harbor Logistics"
-    fails(pick_premise, duplicated, 12, [], 7)
-    catalog.personas = personas(catalog)
-    fails(Persona, id="u1", role="r", seniority="s", timezone="Mars/Olympus", voice="v")
-    fails(Catalog.model_validate, dict(catalog.model_dump(), personas=catalog.model_dump()["personas"][:1]))
-    plan = plan_fixture(catalog)
-    check_plan(catalog, plan)
-    outsider = plan.model_copy(deep=True)
-    outsider.scenes[1].participant_ids = ["u1"]
-    fails(check_plan, catalog, outsider)
-    scenes = {s.id: scripted_scene(s, [], None) for s in plan.scenes}
-    silent = WrittenScene(lines=[Line(author_id="u1", text="hi", local_time="2026-01-02 10:00:00")])
-    assert any("f1" in error for error in check_scene(plan.scenes[0], silent, ZONES))
-    local_start = WrittenScene(lines=[Line(author_id="u1", text="hi", local_time="2026-01-02 12:00:07")])
-    assert not check_scene(plan.scenes[2], local_start, ZONES)
-    overrun = WrittenScene(lines=[Line(author_id="u1", text="hi", local_time="2026-01-02 12:50:00")])
-    assert any("after the scene end" in e for e in check_scene(plan.scenes[2], overrun, ZONES)), "scenes end"
-    as_if_utc = WrittenScene(lines=[Line(author_id="u1", text="hi", local_time="2026-01-02 11:00:00")])
-    assert any("before the scene start" in error for error in check_scene(plan.scenes[2], as_if_utc, ZONES))
-    swapped = WrittenScene(
-        lines=[
-            Line(author_id="u1", text="a", local_time="2026-01-02 12:00:30"),
-            Line(author_id="u2", text="b", local_time="2026-01-02 12:00:12"),
-        ]
-    )
-    assert check_scene(plan.scenes[2], swapped, ZONES) == [
-        "line 1 is at 2026-01-02 12:00:12, before line 0 at 2026-01-02 12:00:30; messages must follow each other in time"
-    ]
-    in_order = WrittenScene(lines=list(reversed(swapped.lines)))
-    assert not check_scene(plan.scenes[2], in_order, {"u1": "Europe/Warsaw", "u2": "Asia/Singapore"}), (
-        "every line is on the scene clock, not its author's"
-    )
-    assert to_utc("2026-01-02 00:30:00", "Europe/Warsaw") == "2026-01-01T23:30:00Z"
-    assert to_utc("2026-01-01 22:00:00", "America/Santiago") == "2026-01-02T01:00:00Z"
-    fails(Line, author_id="u1", text="hi", local_time="2026-01-02T10:00:00Z")
-    lines = [
-        Line(author_id="u1", text="a", local_time="2026-01-02 12:00:01"),
-        Line(author_id="u2", text="b", local_time="2026-01-02 12:00:09"),
-        Line(author_id="u1", text="c", local_time="2026-01-02 12:01:00", reply_to=1),
-        Line(author_id="u2", text="d", local_time="2026-01-02 12:02:00", reply_to=2),
-    ]
-    assert not check_scene(plan.scenes[2], WrittenScene(lines=lines), ZONES)
-    nested, placed = assemble(
-        catalog, plan.model_copy(update={"scenes": [plan.scenes[2]]}), {"s_chat": WrittenScene(lines=lines)}
-    )
-    ids = placed["scene_messages"]["s_chat"]
-    assert {m.id: m.thread_root_id for m in nested.messages}[ids[3]] == ids[1], (
-        "a reply to a reply joins its thread"
-    )
-    lines[3].reply_to = 3
-    assert check_scene(plan.scenes[2], WrittenScene(lines=lines), ZONES) == [
-        "line 3: reply_to 3 must name an earlier line of this scene"
-    ]
-    lines[3].reply_to = 0
-    two_threads, placed = assemble(
-        catalog, plan.model_copy(update={"scenes": [plan.scenes[2]]}), {"s_chat": WrittenScene(lines=lines)}
-    )
-    ids = placed["scene_messages"]["s_chat"]
-    roots = {m.id: m.thread_root_id for m in two_threads.messages}
-    assert roots[ids[2]] == ids[1] and roots[ids[3]] == ids[0] and roots[ids[1]] is None
-    world, index = assemble(catalog, plan, scenes)
-    again, _ = assemble(catalog, plan, scenes)
-    assert world == again and len(world.messages) == 6
-    root_id, reply_id = index["scene_messages"]["s_route"]
-    assert next(m for m in world.messages if m.id == reply_id).thread_root_id == root_id
-    assert index["conveyed"] == {"f1": [root_id], "f2": [index["scene_messages"]["s_private"][0]]}
-    assert not any(reveals_answer(m.id, "region-1", "Which region?") for m in world.messages)
-    report = style(world, catalog.personas)
-    assert report["messages"] == 6 and report["seconds_zero"] == 0 and report["lowercase_start"] == 1
-    assert set(report["authors"]) == {"u1", "u2"} and report["off_hours"] == 0
-    seeds = SeedPacket(examples=[example(f"e{i}") for i in range(5)])
-    assert excerpts(seeds, "1:s") == excerpts(seeds, "1:s") and len(excerpts(seeds, "1:s")) == 2
-    assert excerpts(None, "1:s") == []
-    prompt = brief(
-        catalog,
-        chosen,
-        plan.model_copy(
-            update={
-                "details": {
-                    "QA pool": Detail(value="blr-fleet-2"),
-                    "incident": Detail(value="INC-9", since="2026-01-03T00:00:00Z"),
-                    "cutover": Detail(value="cutover window", at="2026-01-02T15:00:00Z"),
-                }
-            }
-        ),
-        plan.scenes[0],
-        {
-            "recent": [],
-            "elsewhere": [("2026-01-02T08:00:00Z", "restricted", lines[0])],
-            "established": ["release train is 8.4"],
-            "commitments": ["u2 books the lunch table by noon"],
-        },
-        excerpts(seeds, "1:s"),
-        None,
-        "English",
-        {"f1": "2026-01-02T09:15:00Z"},
-    )
-    assert "region-1" in prompt and "Which region" not in prompt and "canonical_answer" not in prompt
-    assert '"start": "2026-01-02 10:00:00"' in prompt and '"language": "English"' in prompt
-    assert '"utc"' not in prompt and "start_local" not in prompt, "the brief shows one clock"
-    assert json.loads(prompt)["world_details"] == {
-        "QA pool": "blr-fleet-2",
-        "cutover": {"value": "cutover window", "at": "Friday 2026-01-02 16:00"},
-    }, "details appear only once known; scheduled moments are on the scene clock"
-    assert json.loads(prompt)["commitments"] == ["u2 books the lunch table by noon"]
-    assert json.loads(prompt)["established_details"] == ["release train is 8.4"]
-    conversations = {c.id: c for c in plan.conversations}
-    route, private, chat = plan.scenes
-    assert visible(route, private, conversations) and visible(route, chat, conversations)
-    assert not visible(chat, route, conversations) and not visible(route, route, conversations)
-    alone = chat.model_copy(update={"participant_ids": ["u1"]})
-    assert not visible(private, alone, conversations), (
-        "u1 is not in the private channel, so it waits for nothing there"
-    )
-    loose = WrittenScene.model_validate_json(
-        '{"lines": [{"author_id": "u1", "text": "x", "local_time": "2026-01-02 12:00:01"}], "introduces": null, "promises": "lunch at noon"}'
-    )
-    assert loose.introduces == [] and loose.promises == ["lunch at noon"]
-    objects = WrittenScene.model_validate(
-        {
-            "lines": loose.model_dump()["lines"],
-            "promises": [{"who": "u2", "what": "book lunch", "by": "noon"}],
+    return settings.model_copy(
+        update={
+            "seed": seed,
+            "premise_count": 2,
+            "personas": personas,
+            "corpus": root / "corpus",
+            "activity": activity,
         }
     )
-    assert objects.promises == ["u2, book lunch, noon"], "a promise written as an object becomes a note"
-    assert '"state_at": "2026-01-02 10:15"' in prompt and '"established_facts"' in prompt
-    assert json.loads(prompt)["seen_elsewhere"] == [
-        {
-            "conversation": "restricted",
-            "author": "Alicia Rao",
-            "time": "Friday 2026-01-02 09:00:00",
-            "text": "a",
+
+
+class FakeRuntime:
+    """The author's VM as files: what the env writes, the author reads and writes, and rm."""
+
+    def __init__(self):
+        self.files = {}
+
+    async def write(self, path, data):
+        self.files[path] = data
+
+    async def read(self, path, max_bytes=None):
+        if path not in self.files:
+            raise SandboxError(f"no {path}")
+        return self.files[path]
+
+    async def run(self, argv, env):
+        if argv[:2] == ["rm", "-f"]:
+            for path in argv[2:]:
+                self.files.pop(path, None)
+        elif argv[:2] == [
+            "sh",
+            "-c",
+        ]:  # the env's upload: empty a directory, then unpack an archive into /task
+            if cleared := re.match(r"rm -rf (\S+) && ", argv[2]):
+                for path in [p for p in self.files if p.startswith(cleared.group(1) + "/")]:
+                    del self.files[path]
+            (archive,) = re.findall(r"tarfile -e (\S+) /task", argv[2])
+            with tarfile.open(fileobj=io.BytesIO(self.files.pop(archive)), mode="r:gz") as unpacked:
+                for member in unpacked.getmembers():
+                    self.files["/task/" + member.name] = unpacked.extractfile(member).read()
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+
+class ScriptedAuthor(ScriptedAgent):
+    """A world author played by a script: each turn runs it against the turn's own world tools and VM."""
+
+    def __init__(self, script):
+        self.script = script
+
+    @asynccontextmanager
+    async def provision(self, task):
+        runtime = FakeRuntime()
+        await task.setup(None, runtime)  # as a VM is provisioned: the setup task's files are laid out
+        yield runtime
+
+    @asynccontextmanager
+    async def interaction(self, task, runtime):
+        tools = None
+        if isinstance(task, WorldAuthorTask):
+            (tools,) = task.toolsets(task.config)
+            await tools.setup()
+            with_state(tools)
+
+        async def turn(prompt):
+            await self.script(prompt, tools, runtime)
+            return SimpleNamespace(terminated=False)
+
+        yield SimpleNamespace(trace=SimpleNamespace(ok=True, info={}), turn=turn)
+
+
+async def check_author(root):
+    """One world written by a scripted author through the v7 driver: setup, the plan, days that close only when done,
+    a review after day 2 whose issues open day 3, a crash in that review and in day 3 with resumes from day 2's world
+    and notes, tasks, probes within their budget and a hardening turn, a final rejection fixed in the same session,
+    publish."""
+    root.mkdir(parents=True)
+    base = flow_settings(root, 3)
+    settings = base.model_copy(
+        update={
+            "calendar": base.calendar.model_copy(update={"days": 4}),
+            "activity": base.activity.model_copy(update={"messages": 16}),
+            "author": base.author.model_copy(
+                update={
+                    "tolerance": 1.0,
+                    "share_tolerance": 1.0,
+                    "review_days": [2],
+                    "probe_solves": 2,
+                    "probe_rounds": 1,
+                    "probe_budget": 10,
+                }  # fmt: skip
+            ),
         }
-    ]
-    assert listed('["f1"]') == ["f1"]
-    clocked = catalog.model_copy(deep=True)
-    clocked.facts[0].valid_from = "2026-01-02T08:30:00Z"
-    assert timed(clocked) == {"f1": "2026-01-02T08:30:00Z"}, (
-        "a fact with a time of day is stated in its minute"
     )
-    local_times = review_payload(clocked, None, [], "catalog")["fact_local_times"]
-    assert local_times == {"f1": {"Europe/Warsaw": "Friday 2026-01-02 09:30"}}, (
-        "judges see timed facts locally"
-    )
-    assert first_mentions(plan) == {"f1": "s_route", "f2": "s_private"}
-    fails(check_plan, clocked, plan)
-    clocked.facts[0].valid_from = "2026-01-02T09:00:00Z"
-    check_plan(clocked, plan)
-    written = scripted_scene(plan.scenes[0], [], None)
-    assert not check_scene(plan.scenes[0], written, ZONES, {"f1": "2026-01-02T09:00:00Z"})
-    assert check_scene(plan.scenes[0], written, ZONES, {"f1": "2026-01-02T09:05:00Z"}) == [
-        "fact f1: the first line stating it is at 2026-01-02 10:00:17 but must be in the minute 2026-01-02 10:05"
-    ], "a timed fact is stated in its own minute, not merely before a deadline"
-    corpus = root / "corpus"
-    atomic_json(
-        corpus / "old/artifacts" / f"{digest(catalog.model_dump(mode='json'))}.json",
-        catalog.model_dump(mode="json"),
-    )
-    atomic_json(corpus / "old/state.json", {"catalog": digest(catalog.model_dump(mode="json"))})
-    atomic_json(corpus / "odd/state.json", [])
-    assert used_names(corpus, corpus / "new") == {
-        "companies": ["Harbor"],
-        "people": ["Alicia Rao", "Owen Sato"],
-    }
-    assert used_names(corpus, corpus / "old") == {"companies": [], "people": []}
-    print(
-        "PASS premise pick, personas, plan/scene contracts, deterministic assembly, style, excerpts, corpus names"
-    )
+    seen, crash, solved = [], {"armed": True, "review": True, "plans": 0}, Counter()
 
-
-async def check_flow(root):
-    catalog, _ = fixture()
-    catalog.personas = personas(catalog)
-    written, turns = [], []
-
-    class ScriptedEnv(GenerationEnv):
-        async def author_turn(self, interaction, runtime, context, attempt, first):
-            assert context.get("group_id") != "g2", "already supported groups need review, not regeneration"
-            turns.append((attempt, context["phase"], bool(context.get("feedback"))))
-            if context["phase"] != "bind":
-                assert context["language"] == "English"
+    class AuthorEnv(GenerationEnv):
+        async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
             if context["phase"] == "premise":
-                assert first and context["used_names"] == {"companies": [], "people": []}
-                return premises().model_dump_json()
-            if context["phase"] == "catalog":
-                assert context["premise"]
-                return catalog.model_copy(update={"company": context["premise"]["company"]}).model_dump_json()
-            if context["phase"] == "plan":
-                assert context["new_messages_hint"] == "9-19", "15 messages per task in a one-task group"
-                plan = self.store.state.plan or plan_fixture(catalog)
-                if [phase for _, phase, _ in turns].count("plan") == 1:
-                    broken = plan.model_copy(deep=True)
-                    broken.scenes[0].conversation_id = "c_missing"
-                    return broken.model_dump_json()
-                return plan.model_dump_json()
-            conveyed = context["conveyed"]
-            assert "open_promises" in context
-            first_bind = not any(
-                line.text == "rewritten" for r in self.store.state.scenes.values() for line in r.scene.lines
-            )
-            misses = not first_bind and not any(phase == "bind" and fed for _, phase, fed in turns)
-            bindings = [
-                Binding(
-                    task_id=f"t{i}",
-                    claims=[ClaimEvidence(claim_index=0, message_ids=conveyed[f"f{i}"])],
-                    gold_calls=[
-                        ReadCall(
-                            action="search_messages", arguments={"query": "lunch" if misses else f"work-{i}"}
-                        )
-                    ],
-                )
-                for i in (1, 2)
-            ]
-            rewrites = [Rewrite(scene_id="s_chat", note="Make lunch plans specific")]
-            # A broken bind that also asks for a rewrite must still be validated once rewrites run out.
-            return BindOutput(
-                bindings=bindings, rewrites=rewrites if first_bind or misses else []
-            ).model_dump_json()
+                return Premises(premises=[Premise(company=f"{w} Software", niche="n", region="r", size="s", culture="c", cast="x", staffing={"software_developer": 4}) for w in ("Lattice", "Birch")]).model_dump_json()  # fmt: skip
+            ids = [c["user_id"] for c in context["candidates"]]
+            kinds = [Routine(kind=k, probability=0.5) for k in ("standup", "handoff", "lunch")]
+            channels = [Channel(name="ops", type="public", members=ids, routines=kinds), Channel(name="leads", type="private", members=ids[:2], routines=kinds)]  # fmt: skip
+            return Organization(people=[Person(user_id=u, title="Engineer", team="Platform") for u in ids], channels=channels, dm_routines=kinds).model_dump_json()  # fmt: skip
 
-        async def write_scene(self, agents, plan, scene, observed, previous, timely):
-            written.append(scene.id)
-            return scripted_scene(scene, observed["recent"], previous)
+        async def solve(self, agents, task):
+            solved[self.store.state.active_attempt, task.data.task_id] += 1
+            return {"semantic_correctness": 0.5, "correct": True, "grounded": True, "execution_ok": True, "calls": 3, "reason": "r"}, SimpleNamespace(id="solve", to_record=lambda: {"nodes": []})  # fmt: skip
 
-        async def review(self, agents, payload, attempt, author_trace=None):
-            verdict = approval(payload)
-            if attempt == "build-g1-02":
-                assert payload["changed_messages"] and payload["previous_issues"], (
-                    "a repair is re-reviewed with focus"
-                )
-            if attempt in {"catalog-01", "build-g1-01"}:
-                upstream = attempt.startswith("catalog")
-                return verdict.model_copy(
-                    update={
-                        "approved": False,
-                        "issues": [
-                            Issue(
-                                owner="synthesizer" if upstream else "builder",
-                                artifact="catalog" if upstream else "workspace",
-                                task_ids=["t1"],
-                                message_ids=[] if upstream else ["m" + digest(["s_chat", 0])[:10]],
-                                defect="Duplicated question" if upstream else "Repetitive activity",
-                                requested_change="Repair the identified defect",
-                            )
-                        ],
-                    }
-                )
+        async def review(self, agents, payload, attempt, files=None, label=""):
+            seen.append(("review", attempt, payload["phase"], "written_through" in payload, "ledger" in payload, bool(payload.get("previous_issues")), tuple(t["id"] for t in payload["tasks"])))  # fmt: skip
+            if attempt == "review-02-01" and crash["review"]:
+                crash["review"] = False
+                raise KeyboardInterrupt("simulated crash in a review")
+            issues = []
+            if payload["phase"] == "world" and attempt in ("review-02-02", "final-01"):
+                first, second = [
+                    m for (m,) in self.world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")
+                ]
+                # A mid-run review's note blocks nothing, and still opens the next day.
+                issues = [Issue(artifact="workspace", message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
+            criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
+            # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
+            reviews = [TaskReview(task_id=t["id"], valid=(attempt, t["id"]) != ("tasks-01", "t3"), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
+            issues += [Issue(artifact="tasks", task_ids=[r.task_id], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
+            verdict = Verdict(approved=not any(i.blocking for i in issues) and all(r.valid for r in reviews), tasks=reviews, issues=issues, criteria=criteria, summary="s")  # fmt: skip
+            validate_verdict(verdict, payload)
             return verdict
 
-        async def evaluate(self, agents):
-            assert self.store.state.final_groups == ["g1", "g2"]
-            self.store.state.evaluation = {
-                t.id: {
-                    "task_id": t.id,
-                    "semantic_correctness": 0.0,
-                    "execution_ok": True,
-                    "grounded": False,
-                    "read_count": 1,
-                }
-                for t in catalog.tasks
-            }
-            self.store.state.phase = "done"
-            self.store.save(approved=True)
+    async def script(prompt, tools, runtime):
+        """The author: plans, writes each day, writes tasks, hardens two of them, fixes what the review names."""
+        call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
+        world = World(tools.config.db_path)
+        a, b, c, d = [r[0] for r in world.db.execute("SELECT id FROM users ORDER BY id")]
+        ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
+        assert runtime.files["/task/memory/now.md"].startswith(b"# Now: "), (
+            "memory is rendered before every turn"
+        )
+        assert "/task/input.json" not in runtime.files, "the setup files are gone, after a resume too"
+        assert "/task/memory/stale.md" not in runtime.files, (
+            "memory is rendered whole: a page that is gone is gone"
+        )
+        runtime.files["/task/memory/stale.md"] = b"a page code no longer renders"
+        seen.append(("turn", tools.config.mode, tools.config.day, prompt.split(":")[0][:40]))
 
-    config = Config(sector="IT", task_count=2, group_size=1, output=root, seed=1, corpus=root / "corpus")
-    store = TestStore(root, {"test": 1})
-    store.state.catalog = catalog
-    agents = SimpleNamespace(synthesizer=ScriptedAgent(), builder=ScriptedAgent())
-    env = ScriptedEnv(config, store)
-    await env.run(None, agents)
-    assert store.state.phase == "done"
-    assert store.state.premise == pick_premise(premises(), 12, [], 1)
-    assert written == ["s_route", "s_private", "s_chat", "s_chat", "s_chat"], (
-        "scenes are written in world time; only new, revised or repaired ones"
-    )
-    assert not any(a == "build-g1-02" and phase == "plan" for a, phase, _ in turns), "a repair keeps the plan"
-    assert "Repetitive activity" in store.state.plan.scenes[2].revision_note, (
-        "the writer gets the judge's words"
-    )
-    chat = store.state.plan.scenes[2]
-    written_now = {k: v.scene for k, v in store.state.scenes.items()}
-    seen = observed(store.state.catalog, store.state.plan, written_now, chat)
-    assert [line.text for _, _, line in seen["recent"]] == ["ok so work-1 goes to region-1", "seen 0"]
-    assert [(name, line.text) for _, name, line in seen["elsewhere"]] == [
-        ("restricted", "work-2 is approved for region-2"),
-        ("restricted", "seen 0"),
-    ]
-    assert not observed(store.state.catalog, store.state.plan, written_now, store.state.plan.scenes[0])[
-        "elsewhere"
-    ]
-    assert seen["established"] == ["s_route detail", "s_private detail"]
-    assert seen["commitments"] == ["u1 posts the region map"], "earlier promises travel to later writers"
-    assert store.state.plan.scenes[2].revision_note and len(store.state.candidate.snapshot.messages) == 6
-    corrected = [(phase, fed) for attempt, phase, fed in turns if attempt == "build-g1-01"]
-    assert corrected[:2] == [("plan", False), ("plan", True)], "plan errors are corrected inside the attempt"
-    assert ("bind", True) in corrected, "bind validation errors are corrected inside the attempt"
-    assert json.loads((root / "attempts/build-g1-01/corrections.json").read_text())
-    judged = []
+        def talk(channel, *lines):
+            lines = [PostLine(**line) for line in lines]
+            return call("post", conversation=Conversation(channel_id=channel, about="work", lines=lines))
 
-    async def flaky(task):
-        judged.append(task)
-        verdict = approval(json.loads(task.config.tools.payload_json)).model_dump(mode="json")
-        return SimpleNamespace(ok=len(judged) > 1, errors=[], info={"verdict": verdict})
+        async def close():
+            while today(world) == tools.config.day:
+                await call("advance", to=onward(world))
 
-    payload = review_payload(catalog, store.state.candidate, ["t1"], "world")
-    verdict = await GenerationEnv.review(
-        env, SimpleNamespace(judge=SimpleNamespace(run=flaky)), payload, "judge"
-    )
-    assert verdict.approved and len(judged) == 2 and judged[0] is not judged[1]
-    atomic_json(
-        store.root / "traces/billing-check.json",
-        {"agent": {"name": "solver"}, "usage": {"cost": 1.0}, "extra_usage": [{"cost": 0.25}]},
-    )
-    billing = store.summary("check")
-    assert billing["reported_model_cost"] == 1.25
-    assert billing["usage_by_role"]["answer_judge"]["judge_calls"] == 1
-    assert billing["usage_by_role"]["answer_judge"]["traces"] == 0
-    assert store.state.rounds == {"catalog": 2, "build:g1": 2, "build:g2": 1, "final:g1": 1, "final:g2": 1}
-    store.publish()
-    world, rows, answers = load_release(root / "release")
-    candidate = store.state.candidate
-    assert world == candidate.snapshot and len(rows) == 2
-    assert rows[0].snapshot_ref == rows[1].snapshot_ref
-    assert "answer" not in rows[0].model_dump()
-    taskset = SlackTaskset(SlackTasksetConfig(task=EvaluationConfig(release_dir=root / "release")))
-    task = next(iter(taskset))
-    rebuilt = EvaluationTask(SlackTaskData.model_validate_json(task.data.model_dump_json()), task.config)
-    await rebuilt.validate(None)
-    assert rebuilt.solver_task().config.reference == answers[task.data.task_id]
-    altered = EvaluationTask(rebuilt.data.model_copy(update={"snapshot_hash": "wrong"}), task.config)
-    fails(altered.solver_task)
-    store.publish()
-    atomic_json(root / "release/tasks.json", [{**rows[0].model_dump(mode="json"), "answer": "leak"}])
-    fails(load_release, root / "release")
-    saved = store.state.last_approved_candidate
-    store.reserve("interrupted", 2)
-    store.close()
-    resumed = TestStore(root, {"test": 1})
-    assert resumed.state.active_attempt is None and resumed.state.rounds["interrupted"] == 1
-    assert resumed.state.last_approved_candidate == saved
-    resumed.reserve("interrupted", 2)
-    fails(resumed.reserve, "interrupted", 2)
-    catalog_review = resumed.state.reviews["catalog"]
-    resumed.invalidate("world-only regression", catalog=False)
-    assert resumed.state.reviews == {"catalog": catalog_review}
-    assert resumed.state.built_groups == ["g1", "g2"] and not resumed.state.final_groups
-    assert resumed.state.last_approved_candidate is None
-    before = dict(resumed.state.rounds)
-    verdict = approval(review_payload(catalog, candidate, ["t1", "t2"], "world")).model_copy(
-        update={
-            "approved": False,
-            "issues": [
-                Issue(
-                    owner="synthesizer",
-                    artifact="catalog",
-                    task_ids=["t2"],
-                    defect="Ambiguous scope",
-                    requested_change="Clarify scope",
+        if tools.config.mode == "plan":
+            crash["plans"] += prompt.startswith("Before day 1")
+            if crash["plans"] == 1:  # the first attempt never writes plan.md, and is rejected for it
+                return
+            assert "was rejected: " in prompt and "write /task/notes/plan.md" in prompt, "a retry is told why"
+            events = [Event(id="e1", storyline="s2", title="audit window", day=3, time="10:00"), Event(id="e2", storyline="s1", title="service restored", day=2, time="14:00")]  # fmt: skip
+            facts = [
+                PlanFact(id="f1", storyline="s1", subject="Release 4.2", attribute="decision", value="rollback", anchor="rollback", channel_id=ops, author_id=a, day=1, summary="s"),
+                PlanFact(id="f2", storyline="s1", subject="Release 4.2", attribute="state", value="service back", channel_id=ops, author_id=b, day=2, after=["f1"], event="e2", kind="happened", summary="s"),
+                PlanFact(id="f3", storyline="s2", subject="Audit", attribute="window", value="dry run", anchor="dry run", channel_id=leads, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
+                PlanFact(id="f4", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=ops, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
+            ]  # fmt: skip
+            await call("plan", ledger=Plan(storylines=[Storyline(id="s1", summary="the release"), Storyline(id="s2", summary="the audit")], events=events, facts=facts))  # fmt: skip
+            await runtime.write("/task/notes/plan.md", b"arcs; board: semantic and search rest on f3 and f4")
+        elif tools.config.mode == "day":
+            day = tools.config.day
+            if day == 1 and prompt.startswith(
+                "It is"
+            ):  # first turn: a recap is written, but the day is left open
+                await talk(ops, dict(author_id=a, text="we go with the rollback", conveys=["f1"]), dict(author_id=b, text="ok, notes tomorrow", reply_to=0, commits=[Commit(id="c1", text="post the notes", due_day=2)]))  # fmt: skip
+                await runtime.write("/task/notes/recap.md", b"day 1: decided, still open")
+                return
+            if day == 2:
+                await call("advance", to="evening")
+                await talk(ops, dict(author_id=b, text="service back at {at:e2}; notes are up", conveys=["f2"], closes=[Close(id="c1", status="kept")]))  # fmt: skip
+            if day == 3:
+                assert "message_ids" in prompt and "evidence_message_ids" in prompt, (
+                    "the review's issues open day 3"
                 )
-            ],
-        }
-    )
-    repairing = ScriptedEnv(config, resumed)
-    repairing.route_rejection(verdict, "build:g2")
-    assert resumed.state.phase == "catalog" and not resumed.state.reviews
-    assert resumed.state.built_groups == ["g1"]
-    assert resumed.state.rounds == before
-    assert resumed.state.last_approved_candidate is None
-    catalog.tasks[1].question += " According to the final approval?"
-    await repairing.synthesize(agents)
-    assert resumed.state.rounds["catalog"] == before["catalog"] + 1, (
-        "catalog repairs use the catalog allowance"
-    )
-    assert resumed.state.rounds["build:g2"] == before["build:g2"]
-    assert resumed.state.phase == "build" and not resumed.state.final_groups
-    assert resumed.state.last_approved_candidate is None
-    await repairing.run(None, agents)
-    assert resumed.state.phase == "done" and resumed.state.final_groups == ["g1", "g2"]
-    assert repairing.current()
-    resumed.state.catalog.facts[0].value += " (revised)"
-    assert not repairing.current(), "a world written against old facts is rebuilt, not re-reviewed"
-    assert resumed.state.rounds["build:g1"] == before["build:g1"]
-    assert resumed.state.rounds["build:g2"] == before["build:g2"] + 1
-    assert resumed.state.rounds["final:g2"] == before["final:g2"] + 1
-    fails(resumed.reserve, "final:g2", resumed.state.rounds["final:g2"])
-    resumed.reserve("build:g2", resumed.state.rounds["build:g2"] + 1)
-    resumed.close()
-    print(
-        "PASS complete feedback flow, upstream invalidation, bounded retries, crash/resume, release and task wire"
-    )
+                if crash["armed"]:
+                    await talk(ops, dict(author_id=c, text="morning"))
+                    crash["armed"] = False
+                    raise KeyboardInterrupt("simulated crash")
+                assert b"board" in runtime.files["/task/notes/plan.md"], (
+                    "the author's notes come back with its world"
+                )
+                issue = json.loads(prompt[prompt.index("[{") : prompt.index("}]") + 2])[0]
+                for message in issue["message_ids"]:
+                    await call("revise", message_id=message, text="ok, notes tomorrow then")
+                seen.append(("revised", issue["message_ids"]))
+                await talk(
+                    leads, dict(author_id=a, text="dry run for the audit window at {at:e1}", conveys=["f3"])
+                )
+                await talk(ops, dict(author_id=a, text="Owen owns the audit at {at:e1}", conveys=["f4"]), dict(author_id=d, text="thanks"))  # fmt: skip
+            if day == 4:
+                assert "message_ids" not in prompt, "a review's issues are delivered once"
+            if day == 4 and "was rejected" not in prompt:
+                # The first attempt closes the day but never writes its recap, so all 3 of its turns end rejected.
+                if prompt.startswith("It is"):
+                    await talk(ops, dict(author_id=d, text="quiet day"))
+                    await close()
+                    await runtime.write("/task/notes/scratch.md", b"day 4, first try")
+                return
+            if day == 4:
+                assert "/task/notes/scratch.md" not in runtime.files, "a rejected attempt's notes are gone"
+                assert "back at the start of the day: " in prompt and "recap.md" in prompt, (
+                    "a retry is told why"
+                )
+                await talk(ops, dict(author_id=d, text="quiet day"))
+            await close()
+            await runtime.write("/task/notes/recap.md", f"day {day}: done".encode())
+        elif prompt.startswith("The last day is closed"):
+            for i, (category, level, *_) in enumerate(json.loads(tools.config.context)["cells"]):
+                await call("add_task", task=scripted_task(settings, i, category, level, a))
+        elif prompt.startswith("Each task's cell"):
+            assert '"level_fit": 3' in prompt and '"evidence_pages"' in prompt and '"concept"' in prompt, (
+                "hardening reads the judge's level fit and code's measures"
+            )
+            for i, (category, level, *_) in list(enumerate(json.loads(tools.config.context)["cells"]))[1:3]:
+                task = scripted_task(settings, i, category, level, a)
+                await call(
+                    "add_task", task=task.model_copy(update={"question": "Asked again: " + task.question})
+                )
+        elif prompt.startswith("The review rejected"):
+            issues = json.loads(prompt[prompt.index("[") : prompt.index("]\n") + 1])
+            for issue in issues:
+                for message in issue.get("message_ids", []):
+                    await call("revise", message_id=message, text="ok, the notes come tomorrow")
+            seen.append(("fixed", [m for i in issues for m in i.get("message_ids", [])]))
+            category, level, *_ = json.loads(tools.config.context)["cells"][0]
+            task = scripted_task(settings, 9, category, level, a)  # t9 replaces t0 in its cell
+            await call("add_task", task=task.model_copy(update={"question": "Asked anew: " + task.question}))
 
-
-async def check_native_servers():
-    catalog, candidate = fixture()
-    payload = review_payload(catalog, candidate, ["t1", "t2"], "world")
-    solver = SolverTask.create(
-        catalog.tasks[0], candidate.snapshot, catalog.workspace_id, reference_for(catalog.tasks[0], candidate)
+    agents = SimpleNamespace(
+        **{name: ScriptedAgent() for name in ("judge", "solver")},
+        author=ScriptedAuthor(script),
     )
-    review = JudgeTask.create(payload)
-    for task, data, expected in (
-        (solver, candidate.snapshot.model_dump(mode="json"), 5),
-        (review, payload, 2),
-    ):
-        stage_tool_data(task, task.config.tools, data)
+    manifest = provenance(settings)
+    store = TestStore(settings.output, manifest)
+    env = AuthorEnv(settings, store)
+    await env.setup(agents)
+    asked = [{"role": "user", "content": "write today"}]
+    append_user_notice(asked)
+    assert "call it again" in asked[0]["content"] and "do not retry" not in asked[0]["content"], (
+        "a dropped tool call is called again, not given up"
+    )
+    for _ in range(2):  # the review after day 2 is cut off, then day 3
         try:
-            assert len(task.config.tools.model_dump_json()) < 2000
-            toolsets = task.toolsets(task.config)
-            assert len(toolsets) == 1
-            toolset = toolsets[0]
-            await toolset.setup()
-            stored = {"state": ReadState()}
-
-            async def pull(stored=stored):
-                state = stored["state"].model_copy(deep=True)
-                await asyncio.sleep(0)
-                return state
-
-            async def push(before, stored=stored, toolset=toolset):
-                await asyncio.sleep(0)
-                stored["state"] = toolset.state.model_copy(deep=True)
-
-            toolset._pull_state, toolset._push_state = pull, push
-            if task is solver:
-                call = toolset._with_state(toolset.get_user)
-                await asyncio.gather(*(call(user_id="u1") for _ in range(20)))
-            else:
-                await toolset._with_state(toolset.check)()
-                call = toolset._with_state(toolset.read)
-                await asyncio.gather(
-                    *(
-                        call(
-                            actor_id="u1",
-                            action="get_user",
-                            arguments={"user_id": "u1"},
-                        )
-                        for _ in range(20)
-                    )
-                )
-                assert stored["state"].checked
-            assert len(stored["state"].reads) == 20
-            async with (
-                asyncio.timeout(30),
-                serve(toolsets[0]) as url,
-                streamable_http_client(url) as (reader, writer),
-                ClientSession(reader, writer) as client,
-            ):
-                await client.initialize()
-                assert len((await client.list_tools()).tools) == expected
-        finally:
-            task._tool_directory.cleanup()
-    print("PASS native subprocess tool entrypoints, tool discovery, bounded private-data configuration")
-
-
-def make_world(seed: int = 0) -> SlackWorld:
-    users = [
-        User(id="agent_user", name="Agent User"),
-        User(id="alice", name="Alice Chen"),
-        User(id="bob", name="Bob Diaz"),
-        User(id="cara", name="Cara Evans"),
-    ]
-    conversations = [
-        Conversation(
-            id="incidents",
-            name="incidents",
-            kind="public_channel",
-            member_ids=[user.id for user in users],
-        ),
-        Conversation(
-            id="private",
-            name="leadership",
-            kind="private_channel",
-            member_ids=["alice", "bob"],
-        ),
-        Conversation(id="dm", kind="dm", member_ids=["agent_user", "cara"]),
-        Conversation(
-            id="archived",
-            name="old-incidents",
-            kind="public_channel",
-            member_ids=[user.id for user in users],
-            is_archived=True,
-        ),
-    ]
-    rows = [
-        ("root", "incidents", "cara", "Payments timeout investigation started.", "10:00:00", None, False),
-        (
-            "msg_cause",
-            "incidents",
-            "alice",
-            "A stale DNS cache caused the payments timeout.",
-            "10:05:00",
-            "root",
-            False,
-        ),
-        (
-            "msg_fix",
-            "incidents",
-            "bob",
-            "We recycled the edge workers and service recovered.",
-            "10:09:00",
-            "root",
-            False,
-        ),
-        ("older", "incidents", "alice", "Payments timeout alert opened.", "09:00:00", None, False),
-        ("newer", "incidents", "bob", "Payments timeout monitoring is green.", "11:00:00", None, False),
-        ("private_msg", "private", "alice", "Confidential roadmap in Cedar.", "09:10:00", None, False),
-        ("dm_msg", "dm", "cara", "Direct handoff is complete.", "09:20:00", None, False),
-        ("deleted", "incidents", "alice", "Deleted secret answer cache.", "09:30:00", None, True),
-        ("archived_msg", "archived", "bob", "Old incident detail.", "09:40:00", None, False),
-        (
-            "variant",
-            "incidents",
-            "cara",
-            f"Rehearsal group {seed % 7} meets tomorrow.",
-            "09:50:00",
-            None,
-            False,
-        ),
-    ]
-    messages = [
-        Message(
-            id=message_id,
-            conversation_id=conversation_id,
-            author_id=author_id,
-            text=text,
-            timestamp=f"2025-01-15T{time}Z",
-            thread_root_id=root,
-            deleted=deleted,
-        )
-        for message_id, conversation_id, author_id, text, time, root, deleted in rows
-    ]
-    return SlackWorld(users=users, conversations=conversations, messages=messages)
-
-
-def check_slack_rules():
-    world = make_world()
-    api = SlackAPI(world, "agent_user")
-    assert {r["conversation_id"] for r in api.list_conversations()["items"]} == {"incidents", "dm"}
-    assert api.get_conversation_history("dm")["items"][0]["message_id"] == "dm_msg"
-    for hidden in ("private", "archived"):
-        fails(api.get_conversation_history, hidden)
-    assert {
-        r["message_id"] for r in api.search_messages("secret answer confidential roadmap")["items"]
-    }.isdisjoint({"deleted", "private_msg"})
-    assert [r["message_id"] for r in api.get_thread("incidents", "root")["items"]] == [
-        "root",
-        "msg_cause",
-        "msg_fix",
-    ]
-    assert [r["message_id"] for r in api.get_conversation_history("incidents")["items"]][:2] == [
-        "newer",
-        "root",
-    ]
-    for field, value in (("author_id", "missing"), ("timestamp", "2025-01-15T09:59:00Z")):
-        changed = world.model_dump(mode="json")
-        next(m for m in changed["messages"] if m["id"] == "msg_fix")[field] = value
-        fails(SlackWorld.model_validate, changed)
-    print("PASS retained Slack visibility, deletion, archive, ordering, membership, and chronology checks")
-
-
-async def check_live_feedback():
-    """Controlled bad candidates exercise the real native author/reviewer exchanges."""
-    import verifiers.v1 as vf
-    from verifiers.v1.clients import EvalClientConfig, ModelContext
-    from .config import ROOT, load_config
-    from .generate import provenance
-
-    config = load_config(Path("configs/worldgen_slack/software.toml"))
-    config.output, config.task_count, config.group_size = ROOT / "data/feedback-check", 3, 2
-    store = Store(config.output, provenance(config))
-
-    class FeedbackEnv(GenerationEnv):
-        async def author_turn(self, interaction, runtime, context, attempt, first):
-            raw = await super().author_turn(interaction, runtime, context, attempt, first)
-            injected = self.store.root / "injected-catalog.json"
-            if context["phase"] != "catalog" or injected.exists():
-                return raw
-            try:
-                Catalog.model_validate_json(raw)
-            except ValueError:
-                return raw
-            content = json.loads(raw)
-            self.store.artifact(attempt, "before_test_injection", content)
-            original, replacement = content["tasks"][:2]
-            content["tasks"][1] = dict(
-                original,
-                id=replacement["id"],
-                group_id=replacement["group_id"],
-                question="In this workspace, " + original["question"][:1].lower() + original["question"][1:],
+            await AuthorEnv(settings, store).run(None, agents)
+            raise AssertionError("the simulated crash did not happen")
+        except KeyboardInterrupt:
+            pass
+        if store.state.phase == "review":
+            assert store.state.day == 2 and store.state.rounds["day-02"] == 1, (
+                "a cut-off review is redone, not its day"
             )
-            raw = json.dumps(content)
-            await runtime.write("/task/catalog.json", raw.encode())
-            self.store.artifact(attempt, "author_catalog", {"text": raw, "controlled_test_injection": True})
-            atomic_json(injected, {"attempt": attempt})
-            self.store.event("controlled_defect_injected", attempt=attempt)
-            return raw
-
-        async def write_scene(self, agents, plan, scene, seen, previous, timely):
-            written = await super().write_scene(agents, plan, scene, seen, previous, timely)
-            injected = self.store.root / "injected-world.json"
-            if scene.beats or injected.exists():
-                return written
-            author = next(line.author_id for line in written.lines)
-            latest = datetime.strptime(max(line.local_time for line in written.lines), "%Y-%m-%d %H:%M:%S")
-            written.lines += [
-                Line(
-                    author_id=author,
-                    text="Status update: everything remains on track. No new information.",
-                    local_time=(latest + timedelta(days=1, minutes=5 * i)).strftime("%Y-%m-%d %H:%M:%S"),
-                )
-                for i in range(40)
-            ]
-            atomic_json(injected, {"attempt": self.store.state.active_attempt, "scene_id": scene.id})
-            self.store.event("controlled_defect_injected", scene_id=scene.id)
-            return written
-
-        async def run(self, task, agents):
-            if self.store.state.phase == "catalog":
-                await self.synthesize(agents)
-            group = self.store.state.catalog.groups[0]
-            if group.id not in self.store.state.built_groups:
-                await self.build_group(agents, group)
-            assert self.store.state.rounds["catalog"] >= 2
-            assert self.store.state.rounds["build:" + group.id] >= 2
-            assert group.id in self.store.state.built_groups
-            for phase in ("catalog", "world"):
-                name = json.loads((self.store.root / ("injected-" + phase + ".json")).read_text())["attempt"]
-                verdict = json.loads((self.store.root / "attempts" / name / "verdict.json").read_text())
-                assert not verdict["approved"]
-                assert any(
-                    issue["owner"] == ("synthesizer" if phase == "catalog" else "builder")
-                    for issue in verdict["issues"]
-                )
-            self.store.event("live_feedback_verified")
-
-    atomic_json(
-        store.root / "fixture.json",
-        {
-            "kind": "controlled feedback test; not a released dataset",
-            "defects": ["paraphrased duplicate QA", "40 repeated five-minute status posts"],
-        },
+            store.close()
+            store = TestStore(settings.output, manifest)
+    after_day_2 = World(store.root / "attempts" / store.state.restore_point / "world.sqlite").db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]  # fmt: skip
+    assert store.world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == after_day_2 + 1, "the crash left a partial day"  # fmt: skip
+    store.close()
+    fails(
+        Store, settings.output, manifest | {"lock_hash": "changed"}
+    )  # a run resumes only with its own config
+    store = TestStore(settings.output, manifest)
+    assert store.state.phase == "day" and store.state.day == 3 and store.state.restore_point == "day-02-01"
+    env = AuthorEnv(settings, store)
+    await env.run(None, agents)
+    state = store.state
+    assert state.phase == "done" and state.rounds["day-03"] == 2 and state.rounds["review-02"] == 2, (
+        state.rounds
     )
-    try:
-        env = FeedbackEnv(config, store)
-        context = ModelContext(
-            model=config.env.solver.model, client=EvalClientConfig(), sampling=vf.Sampling()
-        )
-        async with env.serving():
-            episode = await env.run_episode(
-                vf.Task(vf.TaskData(prompt="Check both generation feedback loops.")), context
-            )
-        for trace in episode.traces:
-            store.trace(trace)
-        atomic_json(store.root / f"episode-{episode.id}.json", episode.to_record())
-        store.summary("feedback_check_complete" if episode.ok else "feedback_check_failed")
-        assert episode.ok, [e.message for e in episode.errors]
-        print("PASS real catalog and builder rejection → feedback → revision → independent approval")
-    finally:
-        store.close()
-
-
-def example(identifier):
-    return SeedExample(
-        id=identifier,
-        dataset="unionai/flyte-slack-data",
-        revision="a" * 40,
-        rows=[0],
-        source_sha256="b" * 64,
-        notes="Fixture excerpt.",
-        messages=[SeedMessage(text=f"{identifier} question?", speaker="speaker_1")],
+    assert state.rounds["plan"] == 2 and not state.feedback
+    assert not store.world.db.execute("SELECT 1 FROM messages WHERE text = 'morning'").fetchone(), (
+        "the crashed day's start is gone"
+    )
+    assert [t[3][:6] for t in [s for s in seen if s[0] == "turn"] if t[1] == "day" and t[2] == 4] == [
+        "It is ",
+        "Day 4 ",
+        "Day 4 ",
+        "It is ",
+    ], "a day needs its recap, and one that never gets it is written again"
+    assert state.rounds["day-04"] == 2, state.rounds
+    turns = [s for s in seen if s[0] == "turn"]
+    assert [t[3][:6] for t in turns if t[1] == "day" and t[2] == 1] == ["It is ", "Day 1 "], "an open day is not accepted"  # fmt: skip
+    first, second = [m for (m,) in store.world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")]
+    assert ("revised", [second]) in seen and ("fixed", [second]) in seen, (
+        "only the messages to change are revised"
+    )
+    assert store.world.db.execute("SELECT text FROM messages WHERE id = ?", (second,)).fetchone()[0] == "ok, the notes come tomorrow"  # fmt: skip
+    assert "rollback" in store.world.db.execute("SELECT text FROM messages WHERE id = ?", (first,)).fetchone()[0], "the evidence stays"  # fmt: skip
+    assert state.probe_solves == 10, state.probe_solves
+    # The probes try every task, then the hardened t1 again (the budget leaves t2 untried); the final reviews solve
+    # only what changed since: t2, then t9, which a fix replaced t0 with.
+    assert solved == {("tasks-01", "t0"): 2, ("tasks-01", "t1"): 4, ("tasks-01", "t2"): 2, ("tasks-01", "t3"): 2, ("final-01", "t2"): 4, ("final-02", "t9"): 4}, solved  # fmt: skip
+    assert set(state.solves) == {"t1", "t2", "t3", "t9"}, "a replaced task's runs go with it"
+    assert ("review", "review-02-02", "world", True, True, False, ()) in seen
+    assert ("review", "final-01", "world", False, True, False, ()) in seen
+    assert ("review", "final-02", "world", False, True, True, ()) in seen, (
+        "the final review checks the last issues"
+    )
+    assert ("review", "final-02", "task", False, False, False, ("t9",)) in seen, (
+        "only the changed task is reviewed again"
+    )
+    probed = [s[6] for s in seen if s[:3] == ("review", "tasks-01", "task")]
+    assert probed == [("t0", "t1", "t2", "t3"), ("t1",)], "the judge reviews each probe's tasks"
+    assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [("t2", "t3")], (
+        "the final review judges only what changed or failed since its probe's review"
+    )
+    assert any(e["event"] == "candidate_finished" and e["attempt"] == "tasks-01" and e["approved"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines())), "the tasks attempt is closed"  # fmt: skip
+    assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"
+    days = [json.loads(line) for line in (store.root / "progress.jsonl").read_text().splitlines()]
+    assert [e["day"] for e in days if e["event"] == "day_closed"] == [1, 2, 3, 4]
+    assert any(e["event"] == "interrupted" for e in days)
+    assert store.world.violations(complete=True) == [] and set(state.task_reviews) == {t for (t,) in store.world.db.execute("SELECT id FROM tasks")}  # fmt: skip
+    ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
+    assert ids == sorted(ids), "the world was written in time order"
+    difficulty = store.summary("complete")["difficulty"]
+    assert set(difficulty) == set(state.task_reviews) and all(
+        d["level_fit"] == 3 and "evidence_pages" in d and d["concept"] for d in difficulty.values()
+    ), "the summary reports each task's measured difficulty beside its level"
+    some = sorted(state.task_reviews)[0]
+    review = state.task_reviews.pop(some)
+    fails(store.publish)  # a task nobody reviewed
+    state.task_reviews[some] = review
+    store.world.insert("facts", [dict(id="f9", storyline="s2", subject="x", attribute="y", value="z", channel_id=channel_id("public", "ops", []), author_id=store.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], day=3, summary="s")])  # fmt: skip
+    store.world.insert("task_facts", [dict(task_id=some, fact_id="f9")])
+    fails(store.publish)  # a task resting on a fact no message states
+    store.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
+    store.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
+    store.publish()
+    world, rows, answers = load_release(store.root / "release")
+    assert len(rows) == 4 and World(world).db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert all(a.rows or a.answer_type == "refusal" for a in answers.values())
+    ledger = [r for r in rows if settings.taxonomy[r.category].gold == "ledger"]
+    assert ledger and all(answers[r.task_id].rows == [{"answer": "Owen"}] and answers[r.task_id].messages for r in ledger)  # fmt: skip
+    store.publish()  # idempotent
+    assert (store.root / "world-calls.jsonl").exists()
+    assert run_label(Path("/x/data/v7-01/software")) == "worldgen-v7-01-software", (
+        "a run's sandboxes are findable"
+    )
+    store.close()
+    retried = SimpleNamespace(
+        ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]
+    )
+    limit = SimpleNamespace(type="ReviewLimit", message="no valid ledger")
+    assert failure("done", SimpleNamespace(errors=[], traces=[retried])) is None, (
+        "a judge failure the review loop retried does not fail a finished run"
+    )
+    assert failure("day", SimpleNamespace(errors=[], traces=[retried])) == "TaskError: malformed verdict"
+    assert failure("done", SimpleNamespace(errors=[limit], traces=[])) == "ReviewLimit: no valid ledger"
+    print(
+        "PASS author: plan, days closed only when done, review issues delivered, crash and resume, tasks, probes, fix"
     )
 
 
-def check_seeds(root):
-    from .config import ROOT, SeedDataConfig
-    from .contracts import (
-        SEED_MAX_BYTES,
-        SEED_MAX_MESSAGES,
-        SEED_MAX_TEXT_CHARS,
-        load_seed_packet,
-        verdict_schema,
-    )
-    from .generate import provenance
-    from scripts.worldgen_slack.prepare_seeds import Selection, normalize, normalize_flyte, normalize_software
-
-    selection = Selection(
-        id="example",
-        dataset="unionai/flyte-slack-data",
-        revision="a" * 40,
-        start=0,
-        end=2,
-        notes="Manually checked sequence; metadata unavailable.",
-        join_pairs=True,
-    )
-    response = {
-        "rows": [
-            {"row_idx": 0, "row": {"input": "Can you check?", "output": "Checking."}, "truncated_cells": []},
-            {"row_idx": 1, "row": {"input": "Checking.", "output": "Fixed."}, "truncated_cells": []},
-        ]
-    }
-    packet = SeedPacket(examples=[normalize(selection, response)])
-    assert [message.text for message in packet.examples[0].messages] == [
-        "Can you check?",
-        "Checking.",
-        "Fixed.",
-    ]
-    assert all(m.speaker is None and m.timestamp is None for m in packet.examples[0].messages)
-    rows = [row["row"] for row in response["rows"]]
-    fails(normalize_flyte, rows, join_pairs=False)
-    fails(normalize_flyte, [rows[0], {"input": "Another conversation", "output": "OK"}], join_pairs=True)
-    fails(normalize, selection, {"rows": response["rows"][:1]})
-    truncated = json.loads(json.dumps(response))
-    truncated["rows"][0]["truncated_cells"] = ["input"]
-    fails(normalize, selection, truncated)
-    software = [
-        dict(workspace="workspace", channel="general", text="Done", user="A", ts="2018-01-01T12:00:00")
-    ]
-    messages = normalize_software(software)
-    assert messages[0].speaker == "A" and messages[0].timestamp == "2018-01-01T12:00:00"
-    fails(normalize_software, [software[0], dict(software[0], channel="elsewhere")])
-    fails(Selection.model_validate, dict(selection.model_dump(), end=101))
-    assert SeedDataConfig(path=Path("data/seeds/example.json")).path == ROOT / "data/seeds/example.json"
-    for update in (
-        {"messages": [{"text": "x"}] * 102},
-        {"messages": [{"text": "x" * (SEED_MAX_TEXT_CHARS + 1)}]},
-        {"messages": [{"text": "   "}]},
-        {"notes": "x" * SEED_MAX_BYTES},
-        {"rows": [1, 0]},
-    ):
-        fails(SeedPacket.model_validate, {"examples": [dict(packet.examples[0].model_dump(), **update)]})
-    fails(SeedPacket, examples=packet.examples * 2)
-    expanded = [
-        dict(packet.examples[0].model_dump(), id=f"example-{index}", messages=[{"text": "x"}] * 64)
-        for index in range(SEED_MAX_MESSAGES // 64)
-    ]
-    assert (
-        sum(len(e.messages) for e in SeedPacket.model_validate({"examples": expanded}).examples)
-        == SEED_MAX_MESSAGES
-    )
-    expanded[0]["messages"].append({"text": "one too many"})
-    fails(SeedPacket.model_validate, {"examples": expanded})
-    root.mkdir(parents=True)
-    path = root / "seeds.json"
-    path.write_text(packet.model_dump_json())
-    assert load_seed_packet(path) == packet
-    oversized = root / "oversized.json"
-    oversized.write_bytes(b" " * (SEED_MAX_BYTES + 1))
-    fails(load_seed_packet, oversized)
-    base = Config(sector="IT", task_count=2, group_size=1, output=root / "baseline")
-    assert "seed_data" not in provenance(base)["config"]
-    seeded = base.model_copy(update={"seed_data": SeedDataConfig(path=path)})
-    fails(provenance, seeded)
-    TestStore(root / "seeded", provenance(seeded, packet)).close()
-    changed = packet.model_copy(deep=True)
-    changed.examples[0].messages[0].text = "Changed source"
-    fails(Store, root / "seeded", provenance(seeded, changed))
-    catalog, candidate = fixture()
-    schema = verdict_schema("world")
-    assert set(schema["properties"]["criteria"]["required"]) == set(QUALITY_CRITERIA)
-    assert schema["properties"]["criteria"]["additionalProperties"] is False
-    assert "criteria" in schema["required"]
-    assert "required" not in verdict_schema("catalog")["properties"]["criteria"]
-    bad = approval(review_payload(catalog, candidate, ["t1", "t2"], "world")).model_dump()
-    bad["criteria"]["weighted_quality"] = 0.9
-    fails(Verdict.model_validate, bad)
-    print("PASS seed normalization, bounds, packet provenance and resume, verdict schema")
+def scripted_task(settings, i, category, level, actor):
+    """A valid task for any cell of the scripted world: its gold follows the category's source."""
+    gold, spec = settings.taxonomy[category].gold, settings.taxonomy[category]
+    question = f"Question {i} about the {category} level {level} work?"
+    if category == "robustness":
+        sql, kind, facts = "SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", "refusal", []
+    elif gold == "ledger":
+        sql, kind, facts = "SELECT value AS answer FROM facts WHERE id = 'f4'", "text", ["f3", "f4"]
+    elif gold == "hybrid":
+        sql, kind, facts = "SELECT COUNT(*) AS answer FROM messages m JOIN evidence e ON e.message_id = m.id WHERE e.fact_id = 'f1'", "number", ["f1"]  # fmt: skip
+    else:
+        sql, kind, facts = "SELECT COUNT(*) AS answer FROM messages", "number", []
+    assert kind in spec.answer_types
+    return Task(id=f"t{i}", category=category, level=level, actor_id=actor, question=question, answer_type=kind, gold_sql=sql, facts=facts)  # fmt: skip
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--live-feedback", action="store_true")
-    args = parser.parse_args()
-    if args.live_feedback:
-        asyncio.run(check_live_feedback())
-    else:
-        check_slack_rules()
-        check_contracts_and_reads()
-        asyncio.run(check_native_servers())
-        with tempfile.TemporaryDirectory() as directory:
-            check_seeds(Path(directory) / "seeds")
-            check_scenes(Path(directory) / "scenes")
-            asyncio.run(check_flow(Path(directory) / "run"))
-        print("All generation checks passed.")
+    with tempfile.TemporaryDirectory() as directory:
+        asyncio.run(check_world(Path(directory) / "world"))
+        check_tasks(Path(directory) / "tasks")
+        check_contracts(Path(directory) / "contracts")
+        check_clock(Path(directory) / "clock")
+        asyncio.run(check_tools(Path(directory) / "tools"))
+        asyncio.run(check_reviews(Path(directory) / "reviews"))
+        asyncio.run(check_author(Path(directory) / "author"))
+    print("All generation checks passed.")

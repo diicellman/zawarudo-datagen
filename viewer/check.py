@@ -1,36 +1,45 @@
-"""Small offline check: run with uv run --frozen python viewer/check.py."""
+"""Offline check on a scripted run: uv run --frozen python viewer/check.py"""
 
-import json
+import asyncio
 import tempfile
 from pathlib import Path
 
-from build import ROOT, load_run, render
+from build import load_run, render
+from generators.worldgen_slack.check import check_author
 
 
 def main():
-    local = ROOT / "data/qualification-01/software"
-    if local.exists():  # a local research run; fresh clones check only the synthetic cases below
-        run = load_run(local)
-        assert run["attempts"][0]["id"] == "catalog-01"
-        assert run["attempts"][0]["validation"]["ok"] is False
-        world = next(a for a in run["attempts"] if a["id"] == "build-grp_helix48-01")
-        assert len(world["candidate"]["snapshot"]["messages"]) == 150
-        assert world["tasks"][0]["answer"]["canonical_answer"]
-        assert world["verdict"]["approved"] is False
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp)
-        attempt = path / "attempts/broken"
-        attempt.mkdir(parents=True)
-        (attempt / "author_output.json").write_text(json.dumps({"text": "not json"}))
-        broken = load_run(path)["attempts"][0]
-        assert broken["candidate"] is None
-        assert "viewer_parse_error" in broken["validation"]
+        asyncio.run(check_author(Path(tmp) / "author"))
+        run = load_run(Path(tmp) / "author" / "run")
+    # A world written in time order by one author: its blocks in order, and each conversation by its lines.
+    steps = [a["id"] for a in run["attempts"]]
+    assert (
+        steps.index("plan-01")
+        < steps.index("day-01-01")
+        < steps.index("review-02-02")
+        < steps.index("day-03-02")
+    ), steps
+    assert steps.index("day-04-01") < steps.index("tasks-01") < steps.index("final-02"), steps
+    assert all(
+        run["snapshots"][a["snapshot"]]["messages"] for a in run["attempts"] if a["id"].startswith("final")
+    ), "each attempt shows the world it ended with"
+    assert set(run["scene_of"]) == {m["id"] for m in run["world"]["messages"]}, (
+        "every message maps to its conversation"
+    )
+    assert all(s["participant_ids"] for s in run["scenes"]) and any(s["beats"] for s in run["scenes"])
+    assert any(s["promises"] for s in run["scenes"]), "a conversation shows the promises its lines make"
+    tasks = {t["id"]: t for t in run["catalog"]["tasks"]}
+    assert tasks and all(t["gold_sql"] for t in tasks.values()), "every task shows its gold query"
+    anchored = [t for t, b in run["bindings"].items() if tasks[t]["fact_ids"]]
+    assert anchored and all(run["bindings"][t]["claims"][0]["message_ids"] for t in anchored), (
+        "ledger tasks show the messages their facts are stated in"
+    )
+    assert all(p["profile"] for p in run["catalog"]["personas"]), "the cast shows seeded profiles"
     attack = "</script><script>alert('artifact')</script>&"
     html = render({"runs": [], "probe": attack})
-    assert attack not in html
-    assert "__VIEWER_DATA__" not in html
-    assert "\\u003c/script\\u003e" in html
-    print("Viewer checks passed: ordering, rejected artifacts, evidence, malformed output, HTML escaping.")
+    assert attack not in html and "__VIEWER_DATA__" not in html and "\\u003c/script\\u003e" in html
+    print("Viewer checks passed: attempt order, snapshots, conversations, gold queries, cast, escaping.")
 
 
 if __name__ == "__main__":

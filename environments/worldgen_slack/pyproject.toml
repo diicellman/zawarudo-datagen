@@ -18,6 +18,7 @@ packages = ["worldgen_slack"]
 include = [
     "worldgen_slack/**/*.json",
     "worldgen_slack/**/*.md",
+    "worldgen_slack/**/*.sql",
     "worldgen_slack/**/*.toml",
 ]
 

@@ -1,62 +1,71 @@
-"""Local artifacts and one atomic restart checkpoint; execution belongs to the Env."""
+"""The run directory: the world file, one atomic checkpoint, attempt snapshots, events, traces and the release."""
 
 import fcntl
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Literal
+
 from pydantic import Field
-from worldgen_slack.dataset import PublicTask, atomic_json, read_json, write_release
-from worldgen_slack.slack.api import canonical, digest
-from worldgen_slack.slack.models import StrictModel
-from .contracts import (
-    Catalog,
-    Candidate,
-    Plan,
-    Premise,
-    SceneRecord,
-    Verdict,
-    validate_candidate,
-    validate_verdict,
+from worldgen_slack.dataset import (
+    PrivateAnswer,
+    PublicTask,
+    StrictModel,
+    atomic_json,
+    read_json,
+    sha256,
+    write_release,
 )
+from worldgen_slack.db import World, canonical
+
+from .contracts import Issue, Premise, SeedPersona, Verdict, measures
+
+Cell = tuple[str, int, str, str]  # category, level, concept, question style
 
 
 def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
-    """Companies and people from every other catalog checkpoint in the corpus."""
+    """Companies and people of every other world in the corpus."""
     companies, people = set(), set()
-    for path in corpus.glob("**/state.json"):
-        state = read_json(path)
-        reference = state.get("catalog") if isinstance(state, dict) else None
-        artifact = path.parent / "artifacts" / f"{reference}.json"
+    for path in corpus.glob("**/world.sqlite"):
         if (
             path.parent.resolve() == exclude.resolve()
-            or not isinstance(reference, str)
-            or not artifact.exists()
+            or path.parent.name in ("release", "attempts")
+            or "attempts" in path.parts
         ):
             continue
-        catalog = read_json(artifact)
-        companies.add(catalog["company"])
-        people.update(person["name"] for person in catalog["people"])
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+            if company := db.execute("SELECT value FROM world_meta WHERE key = 'company'").fetchone():
+                companies.add(company[0])
+            people.update(r[0] for r in db.execute("SELECT real_name FROM users"))
     return {"companies": sorted(companies), "people": sorted(people)}
 
 
 class RunState(StrictModel):
-    phase: Literal["catalog", "build", "final", "evaluate", "done"] = "catalog"
+    phase: Literal["premise", "organization", "plan", "day", "review", "tasks", "final", "done"] = "premise"
     premise: Premise | None = None
-    catalog: Catalog | None = None
-    plan: Plan | None = None
-    scenes: dict[str, SceneRecord] = Field(default_factory=dict)
-    candidate: Candidate | None = None
-    built_groups: list[str] = Field(default_factory=list)
-    final_groups: list[str] = Field(default_factory=list)
+    cast: list[SeedPersona] = Field(default_factory=list)
+    quota: list[Cell] = Field(default_factory=list)
+    organization: list[str] = Field(default_factory=list)  # the channels the organization made
+    drafts: dict[str, dict] = Field(default_factory=dict)  # each setup phase's last document
+    plans: dict[str, dict] = Field(
+        default_factory=dict
+    )  # "agenda": day → the everyday conversations code drew
+    task_reviews: dict[str, dict] = Field(default_factory=dict)
     rounds: dict[str, int] = Field(default_factory=dict)
     reviews: dict[str, dict] = Field(default_factory=dict)
-    evaluation: dict[str, dict] = Field(default_factory=dict)
     feedback: str = ""
     active_attempt: str | None = None
-    last_approved_candidate: str | None = None
     last_verdict: Verdict | None = None
+    # The world author: the day being written (or reviewed), the attempt whose world and notes it starts from, a
+    # review's issues waiting for the author's next turn, the solver's runs of each task as it was when solved
+    # (probes and the final review share them), and the solver runs spent on probing tasks.
+    day: int = 0
+    restore_point: str = ""
+    issues: list[Issue] = Field(default_factory=list)
+    solves: dict[str, dict] = Field(default_factory=dict)  # task → {key, results, traces}
+    probe_solves: int = 0
 
 
 class ReviewLimit(RuntimeError):
@@ -73,17 +82,8 @@ class Store:
         if manifest.exists():
             if read_json(manifest) != config:
                 raise ValueError("resume configuration differs; use a new output directory")
-            checkpoint = read_json(self.root / "state.json")
-            for key in ("catalog", "candidate"):
-                if checkpoint[key]:
-                    identifier = checkpoint[key]
-                    if len(identifier) != 64 or any(c not in "0123456789abcdef" for c in identifier):
-                        raise ValueError("invalid artifact reference")
-                    content = read_json(self.root / "artifacts" / (identifier + ".json"))
-                    if digest(content) != identifier:
-                        raise ValueError("checkpoint artifact hash mismatch")
-                    checkpoint[key] = content
-            self.state = RunState.model_validate(checkpoint)
+            self.state = RunState.model_validate_json((self.root / "state.json").read_bytes())
+            self.world = World(self.root / "world.sqlite", writable=True)
             if self.state.active_attempt:
                 self.event("interrupted", attempt=self.state.active_attempt)
                 self.state.active_attempt = None
@@ -92,10 +92,12 @@ class Store:
             if any(p.name != ".lock" for p in self.root.iterdir()):
                 raise ValueError("output is nonempty without a run manifest")
             self.state = RunState()
+            self.world = World.create(self.root / "world.sqlite")
             atomic_json(manifest, config)
             self.save()
 
     def close(self):
+        self.world.close()
         self.lock.close()
 
     def event(self, event, **fields):
@@ -106,24 +108,8 @@ class Store:
             os.fsync(stream.fileno())
         print(json.dumps(row), flush=True)
 
-    def save(self, *, approved=False):
-        checkpoint = self.state.model_dump(mode="json")
-        for key in ("catalog", "candidate"):
-            if checkpoint[key] is not None:
-                value = checkpoint[key]
-                identifier = digest(value)
-                path = self.root / "artifacts" / (identifier + ".json")
-                if not path.exists():
-                    atomic_json(path, value)
-                checkpoint[key] = identifier
-        if (
-            approved
-            and checkpoint["candidate"]
-            and any(key.startswith(("build:", "final:")) for key in self.state.reviews)
-        ):
-            self.state.last_approved_candidate = checkpoint["candidate"]
-            checkpoint["last_approved_candidate"] = checkpoint["candidate"]
-        atomic_json(self.root / "state.json", checkpoint)
+    def save(self):
+        atomic_json(self.root / "state.json", self.state.model_dump(mode="json"))
 
     def reserve(self, key, maximum):
         used = self.state.rounds.get(key, 0)
@@ -136,8 +122,28 @@ class Store:
         self.event("candidate_started", attempt=attempt, round=used + 1)
         return attempt
 
+    def path(self, attempt: str, name: str) -> Path:
+        path = self.root / "attempts" / attempt / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
     def artifact(self, attempt, name, value):
-        atomic_json(self.root / "attempts" / attempt / (name + ".json"), value)
+        atomic_json(self.path(attempt, name + ".json"), value)
+
+    def snapshot(self, attempt: str, name: str = "world.sqlite") -> Path:
+        """The world as it is now, kept with the attempt; reviews and the viewer read these files."""
+        path = self.path(attempt, name)
+        path.unlink(missing_ok=True)
+        self.world.snapshot(path)
+        return path
+
+    def restore(self, attempt: str) -> None:
+        """The world as an attempt left it: a day is always written from where the last one closed."""
+        source = sqlite3.connect(self.path(attempt, "world.sqlite"))
+        try:
+            source.backup(self.world.db)
+        finally:
+            source.close()
 
     def trace(self, trace):
         record = trace.to_record()
@@ -152,18 +158,12 @@ class Store:
         )
 
     def finish_attempt(self, approved):
-        self.event("candidate_finished", attempt=self.state.active_attempt, approved=approved)
+        attempt = self.state.active_attempt
+        if attempt:
+            self.snapshot(attempt)
+        self.event("candidate_finished", attempt=attempt, approved=approved)
         self.state.active_attempt = None
-        self.save(approved=approved)
-
-    def invalidate(self, reason, *, catalog=True):
-        self.state.final_groups.clear()
-        self.state.reviews = {
-            key: review for key, review in self.state.reviews.items() if key == "catalog" and not catalog
-        }
-        self.state.evaluation.clear()
-        self.state.last_approved_candidate = None
-        self.event("approvals_invalidated", reason=reason)
+        self.save()
 
     def summary(self, status, reason=""):
         usage = {}
@@ -180,10 +180,11 @@ class Store:
                         "input_tokens": 0,
                         "output_tokens": 0,
                         "reported_cost": 0.0,
-                        "unpriced_calls": 0,
-                    },
+                    }
+                    | {"unpriced_calls": 0, "failed_traces": 0},
                 )
                 row["judge_calls" if is_judge else "traces"] += 1
+                row["failed_traces"] += not is_judge and trace.get("ok") is False
                 row["input_tokens"] += (account.get("prompt_tokens") or 0) + (
                     account.get("cached_input_tokens") or 0
                 )
@@ -192,82 +193,106 @@ class Store:
                     row["unpriced_calls"] += 1
                 else:
                     row["reported_cost"] += account["cost"]
-        events = (
-            [json.loads(line) for line in (self.root / "progress.jsonl").read_text().splitlines()]
-            if (self.root / "progress.jsonl").exists()
-            else []
-        )
-        evidence = {}
-        if self.state.candidate:
-            for binding in self.state.candidate.bindings:
-                for identifier in {m for c in binding.claims for m in c.message_ids}:
-                    evidence.setdefault(identifier, set()).add(binding.task_id)
-        results = list(self.state.evaluation.values())
+        events = []
+        if (self.root / "progress.jsonl").exists():
+            events = [json.loads(line) for line in (self.root / "progress.jsonl").read_text().splitlines()]
+        rates = {task: review["solve_rate"] for task, review in self.state.task_reviews.items()}
+        count = lambda sql: self.world.db.execute(sql).fetchone()[0]  # noqa: E731
         summary = {
             "status": status,
             "reason": reason,
             "phase": self.state.phase,
+            "day": self.state.day,
             "rounds": self.state.rounds,
-            "built_groups": self.state.built_groups,
-            "final_groups": self.state.final_groups,
-            "task_count": len(self.state.catalog.tasks) if self.state.catalog else 0,
-            "message_count": len(self.state.candidate.snapshot.messages) if self.state.candidate else 0,
-            "workspace_hash": digest(self.state.candidate.snapshot.model_dump(mode="json"))
-            if self.state.candidate
-            else None,
-            "evaluated_tasks": len(results),
-            "solved_tasks": sum(r["semantic_correctness"] == 1 for r in results),
-            "grounded_tasks": sum(r["grounded"] for r in results),
-            "solver_calls": sum(r["read_count"] for r in results),
-            "solver_execution_failures": sum(not r["execution_ok"] for r in results),
+            "final_approved": "final" in self.state.reviews,
+            "tasks": count("SELECT COUNT(*) FROM tasks"),
+            "messages": count("SELECT COUNT(*) FROM messages"),
+            "task_mix": [
+                list(r)
+                for r in self.world.db.execute("SELECT category, level, COUNT(*) FROM tasks GROUP BY 1, 2")
+            ],
+            "solve_rates": rates,
+            "mean_learnability": sum(4 * p * (1 - p) for p in rates.values()) / len(rates) if rates else None,
             "usage_by_role": usage,
             "reported_model_cost": sum(r["reported_cost"] for r in usage.values()),
             "elapsed_seconds": events[-1]["time"] - events[0]["time"] if events else 0,
             "rejected_candidates": sum(
                 e["event"] == "candidate_finished" and not e["approved"] for e in events
             ),
-            "evidence_messages": len(evidence),
-            "reused_evidence_messages": sum(len(tasks) > 1 for tasks in evidence.values()),
-            "last_approved_candidate": self.state.last_approved_candidate,
         }
+        if status != "running":
+            summary["difficulty"] = self.difficulty()
         atomic_json(self.root / "summary.json", summary)
         return summary
 
-    def publish(self):
-        from .agents.judge import review_payload
-        from .env import reference_for
-
-        state = self.state
-        if state.phase != "done" or set(state.evaluation) != {t.id for t in state.catalog.tasks}:
-            raise ValueError("release requires every task to finish evaluation")
-        catalog, candidate = state.catalog, state.candidate
-        if not validate_candidate(catalog, candidate, [t.id for t in catalog.tasks])["ok"]:
-            raise ValueError("release fails deterministic validation")
-        scopes = [("catalog", None, [t.id for t in catalog.tasks], "catalog")]
-        scopes += [
-            ("final:" + g.id, candidate, [t.id for t in catalog.tasks if t.group_id == g.id], "world")
-            for g in catalog.groups
-        ]
-        for key, snapshot, ids, phase in scopes:
-            verdict = Verdict.model_validate(state.reviews[key])
-            validate_verdict(verdict, review_payload(catalog, snapshot, ids, phase))
-            if not verdict.approved:
-                raise ValueError("release includes rejected work")
-        world_hash = digest(candidate.snapshot.model_dump(mode="json"))
-        rows = [
-            PublicTask(
-                task_id=t.id,
-                workspace_id=catalog.workspace_id,
-                question=t.question,
-                actor_id=t.actor_id,
-                snapshot_ref="snapshot.json",
-                snapshot_hash=world_hash,
+    def difficulty(self) -> dict:
+        """Each task's intended level beside how hard it measures on the final world: the judge's level_fit, the
+        solve rate, and code's measures (evidence pages, tables read, search rank)."""
+        out = {}
+        for task in self.world.db.execute(
+            "SELECT id, category, level, concept, actor_id, gold_sql FROM tasks"
+        ):
+            review = self.state.task_reviews.get(task["id"], {})
+            try:
+                gold = self.world.gold(task["actor_id"], task["gold_sql"], max_rows=50)
+                measured = measures(self.world, task["id"], gold["rows"], gold["tables"])
+            except ValueError as error:
+                measured = {"error": str(error)}
+            out[task["id"]] = (
+                {k: task[k] for k in ("category", "level", "concept")}
+                | {
+                    "level_fit": review.get("level_fit"),
+                    "solve_rate": review.get("solve_rate"),
+                }
+                | measured
             )
-            for t in catalog.tasks
-        ]
-        write_release(
-            self.root / "release",
-            candidate.snapshot,
-            rows,
-            {t.id: reference_for(t, candidate) for t in catalog.tasks},
-        )
+        return out
+
+    def release_rows(self, world_hash: str) -> tuple[list[PublicTask], dict[str, PrivateAnswer]]:
+        """Each task's public row and private answer: its gold rows, and the messages and people they rest on."""
+        rows, answers = [], {}
+        db = self.world.db
+        for task in db.execute("SELECT * FROM tasks ORDER BY id").fetchall():
+            gold = json.loads(task["gold_json"])
+            ids = {r["message_id"] for r in gold if r.get("message_id") is not None}
+            ids |= {
+                r[0]
+                for r in db.execute(
+                    """SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id
+                    WHERE tf.task_id = ? AND e.role = 'anchor'""",
+                    (task["id"],),
+                )
+            }
+            marks = ", ".join("?" * len(ids))
+            messages = [
+                list(r)
+                for r in db.execute(
+                    f"SELECT channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us", sorted(ids)
+                )
+            ]
+            rows.append(
+                PublicTask(task_id=task["id"], question=task["question"], actor_id=task["actor_id"], category=task["category"], level=task["level"], answer_type=task["answer_type"], world_hash=world_hash)
+            )  # fmt: skip
+            answers[task["id"]] = PrivateAnswer(
+                answer_type=task["answer_type"],
+                rows=gold,
+                gold_sql=task["gold_sql"],
+                messages=messages,
+                users=sorted({r["user_id"] for r in gold if r.get("user_id") is not None}),
+            )
+        return rows, answers
+
+    def publish(self):
+        if self.state.phase != "done":
+            raise ValueError("release requires a finished run")
+        if missing := [
+            t for (t,) in self.world.db.execute("SELECT id FROM tasks") if t not in self.state.task_reviews
+        ]:
+            raise ValueError(f"release requires an approved review of every task; missing {missing}")
+        if self.world.violations(complete=True):
+            raise ValueError("release requires a world that breaks no rule")
+        copy = self.root / "solver.sqlite"
+        copy.unlink(missing_ok=True)
+        self.world.solver_copy(copy)
+        rows, answers = self.release_rows(sha256(copy))
+        write_release(self.root / "release", copy, rows, answers)

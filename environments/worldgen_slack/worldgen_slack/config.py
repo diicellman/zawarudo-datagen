@@ -6,7 +6,7 @@ from verifiers.v1.configs.retries import RetryConfig
 from verifiers.v1.harnesses.null.harness import NullHarnessConfig
 from verifiers.v1.harnesses.rlm.harness import RLMHarnessConfig
 
-RLM_REVISION = "ad081dbcf5e8c1d4e5b431b4b7d4dd5f30b7367c"
+RLM_REVISION = "d9784b6b58408b9a20b501875600db2227e05102"
 IMAGE = "python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a"
 
 

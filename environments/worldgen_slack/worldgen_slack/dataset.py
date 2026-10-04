@@ -1,13 +1,24 @@
-"""One shared snapshot, public questions, and private answer references."""
+"""The release: one solver copy of the world, public questions, and private gold answers."""
 
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
-from typing import Literal
-from .slack.models import SafeId, SlackWorld, StrictModel, AnswerSpec
-from .slack.api import INTERFACE_ID, canonical, digest
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
+
+from .db import World, canonical
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+SafeId = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
+NonEmptyText = Annotated[str, Field(min_length=1)]
 
 
 def atomic_json(path: Path, value) -> None:
@@ -19,11 +30,6 @@ def atomic_json(path: Path, value) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -38,102 +44,89 @@ def read_json(path: Path):
             result[key] = value
         return result
 
-    def invalid(value):
-        raise ValueError(f"invalid JSON constant: {value}")
+    return json.loads(path.read_bytes(), object_pairs_hook=unique)
 
-    return json.loads(path.read_bytes(), object_pairs_hook=unique, parse_constant=invalid)
+
+def sha256(path: Path) -> str:
+    with open(path, "rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 class PublicTask(StrictModel):
     task_id: SafeId
-    workspace_id: SafeId
-    question: str
+    question: NonEmptyText
     actor_id: SafeId
-    interface_id: Literal["slack.readonly.v2"] = INTERFACE_ID
-    snapshot_ref: str
-    snapshot_hash: str
+    category: NonEmptyText
+    level: int
+    answer_type: Literal["text", "set", "number", "refusal"]
+    world_hash: str
 
 
 class PrivateAnswer(StrictModel):
-    answer: AnswerSpec
-    message_ids: list[SafeId]
-    user_ids: list[SafeId]
+    """The gold rows of a task, and the messages (channel, ts) and people its answer rests on."""
+
+    answer_type: Literal["text", "set", "number", "refusal"]
+    rows: list[dict[str, JsonValue]]
+    gold_sql: NonEmptyText
+    messages: list[Annotated[list[str], Field(min_length=2, max_length=2)]]  # [channel, ts]
+    users: list[str]
 
 
 class Manifest(StrictModel):
-    format: Literal["worldgen-slack.v1"] = "worldgen-slack.v1"
-    workspace_id: SafeId
-    snapshot_hash: str
+    format: Literal["worldgen-slack.v6"] = "worldgen-slack.v6"
+    world_hash: str
     files: dict[str, str]
 
 
-def load_release(root: Path):
-    from .slack.api import SlackAPI
+FILES = {"world.sqlite", "tasks.json", "answers.json"}
 
+
+def load_release(root: Path) -> tuple[Path, list[PublicTask], dict[str, PrivateAnswer]]:
+    """Verify a release before use: file hashes, one world, matching tasks and answers, readable evidence."""
     root = root.resolve()
     manifest = Manifest.model_validate_json((root / "manifest.json").read_bytes())
-    if set(manifest.files) != {"tasks.json", "snapshot.json", "answers.json"}:
-        raise ValueError("release must contain public tasks, snapshot, and private answers")
+    if set(manifest.files) != FILES:
+        raise ValueError("a release holds world.sqlite, tasks.json and answers.json")
     for name, expected in manifest.files.items():
-        path = root / name
-        if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            raise ValueError(f"release artifact hash mismatch: {name}")
-    world = SlackWorld.model_validate_json((root / "snapshot.json").read_bytes())
-    if digest(world.model_dump(mode="json")) != manifest.snapshot_hash:
-        raise ValueError("snapshot identity mismatch")
-    rows = [PublicTask.model_validate(row) for row in read_json(root / "tasks.json")]
-    answers = {
-        key: PrivateAnswer.model_validate(value) for key, value in read_json(root / "answers.json").items()
-    }
-    if (
-        not rows
-        or len({row.task_id for row in rows}) != len(rows)
-        or set(answers) != {r.task_id for r in rows}
-    ):
+        if (root / name).is_symlink() or sha256(root / name) != expected:
+            raise ValueError(f"release file hash mismatch: {name}")
+    rows = [PublicTask.model_validate(r) for r in read_json(root / "tasks.json")]
+    answers = {k: PrivateAnswer.model_validate(v) for k, v in read_json(root / "answers.json").items()}
+    if not rows or len({r.task_id for r in rows}) != len(rows) or set(answers) != {r.task_id for r in rows}:
         raise ValueError("public tasks and private answers must match exactly")
-    messages = {m.id: m for m in world.messages}
     for row in rows:
-        if (row.workspace_id, row.snapshot_hash, row.snapshot_ref) != (
-            manifest.workspace_id,
-            manifest.snapshot_hash,
-            "snapshot.json",
-        ):
-            raise ValueError("task references a different snapshot")
-        api = SlackAPI(world, row.actor_id)
-        answer = answers[row.task_id]
-        if not answer.message_ids and not answer.user_ids:
-            raise ValueError("answer has no evidence")
-        for identifier in answer.message_ids:
-            message = messages.get(identifier)
-            if message is None or message.deleted or not api.is_conversation_visible(message.conversation_id):
-                raise ValueError("answer references missing or inaccessible evidence")
-        for identifier in answer.user_ids:
-            api.get_user(identifier)
-    return world, rows, answers
+        if row.world_hash != manifest.world_hash:
+            raise ValueError("a task references another world")
+        reader = World(root / "world.sqlite", actor=row.actor_id)
+        for channel, ts in answers[row.task_id].messages:
+            if not reader.db.execute(
+                "SELECT 1 FROM messages WHERE channel_id = ? AND ts = ?", (channel, ts)
+            ).fetchone():
+                raise ValueError(f"{row.task_id}: evidence its actor cannot read")
+        for user in answers[row.task_id].users:
+            reader.get_user(user)
+        reader.close()
+    return root / "world.sqlite", rows, answers
 
 
-def write_release(root: Path, world: SlackWorld, rows: list[PublicTask], answers: dict[str, PrivateAnswer]):
-    expected = (world, rows, answers)
+def write_release(root: Path, world: Path, rows: list[PublicTask], answers: dict[str, PrivateAnswer]) -> None:
+    """Publish atomically; an existing release must be the same one."""
     if root.exists():
-        if load_release(root) != expected:
+        _, old_rows, old_answers = load_release(root)
+        if (old_rows, old_answers) != (rows, answers) or sha256(root / "world.sqlite") != sha256(world):
             raise ValueError("refusing to overwrite a different release")
         return
     root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root.parent, prefix=".release-") as temporary:
         stage = Path(temporary) / "release"
-        files = {
-            "tasks.json": [row.model_dump(mode="json") for row in rows],
-            "snapshot.json": world.model_dump(mode="json"),
-            "answers.json": {key: value.model_dump(mode="json") for key, value in answers.items()},
-        }
-        for name, content in files.items():
-            atomic_json(stage / name, content)
-        manifest = Manifest(
-            workspace_id=rows[0].workspace_id,
-            snapshot_hash=digest(world.model_dump(mode="json")),
-            files={name: hashlib.sha256((stage / name).read_bytes()).hexdigest() for name in files},
+        stage.mkdir()
+        shutil.copyfile(world, stage / "world.sqlite")
+        atomic_json(stage / "tasks.json", [r.model_dump(mode="json") for r in rows])
+        atomic_json(stage / "answers.json", {k: v.model_dump(mode="json") for k, v in answers.items()})
+        files = {name: sha256(stage / name) for name in sorted(FILES)}
+        atomic_json(
+            stage / "manifest.json", Manifest(world_hash=files["world.sqlite"], files=files).model_dump()
         )
-        atomic_json(stage / "manifest.json", manifest.model_dump(mode="json"))
-        if load_release(stage) != expected:
+        if load_release(stage)[1:] != (rows, answers):
             raise ValueError("published data differs from approved inputs")
         os.rename(stage, root)

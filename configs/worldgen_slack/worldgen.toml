@@ -1,0 +1,166 @@
+# One generation run: uv run --frozen worldgen-slack --config configs/worldgen_slack/worldgen.toml
+# A new world needs a new `seed` and `output`; a run resumes only with the configuration it started with.
+# Now: the smoke run (S1a), 2 days, 80 messages, 2 tasks. The full world (S1) is output "data/v7-01/software",
+# [calendar] days = 10, [activity] messages = 400, [tasks] count = 10, and a budget set from the smoke's cost per day.
+sector = "IT for a business-to-business software company: cloud platform operations, service releases, and customer incident coordination"
+seed = 20261007
+output = "data/v7-03-smoke/software"
+
+# One author writes the world in time order.
+[author]
+review_days = [1]         # the judge reviews the world after these days, and at the end
+probe_solves = 4
+probe_rounds = 1
+probe_budget = 16
+
+# Built by: duckdb < scripts/worldgen_slack/personas.sql
+[personas]
+path = "data/seeds/personas-usa.jsonl"
+typing = "data/seeds/typing-profiles.jsonl"
+gaps = "data/seeds/reply-gaps.json"
+
+[calendar]
+days = 2
+
+# The workspace's shape: code places conversations by these targets, and measure.py scores the world against them.
+[activity]
+messages = 80             # whole world, storylines included (estimate; 400 for a full world)
+channel_skew = 1.1        # Zipf exponent over channels ranked by members (estimate)
+dms_per_person = 0.4      # direct-message pairs per person (estimate)
+dm_share = 0.25           # share of background messages in DMs (estimate)
+conversation_lines = 6    # mean lines of a background conversation (estimate)
+reply_share = 0.3         # share of messages that are thread replies (vendor survey, low confidence)
+reaction_rate = 0.2       # share of messages with at least one reaction (estimate)
+mention_rate = 0.11       # measured: spencer/software_slacks, deduplicated; scorecard only
+emoji_rate = 0.08         # measured, same corpus; scorecard only
+parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 0.03 }  # workday rhythm (estimate)
+
+[tasks]
+count = 2
+per_storyline = 5
+max_answer_rows = 5
+# How a question is asked; the seed draws one per task, as DataDesigner draws instruction styles.
+styles = [
+  "a direct question",
+  "a request to look something up, in the imperative",
+  "a question with a sentence of context about why the asker needs it",
+  "a terse question, the way someone types in a hurry",
+]
+
+# The task taxonomy. Each world's (category, level) mix is drawn from it by the run seed. `gold` says where an
+# answer comes from: "sql" over what the asker can see, the "ledger" of facts planned before any message is
+# written, or a "hybrid" of both. Every task is written on the finished world.
+# `concepts`, one list per level, are concrete things a task of that level requires; the seed draws one per task
+# (DataDesigner's complexity -> concept subcategories). `spread`, per level, is how many channels a ledger task's
+# facts are first stated in; a task whose facts are not spread that far is refused.
+[taxonomy.lookup]
+gold = "sql"
+answer_types = ["text", "set", "number"]
+definition = "Read one thing off the workspace's structure: who posted, where, when, in which thread, who is a member, who reacted."
+levels = [
+  "one message or directory entry",
+  "a reply inside a thread, or a read narrowed by a filter",
+  "something buried in a long channel that takes several pages to read",
+]
+concepts = [
+  ["who posted a message the question describes", "which channel holds a message the question describes", "a person's title or team in the directory"],
+  ["who replied in the thread of a message the question describes", "a message narrowed down by its author and its day", "who reacted to a message the question describes"],
+  ["a message several pages back in a busy channel", "the earliest or the latest of many similar messages", "a reply deep in a long thread"],
+]
+
+[taxonomy.search]
+gold = "ledger"
+answer_types = ["text", "set", "number"]
+definition = "Find the message that states a fact the question asks about, and answer with that fact."
+levels = [
+  "one exact keyword finds one message",
+  "finding it needs combined filters: a person, a date, a channel",
+  "the question names it only partly or indirectly, several messages look plausible, and some are distractors",
+]
+concepts = [
+  ["a fact stated once, with a distinctive word in the question"],
+  ["a fact found by combining who said it, where and on which day", "a fact stated only in a direct message"],
+  ["a fact the question names only indirectly", "a fact among near-miss messages about the same subject", "a fact whose keyword also appears in unrelated chatter"],
+]
+
+[taxonomy.semantic]
+gold = "ledger"
+answer_types = ["text", "set", "number"]
+definition = "Answer from facts related to each other: a value superseded by a later one, an alias, a value split across messages, a contradiction."
+levels = [
+  "one relation, such as a superseded value",
+  "two relations, or an alias",
+  "a value split across messages, together with a decoy and a contradiction",
+]
+concepts = [
+  ["a value superseded once by a later message"],
+  ["a value superseded twice", "a value the later messages refer to by another name", "a value corrected in a reply thread"],
+  ["a value split across messages in two channels", "a credible decoy that is never explicitly retracted", "a contradiction settled by the more authoritative person"],
+]
+spread = [1, 1, 2]
+
+[taxonomy.join]
+gold = "sql"
+answer_types = ["text", "set", "number"]
+definition = "Combine the workspace's structure across channels, threads, members and reactions: compare, intersect, subtract or count."
+levels = [
+  "two hops",
+  "three hops with a filter",
+  "four or more hops with a set operation or a time window",
+]
+concepts = [
+  ["members of a channel who posted in it", "repliers of a thread who also reacted in it"],
+  ["people active in one channel but not in another", "replies within the threads of one person"],
+  ["a set difference across channels within a time window", "people who reacted to every message of a kind", "distinct participants across several threads within a window"],
+]
+
+[taxonomy.hybrid]
+gold = "hybrid"
+answer_types = ["text", "set", "number"]
+definition = "Find the message that states a fact, then answer a structural question about that message: who replied, reacted, was mentioned, or stayed silent."
+levels = [
+  "the message plus one join",
+  "the message plus two joins",
+  "the message plus joins and a time window",
+]
+concepts = [
+  ["who replied to the message stating a fact"],
+  ["who both reacted to and replied to the message stating a fact", "who was mentioned around the message stating a fact"],
+  ["which members of a channel stayed silent within a window after the message stating a fact"],
+]
+
+[taxonomy.robustness]
+gold = "sql"
+answer_types = ["refusal"]
+definition = "A request the asker cannot fulfill from what they can see; the right answer says so."
+levels = [
+  "what it asks about does not exist",
+  "what it asks about is in a conversation the asker cannot read",
+]
+concepts = [
+  ["a project, person or decision that never appears in the workspace"],
+  ["a decision discussed only in a private channel the asker is not in", "a detail settled only in a direct message between others"],
+]
+
+# One model per agent. Unset fields (harness, runtime, sampling) keep the role defaults in config.py.
+[env.timeout]
+episode = 43200
+finalize = 300
+
+[env.author]
+model = "anthropic/claude-opus-5.5"  # the voice lab (2026-10-04): 0.77 blind realism on one prompt, against terra's 0.43
+
+# Anthropic caches a prompt only when asked: each request's prefix is cached up to its end, so an agent's next step
+# pays for its new tail alone. Without it every step was billed in full, and the harness's token cap (new tokens only)
+# cut smoke 02's second day.
+[env.author.sampling]
+cache_control = { type = "ephemeral" }
+
+[env.judge]
+model = "openai/gpt-6-sol"
+
+[env.solver]
+model = "z-ai/glm-5.3-flash"
+
+[answer_judge]
+model = "openai/gpt-6-sol"

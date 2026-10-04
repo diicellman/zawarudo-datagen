@@ -1,63 +1,58 @@
-"""Run shared-workspace backward generation with native Verifiers agents."""
+"""Generate one Slack world with its tasks, on native Verifiers agents: uv run --frozen worldgen-slack --config <toml>"""
 
 import argparse
 import asyncio
-import contextlib
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
 import verifiers.v1 as vf
-from .config import ROOT, Config, load_config
-from .env import GenerationEnv
-from .store import Store
-from .contracts import SeedPacket, load_seed_packet
-from worldgen_slack.slack.api import digest
 from verifiers.v1.clients import EvalClientConfig, ModelContext
+from verifiers.v1.runtimes.prime import set_base_sandbox_labels
+from verifiers.v1.utils.interrupt import install_interrupt
 from worldgen_slack.dataset import atomic_json
 
+from .chronicle import daily
+from .config import ROOT, Config, load_config
+from .contracts import calendar, census, pick_cast, quota
+from .env import GenerationEnv
+from .store import Store
 
-def provenance(config: Config, seeds: SeedPacket | None = None) -> dict:
-    if (config.seed_data is None) != (seeds is None):
-        raise ValueError("seed configuration and loaded packet must agree")
-    result = {
-        "config": config.model_dump(
-            mode="json", exclude={"seed_data"} if config.seed_data is None else set()
-        ),
+
+def provenance(config: Config) -> dict:
+    """Everything a resumed run must share with its start: the configuration (taxonomy included), the pinned
+    framework and the lock file."""
+    return {
+        "config": config.model_dump(mode="json"),
         "verifiers_revision": "ac2ec29",
         "lock_hash": hashlib.sha256((ROOT / "uv.lock").read_bytes()).hexdigest(),
     }
-    if seeds is not None:
-        result["seed_data_hash"] = digest(seeds.model_dump(mode="json"))
-    return result
+
+
+def failure(phase: str, episode) -> str | None:
+    """Why a run failed, or None. A run fails when its control flow did not finish. An agent failure the pipeline
+    absorbed (a malformed verdict rerun, a corrected author turn) is counted in the summary, not fatal."""
+    if phase == "done" and not episode.errors:
+        return None
+    reason = "; ".join(f"{e.type}: {e.message}" for e in episode.errors)
+    return reason or "; ".join(f"{e.type}: {e.message}" for t in episode.traces for e in t.errors) or phase
+
+
+def run_label(output: Path) -> str:
+    """The label every sandbox of a run carries, so one left behind is found by it: prime sandbox list."""
+    return "worldgen-" + re.sub(r"[^a-z0-9]+", "-", f"{output.parent.name}-{output.name}".lower()).strip("-")
 
 
 async def run(config: Config) -> dict:
-    seeds = load_seed_packet(config.seed_data.path) if config.seed_data else None
-    manifest = provenance(config, seeds)
-    store = Store(config.output, manifest)
-
-    async def heartbeat():
-        while True:
-            await asyncio.sleep(10)
-            store.event(
-                "heartbeat",
-                attempt=store.state.active_attempt,
-                built_groups=len(store.state.built_groups),
-                evaluated=len(store.state.evaluation),
-            )
-
-    pulse = asyncio.create_task(heartbeat())
+    set_base_sandbox_labels([run_label(config.output)])
+    store = Store(config.output, provenance(config))
     try:
-        if seeds is not None:
-            atomic_json(store.root / "seeds.json", seeds.model_dump(mode="json"))
         if store.state.phase != "done":
-            env = GenerationEnv(config, store, seeds)
+            env = GenerationEnv(config, store)
             context = ModelContext(
-                model=config.env.solver.model,
-                client=EvalClientConfig(),
-                sampling=vf.Sampling(),
+                model=config.env.solver.model, client=EvalClientConfig(), sampling=vf.Sampling()
             )
             seed = vf.Task(vf.TaskData(idx=config.seed, prompt="Generate the shared Slack workspace."))
             async with env.serving():
@@ -65,47 +60,45 @@ async def run(config: Config) -> dict:
             for trace in episode.traces:
                 store.trace(trace)
             atomic_json(store.root / f"episode-{episode.id}.json", episode.to_record())
-            if not episode.ok and (
-                store.state.phase != "done"
-                or episode.errors
-                or any(
-                    not trace.ok and trace.agent.name not in {"solver", "writer"} for trace in episode.traces
+            if (reason := failure(store.state.phase, episode)) is not None:
+                return store.summary(
+                    "incomplete" if "ReviewLimit" in reason else "infrastructure_error", reason
                 )
-            ):
-                reason = "; ".join(f"{e.type}: {e.message}" for e in episode.errors)
-                reason = reason or "; ".join(
-                    f"{e.type}: {e.message}" for t in episode.traces for e in t.errors
-                )
-                status = "incomplete" if "ReviewLimit" in reason else "infrastructure_error"
-                return store.summary(status, reason)
         summary = store.summary("complete")
         store.publish()
         return summary
     except asyncio.CancelledError:
-        store.summary(
-            "interrupted",
-            "run interrupted; committed progress and available traces are preserved",
-        )
+        store.summary("interrupted", "run interrupted; committed progress and available traces are preserved")
         raise
     finally:
-        pulse.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await pulse
         store.close()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="validate the configuration; spend nothing")
     args = parser.parse_args()
     config = load_config(args.config)
     if args.dry_run:
-        if config.seed_data:
-            load_seed_packet(config.seed_data.path)
-        print(config.model_dump_json(indent=2))
+        (occupation, _), *_ = census(config.personas)[1].most_common(1)
+        pick_cast(config.personas, config.seed, [], {occupation: config.personas.pool})
+        plan = {
+            "config": config.model_dump(mode="json"),
+            "quota": quota(config.taxonomy, config.tasks.styles, config.seed, config.tasks.count),
+        }
+        dates = [d["date"] for d in calendar(config.seed, config.calendar, "UTC")]
+        plan["daily"] = dict(zip(dates, daily(dates, config)))  # each date's messages and their parts
+        print(json.dumps(plan, indent=1))
         return 0
-    result = asyncio.run(run(config))
+    # The first Ctrl-C or SIGTERM unwinds the run: its interactions close, its tool servers and tunnels stop and its
+    # VM is deleted; signals during that cleanup are ignored. The checkpoint stays for a resume.
+    install_interrupt()
+    try:
+        result = asyncio.run(run(config))
+    except KeyboardInterrupt:
+        print("interrupted: the run is stopped and its sandboxes deleted; rerun to resume", file=sys.stderr)
+        return 130
     print(json.dumps(result, indent=2))
     return 0 if result["status"] == "complete" else 2
 

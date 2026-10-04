@@ -3,276 +3,688 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Artifact observatory</title>
+<title>Worldgen viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap">
 <style>
-:root{color-scheme:light;--ink:#192b3a;--muted:#526779;--line:#d7e2e8;--paper:#fff;--accent:#006c70;--soft:#edf5f6}
-*{box-sizing:border-box}body{margin:0;background:#f3f6f8;color:var(--ink);font:15px/1.55 system-ui,sans-serif}
-header{background:#163747;color:white;padding:26px max(24px,calc((100vw - 1440px)/2))}h1{font-size:27px;margin:0}header p{max-width:950px;color:#d4e6ef;margin:6px 0}
-main{max-width:1488px;margin:auto;padding:24px}h2{font-size:19px;margin:0 0 14px}h3{font-size:16px;margin:12px 0 6px}p{margin:8px 0}
-.panel{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:18px;min-width:0}.toolbar{display:flex;gap:16px;flex-wrap:wrap;align-items:end}
-.field{display:flex;flex:1;min-width:190px;flex-direction:column;gap:5px}label,.eyebrow{font-size:12px;font-weight:700;letter-spacing:.04em}.eyebrow{text-transform:uppercase;color:var(--muted)}
-select,input[type=search]{width:100%;font:inherit;background:white;border:1px solid #9eafb9;border-radius:6px;padding:9px;color:var(--ink)}input[type=checkbox]{accent-color:var(--accent)}
-button{font:inherit;cursor:pointer;border:1px solid #89b9bc;background:var(--soft);color:#00595e;border-radius:6px;padding:5px 9px;margin:3px 5px 3px 0;text-align:left}button:hover{background:#d7ebed}
-:focus-visible{outline:3px solid #d18711;outline-offset:3px}a{color:var(--accent)}.grid{display:grid;grid-template-columns:minmax(300px, .9fr) minmax(400px,1.4fr);gap:20px}
-.muted{color:var(--muted);font-size:13px}.notice{padding:10px 12px;background:#fff4da;border-radius:6px}.question{font-size:20px;line-height:1.45;white-space:pre-wrap}.text{white-space:pre-wrap;overflow-wrap:anywhere}
-pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 ui-monospace,monospace;background:#f4f7f9;padding:12px;border-radius:6px;max-height:400px;overflow:auto}
-details{margin:10px 0}summary{cursor:pointer;font-weight:650;padding:5px 0}.message{border:1px solid var(--line);border-radius:8px;padding:12px;margin:10px 0;background:white}.message.target{border:2px solid var(--accent);background:#f0fbfa}
-.message .meta{font-size:12px;color:var(--muted);overflow-wrap:anywhere}.badge{display:inline-block;border-radius:20px;padding:2px 9px;background:var(--soft);font-size:12px;margin:2px 5px 2px 0}.scroll{max-height:680px;overflow:auto;padding:2px 8px 2px 2px}
-.claim{border-top:1px solid var(--line);padding:10px 0}.diffrow{border-top:1px solid var(--line);padding-top:14px;margin-top:14px}.pair{display:grid;grid-template-columns:1fr 1fr;gap:14px}.added{color:#17663d}.removed{color:#9f3434}.changed{color:#855700}
-[hidden]{display:none!important}#thread{scroll-margin-top:18px}.empty{padding:20px 0;color:var(--muted)}.check{display:flex;gap:8px;align-items:center;padding:10px 0}.stats{margin:8px 0}
-@media(max-width:850px){.grid,.pair{grid-template-columns:1fr}main{padding:14px}.panel{padding:15px}header{padding:20px}.scroll{max-height:500px}}
+:root{--bg:#0e0e0e;--card:#151515;--raise:#1b1b1b;--line:#2a2a2a;--soft:#202020;--fg:#f4f4f4;--fg2:rgba(255,255,255,.64);--fg3:rgba(255,255,255,.42);
+--good:#85ed75;--warn:#f3bc56;--bad:#fb7185;--ev:#8b7cf6;--evbg:rgba(139,124,246,.12);--sel:rgba(255,255,255,.07);--bar:rgba(255,255,255,.5);
+--sans:Geist,"Geist Fallback",ui-sans-serif,system-ui,sans-serif;--mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;color-scheme:dark}
+@media (prefers-color-scheme:light){:root:not([data-theme=dark]){--bg:#fafafa;--card:#fff;--raise:#f3f3f3;--line:#e2e2e2;--soft:#ececec;--fg:#111;--fg2:rgba(0,0,0,.64);--fg3:rgba(0,0,0,.46);
+--good:#0a7d2c;--warn:#9a6400;--bad:#c4262e;--ev:#5b45d6;--evbg:rgba(91,69,214,.09);--sel:rgba(0,0,0,.05);--bar:rgba(0,0,0,.45);color-scheme:light}}
+:root[data-theme=light]{--bg:#fafafa;--card:#fff;--raise:#f3f3f3;--line:#e2e2e2;--soft:#ececec;--fg:#111;--fg2:rgba(0,0,0,.64);--fg3:rgba(0,0,0,.46);
+--good:#0a7d2c;--warn:#9a6400;--bad:#c4262e;--ev:#5b45d6;--evbg:rgba(91,69,214,.09);--sel:rgba(0,0,0,.05);--bar:rgba(0,0,0,.45);color-scheme:light}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--fg)}body{font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
+button,select,input{font:inherit;color:inherit}button{cursor:pointer}:focus-visible{outline:1px solid var(--fg);outline-offset:2px}
+.mono,.label,.chip,.tab,code{font-family:var(--mono)}.label{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg3)}
+.muted{color:var(--fg2)}.faint{color:var(--fg3)}.small{font-size:12px}.pre{white-space:pre-wrap;overflow-wrap:anywhere}.nowrap{white-space:nowrap}
+header{border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;background:var(--bg)}
+.bar{display:flex;align-items:center;gap:16px;padding:12px 24px;flex-wrap:wrap}.brand{font:500 13px var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.brand b{font-weight:500;color:var(--fg3)}.spacer{flex:1}
+select,input[type=search]{background:var(--card);border:1px solid var(--line);border-radius:0;padding:6px 10px;min-width:0}
+.btn{background:var(--card);border:1px solid var(--line);padding:6px 12px;font:12px var(--mono);letter-spacing:.04em;text-transform:uppercase}
+.btn:hover,.btn[aria-pressed=true]{background:var(--raise);border-color:var(--fg3)}
+nav{display:flex;gap:0;padding:0 24px;overflow-x:auto}.tab{background:none;border:0;border-bottom:1px solid transparent;padding:10px 14px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg2)}
+.tab sup{color:var(--fg3);margin-left:4px;font-size:10px}.tab[aria-selected=true]{color:var(--fg);border-bottom-color:var(--fg)}
+main{padding:24px;max-width:1600px;margin:0 auto}section{margin-bottom:28px}
+.card{background:var(--card);border:1px solid var(--line);padding:16px;min-width:0}
+.hero h1{font:500 30px/1.2 var(--sans);margin:4px 0 6px}.hero p{max-width:900px;margin:6px 0}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line)}
+.tile{background:var(--card);padding:14px 16px}.tile .v{font:500 24px/1.2 var(--sans);margin-top:6px}.tile .s{font:11px var(--mono);color:var(--fg3);margin-top:2px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--soft);vertical-align:top}
+th{font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--fg3);font-weight:400}td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+tr.click{cursor:pointer}tr.click:hover td,tr.on td{background:var(--sel)}
+.chip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);padding:1px 7px;font-size:11px;letter-spacing:.03em;margin:2px 4px 2px 0;background:none;white-space:nowrap}
+button.chip:hover{border-color:var(--fg3)}.chip.good{color:var(--good);border-color:color-mix(in srgb,var(--good) 45%,transparent)}
+.chip.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent)}.chip.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 45%,transparent)}
+.chip.ev{color:var(--ev);border-color:color-mix(in srgb,var(--ev) 50%,transparent)}.chip.solid{background:var(--raise)}
+.meter{display:inline-block;width:64px;height:4px;background:var(--soft);vertical-align:middle;margin-right:6px}.meter i{display:block;height:100%;background:var(--bar)}
+.hbar{display:grid;grid-template-columns:120px 1fr 48px;align-items:center;gap:10px;padding:4px 0}.hbar .track{height:8px;background:var(--soft)}.hbar .track i{display:block;height:100%;background:var(--bar)}
+/* lineage */
+.graphwrap{position:relative;overflow-x:auto;border:1px solid var(--line);background:var(--card)}
+.graph{position:relative;display:flex;gap:84px;padding:20px 24px 28px;min-width:min-content}.graph svg.edges{position:absolute;inset:0;pointer-events:none;overflow:visible}
+.col{display:flex;flex-direction:column;gap:36px;min-width:220px;max-width:260px}.colhead{font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--fg3);border-bottom:1px solid var(--line);padding-bottom:6px}
+.node{position:relative;z-index:1;text-align:left;background:var(--bg);border:1px solid var(--line);padding:10px 12px;width:100%}
+.node:hover{border-color:var(--fg3)}.node.on{border-color:var(--fg)}.node.good{box-shadow:inset 2px 0 0 var(--good)}.node.bad{box-shadow:inset 2px 0 0 var(--bad)}.node.warn{box-shadow:inset 2px 0 0 var(--warn)}
+.node .id{font:500 12px var(--mono)}.node .steps{font:11px/1.6 var(--mono);color:var(--fg2);margin-top:6px}
+.edge{fill:none;stroke-width:1.25}.edge.good{stroke:var(--good)}.edge.bad{stroke:var(--bad)}.edge.plain{stroke:var(--fg3)}
+.elabel{font:10px var(--mono);letter-spacing:.04em;text-transform:uppercase;fill:var(--fg2)}.elabel-bg{fill:var(--card)}
+.timeline svg{display:block;width:100%}.lane-label{font:11px var(--mono);fill:var(--fg3);text-transform:uppercase;letter-spacing:.06em}
+.tick{font:10px var(--mono);fill:var(--fg3)}.gridline{stroke:var(--soft)}.band{fill:var(--sel)}.band-label{font:10px var(--mono);fill:var(--fg3)}
+.tbar{fill:var(--bar)}.tbar.fail{fill:none;stroke:var(--bad);stroke-width:1.5}.tbar:hover{fill:var(--fg)}
+#tip{position:fixed;z-index:20;pointer-events:none;background:var(--raise);border:1px solid var(--line);padding:8px 10px;font:11px/1.5 var(--mono);max-width:360px;display:none}
+.issue{border-top:1px solid var(--soft);padding:10px 0}.issue:first-child{border-top:0}
+/* world */
+.world{display:grid;grid-template-columns:260px minmax(0,1fr) 360px;border:1px solid var(--line);background:var(--card);height:calc(100vh - 170px);min-height:520px}
+.side{border-right:1px solid var(--line);overflow:auto;padding:12px}.pane{overflow:auto;min-width:0}.thread{border-left:1px solid var(--line);overflow:auto;padding:14px}
+.conv{display:flex;width:100%;gap:8px;align-items:center;background:none;border:0;text-align:left;padding:5px 8px;color:var(--fg2)}.conv:hover,.conv.on{background:var(--sel);color:var(--fg)}
+.conv .n{margin-left:auto;font:11px var(--mono);color:var(--fg3)}.conv .dot{color:var(--ev);font-size:10px}
+.chan-head{position:sticky;top:0;background:var(--card);border-bottom:1px solid var(--line);padding:12px 16px;z-index:1}
+.msg{display:grid;grid-template-columns:32px minmax(0,1fr);gap:10px;padding:10px 16px;border-left:2px solid transparent}.msg:hover{background:var(--sel)}
+.msg.ev{border-left-color:var(--ev);background:var(--evbg)}.msg.flash{outline:1px solid var(--fg)}
+.av{width:32px;height:32px;display:grid;place-items:center;background:var(--raise);border:1px solid var(--line);font:500 11px var(--mono);color:var(--fg2)}
+.who{font-weight:600}.when{font:11px var(--mono);color:var(--fg3);margin-left:8px}.text{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}
+.linkish{background:none;border:0;padding:0;color:var(--fg2);font:11px var(--mono);text-decoration:underline;text-underline-offset:3px}
+/* tasks */
+.tasks{display:grid;grid-template-columns:320px minmax(0,1fr);gap:16px}.tlist{display:flex;flex-direction:column;gap:1px;background:var(--line);border:1px solid var(--line);align-self:start}
+.titem{background:var(--card);border:0;text-align:left;padding:10px 12px}.titem:hover,.titem.on{background:var(--raise)}
+.q{font:500 21px/1.35 var(--sans);margin:6px 0 10px}.step{display:grid;grid-template-columns:28px minmax(0,1fr);gap:10px;padding:10px 0;border-top:1px solid var(--soft)}
+.step .k{font:11px var(--mono);color:var(--fg3);padding-top:2px}.evmsg{border:1px solid var(--line);border-left:2px solid var(--ev);padding:8px 10px;margin:6px 0;background:var(--bg);text-align:left;width:100%}
+.solves{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+.people{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.spoiler{filter:blur(6px);user-select:none}.clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.empty{padding:28px;color:var(--fg3);font:12px var(--mono);text-align:center}
+.split{display:grid;grid-template-columns:minmax(0,1fr) 420px;gap:16px}
+@media (max-width:1100px){.world{grid-template-columns:220px minmax(0,1fr)}.thread{grid-column:1/-1;border-left:0;border-top:1px solid var(--line)}.split{grid-template-columns:1fr}}
+@media (max-width:760px){main{padding:16px}.bar,nav{padding-left:16px;padding-right:16px}.world{grid-template-columns:1fr;height:auto}.side{border-right:0;border-bottom:1px solid var(--line);max-height:240px}
+.pane{max-height:70vh}.tasks{grid-template-columns:1fr}.hero h1{font-size:24px}.grid2{grid-template-columns:1fr}.hbar{grid-template-columns:90px 1fr 40px}}
+@media (forced-colors:active){.node.good,.node.bad,.node.warn{box-shadow:none;border-width:2px}}
 </style>
 </head>
 <body>
-<header><div class="eyebrow" style="color:#a5d6d8">Local artifact inspector</div><h1>Artifact observatory</h1><p>Explore generated worlds, task evidence, and revisions. This is an omniscient inspector, not a replay of solver access. Private channels and deleted messages remain visible.</p></header>
-<main>
-<section class="panel" aria-label="Artifact selection">
-<div class="toolbar"><label class="field">Run<select id="run"></select></label><label class="field">Attempt / artifact<select id="attempt"></select></label><label class="field">Task<select id="task"></select></label></div>
-<label class="check"><input id="hide" type="checkbox" checked> Hide private answers and review details</label>
-<p class="muted">Hiding answers is a display aid, not redaction. Workspace messages may reveal answers. All embedded data is available in this local file.</p>
-<div id="status" class="muted" role="status" aria-live="polite"></div>
-<details><summary>Artifact sources and run summary</summary><div id="sources"></div></details>
-</section>
-<div class="grid">
-<div>
-<section class="panel"><div class="eyebrow">Selected task</div><h2 id="question" class="question"></h2><div id="taskMeta" class="muted"></div><div id="privateTask"></div><div id="evidence"></div></section>
-<section class="panel"><h2>Catalog context</h2><div id="catalog"></div></section>
-<section class="panel"><h2>Review &amp; validation</h2><div id="review"></div></section>
-</div>
-<div>
-<section class="panel"><h2>Workspace explorer</h2><div class="toolbar"><label class="field">Channel<select id="channel"></select></label><label class="field">Search messages<input id="search" type="search" placeholder="Text, author, or message ID"></label></div><div id="workspaceStats" class="muted stats" role="status"></div><div id="messages" class="scroll"></div><details><summary>User directory</summary><div id="users"></div></details></section>
-<section class="panel" id="thread" tabindex="-1"><h2>Evidence &amp; full thread</h2><p class="muted">Select a message to inspect its root and all replies in this artifact, without the channel or search filters.</p><div id="threadContent"></div></section>
-</div>
-</div>
-<section class="panel"><h2>Compare selected artifacts</h2><p class="muted">This compares selected snapshots. It does not assume a causal edit history. Message IDs determine identity; deleted flags are metadata, not removals. “Before” defaults to the previous listed artifact.</p><div class="toolbar"><label class="field">Before<select id="before"></select></label><label class="field">After<select id="after"></select></label></div><div id="diffStats" class="stats" role="status"></div><div id="diff" class="scroll"></div></section>
-</main>
+<header>
+  <div class="bar">
+    <div class="brand">Zawarudo <b>/</b> Worldgen viewer</div>
+    <label class="label" for="run">Run</label><select id="run"></select>
+    <div class="spacer"></div>
+    <button class="btn" id="spoil" type="button" aria-pressed="true" title="Show private answers, facts and evidence marks">Answers shown</button>
+    <button class="btn" id="theme" type="button">Theme</button>
+  </div>
+  <nav role="tablist" id="tabs"></nav>
+</header>
+<main id="main"></main>
+<div id="tip" role="tooltip"></div>
 <script id="viewer-data" type="application/json">__VIEWER_DATA__</script>
 <script>
 'use strict';
-const $ = id => document.getElementById(id);
-const list = value => Array.isArray(value) ? value : [];
-const fmt = value => typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-function el(tag, text, cls) {
+const DATA = JSON.parse(document.getElementById('viewer-data').textContent);
+const TABS = [['overview', 'Overview'], ['lineage', 'Lineage'], ['world', 'World'], ['tasks', 'Tasks'], ['cast', 'Cast'], ['traces', 'Traces']];
+const ROLES = ['synthesizer', 'builder', 'writer', 'solver', 'judge'];
+const S = {tab: 'overview', run: 0, attempt: null, snapshot: null, conv: null, message: null, reader: '', search: '', task: null, trace: null, role: '', spoilers: true};
+let R, X;  // the selected run and its indexes
+
+function h(tag, props, ...kids) {
   const node = document.createElement(tag);
-  if (text !== undefined && text !== null) node.textContent = String(text);
-  if (cls) node.className = cls;
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === 'class') node.className = v;
+    else if (k === 'text') node.textContent = String(v);
+    else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v === true ? '' : String(v));
+  }
+  for (const kid of kids.flat(Infinity)) if (kid !== null && kid !== undefined && kid !== false) node.append(kid instanceof Node ? kid : String(kid));
   return node;
 }
-function clear(id) { const node = $(id); node.replaceChildren(); return node; }
-function note(node, text) { node.append(el('p', text, 'muted')); }
-function raw(node, title, value) {
-  if (value === undefined || value === null) return;
-  const details = el('details'); details.append(el('summary', title), el('pre', fmt(value))); node.append(details);
+const svg = (tag, props, ...kids) => {
+  const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(props || {})) if (v !== undefined && v !== null) {
+    if (k === 'text') node.textContent = String(v); else if (k.startsWith('on')) node.addEventListener(k.slice(2), v); else node.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) if (kid) node.append(kid);
+  return node;
+};
+const label = t => h('div', {class: 'label', text: t});
+const empty = t => h('div', {class: 'empty', text: t});
+const list = v => Array.isArray(v) ? v : [];
+const pct = v => v === null || v === undefined ? '–' : Math.round(v * 100) + '%';
+const num = v => v === null || v === undefined ? '–' : Number(v).toLocaleString('en-US');
+const usd = v => v === null || v === undefined ? '–' : '$' + Number(v).toFixed(2);
+const dur = s => s === null || s === undefined || isNaN(s) ? '–' : s < 60 ? Math.round(s) + 's' : s < 3600 ? (s / 60).toFixed(1) + 'm' : (s / 3600).toFixed(2) + 'h';
+const short = (t, n = 140) => { t = String(t ?? ''); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
+const initials = name => String(name || '?').split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase();
+const status = (ok, yes = 'Approved', no = 'Rejected') => ok === null || ok === undefined ? h('span', {class: 'chip', text: '… Pending'})
+  : h('span', {class: 'chip ' + (ok ? 'good' : 'bad'), text: (ok ? '✓ ' : '✕ ') + (ok ? yes : no)});
+const meter = v => h('span', {class: 'nowrap'}, h('span', {class: 'meter'}, h('i', {style: `width:${Math.round((v || 0) * 100)}%`})), h('span', {class: 'mono small', text: v === undefined ? '–' : Number(v).toFixed(2)}));
+function spoil(node) { if (!S.spoilers) node.classList.add('spoiler'); return node; }
+function utc(ts, zone) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const f = new Intl.DateTimeFormat('en-GB', {timeZone: zone || 'UTC', weekday: 'short', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit'});
+  return f.format(d) + (zone ? '' : ' UTC');
 }
-function button(text, action) { const b = el('button', text); b.type = 'button'; b.onclick = action; return b; }
-function options(id, rows, selected) {
-  const node = clear(id);
-  for (const [value, label] of rows) { const o = el('option', label); o.value = value; node.append(o); }
-  if (selected !== undefined) node.value = String(selected);
-  node.disabled = !rows.length;
+
+/* ---------- indexes ---------- */
+function view(world) {
+  const convs = Object.fromEntries(list(world.conversations).map(c => [c.id, c]));
+  const msgs = Object.fromEntries(list(world.messages).map(m => [m.id, m]));
+  const replies = {};
+  for (const m of list(world.messages)) if (m.thread_root_id) (replies[m.thread_root_id] ||= []).push(m);
+  return {world, convs, msgs, replies};
 }
-let data;
-try { data = JSON.parse($('viewer-data').textContent); }
-catch (error) { $('status').textContent = 'Cannot read embedded artifact data: ' + error.message; }
-const runs = list(data?.runs);
-let run, attempt, tasks = [], snapshot = {}, selectedTask;
-const hidden = () => $('hide').checked;
-const snap = artifact => artifact?.candidate?.snapshot || null;
-const attemptLabel = a => [a.id, a.phase].filter(Boolean).join(' · ');
-const byId = (items, id) => list(items).find(item => item.id === id);
-const userName = (s, id) => byId(s.users, id)?.name || id || 'Unknown author';
-const channelName = (s, id) => byId(s.conversations, id)?.name || id || 'Unknown channel';
-function messageCard(message, s, clickable = true, target = false) {
-  const card = el('article', null, 'message' + (target ? ' target' : ''));
-  card.append(el('strong', userName(s, message.author_id)));
-  card.append(el('div', [channelName(s, message.conversation_id), message.timestamp, message.id,
-    message.deleted ? 'DELETED' : '', message.thread_root_id ? 'Reply to ' + message.thread_root_id : 'Thread root'].filter(Boolean).join(' · '), 'meta'));
-  card.append(el('p', message.text || '(No text)', 'text'));
-  if (clickable) card.append(button('Open full thread', () => openMessage(message.id)));
-  raw(card, 'Message metadata', Object.fromEntries(Object.entries(message).filter(([key]) => key !== 'text')));
-  return card;
+const V = () => S.snapshot && R.snapshots[S.snapshot] ? (X.views[S.snapshot] ||= view(R.snapshots[S.snapshot])) : X;
+function index(run) {
+  const cat = run.catalog || {};
+  const attemptsInOrder = run.attempts;
+  let world = run.world;
+  if (!world) for (const a of [...attemptsInOrder].reverse()) if (a.snapshot) { world = run.snapshots[a.snapshot]; break; }
+  world = world || {users: [], conversations: [], messages: []};
+  const people = Object.fromEntries(list(cat.people || world.users).map(p => [p.id, p]));
+  const personas = Object.fromEntries(list(cat.personas).map(p => [p.id, p]));
+  const {convs, msgs, replies} = view(world);
+  const evidence = {};  // message -> [[task, claim]]
+  for (const [t, b] of Object.entries(run.bindings || {})) for (const c of list(b.claims)) for (const m of list(c.message_ids)) (evidence[m] ||= []).push([t, c.claim_index]);
+  const tasks = Object.fromEntries(list(cat.tasks).map(t => [t.id, t]));
+  const facts = Object.fromEntries(list(cat.facts).map(f => [f.id, f]));
+  const scenes = Object.fromEntries(list(run.scenes).map(s => [s.id, s]));
+  const traces = Object.fromEntries(run.traces.map(t => [t.id, t]));
+  const events = run.events;
+  const t0 = Math.min(...[...events.map(e => e.time), ...run.traces.map(t => t.start).filter(Boolean)]);
+  const t1 = Math.max(...[...events.map(e => e.time), ...run.traces.map(t => t.end).filter(Boolean)]);
+  // attempt windows, outcomes and routes
+  const win = {}, outcome = {}, routed = {}, interrupted = {};
+  for (const e of events) {
+    if (e.event === 'candidate_started') win[e.attempt] = [e.time, null];
+    if (e.event === 'candidate_finished' && win[e.attempt]) { win[e.attempt][1] = e.time; outcome[e.attempt] = e.approved; }
+    if (e.event === 'attempt_routed') routed[e.attempt] = e.route;
+    if (e.event === 'scenes_repaired') routed[e.attempt] = 'repair';
+    if (e.event === 'bindings_repaired') routed[e.attempt] = 'rebind';
+    if (e.event === 'candidate_reused') routed[e.attempt] = 'reuse';
+    if (e.event === 'interrupted') interrupted[e.attempt] = true;
+    if (e.event === 'premise_selected') { win.premise = [t0, e.time]; outcome.premise = true; }
+    if (e.event === 'organization_built') outcome.organization = true;
+  }
+  for (const a of attemptsInOrder) {
+    if (outcome[a.id] === undefined) {
+      if (a.verdict) outcome[a.id] = a.verdict.approved;
+      else if (a.validation && a.validation.ok === false) outcome[a.id] = false;
+    }
+  }
+  const attemptOf = tr => {
+    if (tr.attempt && win[tr.attempt]) return tr.attempt;
+    let best = null;
+    for (const [id, [s, e]] of Object.entries(win)) if (tr.start >= s - 1 && (e === null || tr.start <= e + 1) && (!best || s > win[best][0])) best = id;
+    return best;
+  };
+  const byAttempt = {};
+  for (const tr of run.traces) (byAttempt[attemptOf(tr)] ||= []).push(tr);
+  return {cat, world, people, personas, convs, msgs, replies, evidence, tasks, facts, scenes, traces, t0, t1, win, outcome, routed, interrupted, byAttempt, views: {}};
 }
+const personName = id => X.people[id]?.name || id;
+function column(id) {
+  if (id === 'premise' || id === 'organization') return id;
+  if (id.startsWith('ledger')) return 'ledger';
+  if (id.startsWith('tasks')) return 'tasks';
+  if (id.startsWith('final')) return 'final';
+  const m = id.match(/^build-(.+)-\d+$/);
+  return m ? m[1] : 'other';
+}
+function routeOf(a, i, all) {
+  const col = column(a.id), prev = all[i - 1];
+  if (col === 'premise') return 'seed pick';
+  if (col === 'organization') return 'organization';
+  if (prev && X.interrupted[prev.id] && X.outcome[prev.id] === undefined) return 'resume';
+  if (col === 'ledger') return !prev || ['premise', 'organization'].includes(column(prev.id)) ? 'ledger' : column(prev.id) === 'ledger' ? 'repair' : 'ledger repair';
+  if (col === 'tasks') return prev && column(prev.id) === 'tasks' ? 'repair' : 'tasks';
+  if (col === 'final') return 'final review';
+  const r = X.routed[a.id];
+  if (prev && column(prev.id) === col) return r === 'plan' || !r ? 're-plan' : r;
+  if (prev && column(prev.id) === 'final') return 'regression';
+  return r === 'reuse' ? 'reuse' : 'build';
+}
+
+/* ---------- chrome ---------- */
+function renderChrome() {
+  const runSel = document.getElementById('run');
+  runSel.replaceChildren(...DATA.runs.map((r, i) => h('option', {value: i, text: r.name})));
+  runSel.value = S.run;
+  runSel.onchange = () => { S.run = +runSel.value; S.attempt = S.snapshot = S.conv = S.message = S.task = S.trace = null; load(); };
+  const tabs = document.getElementById('tabs');
+  tabs.replaceChildren(...TABS.map(([id, name], i) => h('button', {class: 'tab', role: 'tab', 'aria-selected': S.tab === id ? 'true' : 'false',
+    onclick: () => go(id)}, name, h('sup', {text: String(i + 1).padStart(2, '0')}))));
+  const spoil = document.getElementById('spoil');
+  spoil.setAttribute('aria-pressed', String(S.spoilers));
+  spoil.textContent = S.spoilers ? 'Answers shown' : 'Answers hidden';
+  spoil.onclick = () => { S.spoilers = !S.spoilers; renderChrome(); render(); };
+  document.getElementById('theme').onclick = () => {
+    const root = document.documentElement, dark = getComputedStyle(root).colorScheme.includes('dark');
+    root.dataset.theme = dark ? 'light' : 'dark';
+    try { localStorage.setItem('worldgen-theme', root.dataset.theme); } catch (e) { /* storage may be unavailable */ }
+    render();
+  };
+}
+function go(tab, patch) { Object.assign(S, patch || {}); S.tab = tab; renderChrome(); render(); window.scrollTo(0, 0); }
+function load() { R = DATA.runs[S.run]; X = index(R); renderChrome(); render(); }
+function render() {
+  const main = document.getElementById('main');
+  main.replaceChildren(({overview, lineage, world, tasks, cast, traces})[S.tab]());
+  if (S.tab === 'lineage') requestAnimationFrame(drawEdges);
+}
+
+/* ---------- overview ---------- */
+function overview() {
+  const sum = R.summary || {}, p = R.premise || {}, cat = X.cat;
+  const reviews = Object.values(R.task_reviews || {});
+  const rates = reviews.map(r => r.solve_rate).filter(v => v !== undefined);
+  const rejected = R.attempts.filter(a => X.outcome[a.id] === false).length;
+  const tiles = [
+    ['Status', sum.status || R.phase, sum.reason ? short(sum.reason, 40) : 'phase ' + R.phase],
+    ['Messages', num(list(X.world.messages).length), num(list(X.world.conversations).length) + ' conversations'],
+    ['Tasks', num(list(cat.tasks).length), num(list(cat.groups).length) + ' storylines · ' + num(list(cat.facts).length) + ' facts'],
+    ['People', num(list(cat.people).length), list(cat.personas).filter(x => x.profile).length ? 'seeded from personas' : 'written by synthesizer'],
+    ['Attempts', num(R.attempts.length), rejected + ' rejected'],
+    ['Cost', usd(sum.reported_model_cost), 'priced calls only'],
+    ['Wall time', dur(sum.elapsed_seconds ?? (X.t1 - X.t0)), 'first to last event'],
+    ['Solve rate', rates.length ? pct(rates.reduce((a, b) => a + b, 0) / rates.length) : '–', rates.length + ' tasks reviewed'],
+  ];
+  const usage = Object.entries(sum.usage_by_role || {});
+  return h('div', {},
+    h('section', {class: 'hero'}, label(cat.sector || 'Run'), h('h1', {text: p.company || cat.company || R.name}),
+      h('p', {class: 'muted', text: [p.niche, p.region, p.size].filter(Boolean).join(' · ')}),
+      cat.overview ? h('p', {text: cat.overview}) : null),
+    h('section', {}, h('div', {class: 'tiles'}, tiles.map(([k, v, s]) => h('div', {class: 'tile'}, label(k), h('div', {class: 'v', text: v}), h('div', {class: 's', text: s}))))),
+    h('section', {class: 'grid2'},
+      h('div', {class: 'card'}, label('Solve rate by task'), h('p', {class: 'small faint', text: 'Share of independent solves that were correct and grounded.'}),
+        list(cat.tasks).map(t => {
+          const r = R.task_reviews?.[t.id]?.solve_rate;
+          return h('div', {class: 'hbar'}, h('button', {class: 'linkish', text: t.id, onclick: () => go('tasks', {task: t.id})}),
+            h('div', {class: 'track'}, h('i', {style: `width:${Math.round((r || 0) * 100)}%`})), h('span', {class: 'mono small', text: pct(r)}));
+        })),
+      h('div', {class: 'card'}, label('Usage by role'),
+        usage.length ? h('table', {}, h('tr', {}, ['role', 'runs', 'input', 'output', 'cost', 'unpriced'].map((c, i) => h('th', {class: i ? 'num' : '', text: c}))),
+          usage.map(([role, u]) => h('tr', {}, h('td', {class: 'mono', text: role}), h('td', {class: 'num', text: num(u.traces)}), h('td', {class: 'num', text: num(u.input_tokens)}),
+            h('td', {class: 'num', text: num(u.output_tokens)}), h('td', {class: 'num', text: usd(u.reported_cost)}), h('td', {class: 'num', text: num(u.unpriced_calls)}))))
+          : empty('No summary yet'))),
+    h('section', {class: 'grid2'},
+      h('div', {class: 'card'}, label('Premise'), Object.entries(p).map(([k, v]) => h('p', {}, h('span', {class: 'label', text: k + ' '}), h('span', {text: v})))),
+      h('div', {class: 'card'}, label('Storylines'), list(cat.groups).map(g => h('p', {}, h('span', {class: 'chip', text: g.id}), g.description)),
+        label('Task mix (category · level, drawn by the seed)'), h('p', {}, list(R.quota).map(([c, l]) => h('span', {class: 'chip', text: `${c} · L${l}`}))))));
+}
+
+/* ---------- lineage ---------- */
+function lineage() {
+  const attempts = R.attempts;
+  const order = ['premise', 'organization', 'ledger', ...list(X.cat.groups).map(g => g.id), 'tasks', 'final'];
+  const cols = {};
+  attempts.forEach((a, i) => (cols[column(a.id)] ||= []).push([a, i]));
+  const keys = [...order.filter(k => cols[k]), ...Object.keys(cols).filter(k => !order.includes(k))];
+  const graph = h('div', {class: 'graph', id: 'graph'},
+    keys.map(k => h('div', {class: 'col'}, h('div', {class: 'colhead', text: ['premise', 'organization', 'ledger', 'tasks', 'final'].includes(k) ? k : 'storyline · ' + k}),
+      cols[k].map(([a, i]) => node(a, i, attempts)))),
+    R.phase === 'done' ? h('div', {class: 'col'}, h('div', {class: 'colhead', text: 'release'}),
+      h('div', {class: 'node good', id: 'n-publish'}, h('div', {class: 'id', text: 'publish'}), h('div', {class: 'steps', text: 'world.sqlite · tasks · answers · manifest'}))) : null);
+  const sel = attempts.find(a => a.id === S.attempt);
+  return h('div', {},
+    h('section', {}, label('Pipeline lineage'), h('p', {class: 'small muted', text: 'Each card is one attempt, in the order it ran. The edge label names the route the pipeline took next; select a card for its reviews, issues and world changes.'}),
+      h('div', {class: 'graphwrap'}, graph)),
+    sel ? h('section', {}, detail(sel)) : null,
+    h('section', {class: 'timeline'}, label('Agent runs over time'), h('p', {class: 'small muted', text: 'One lane per role; each bar is one agent run. Shaded bands are attempts. Hover for details, select a bar to open its trace.'}),
+      h('div', {class: 'card', id: 'timeline'}, timeline())));
+}
+function node(a, i, all) {
+  const ok = X.outcome[a.id], trs = X.byAttempt[a.id] || [];
+  const count = role => trs.filter(t => t.role === role).length;
+  const w = X.win[a.id];
+  const steps = [];
+  const col = column(a.id);
+  if (col === 'premise') steps.push('12 proposals → seed pick');
+  else if (col === 'catalog') steps.push('synthesizer → catalog judge');
+  else {
+    if (count('writer')) steps.push(`write ${count('writer')} scene${count('writer') > 1 ? 's' : ''}`);
+    if (a.corrections?.length) steps.push(`${a.corrections.length} in-attempt correction${a.corrections.length > 1 ? 's' : ''}`);
+    if (count('solver')) steps.push(`${count('solver')} solves`);
+    const labels = Object.keys(a.reviews || {});
+    if (labels.length) steps.push('reviews ' + labels.map(l => (a.reviews[l].verdict?.approved ? '✓' : '✕') + l).join(' '));
+    else if (a.verdict) steps.push('judge ' + (a.verdict.approved ? '✓' : '✕'));
+  }
+  const issues = list(a.verdict?.issues);
+  const blocking = issues.filter(x => x.blocking !== false).length;
+  if (issues.length) steps.push(`${blocking} blocking · ${issues.length - blocking} minor issue${issues.length - blocking === 1 ? '' : 's'}`);
+  if (a.validation && a.validation.ok === false) steps.push(`✕ validation: ${list(a.validation.errors).length} error(s)`);
+  const tone = ok === true ? (issues.length ? 'warn' : 'good') : ok === false ? 'bad' : '';
+  return h('button', {type: 'button', class: `node ${tone} ${S.attempt === a.id ? 'on' : ''}`, id: 'n-' + a.id, 'data-route': routeOf(a, i, all), 'data-ok': String(ok),
+    onclick: () => { S.attempt = S.attempt === a.id ? null : a.id; render(); }},
+    h('div', {class: 'id', text: a.id}),
+    h('div', {}, ok === true ? h('span', {class: 'chip good', text: col === 'premise' ? '✓ Selected' : '✓ Approved'}) : ok === false ? h('span', {class: 'chip bad', text: a.verdict ? '✕ Rejected' : '✕ Structural'}) : h('span', {class: 'chip', text: X.interrupted[a.id] ? '⏸ Interrupted' : '… Running'}),
+      w ? h('span', {class: 'chip', text: dur((w[1] ?? X.t1) - w[0])}) : null),
+    h('div', {class: 'steps'}, steps.map(s => h('div', {text: s}))));
+}
+function drawEdges() {
+  const graph = document.getElementById('graph');
+  if (!graph) return;
+  graph.querySelector('svg.edges')?.remove();
+  const box = graph.getBoundingClientRect();
+  const ids = [...R.attempts.map(a => a.id), ...(R.phase === 'done' ? ['publish'] : [])];
+  const layer = svg('svg', {class: 'edges', width: graph.scrollWidth, height: graph.scrollHeight});
+  for (let i = 1; i < ids.length; i++) {
+    const a = document.getElementById('n-' + ids[i - 1]), b = document.getElementById('n-' + ids[i]);
+    if (!a || !b) continue;
+    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    const same = Math.abs(ra.left - rb.left) < 4;
+    const ok = a.dataset.ok === 'true', bad = a.dataset.ok === 'false';
+    let d, lx, ly, anchor = 'middle';
+    if (same) {
+      const x = ra.left + 24 - box.left, y1 = ra.bottom - box.top, y2 = rb.top - box.top;
+      d = `M${x},${y1} L${x},${y2}`; lx = x + 10; ly = (y1 + y2) / 2; anchor = 'start';
+    } else {
+      const back = rb.left < ra.left;
+      const x1 = (back ? ra.left : ra.right) - box.left, y1 = ra.top + ra.height / 2 - box.top;
+      const x2 = (back ? rb.right : rb.left) - box.left, y2 = rb.top + rb.height / 2 - box.top;
+      const bend = back ? -40 : 40;
+      d = back ? `M${x1},${y1} C${x1 - 40},${y1 + 60} ${x2 + 40},${y2 + 60} ${x2},${y2}` : `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`;
+      lx = (x1 + x2) / 2; ly = (y1 + y2) / 2 + (back ? 44 : 0);
+    }
+    layer.append(svg('path', {d, class: 'edge ' + (bad ? 'bad' : ok ? 'good' : 'plain'), 'marker-end': 'url(#arrow)'}));
+    const text = (bad ? '✕ ' : ok ? '✓ ' : '') + (b.dataset.route || 'publish');
+    const w = text.length * 6.2 + 8, rx = anchor === 'start' ? lx - 4 : lx - w / 2;
+    layer.append(svg('rect', {class: 'elabel-bg', x: rx, y: ly - 8, width: w, height: 14}), svg('text', {class: 'elabel', x: lx, y: ly + 3, 'text-anchor': anchor, text}));
+  }
+  layer.prepend(svg('defs', {}, svg('marker', {id: 'arrow', viewBox: '0 0 8 8', refX: 7, refY: 4, markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse'},
+    svg('path', {d: 'M0,0 L8,4 L0,8 z', fill: 'var(--fg3)'}))));
+  graph.prepend(layer);
+}
+addEventListener('resize', () => { if (S.tab === 'lineage') drawEdges(); });
+
+function issueList(issues) {
+  if (!issues.length) return empty('No issues');
+  return h('div', {}, issues.map(x => h('div', {class: 'issue'},
+    h('div', {}, h('span', {class: 'chip ' + (x.blocking === false ? 'warn' : 'bad'), text: x.blocking === false ? '! Minor' : '✕ Blocking'}),
+      h('span', {class: 'chip', text: `${x.owner} · ${x.artifact}`}), list(x.task_ids).map(t => h('button', {class: 'chip', type: 'button', text: t, onclick: () => go('tasks', {task: t})})),
+      list(x.fact_ids).map(f => h('span', {class: 'chip', text: f}))),
+    h('p', {text: x.defect}), h('p', {class: 'muted'}, h('span', {class: 'label', text: 'Requested  '}), x.requested_change),
+    list(x.message_ids).length ? h('div', {}, list(x.message_ids).map(m => h('button', {class: 'chip ev', type: 'button', text: m + (R.scene_of[m] ? ' · ' + R.scene_of[m] : ''),
+      onclick: () => openMessage(m)}))) : null)));
+}
+function detail(a) {
+  const trs = X.byAttempt[a.id] || [];
+  const cost = trs.reduce((s, t) => s + (t.cost || 0), 0);
+  const reviews = Object.entries(a.reviews || {});
+  const i = R.attempts.indexOf(a);
+  const prev = R.attempts.slice(0, i).reverse().find(x => x.snapshot && x.snapshot !== a.snapshot);
+  return h('div', {class: 'card'},
+    h('div', {}, label('Attempt'), h('h2', {class: 'mono', style: 'margin:4px 0', text: a.id}),
+      h('span', {class: 'chip', text: 'route · ' + routeOf(a, i, R.attempts)}), status(X.outcome[a.id]),
+      h('span', {class: 'chip', text: trs.length + ' agent runs'}), h('span', {class: 'chip', text: usd(cost) + ' priced'})),
+    a.verdict ? h('div', {}, h('p', {text: a.verdict.summary}), label('Issues'), issueList(list(a.verdict.issues))) : null,
+    reviews.length ? h('div', {style: 'margin-top:16px'}, label('Reviews'), h('table', {},
+      h('tr', {}, ['review', 'verdict', 'criteria', 'solves'].map(c => h('th', {text: c}))),
+      reviews.map(([l, r]) => h('tr', {},
+        h('td', {}, l === 'world' ? h('span', {class: 'mono', text: 'world'}) : h('button', {class: 'linkish', text: l, onclick: () => go('tasks', {task: l})})),
+        h('td', {}, status(r.verdict?.approved), h('div', {class: 'small muted', text: short(r.verdict?.summary, 220)})),
+        h('td', {}, Object.entries(r.verdict?.criteria || {}).map(([k, v]) => h('div', {class: 'small'}, meter(v), ' ', h('span', {class: 'faint', text: k})))),
+        h('td', {}, solveDots(r.solves)))))) : null,
+    a.validation && list(a.validation.errors).length ? h('div', {style: 'margin-top:16px'}, label('Validation errors'), list(a.validation.errors).map(e => h('p', {class: 'pre small', text: e}))) : null,
+    list(a.corrections).length ? h('details', {style: 'margin-top:12px'}, h('summary', {class: 'label', text: `In-attempt corrections (${a.corrections.length})`}),
+      a.corrections.map(e => h('p', {class: 'pre small muted', text: e}))) : null,
+    a.snapshot && prev ? diff(R.snapshots[prev.snapshot], R.snapshots[a.snapshot], prev.id) : null);
+}
+function diff(before, after, name) {
+  const b = Object.fromEntries(before.messages.map(m => [m.id, m])), a = Object.fromEntries(after.messages.map(m => [m.id, m]));
+  const added = Object.keys(a).filter(k => !b[k]), removed = Object.keys(b).filter(k => !a[k]);
+  const changed = Object.keys(a).filter(k => b[k] && (b[k].text !== a[k].text || b[k].timestamp !== a[k].timestamp));
+  return h('details', {style: 'margin-top:12px'}, h('summary', {class: 'label', text: `World changes since ${name}: +${added.length} −${removed.length} ~${changed.length}`}),
+    [...added.map(k => ['+', a[k]]), ...changed.map(k => ['~', a[k]]), ...removed.map(k => ['−', b[k]])].slice(0, 200).map(([s, m]) =>
+      h('p', {class: 'small'}, h('span', {class: 'mono faint', text: `${s} ${R.scene_of[m.id] || ''} `}), h('b', {text: personName(m.author_id) + ': '}), short(m.text, 220))));
+}
+function solveDots(solves) {
+  return list(solves).map(s => {
+    const good = s.correct && s.grounded, part = s.correct && !s.grounded;
+    return h('span', {class: 'chip ' + (good ? 'good' : part ? 'warn' : 'bad'), title: s.reason || '', text: good ? '✓' : part ? '~' : '✕'});
+  });
+}
+function timeline() {
+  const W = Math.max(720, (document.getElementById('main')?.clientWidth || 1200) - 34), lane = 26, top = 24, left = 96;
+  const span = Math.max(1, X.t1 - X.t0), x = t => left + (t - X.t0) / span * (W - left - 8);
+  const H = top + ROLES.length * lane + 22;
+  const root = svg('svg', {viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': 'Agent runs over time by role'});
+  const step = [60, 120, 300, 600, 900, 1800, 3600].find(s => span / s <= 10) || 7200;
+  for (let t = 0; t <= span; t += step) root.append(svg('line', {class: 'gridline', x1: x(X.t0 + t), x2: x(X.t0 + t), y1: top - 6, y2: H - 18}), svg('text', {class: 'tick', x: x(X.t0 + t), y: H - 4, 'text-anchor': 'middle', text: Math.round(t / 60) + 'm'}));
+  for (const [id, [s, e]] of Object.entries(X.win)) {
+    const x1 = x(s), x2 = x(e ?? X.t1);
+    root.append(svg('rect', {class: 'band', x: x1, y: top - 6, width: Math.max(1, x2 - x1), height: ROLES.length * lane + 4}),
+      svg('text', {class: 'band-label', x: x1 + 3, y: top - 10, text: x2 - x1 > 60 ? id : ''}));
+  }
+  ROLES.forEach((role, r) => {
+    const y = top + r * lane;
+    root.append(svg('text', {class: 'lane-label', x: 0, y: y + lane / 2 + 4, text: role}));
+    for (const t of R.traces.filter(t => t.role === role && t.start)) {
+      const x1 = x(t.start), x2 = x(t.end || t.start);
+      root.append(svg('rect', {class: 'tbar' + (t.ok === false ? ' fail' : ''), x: x1, y: y + 5, width: Math.max(2, x2 - x1), height: lane - 10, tabindex: 0,
+        onmousemove: ev => tip(ev, traceTip(t)), onmouseleave: () => tip(), onclick: () => go('traces', {trace: t.id})}));
+    }
+  });
+  return root;
+}
+function traceTip(t) {
+  return [`${t.role}${t.ok === false ? ' · FAILED' : ''}`, t.attempt || X.byAttempt && Object.entries(X.byAttempt).find(([, v]) => v.includes(t))?.[0], t.task_id && 'task ' + t.task_id,
+    t.scene_id && 'scene ' + t.scene_id, 'duration ' + dur((t.end || t.start) - t.start), `tokens ${num(t.input_tokens)} in · ${num(t.cached_tokens)} cached · ${num(t.output_tokens)} out`,
+    'cost ' + (t.cost === null ? 'unpriced' : usd(t.cost))].filter(Boolean).join('\n');
+}
+function tip(ev, text) {
+  const node = document.getElementById('tip');
+  if (!ev) { node.style.display = 'none'; return; }
+  node.textContent = text; node.style.whiteSpace = 'pre'; node.style.display = 'block';
+  node.style.left = Math.min(ev.clientX + 14, innerWidth - 380) + 'px'; node.style.top = (ev.clientY + 14) + 'px';
+}
+
+/* ---------- world ---------- */
+function visibleTo(c) { return !S.reader || c.kind === 'public_channel' || list(c.member_ids).includes(S.reader); }
 function openMessage(id) {
-  const box = clear('threadContent'), message = byId(snapshot.messages, id);
-  if (!message) note(box, 'Message not present in this artifact: ' + id);
-  else {
-    const rootId = message.thread_root_id || message.id;
-    const thread = list(snapshot.messages).filter(m => m.conversation_id === message.conversation_id && (m.id === rootId || m.thread_root_id === rootId));
-    thread.sort((a, b) => a.id === rootId ? -1 : b.id === rootId ? 1 : String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
-    note(box, 'Thread ' + rootId + ' · ' + thread.length + ' messages');
-    if (!thread.some(m => m.id === rootId)) note(box, 'Thread root is missing from this snapshot.');
-    for (const m of thread) box.append(messageCard(m, snapshot, false, m.id === id));
+  let snapshot = null, m = X.msgs[id];
+  for (const a of [...R.attempts].reverse()) {
+    if (m) break;
+    const found = a.snapshot && R.snapshots[a.snapshot].messages.find(x => x.id === id);
+    if (found) [snapshot, m] = [a.snapshot, found];
   }
-  $('thread').focus(); $('thread').scrollIntoView({behavior:'smooth', block:'start'});
+  if (m) go('world', {snapshot, conv: m.conversation_id, message: m.thread_root_id || m.id, reader: ''});
 }
-function openUser(id) {
-  const box = clear('threadContent'), user = byId(snapshot.users, id);
-  box.append(el('h3', 'User evidence · ' + id));
-  if (user) box.append(el('pre', fmt(user))); else note(box, 'User not present in this artifact.');
-  $('thread').focus(); $('thread').scrollIntoView({behavior:'smooth', block:'start'});
+function world() {
+  const W = V();
+  const convs = list(W.world.conversations).filter(visibleTo);
+  if (!convs.length) return empty('No world yet');
+  if (!S.conv || !convs.some(c => c.id === S.conv)) S.conv = convs[0].id;
+  const kinds = [['public_channel', 'Channels', '#'], ['private_channel', 'Private channels', '⌂'], ['dm', 'Direct messages', '@'], ['group_dm', 'Group DMs', '@']];
+  const counts = {}, evCounts = {};
+  for (const m of list(W.world.messages)) { counts[m.conversation_id] = (counts[m.conversation_id] || 0) + 1; if (X.evidence[m.id]) evCounts[m.conversation_id] = (evCounts[m.conversation_id] || 0) + 1; }
+  const convName = c => c.name || list(c.member_ids).map(personName).join(', ');
+  const worlds = [[null, 'Final world'], ...[...new Map(R.attempts.filter(a => a.snapshot).map(a => [a.snapshot, a.id])).entries()]];
+  const side = h('div', {class: 'side'},
+    label('World'), h('select', {style: 'width:100%;margin:4px 0 10px', onchange: e => { S.snapshot = e.target.value || null; S.conv = S.message = null; render(); }},
+      worlds.map(([key, name]) => { const o = h('option', {value: key || '', text: key ? 'as of ' + name : name}); if ((S.snapshot || null) === key) o.selected = true; return o; })),
+    label('Reader'), h('select', {style: 'width:100%;margin:4px 0 10px', onchange: e => { S.reader = e.target.value; render(); }},
+      h('option', {value: '', text: 'Everyone (omniscient)'}), Object.values(X.people).map(p => { const o = h('option', {value: p.id, text: p.name}); if (S.reader === p.id) o.selected = true; return o; })),
+    h('input', {type: 'search', placeholder: 'Search messages', value: S.search, style: 'width:100%;margin-bottom:12px', oninput: e => { S.search = e.target.value; renderMessages(); }}),
+    kinds.map(([kind, title, mark]) => {
+      const cs = convs.filter(c => c.kind === kind);
+      return cs.length ? h('div', {style: 'margin-bottom:12px'}, label(title), cs.map(c => h('button', {type: 'button', class: 'conv' + (S.conv === c.id ? ' on' : ''),
+        onclick: () => { S.conv = c.id; S.message = null; render(); }}, h('span', {class: 'mono faint', text: mark}), h('span', {text: convName(c)}),
+        S.spoilers && evCounts[c.id] ? h('span', {class: 'dot', title: 'contains task evidence', text: '●'}) : null, h('span', {class: 'n', text: counts[c.id] || 0})))) : null;
+    }));
+  const c = W.convs[S.conv];
+  const pane = h('div', {class: 'pane'}, h('div', {class: 'chan-head'}, h('div', {style: 'font-weight:600', text: (c.kind === 'public_channel' ? '# ' : '') + convName(c)}),
+    h('div', {class: 'small muted', text: [c.topic, c.purpose].filter(Boolean).join(' — ')}), h('div', {class: 'small faint mono', text: `${c.kind} · ${list(c.member_ids).length} members`})),
+    h('div', {id: 'msgs'}));
+  const thread = h('div', {class: 'thread', id: 'thread'});
+  requestAnimationFrame(() => { renderMessages(); renderThread(); });
+  return h('div', {class: 'world'}, side, pane, thread);
 }
-function renderTask() {
-  selectedTask = tasks[Number($('task').value)];
-  $('question').textContent = selectedTask?.question || 'No task available';
-  $('taskMeta').textContent = selectedTask ? [selectedTask.id, 'Actor: ' + userName(snapshot, selectedTask.actor_id), selectedTask.actor_id].filter(Boolean).join(' · ') : '';
-  const priv = clear('privateTask'), evidence = clear('evidence');
-  if (!selectedTask) return;
-  if (hidden()) note(priv, 'Private answer, reasoning, claim evidence, and gold calls are hidden.');
-  else {
-    priv.append(el('h3', 'Canonical answer'), el('p', fmt(selectedTask.answer?.canonical_answer ?? 'Not provided'), 'text'));
-    raw(priv, 'Required claims', selectedTask.answer?.required_claims);
-    raw(priv, 'Author reasoning', selectedTask.reasoning);
-    raw(priv, 'Fact references', selectedTask.fact_ids);
-    const binding = list(attempt.candidate?.bindings).find(b => b.task_id === selectedTask.id);
-    evidence.append(el('h3', 'Bound evidence'));
-    if (!binding) note(evidence, 'No evidence binding for this task.');
-    for (const claim of list(binding?.claims)) {
-      const row = el('div', null, 'claim'); row.append(el('strong', 'Claim index ' + claim.claim_index));
-      const required = list(selectedTask.answer?.required_claims)[claim.claim_index];
-      if (required !== undefined) row.append(el('p', fmt(required), 'text'));
-      row.append(el('div'));
-      for (const id of list(claim.message_ids)) row.append(button('Message · ' + id, () => openMessage(id)));
-      for (const id of list(claim.user_ids)) row.append(button('User · ' + userName(snapshot, id) + ' (' + id + ')', () => openUser(id)));
-      if (!list(claim.message_ids).length && !list(claim.user_ids).length) note(row, 'No evidence references.');
-      evidence.append(row);
-    }
-    raw(evidence, 'Gold calls (recorded, not executed)', binding?.gold_calls);
-  }
-}
-function renderCatalog() {
-  const node = clear('catalog'), catalog = attempt.catalog;
-  if (!catalog) { note(node, 'No catalog included.'); return; }
-  if (catalog.overview) node.append(el('p', fmt(catalog.overview), 'text'));
-  raw(node, 'Company', catalog.company); raw(node, 'People', catalog.people);
-  if (!hidden()) raw(node, 'Private catalog facts', catalog.facts);
-}
-function renderReview() {
-  const node = clear('review');
-  if (hidden()) { note(node, 'Review details can reveal answers. Uncheck “Hide private answers” to inspect them.'); return; }
-  const v = attempt.verdict;
-  if (!v) note(node, 'No judge verdict for this artifact.');
-  else {
-    const details = el('details'); details.append(el('summary', 'Judge verdict · ' + (v.approved === true ? 'Approved' : v.approved === false ? 'Not approved' : 'Recorded')));
-    if (v.summary) details.append(el('p', v.summary, 'text'));
-    raw(details, 'Scores / criteria', v.criteria ?? v.scores);
-    for (const issue of list(v.issues)) {
-      const finding = el('div', null, 'claim');
-      finding.append(el('h3', [issue.owner, issue.artifact].filter(Boolean).join(' · ')),
-        el('p', issue.defect, 'text'), el('strong', 'Requested change'),
-        el('p', issue.requested_change, 'text'));
-      for (const id of list(issue.message_ids)) finding.append(button('Inspect · ' + id, () => openMessage(id)));
-      raw(finding, 'Affected tasks and facts', {task_ids: issue.task_ids, fact_ids: issue.fact_ids});
-      details.append(finding);
-    }
-    raw(details, 'Selected task review', list(v.tasks).filter(t => t.task_id === selectedTask?.id));
-    raw(details, 'Complete verdict', v); node.append(details);
-  }
-  raw(node, 'Validation report (includes recorded outputs)', attempt.validation);
+function messageRow(m, compact) {
+  const ev = S.spoilers ? X.evidence[m.id] || [] : [];
+  const persona = X.personas[m.author_id];
+  const zone = persona?.timezone;
+  const n = list(V().replies[m.id]).length;
+  return h('div', {class: 'msg' + (ev.length ? ' ev' : '') + (S.message === m.id ? ' flash' : ''), id: 'm-' + m.id},
+    h('div', {class: 'av', text: initials(personName(m.author_id))}),
+    h('div', {}, h('span', {class: 'who', text: personName(m.author_id)}),
+      h('span', {class: 'when', title: zone ? 'author local: ' + utc(m.timestamp, zone) + ' (' + zone + ')' : '', text: utc(m.timestamp, V().world?.zone)}),
+      persona ? h('span', {class: 'when', text: persona.role}) : null,
+      h('div', {class: 'text', text: m.text}),
+      h('div', {}, !compact && n ? h('button', {class: 'linkish', type: 'button', text: `${n} repl${n > 1 ? 'ies' : 'y'}`, onclick: () => { S.message = m.id; renderThread(); renderMessages(); }}) : null,
+        ev.map(([t, k]) => h('button', {class: 'chip ev', type: 'button', text: `${t} · claim ${k}`, onclick: () => go('tasks', {task: t})})),
+        R.scene_of[m.id] ? h('span', {class: 'chip', text: R.scene_of[m.id]}) : null,
+        m.deleted ? h('span', {class: 'chip bad', text: 'deleted'}) : null)));
 }
 function renderMessages() {
-  const node = clear('messages'), channel = $('channel').value, query = $('search').value.trim().toLocaleLowerCase();
-  const messages = list(snapshot.messages).filter(m => (!channel || m.conversation_id === channel) &&
-    (!query || [m.text, m.id, m.author_id, userName(snapshot, m.author_id)].join(' ').toLocaleLowerCase().includes(query)));
-  messages.sort((a,b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
-  $('workspaceStats').textContent = messages.length + ' of ' + list(snapshot.messages).length + ' messages · ' + list(snapshot.users).length + ' users · ' + list(snapshot.conversations).length + ' channels';
-  if (!messages.length) note(node, snap(attempt) ? 'No messages match these filters.' : 'No candidate snapshot in this artifact.');
-  for (const m of messages) node.append(messageCard(m, snapshot));
+  const box = document.getElementById('msgs');
+  if (!box) return;
+  const q = S.search.trim().toLowerCase();
+  const W = V();
+  const rows = list(W.world.messages).filter(m => m.conversation_id === S.conv && !m.thread_root_id && (!q || (m.text + ' ' + personName(m.author_id)).toLowerCase().includes(q)
+    || list(W.replies[m.id]).some(r => r.text.toLowerCase().includes(q)))).sort((a, b) => a.timestamp < b.timestamp ? -1 : 1);
+  box.replaceChildren(...(rows.length ? rows.map(m => messageRow(m)) : [empty('No messages')]));
+  if (S.message) document.getElementById('m-' + S.message)?.scrollIntoView({block: 'center'});
 }
-function stable(value) {
-  if (Array.isArray(value)) return value.map(stable);
-  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(k => [k, stable(value[k])]));
-  return value;
+function renderThread() {
+  const box = document.getElementById('thread');
+  if (!box) return;
+  const W = V(), root = W.msgs[S.message];
+  if (!root) { box.replaceChildren(label('Thread'), empty('Select a message’s replies, or an evidence link')); return; }
+  const scene = X.scenes[R.scene_of[root.id]];
+  box.replaceChildren(label('Thread'), messageRow(root, true), ...list(W.replies[root.id]).map(m => messageRow(m, true)),
+    scene ? h('div', {class: 'card', style: 'margin-top:14px'}, label('Scene · ' + scene.id),
+      h('p', {class: 'small', text: scene.situation}),
+      h('p', {class: 'small faint mono', text: `${scene.start} → ${scene.end} · ${list(scene.participant_ids).map(personName).join(', ')}`}),
+      list(scene.beats).length ? h('div', {}, label('Beats'), list(scene.beats).map(b => spoil(h('p', {class: 'small'}, h('span', {class: 'chip', text: b.fact_id}),
+        `${personName(b.author_id)} states ${X.facts[b.fact_id]?.predicate || ''}: ${X.facts[b.fact_id]?.value || ''}`)))) : null,
+      scene.revision_note ? h('p', {class: 'small warn'}, h('span', {class: 'label', text: 'Revision note  '}), scene.revision_note) : null,
+      list(scene.promises).length ? h('div', {}, label('Promises left open'), list(scene.promises).map(p => h('p', {class: 'small muted', text: p}))) : null) : null);
+  requestAnimationFrame(() => document.getElementById('m-' + root.id)?.scrollIntoView({block: 'nearest'}));
 }
-const equal = (a,b) => JSON.stringify(stable(a)) === JSON.stringify(stable(b));
-function renderDiff() {
-  const node = clear('diff'), artifacts = list(run?.attempts);
-  const a = snap(artifacts[Number($('before').value)]), b = snap(artifacts[Number($('after').value)]);
-  const leftCatalog = artifacts[Number($('before').value)]?.catalog;
-  const rightCatalog = artifacts[Number($('after').value)]?.catalog;
-  if (leftCatalog && rightCatalog && !hidden() && !equal(leftCatalog, rightCatalog)) {
-    const d = el('details'); d.append(el('summary', 'Private catalog changed · before / after'));
-    const pair = el('div', null, 'pair');
-    for (const [label, value] of [['Before', leftCatalog], ['After', rightCatalog]]) {
-      const side = el('div'); side.append(el('h3', label), el('pre', fmt(value))); pair.append(side);
+
+/* ---------- tasks ---------- */
+function solvesFor(t) {
+  const review = R.task_reviews?.[t];
+  if (review?.results?.length) return review.results;
+  for (const a of [...R.attempts].reverse()) {
+    const solves = list((a.reviews?.[t] || a.reviews?.tasks)?.solves).filter(s => s.task_id === t);
+    if (solves.length) return solves;
+  }
+  return [];
+}
+function tasks() {
+  const all = list(X.cat.tasks);
+  if (!all.length) return empty('No catalog yet');
+  if (!S.task || !X.tasks[S.task]) S.task = all[0].id;
+  const t = X.tasks[S.task];
+  const left = h('div', {class: 'tlist'}, all.map(x => h('button', {type: 'button', class: 'titem' + (x.id === S.task ? ' on' : ''), onclick: () => { S.task = x.id; render(); }},
+    h('div', {}, h('span', {class: 'mono small', text: x.id}), ' ', h('span', {class: 'faint small mono', text: x.group_id})),
+    h('div', {class: 'small clamp', text: x.question}), h('div', {}, solveDots(solvesFor(x.id))))));
+  return h('div', {class: 'tasks'}, left, taskDetail(t));
+}
+function taskDetail(t) {
+  const reader = X.people[t.actor_id], persona = X.personas[t.actor_id];
+  const binding = R.bindings?.[t.id];
+  const solves = solvesFor(t.id);
+  let verdict = null;
+  for (const a of [...R.attempts].reverse()) {
+    const own = a.reviews?.[t.id]?.verdict, batch = a.reviews?.tasks?.verdict;
+    if (own) { verdict = [a.id, own]; break; }
+    if (batch && list(batch.tasks).some(r => r.task_id === t.id)) {
+      verdict = [a.id + ' · batch', {...batch, issues: list(batch.issues).filter(i => !list(i.task_ids).length || i.task_ids.includes(t.id))}];
+      break;
     }
-    d.append(pair); node.append(d);
   }
-  if (!a || !b) {
-    $('diffStats').textContent = 'World comparison needs two snapshots. Unhide private details to inspect changed catalogs below. A missing snapshot is not an empty world.';
-    return;
-  }
-  const before = new Map(list(a.messages).map(m => [m.id,m])), after = new Map(list(b.messages).map(m => [m.id,m]));
-  const counts = {added:0, removed:0, text:0, metadata:0, unchanged:0};
-  const rows = [];
-  for (const id of new Set([...before.keys(), ...after.keys()])) {
-    const left = before.get(id), right = after.get(id), types = [];
-    if (!left) { counts.added++; types.push('Added'); }
-    else if (!right) { counts.removed++; types.push('Removed'); }
-    else {
-      if (!equal(left.text,right.text)) { counts.text++; types.push('Text changed'); }
-      const metadata = m => Object.fromEntries(Object.entries(m).filter(([key]) => key !== 'text'));
-      if (!equal(metadata(left),metadata(right))) { counts.metadata++; types.push('Metadata changed'); }
-      if (!types.length) counts.unchanged++;
-    }
-    if (types.length) rows.push({id,left,right,types});
-  }
-  $('diffStats').textContent = `${counts.added} added · ${counts.removed} removed · ${counts.text} text changes · ${counts.metadata} metadata changes · ${counts.unchanged} unchanged. Text and metadata counts can overlap.`;
-  for (const field of ['users','conversations']) {
-    if (!equal(a[field],b[field])) {
-      const d = el('details'); d.append(el('summary', field === 'users' ? 'User directory changed' : 'Channel directory changed'));
-      const pair = el('div', null, 'pair');
-      for (const [label, value] of [['Before',a[field]],['After',b[field]]]) { const side = el('div'); side.append(el('h3',label),el('pre',fmt(value ?? []))); pair.append(side); }
-      d.append(pair); node.append(d);
-    }
-  }
-  if (!rows.length) note(node, 'No message changes.');
-  for (const {id,left,right,types} of rows) {
-    const row = el('section', null, 'diffrow'); row.append(el('h3',id));
-    for (const type of types) row.append(el('span',type,'badge ' + (type === 'Added' ? 'added' : type === 'Removed' ? 'removed' : 'changed')));
-    const pair = el('div',null,'pair');
-    for (const [label,m,s] of [['Before',left,a],['After',right,b]]) {
-      const side = el('div'); side.append(el('div',label,'eyebrow'));
-      if (m) side.append(messageCard(m,s,false)); else note(side,'Not present');
-      pair.append(side);
-    }
-    row.append(pair); node.append(row);
-  }
+  const evidence = new Set(list(binding?.claims).flatMap(c => c.message_ids));
+  return h('div', {},
+    h('div', {class: 'card'}, label(`${t.id} · ${t.group_id}`), h('div', {class: 'q', text: t.question}),
+      h('span', {class: 'chip', text: 'reader · ' + (reader?.name || t.actor_id) + (persona ? ' · ' + persona.role : '')}),
+      h('span', {class: 'chip', text: `${t.category} · level ${t.level}`}),
+      h('span', {class: 'chip', text: 'solve rate · ' + pct(R.task_reviews?.[t.id]?.solve_rate)})),
+    h('div', {class: 'card', style: 'margin-top:12px'}, label('Answer'),
+      spoil(h('p', {style: 'font-size:16px', text: t.answer.canonical_answer})),
+      list(t.answer.required_claims).map((claim, k) => {
+        const ev = list(binding?.claims).find(c => c.claim_index === k);
+        return h('div', {class: 'step'}, h('div', {class: 'k', text: String(k).padStart(2, '0')}),
+          h('div', {}, spoil(h('div', {text: claim})), S.spoilers ? list(ev?.message_ids).map(id => evidenceCard(id)) : null,
+            S.spoilers ? list(ev?.user_ids).map(u => h('span', {class: 'chip ev', text: 'directory · ' + personName(u)})) : null));
+      }),
+      spoil(h('p', {class: 'small muted'}, h('span', {class: 'label', text: 'Reasoning  '}), t.reasoning)),
+      S.spoilers ? h('div', {}, label('Facts'), list(t.fact_ids).map(f => X.facts[f] ? h('p', {class: 'small'}, h('span', {class: 'chip', text: f}),
+        `${X.facts[f].subject} · ${X.facts[f].predicate}: ${X.facts[f].value}`, h('span', {class: 'faint mono', text: `  from ${X.facts[f].valid_from}${X.facts[f].valid_until ? ' until ' + X.facts[f].valid_until : ''}`})) : null)) : null),
+    h('div', {class: 'card', style: 'margin-top:12px'}, label('Gold query'), h('p', {class: 'small muted', text: 'Runs as the reader sees the world: channels they cannot read do not exist for it. Its rows are the answer.'}),
+      t.gold_sql ? spoil(h('pre', {class: 'small mono', style: 'white-space:pre-wrap', text: t.gold_sql})) : empty('No gold query')),
+    h('div', {class: 'card', style: 'margin-top:12px'}, label(`Independent solves (${solves.length})`),
+      solves.length ? h('div', {class: 'solves'}, solves.map((s, k) => solveCard(s, k, evidence))) : empty('No solves recorded')),
+    verdict ? h('div', {class: 'card', style: 'margin-top:12px'}, label(`Task judge · ${verdict[0]}`), status(verdict[1].approved),
+      h('p', {text: verdict[1].summary}), Object.entries(verdict[1].criteria || {}).map(([k, v]) => h('div', {class: 'small'}, meter(v), ' ', h('span', {class: 'faint', text: k}))),
+      issueList(list(verdict[1].issues))) : null);
 }
-function selectAttempt() {
-  attempt = list(run?.attempts)[Number($('attempt').value)] || {};
-  snapshot = snap(attempt) || {};
-  tasks = list(attempt.tasks?.tasks ?? attempt.tasks);
-  if (!tasks.length) tasks = list(attempt.catalog?.tasks);
-  options('task', tasks.map((t,i) => [i,t.id + ' · ' + (t.question || '').slice(0,80)]),0);
-  const source = clear('sources'); note(source, 'Run path: ' + (run?.path || 'Not supplied'));
-  raw(source,'Source paths',attempt.source);
-  if (!hidden()) raw(source,'Run summary',run?.summary);
-  $('status').textContent = `${run?.name || 'No run'} · ${attemptLabel(attempt) || 'No attempts'} · ${tasks.length} tasks`;
-  options('channel',[['','All channels'],...list(snapshot.conversations).map(c => [c.id,`${c.name || c.id} · ${c.kind || 'channel'}${c.is_archived ? ' · archived' : ''}`])],'');
-  $('search').value = ''; clear('threadContent');
-  const users = clear('users');
-  for (const u of list(snapshot.users)) users.append(button((u.name || u.id) + ' · ' + u.id,() => openUser(u.id)));
-  raw(users,'Channel membership and metadata',snapshot.conversations);
-  renderTask(); renderCatalog(); renderReview(); renderMessages();
-  const rows = list(run?.attempts).map((a,i) => [i,attemptLabel(a)]), index = Number($('attempt').value) || 0;
-  options('before',rows,Math.max(0,index-1)); options('after',rows,index); renderDiff();
+function evidenceCard(id) {
+  const m = X.msgs[id];
+  if (!m) return h('span', {class: 'chip bad', text: id + ' (missing)'});
+  const c = X.convs[m.conversation_id];
+  return h('button', {class: 'evmsg', type: 'button', onclick: () => openMessage(id)},
+    h('div', {class: 'small'}, h('b', {text: personName(m.author_id)}), h('span', {class: 'when', text: `${utc(m.timestamp)} · ${c?.name || c?.kind || ''}`})),
+    h('div', {class: 'text small', text: m.text}));
 }
-function selectRun() {
-  run = runs[Number($('run').value)];
-  options('attempt',list(run?.attempts).map((a,i) => [i,attemptLabel(a)]),Math.max(0,list(run?.attempts).length-1));
-  selectAttempt();
+function solveCard(s, k, evidence) {
+  const trace = X.traces[s.solver_trace_id] || null;
+  const good = s.correct && s.grounded;
+  return h('div', {class: 'card', style: 'background:var(--bg)'},
+    h('div', {}, h('span', {class: 'mono small', text: `solve ${k + 1}  `}), h('span', {class: 'chip ' + (s.correct ? 'good' : 'bad'), text: s.correct ? '✓ correct' : '✕ wrong'}),
+      h('span', {class: 'chip ' + (s.grounded ? 'good' : 'warn'), text: s.grounded ? '✓ grounded' : '! ungrounded'}), h('span', {class: 'chip', text: `${s.read_count ?? '–'} reads`})),
+    trace?.route ? h('div', {style: 'margin:8px 0'}, trace.route.map((r, i) => h('div', {class: 'small mono'},
+      `${i + 1}. ${r.call.action}(${Object.entries(r.call.arguments || {}).filter(([, v]) => v !== null).map(([a, v]) => `${a}=${JSON.stringify(v)}`).join(', ')})`,
+      S.spoilers && r.messages.some(m => evidence.has(m)) ? h('span', {class: 'chip ev', text: 'hits evidence'}) : null))) : null,
+    h('details', {}, h('summary', {class: 'label', text: 'Answer'}), h('div', {class: 'pre small', text: s.response || ''})),
+    s.reason ? h('p', {class: 'small muted', text: s.reason}) : null,
+    trace ? h('button', {class: 'linkish', type: 'button', text: 'open trace', onclick: () => go('traces', {trace: trace.id})}) : null);
 }
-$('run').onchange = selectRun; $('attempt').onchange = selectAttempt;
-$('task').onchange = () => { clear('threadContent'); renderTask(); renderReview(); };
-$('hide').onchange = () => {
-  clear('threadContent'); renderTask(); renderCatalog(); renderReview(); renderDiff();
-  const source = clear('sources'); note(source,'Run path: ' + (run?.path || 'Not supplied'));
-  raw(source,'Source paths',attempt.source); if (!hidden()) raw(source,'Run summary',run?.summary);
-};
-$('channel').onchange = renderMessages; $('search').oninput = renderMessages;
-$('before').onchange = renderDiff; $('after').onchange = renderDiff;
-options('run',runs.map((r,i) => [i,r.name || r.path || 'Run ' + (i+1)]),0);
-if (data) selectRun();
+
+/* ---------- cast ---------- */
+function measured(id) {
+  const texts = list(X.world.messages).filter(m => m.author_id === id && !m.deleted).map(m => m.text.trim());
+  if (!texts.length) return null;
+  const words = texts.map(t => t.split(/\s+/).filter(Boolean).length).sort((a, b) => a - b);
+  const mid = words.length / 2, share = f => texts.filter(f).length / texts.length;
+  return {messages: texts.length, median_words: words.length % 2 ? words[Math.floor(mid)] : (words[mid - 1] + words[mid]) / 2,
+    short_share: words.filter(w => w <= 4).length / texts.length, question_share: share(t => t.includes('?')), lowercase_share: share(t => /^[a-z]/.test(t)),
+    emoji_share: share(t => /:[a-z0-9_+-]+:|\p{Extended_Pictographic}/u.test(t))};
+}
+function cast() {
+  const people = list(X.cat.people);
+  if (!people.length) return empty('No catalog yet');
+  const keys = [['median_words', 'median words', v => (+v).toFixed(v % 1 ? 1 : 0)], ['short_share', '≤ 4 words', pct], ['question_share', 'questions', pct], ['lowercase_share', 'lowercase start', pct], ['emoji_share', 'emoji', pct]];
+  return h('div', {}, h('p', {class: 'small muted', text: 'Typing targets come from real Slack users; measured values are this world’s messages by each person.'}),
+    h('div', {class: 'people'}, people.map(p => {
+      const persona = X.personas[p.id] || {}, prof = persona.profile, got = measured(p.id);
+      return h('div', {class: 'card'},
+        h('div', {style: 'display:flex;gap:10px;align-items:center'}, h('div', {class: 'av', text: initials(p.name)}),
+          h('div', {}, h('div', {style: 'font-weight:600', text: p.name}), h('div', {class: 'small muted', text: [persona.role, persona.seniority, p.team].filter(Boolean).join(' · ')}))),
+        h('p', {class: 'small mono faint', text: [persona.timezone, prof && `${prof.age} · ${prof.city}, ${prof.state}`, prof && prof.occupation].filter(Boolean).join(' · ')}),
+        persona.voice ? h('p', {class: 'small'}, h('span', {class: 'label', text: 'Voice  '}), persona.voice) : null,
+        prof ? h('details', {}, h('summary', {class: 'label', text: 'Profile'}), h('p', {class: 'small', text: prof.persona}), h('p', {class: 'small muted', text: prof.cultural_background}),
+          h('div', {}, list(prof.hobbies).map(x => h('span', {class: 'chip', text: x})))) : null,
+        h('table', {style: 'margin-top:8px'}, h('tr', {}, h('th', {text: 'typing'}), h('th', {class: 'num', text: 'target'}), h('th', {class: 'num', text: 'measured'})),
+          keys.map(([k, name, f]) => h('tr', {}, h('td', {class: 'small', text: name}), h('td', {class: 'num small', text: prof?.typing ? f(prof.typing[k]) : '–'}),
+            h('td', {class: 'num small', text: got ? f(got[k]) : '–'})))),
+        h('p', {class: 'small faint mono', text: got ? `${got.messages} messages` : 'never posts'}));
+    })));
+}
+
+/* ---------- traces ---------- */
+function traces() {
+  const rows = R.traces.filter(t => !S.role || t.role === S.role);
+  const sel = X.traces[S.trace];
+  const table = h('div', {class: 'card', style: 'overflow-x:auto'},
+    h('div', {style: 'margin-bottom:10px'}, ['', ...ROLES].map(r => h('button', {class: 'btn', type: 'button', 'aria-pressed': String(S.role === r), style: 'margin-right:6px',
+      text: r || 'all', onclick: () => { S.role = r; render(); }}))),
+    h('table', {}, h('tr', {}, ['at', 'role', 'attempt', 'task / scene', 'dur', 'input', 'cached', 'output', 'cost', ''].map((c, i) => h('th', {class: i > 3 ? 'num' : '', text: c}))),
+      rows.map(t => h('tr', {class: 'click' + (S.trace === t.id ? ' on' : ''), onclick: () => { S.trace = t.id; render(); }},
+        h('td', {class: 'mono small', text: dur(t.start - X.t0)}), h('td', {class: 'mono small', text: t.role}),
+        h('td', {class: 'mono small', text: Object.entries(X.byAttempt).find(([, v]) => v.includes(t))?.[0] || ''}),
+        h('td', {class: 'mono small', text: t.task_id || t.scene_id || ''}), h('td', {class: 'num small', text: dur((t.end || t.start) - t.start)}),
+        h('td', {class: 'num small', text: num(t.input_tokens)}), h('td', {class: 'num small', text: num(t.cached_tokens)}), h('td', {class: 'num small', text: num(t.output_tokens)}),
+        h('td', {class: 'num small', text: t.cost === null ? 'unpriced' : usd(t.cost)}), h('td', {}, t.ok === false ? h('span', {class: 'chip bad', text: '✕'}) : null)))));
+  return h('div', {class: 'split'}, table, sel ? traceDetail(sel) : h('div', {class: 'card'}, empty('Select an agent run')));
+}
+function traceDetail(t) {
+  return h('div', {class: 'card', style: 'align-self:start;position:sticky;top:110px;max-height:calc(100vh - 130px);overflow:auto'},
+    label(t.role + ' · ' + t.model), h('div', {class: 'mono small', text: t.id}),
+    h('pre', {class: 'pre small mono muted', text: traceTip(t)}),
+    t.evaluation ? h('div', {}, label('Evaluation'), h('p', {}, status(t.evaluation.correct, 'correct', 'wrong'), status(t.evaluation.grounded, 'grounded', 'ungrounded')),
+      h('div', {class: 'pre small', text: t.evaluation.response || ''}), h('p', {class: 'small muted', text: t.evaluation.reason || ''})) : null,
+    t.route ? h('div', {}, label('Reads'), t.route.map((r, i) => h('div', {class: 'small mono', text: `${i + 1}. ${r.call.action} ${JSON.stringify(Object.fromEntries(Object.entries(r.call.arguments || {}).filter(([, v]) => v !== null)))} → ${r.messages.length} msgs`}))) : null,
+    t.messages ? h('div', {}, label(`Transcript (${t.messages.length})`), t.messages.map(m => h('details', {open: m.role !== 'system' ? true : null},
+      h('summary', {class: 'label', text: m.role + (m.tool_calls?.length ? ` · ${m.tool_calls.length} tool call(s)` : '')}),
+      h('div', {class: 'pre small', text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 1)}),
+      m.tool_calls?.length ? h('div', {class: 'pre small mono muted', text: JSON.stringify(m.tool_calls, null, 1)}) : null)))
+      : h('p', {class: 'small faint', text: 'Transcripts are embedded only when the page is built with --traces.'}));
+}
+
+try { const saved = localStorage.getItem('worldgen-theme'); if (saved) document.documentElement.dataset.theme = saved; } catch (e) { /* storage may be unavailable */ }
+if (DATA.runs.length) load(); else document.getElementById('main').replaceChildren(empty('No runs embedded'));
 </script>
 </body>
 </html>
