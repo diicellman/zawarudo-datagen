@@ -11,8 +11,8 @@ from urllib.request import urlopen
 from pydantic import Field, model_validator
 
 from generators.worldgen_slack.contracts import SeedExample, SeedMessage, SeedPacket, SEED_MAX_BYTES
-from worldgen_slack.slack.api import digest
-from worldgen_slack.slack.models import NonEmptyText, SafeId, StrictModel
+from worldgen_slack.db import digest
+from worldgen_slack.dataset import NonEmptyText, SafeId, StrictModel
 from worldgen_slack.dataset import atomic_json
 
 ROOT = Path(__file__).resolve().parents[2]

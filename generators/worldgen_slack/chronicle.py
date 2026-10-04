@@ -1,0 +1,605 @@
+"""The world written in time order (v7): one author plans the ledger and its events, posts each conversation at the
+world's present, and moves the present forward. Code checks every step, owns every time, and never writes into the
+past. Pure functions over `World`; the author's tools (`agents/world.py`) call them inside `World.trial()`."""
+
+import json
+import statistics
+from datetime import date, datetime
+from typing import Literal, Self
+from zoneinfo import ZoneInfo
+
+from pydantic import Field, model_validator
+from worldgen_slack.dataset import NonEmptyText, SafeId, StrictModel
+
+from .contracts import (
+    MENTION,
+    PARTS,
+    PLACEHOLDER,
+    TIME_LITERAL,
+    Clock,
+    Ids,
+    Moment,
+    Reaction,
+    Storyline,
+    Task,
+    Zone,
+    activity,
+    at,
+    check_facts,
+    clock,
+    insert_lines,
+    measures,
+    normalized,
+    record_tasks,
+    render,
+    text_errors,
+    window,
+    world_meta,
+)
+
+# ---------------------------------------------------------------------- the documents the author writes
+
+
+class Event(StrictModel):
+    """A moment of the story that facts and messages refer to: a calendar day, a time, and the clock it is told on
+    (the company's when unset)."""
+
+    id: SafeId
+    storyline: SafeId
+    title: NonEmptyText
+    day: int = Field(ge=1)
+    time: Clock
+    zone: Zone | None = None
+
+
+class PlanFact(StrictModel):
+    """What someone states in Slack, and where it is first stated: by its author, in its channel, on its day."""
+
+    id: SafeId
+    storyline: SafeId
+    subject: NonEmptyText
+    attribute: NonEmptyText
+    value: NonEmptyText
+    anchor: str | None = None
+    channel_id: SafeId
+    author_id: SafeId
+    day: int = Field(ge=1)
+    after: Ids = Field(default_factory=list)
+    supersedes: SafeId | None = None
+    event: SafeId | None = None
+    kind: Literal["happened", "scheduled"] | None = None
+    decoy: bool = False
+    summary: NonEmptyText
+
+    @model_validator(mode="after")
+    def about_an_event(self) -> Self:
+        if (self.event is None) != (self.kind is None):
+            raise ValueError(
+                f"{self.id}: a fact about an event names it and whether it happened or is scheduled"
+            )
+        return self
+
+
+class Plan(StrictModel):
+    storylines: list[Storyline] = Field(min_length=1)
+    events: list[Event] = Field(default_factory=list)
+    facts: list[PlanFact] = Field(min_length=1)
+
+
+class Commit(StrictModel):
+    """A promise the line makes, due by the end of a calendar day."""
+
+    id: SafeId
+    text: NonEmptyText
+    due_day: int = Field(ge=1)
+
+
+class Close(StrictModel):
+    """How an open promise ends: kept, changed or dropped."""
+
+    id: SafeId
+    status: Literal["kept", "changed", "dropped"]
+
+
+class PostLine(StrictModel):
+    author_id: SafeId
+    text: NonEmptyText
+    reply_to: int | None = Field(default=None, ge=0)
+    conveys: Ids = Field(default_factory=list)
+    pause: Literal["", "hours"] = ""
+    reactions: list[Reaction] = Field(default_factory=list)
+    commits: list[Commit] = Field(default_factory=list)
+    closes: list[Close] = Field(default_factory=list)
+
+
+class Conversation(StrictModel):
+    """One stretch of talk in one channel, posted at the present. `thread` continues an earlier thread of the channel:
+    every line then replies in it."""
+
+    channel_id: SafeId
+    about: NonEmptyText
+    thread: int | None = None
+    lines: list[PostLine] = Field(min_length=1, max_length=40)
+
+
+# ---------------------------------------------------------------------- the clock
+
+
+def start_clock(world) -> None:
+    """From now on the world only grows forward: its present moves to day 1 at the start of the early part."""
+    world.db.execute(
+        "UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(window(world, 1, "early")[0]),)
+    )
+    world.insert("world_meta", [{"key": "chronological", "value": "1"}])
+
+
+def present(world) -> int:
+    return int(world_meta(world, "now_us"))
+
+
+def today(world) -> int | None:
+    """The calendar day of the present; None once the last day is closed."""
+    row = world.db.execute(
+        "SELECT day FROM calendar WHERE start_us <= ? AND ? < end_us", (present(world), present(world))
+    ).fetchone()
+    return row[0] if row else None
+
+
+def part_of(world, moment_us: int) -> str:
+    hour = datetime.fromtimestamp(moment_us / 1e6, ZoneInfo(world_meta(world, "zone"))).hour
+    return next((p for p, (start, end) in PARTS.items() if start <= hour < end), "early")
+
+
+def moments(world) -> dict[str, int]:
+    """What {at:id} may name: every event, and every fact that carries a moment."""
+    rows = world.db.execute(
+        "SELECT id, moment_us FROM events UNION ALL SELECT id, moment_us FROM facts WHERE moment_us IS NOT NULL"
+    )
+    return {r[0]: r[1] for r in rows}
+
+
+def bounds(world, day: int) -> tuple[int, int]:
+    return tuple(world.db.execute("SELECT start_us, end_us FROM calendar WHERE day = ?", (day,)).fetchone())
+
+
+def apportion(total: int, weights: list[float]) -> list[int]:
+    """Whole numbers in proportion to `weights` that add up to `total` (largest remainders)."""
+    exact = [total * w / sum(weights) if sum(weights) else 0.0 for w in weights]
+    counts = [int(x) for x in exact]
+    for i in sorted(range(len(exact)), key=lambda i: (counts[i] - exact[i], i))[: total - sum(counts)]:
+        counts[i] += 1
+    return counts
+
+
+def daily(dates: list[str], settings) -> list[dict]:
+    """Code's share of the world per calendar date and part: `[activity].messages` over the dates, a weekend day
+    weighing `[author].weekend` of a workday, and each day split by the parts' rhythm."""
+    weights = [settings.author.weekend if date.fromisoformat(d).weekday() >= 5 else 1.0 for d in dates]
+    rhythm = [settings.activity.parts.get(p, 0.0) for p in PARTS]
+    return [
+        {"messages": n, "parts": dict(zip(PARTS, apportion(n, rhythm)))}
+        for n in apportion(settings.activity.messages, weights)
+    ]
+
+
+def quotas(world, settings) -> dict[int, dict]:
+    days = world.db.execute("SELECT day, date FROM calendar ORDER BY day").fetchall()
+    return {day: quota for (day, _), quota in zip(days, daily([d for _, d in days], settings))}
+
+
+def posted(world, start_us: int, end_us: int) -> int:
+    return world.db.execute(
+        "SELECT COUNT(*) FROM messages WHERE ts_us >= ? AND ts_us < ?", (start_us, end_us)
+    ).fetchone()[0]
+
+
+# ---------------------------------------------------------------------- the ledger, planned and re-planned
+
+
+def fact_row(fact: PlanFact, events: dict[str, Event], moment: dict[str, int], zone: str) -> dict:
+    row = fact.model_dump(
+        include={
+            "id",
+            "storyline",
+            "subject",
+            "attribute",
+            "value",
+            "anchor",
+            "channel_id",
+            "author_id",
+            "day",
+            "summary",
+        }
+    ) | {"event_id": fact.event, "is_decoy": int(fact.decoy)}
+    if fact.event is None:
+        return row | {"moment_us": None, "moment_zone": None, "moment_kind": None}
+    return row | {
+        "moment_us": moment[fact.event],
+        "moment_zone": events[fact.event].zone or zone,
+        "moment_kind": fact.kind,
+    }
+
+
+def record_plan(world, plan: Plan, settings) -> None:
+    """The ledger in time order. Storylines are fixed once planned (summaries may change); an event, once planned,
+    never moves or goes; a stated fact keeps everything but its summary, while an unstated one may change or go and is
+    planned for today or later. A fact about an event carries the event's moment."""
+    count = -(-settings.tasks.count // settings.tasks.per_storyline)
+    if len(plan.storylines) != count:
+        raise ValueError(f"plan exactly {count} storylines")
+    ids = [x.id for x in (*plan.storylines, *plan.events, *plan.facts)]
+    if repeated := sorted({i for i in ids if ids.count(i) > 1}):
+        raise ValueError(f"storyline, event and fact ids are distinct; repeated {repeated}")
+    kept = [r[0] for r in world.db.execute("SELECT id FROM storylines ORDER BY position")]
+    if kept and kept != [s.id for s in plan.storylines]:
+        raise ValueError(f"the storylines are planned: keep {kept} in this order (summaries may change)")
+    check_facts(plan.facts, {s.id for s in plan.storylines})
+    day, zone = today(world), world_meta(world, "zone")
+    if day is None:
+        raise ValueError("the calendar is closed: the ledger is final")
+    events, moment = {e.id: e for e in plan.events}, {}
+    old = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM events")}
+    for e in plan.events:
+        if e.storyline not in {s.id for s in plan.storylines}:
+            raise ValueError(f"{e.id}: storyline {e.storyline} is not in storylines")
+        if TIME_LITERAL.search(e.title):
+            raise ValueError(f"{e.id}: a title has no time or date in it; day and time say when")
+        moment[e.id] = at(world, Moment(day=e.day, time=e.time, zone=e.zone or zone))
+        if e.id in old and (old[e.id]["moment_us"], old[e.id]["zone"], old[e.id]["title"]) != (
+            moment[e.id],
+            e.zone or zone,
+            e.title,
+        ):
+            raise ValueError(
+                f"{e.id} is planned: an event never moves; a change of plan is a new event, with a fact that "
+                "supersedes the old one"
+            )
+    if gone := sorted(old.keys() - events.keys()):
+        raise ValueError(f"planned events stay in the ledger: {gone}")
+    members = {
+        (r[0], r[1])
+        for r in world.db.execute("SELECT channel_id, user_id FROM members WHERE left_us IS NULL")
+    }
+    stated = {r[0] for r in world.db.execute("SELECT DISTINCT fact_id FROM evidence")}
+    current = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
+    relations = {
+        (r[0], r[1], r[2]) for r in world.db.execute("SELECT src_fact, dst_fact, kind FROM fact_relations")
+    }
+    planned = {f.id: f for f in plan.facts}
+    if gone := sorted(stated - planned.keys()):
+        raise ValueError(f"stated facts stay in the ledger: {gone}")
+    rows = {}
+    for f in plan.facts:
+        if f.event is not None and f.event not in events:
+            raise ValueError(f"{f.id}: event {f.event} is not in events")
+        rows[f.id] = fact_row(f, events, moment, zone)
+        mine = {(f.id, d, "after") for d in f.after} | (
+            {(f.id, f.supersedes, "supersedes")} if f.supersedes else set()
+        )
+        if f.id in stated:
+            if {k: v for k, v in rows[f.id].items() if k != "summary"} != {
+                k: current[f.id][k] for k in rows[f.id] if k != "summary"
+            } or mine != {r for r in relations if r[0] == f.id}:
+                raise ValueError(f"{f.id} is stated: only its summary may change")
+            continue
+        if (f.channel_id, f.author_id) not in members:
+            raise ValueError(f"{f.id}: its author {f.author_id} is a member of {f.channel_id}")
+        if f.day < day:
+            raise ValueError(f"{f.id}: an unstated fact is planned for today (day {day}) or later")
+        if f.kind == "happened" and f.day < events[f.event].day:
+            raise ValueError(f"{f.id}: what happened is first stated on or after the day of {f.event}")
+        earlier = [*f.after, *([f.supersedes] if f.supersedes else [])]
+        if later := [d for d in earlier if planned[d].day > f.day]:
+            raise ValueError(f"{f.id} comes after {later}, which are first stated on a later day")
+    with world.batch():
+        if kept:
+            for s in plan.storylines:
+                world.db.execute("UPDATE storylines SET summary = ? WHERE id = ?", (s.summary, s.id))
+        else:
+            world.insert(
+                "storylines", [s.model_dump() | {"position": i} for i, s in enumerate(plan.storylines, 1)]
+            )
+        world.insert(
+            "events",
+            [
+                dict(
+                    id=e.id, storyline=e.storyline, title=e.title, moment_us=moment[e.id], zone=e.zone or zone
+                )
+                for e in plan.events
+                if e.id not in old
+            ],
+        )
+        world.db.execute("DELETE FROM fact_relations")
+        unstated = [f for f in current if f not in stated]
+        world.db.execute(f"DELETE FROM facts WHERE id IN ({', '.join('?' * len(unstated))})", unstated)
+        world.insert("facts", [rows[f] for f in planned if f not in stated])
+        for f in stated:
+            world.db.execute("UPDATE facts SET summary = ? WHERE id = ?", (planned[f].summary, f))
+        world.insert(
+            "fact_relations",
+            [
+                dict(src_fact=f.id, dst_fact=d, kind="after")
+                for f in plan.facts
+                for d in dict.fromkeys(f.after)
+            ]
+            + [
+                dict(src_fact=f.id, dst_fact=f.supersedes, kind="supersedes")
+                for f in plan.facts
+                if f.supersedes
+            ],
+        )
+
+
+# ---------------------------------------------------------------------- conversations, at the present
+
+
+def opening(world, settings, rng, now: int, day: int) -> int:
+    """How long the present waits before a conversation starts: the part's remaining time, spread over the
+    conversations its quota still holds."""
+    part = part_of(world, now)
+    start, end = window(world, day, part)
+    left = max(quotas(world, settings)[day]["parts"][part] - posted(world, start, now), 1)
+    conversations = max(1, round(left / settings.activity.conversation_lines))
+    return int(rng.random() * 2 * max(end - now, 0) / (conversations + 1)) + rng.randrange(
+        1_000_000, 60_000_000
+    )
+
+
+def stated_anchors(facts: dict[str, dict], text: str) -> list[str]:
+    """The facts whose anchor the text contains."""
+    said = f" {normalized(PLACEHOLDER.sub(' ', text))} "
+    return [f for f, x in facts.items() if x["anchor"] and f" {normalized(x['anchor'])} " in said]
+
+
+def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
+    """One conversation at the present, in one channel among its members. A line that contains a planned fact's
+    anchor states that fact and lists it in conveys; a fact's first statement is its planned author's, in its planned
+    channel, on its planned day. Code times each line after the last, before midnight, and moves the present to the
+    last line; promises open and close with the lines that make and settle them."""
+    day = today(world)
+    if day is None:
+        raise ValueError("the calendar is closed; nothing more is posted")
+    start, end = bounds(world, day)
+    lines, channel = conversation.lines, conversation.channel_id
+    if world.db.execute("SELECT 1 FROM channels WHERE id = ?", (channel,)).fetchone() is None:
+        raise ValueError(f"no channel {channel}")
+    facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
+    moment = moments(world)
+    errors = []  # members post and react, and replies stay in their channel's threads: the world file's triggers
+    for i, line in enumerate(lines):
+        if line.author_id in {r.user_id for r in line.reactions}:
+            errors.append(f"line {i}: nobody reacts to their own line")
+        if untagged := [f for f in stated_anchors(facts, line.text) if f not in line.conveys]:
+            errors.append(
+                f"line {i}: it contains the anchors of {untagged}, so it states them: list them in conveys"
+            )
+    errors += text_errors(world, lines, set(facts), set(moment))
+    anchored = {r[0] for r in world.db.execute("SELECT fact_id FROM evidence WHERE role = 'anchor'")}
+    follows = {}
+    for src, dst in world.db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind IN ('after', 'supersedes')"):  # fmt: skip
+        follows.setdefault(src, []).append(dst)
+    first = set()
+    for i, line in enumerate(lines):
+        for f in line.conveys:
+            if f in facts and f not in anchored and f not in first:
+                x = facts[f]
+                if (channel, line.author_id, day) != (x["channel_id"], x["author_id"], x["day"]):
+                    errors.append(
+                        f"line {i}: {f} is first stated by {x['author_id']} in {x['channel_id']} on day {x['day']}"
+                    )
+                if pending := [d for d in follows.get(f, []) if d not in anchored and d not in first]:
+                    errors.append(f"line {i}: {f} comes after {pending}, which are not stated yet")
+                first.add(f)
+    if conversation.thread is not None and any(line.reply_to is not None for line in lines):
+        errors.append("in a continued thread every line replies to it: leave reply_to empty")
+    promises = {r["id"]: r["status"] for r in world.db.execute("SELECT id, status FROM commitments")}
+    days = {r[0] for r in world.db.execute("SELECT day FROM calendar")}
+    for i, line in enumerate(lines):
+        for c in line.commits:
+            if c.due_day < day or c.due_day not in days:
+                errors.append(f"line {i}: {c.id} is due today or on a later day of the calendar")
+        for c in line.closes:
+            if promises.get(c.id) != "open":
+                errors.append(f"line {i}: {c.id} is no open commitment")
+    if errors:
+        raise ValueError("; ".join(errors))
+    now = present(world)
+    stamps = [
+        now + (gaps.sample(rng, "hours") if lines[0].pause else opening(world, settings, rng, now, day))
+    ]
+    for line in lines[1:]:
+        stamps.append(stamps[-1] + gaps.sample(rng, line.pause))
+    if stamps[-1] >= end:
+        raise ValueError(
+            f"this conversation would run past midnight ({clock(world, stamps[-1])}); post fewer lines or pauses "
+            "today, or carry it on tomorrow"
+        )
+    number = world.db.execute("SELECT COUNT(*) FROM scenes WHERE day = ?", (day,)).fetchone()[0] + 1
+    conveyed = [f for line in lines for f in line.conveys]
+    scene = dict(
+        id=f"d{day:02d}-{number:03d}", channel_id=channel, day=day, part=part_of(world, stamps[0])
+    ) | dict(
+        storyline=facts[conveyed[0]]["storyline"] if conveyed else None,
+        slot_start_us=stamps[0],
+        slot_end_us=stamps[-1] + 1,
+        situation=conversation.about,
+        plan_json=json.dumps(conversation.model_dump(mode="json")),
+    )
+    with world.batch():
+        world.db.execute("UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(stamps[-1]),))
+        ids = insert_lines(world, scene, lines, stamps, moment, first, rng, gaps, conversation.thread, end)
+        for message, line in zip(ids, lines):
+            world.insert(
+                "commitments",
+                [
+                    dict(
+                        id=c.id,
+                        owner_id=line.author_id,
+                        text=c.text,
+                        message_id=message,
+                        due_us=bounds(world, c.due_day)[1],
+                    )
+                    for c in line.commits
+                ],
+            )
+            for c in line.closes:
+                world.db.execute(
+                    "UPDATE commitments SET status = ?, closed_by = ? WHERE id = ?", (c.status, message, c.id)
+                )
+    texts = {r[0]: r[1] for r in world.db.execute(f"SELECT id, text FROM messages WHERE id IN ({', '.join('?' * len(ids))})", ids)}  # fmt: skip
+    quota = quotas(world, settings)[day]["messages"]
+    return {
+        "conversation": scene["id"],
+        "messages": [
+            {"id": m, "at": clock(world, ts), "author": line.author_id, "text": texts[m]}
+            for m, ts, line in zip(ids, stamps, lines)
+        ],
+        "now": clock(world, stamps[-1]),
+        "today": f"{posted(world, start, end)} of about {quota} messages",
+    }
+
+
+# ---------------------------------------------------------------------- moving the present, closing a day
+
+
+def close_day(world, settings, day: int) -> list[str]:
+    """Why the day cannot close yet: its message count outside its quota's tolerance, a fact planned for it still
+    unstated, a promise due by its end still open, and, on the last day, the workspace's shares off their targets."""
+    start, end = bounds(world, day)
+    quota, slack, errors = quotas(world, settings)[day]["messages"], settings.author.tolerance, []
+    count = posted(world, start, end)
+    if not quota * (1 - slack) <= count <= quota * (1 + slack):
+        errors.append(f"{count} messages today; the day holds about {quota} (within {slack:.0%})")
+    for (fact,) in world.db.execute(
+        "SELECT id FROM facts f WHERE day = ? AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.fact_id = f.id AND e.role = 'anchor')",
+        (day,),
+    ):
+        errors.append(f"{fact} is planned for today: its author states it in its channel")
+    for (promise,) in world.db.execute(
+        "SELECT id FROM commitments WHERE status = 'open' AND due_us <= ?", (end,)
+    ):
+        errors.append(f"{promise} is due by today's end: keep it, change it or drop it in a message")
+    if day == world.db.execute("SELECT MAX(day) FROM calendar").fetchone()[0]:
+        measured = activity(world)
+        for share in ("reply_share", "reaction_rate", "dm_share"):
+            target = getattr(settings.activity, share)
+            if abs(measured[share] - target) > settings.author.share_tolerance:
+                errors.append(f"the workspace's {share} is {measured[share]}; its target is {target}")
+    return errors
+
+
+def advance(world, settings, to: str | None = None) -> dict:
+    """Move the present to the start of the next part of today, or of the part `to`. From the night it closes the
+    day, if the day can close, and moves to the next day's early part, or past the calendar's end."""
+    day = today(world)
+    if day is None:
+        raise ValueError("the calendar is closed")
+    now, order = present(world), list(PARTS)
+    part = part_of(world, now)
+    closed = False
+    if to is not None:
+        if to not in order[order.index(part) + 1 :]:
+            raise ValueError(
+                f"advance moves to a later part of today: one of {order[order.index(part) + 1 :]}"
+            )
+        target = window(world, day, to)[0]
+    elif part != "night":
+        target = window(world, day, order[order.index(part) + 1])[0]
+    else:
+        if errors := close_day(world, settings, day):
+            raise ValueError(f"day {day} stays open: " + "; ".join(errors))
+        last = world.db.execute("SELECT MAX(day) FROM calendar").fetchone()[0]
+        target, closed = (window(world, day + 1, "early")[0] if day < last else bounds(world, day)[1]), True
+    world.db.execute("UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(max(target, now)),))
+    return {
+        "now": clock(world, max(target, now)),
+        "closed_day": day if closed else None,
+        "today": today(world),
+    }
+
+
+def drift(world, cards: dict[str, dict], since_us: int = 0) -> dict[str, str]:
+    """Each person's messages since `since_us` beside the typing card they were given: what is far from it, by person."""
+    rows = world.db.execute("SELECT user_id, text FROM messages WHERE ts_us >= ? AND is_deleted = 0", (since_us,)).fetchall()  # fmt: skip
+    by = {}
+    for user, text in rows:
+        by.setdefault(user, []).append(text.strip())
+    notes = {}
+    for user, texts in sorted(by.items()):
+        card = cards.get(user)
+        if card is None or len(texts) < 4:
+            continue
+        share = lambda flags: sum(flags) / len(flags)  # noqa: E731
+        measured = {
+            "short_share": share([len(t.split()) <= 4 for t in texts]),
+            "long_share": share([len(t.split()) > 20 for t in texts]),
+            "question_share": share(["?" in t for t in texts]),
+            "lowercase_share": share([t[:1].islower() for t in texts]),
+        }
+        far = [
+            f"{k.removesuffix('_share')} {v:.2f} vs {card[k]:.2f}"
+            for k, v in measured.items()
+            if abs(v - card[k]) > 0.2
+        ]
+        median = statistics.median(len(t.split()) for t in texts)
+        if not card["median_words"] / 1.6 <= median <= card["median_words"] * 1.6:
+            far.append(f"median words {median:g} vs {card['median_words']:g}")
+        if far:
+            notes[user] = "; ".join(far)
+    return notes
+
+
+# ---------------------------------------------------------------------- fixes and tasks
+
+
+def revise(world, message_id: int, text: str) -> dict:
+    """A fix to one message's text where it stands: same author, time, thread and statements. Every rule runs again,
+    and no task's gold answer may change. Run inside `World.trial()`."""
+    row = world.db.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no message {message_id}")
+    facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
+    conveyed = [
+        r[0] for r in world.db.execute("SELECT fact_id FROM evidence WHERE message_id = ?", (message_id,))
+    ]
+    line = PostLine(author_id=row["user_id"], text=text, conveys=conveyed)
+    errors = text_errors(world, [line], set(conveyed), set(moments(world)))
+    if new := [f for f in stated_anchors(facts, text) if f not in conveyed]:
+        errors.append(f"a revision states nothing new: it contains the anchors of {new}")
+    if errors:
+        raise ValueError("; ".join(errors))
+    zone = world.db.execute("SELECT tz FROM users WHERE id = ?", (row["user_id"],)).fetchone()[0]
+    moment = moments(world)
+    rendered = PLACEHOLDER.sub(lambda m: render(moment[m[1]], zone, row["ts_us"]), text)
+    gold = {t["id"]: json.loads(t["gold_json"]) for t in world.db.execute("SELECT id, gold_json FROM tasks")}
+    with world.batch():
+        world.db.execute("UPDATE messages SET text = ? WHERE id = ?", (rendered, message_id))
+        world.db.execute("DELETE FROM message_mentions WHERE message_id = ?", (message_id,))
+        world.insert(
+            "message_mentions",
+            [dict(message_id=message_id, user_id=u) for u in dict.fromkeys(MENTION.findall(rendered))],
+        )
+    for task in world.db.execute("SELECT id, actor_id, gold_sql FROM tasks").fetchall():
+        if world.gold(task["actor_id"], task["gold_sql"], max_rows=50)["rows"] != gold[task["id"]]:
+            raise ValueError(f"the revision changes task {task['id']}'s gold answer")
+    return {"message": message_id, "text": rendered}
+
+
+def add_task(world, task: Task, settings, cells: list[tuple]) -> dict:
+    """One task for one of the world's cells, on the finished world; it replaces the cell's task, if any. Its gold
+    query is checked as v6 checks every task (T1-T7, readable facts, the level's spread). Returns its gold rows and
+    code's measures of how hard it is."""
+    if today(world) is not None:
+        raise ValueError("tasks are written once the calendar is closed")
+    cell = next((c for c in cells if (c[0], c[1]) == (task.category, task.level)), None)
+    if cell is None:
+        raise ValueError(f"a task fills one of the cells {[(c[0], c[1]) for c in cells]}")
+    replaced = [
+        r[0] for r in world.db.execute("SELECT id FROM tasks WHERE category = ? AND level = ?", cell[:2])
+    ]
+    marks = ", ".join("?" * len(replaced))
+    world.db.execute(f"DELETE FROM task_facts WHERE task_id IN ({marks})", replaced)
+    world.db.execute(f"DELETE FROM tasks WHERE id IN ({marks})", replaced)
+    record_tasks(world, [task], settings, [cell])  # every planned fact is stated once the calendar is closed
+    gold = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)
+    return {"task": task.id, "gold": gold["rows"]} | measures(world, task.id, gold["rows"], gold["tables"])

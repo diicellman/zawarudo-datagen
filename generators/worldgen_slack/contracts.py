@@ -1,32 +1,23 @@
-"""Private generation contracts and checks for a shared Slack workspace."""
+"""What agents write, how code turns it into the world, and the deterministic rules in between."""
 
+import bisect
 import json
 import random
 import re
 import statistics
 import unicodedata
 from collections import Counter, defaultdict
-from datetime import UTC, datetime
+from itertools import combinations
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
-from pydantic.json_schema import SkipJsonSchema
 
-from worldgen_slack.slack.models import (
-    QUALITY_CRITERIA,
-    AnswerSpec,
-    Conversation,
-    Message,
-    NonEmptyText,
-    SafeId,
-    SlackWorld,
-    StrictModel,
-    User,
-)
-
-from worldgen_slack.slack.api import SlackAPI, ReadCall, canonical, digest
+from worldgen_slack.db import World, canonical, digest
+from worldgen_slack.db import words
+from worldgen_slack.dataset import NonEmptyText, SafeId, StrictModel
 
 SEED_MAX_BYTES = 262_144
 SEED_MAX_MESSAGES = 512
@@ -83,86 +74,13 @@ def load_seed_packet(path: Path) -> SeedPacket:
     return SeedPacket.model_validate_json(raw)
 
 
-def _compact_identifier(value: str) -> str:
-    return "".join(char for char in unicodedata.normalize("NFKC", value).casefold() if char.isalnum())
-
-
 def _meaningful_tokens(value: str) -> set[str]:
     normalized = unicodedata.normalize("NFKC", value).casefold()
     return {token for token in re.findall(r"[^\W_]+", normalized) if len(token) >= 2}
 
 
-def _identifier_reveals(identifier: str, value: str, *, match_tokens: bool = True) -> bool:
-    segments = re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", identifier).casefold())
-    compact_value = _compact_identifier(value)
-    if len(compact_value) < 2:
-        return False
-    if any(
-        "".join(segments[start:end]) == compact_value
-        for start in range(len(segments))
-        for end in range(start + 1, len(segments) + 1)
-    ):
-        return True
-    compact_identifier = _compact_identifier(identifier)
-    candidates = [compact_identifier]
-    for prefix in ("conversation", "channel", "message", "user", "conv", "chan", "usr", "msg"):
-        if compact_identifier.startswith(prefix):
-            candidates.append(compact_identifier.removeprefix(prefix))
-    if len(compact_value) >= 4 and compact_identifier.startswith("u"):
-        candidates.append(compact_identifier.removeprefix("u"))
-    for candidate in candidates:
-        if candidate == compact_value:
-            return True
-        suffix = candidate.removeprefix(compact_value)
-        if candidate.startswith(compact_value) and suffix.isdigit() and len(suffix) <= 2:
-            return True
-    if not match_tokens:
-        return False
-    for token in _meaningful_tokens(value):
-        for segment in segments:
-            if segment == token:
-                return True
-            if (
-                len(token) >= 3
-                and segment.startswith(token)
-                and len(segment) - len(token) <= 2
-                and segment[len(token) :].isdigit()
-            ):
-                return True
-    return False
-
-
 def normalized(text: str) -> str:
     return " ".join(re.findall(r"\w+", text.casefold()))
-
-
-def utc(value: str) -> str:
-    parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
-        raise ValueError("timestamps must be canonical UTC: YYYY-MM-DDTHH:MM:SSZ")
-    return value
-
-
-Timestamp = Annotated[str, AfterValidator(utc)]
-
-
-def wall_clock(value: str) -> str:
-    datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-    return value
-
-
-def to_utc(local: str, timezone: str) -> str:
-    moment = datetime.strptime(local, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo(timezone))
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def to_local(utc: str, timezone: str, form: str = "%Y-%m-%d %H:%M:%S") -> str:
-    return datetime.fromisoformat(utc).astimezone(ZoneInfo(timezone)).strftime(form)
-
-
-def clock(scene: "ScenePlan", zones: dict[str, str]) -> str:
-    """A scene is written on one clock: its first participant's timezone."""
-    return zones[scene.participant_ids[0]]
 
 
 def zone(value: str) -> str:
@@ -180,7 +98,7 @@ class Premise(StrictModel):
     size: NonEmptyText
     culture: NonEmptyText
     cast: NonEmptyText
-    occupations: list[NonEmptyText] = Field(default_factory=list)
+    staffing: dict[NonEmptyText, Annotated[int, Field(ge=1)]]
 
 
 class Premises(StrictModel):
@@ -205,6 +123,7 @@ class Typing(StrictModel):
     messages: int
     median_words: float
     short_share: float
+    long_share: float
     question_share: float
     lowercase_share: float
     emoji_share: float
@@ -233,198 +152,60 @@ class SeedPersona(StrictModel):
     typing: Typing | None = None
 
 
-def census(personas) -> tuple[list[str], Counter]:
-    """The persona file's countries, and how many people hold each occupation."""
-    people = [json.loads(line) for line in personas.path.read_text().splitlines()]
-    return sorted({p["country"] for p in people}), Counter(p["occupation"] for p in people)
+def census(personas, used=()) -> tuple[list[str], Counter]:
+    """The persona file's countries, and how many people unused elsewhere in the corpus hold each occupation."""
+    people, taken = [json.loads(line) for line in personas.path.read_text().splitlines()], set(used)
+    supply = Counter(p["occupation"] for p in people if p["name"] not in taken)
+    return sorted({p["country"] for p in people}), supply
 
 
-def pick_cast(personas, seed: int, used: list[str], occupations: list[str]) -> list[SeedPersona]:
-    """Entropy comes from code: the run seed draws the candidate cast from the company's occupations, skipping
-    people used elsewhere in the corpus, and pairs each candidate with a real user's typing."""
-    rng, taken, cast = random.Random(seed), set(used), []
+def pick_cast(personas, seed: int, used: list[str], staffing: dict[str, int]) -> list[SeedPersona]:
+    """Entropy comes from code: the run seed draws the premise's staffing, occupation by occupation, from people
+    unused elsewhere in the corpus, and pairs each candidate with a real user's typing."""
+    rng, taken, cast, roles = random.Random(seed), set(used), [], Counter(staffing)
     lines = personas.path.read_text().splitlines()
     for line in rng.sample(lines, len(lines)):
-        if len(cast) == personas.pool:
+        if not +roles:
             break
-        person = SeedPersona.model_validate_json(line)
-        if person.occupation in occupations and person.name not in taken:
-            cast.append(person)
-    if len(cast) < personas.pool:
-        raise ValueError(f"the persona file has fewer than {personas.pool} people unused in the corpus")
+        person = json.loads(line)
+        if roles[person["occupation"]] > 0 and person["name"] not in taken:
+            roles[person["occupation"]] -= 1
+            cast.append(SeedPersona.model_validate(person))
+    if short := +roles:
+        raise ValueError(f"the persona file has too few people unused in the corpus for {dict(short)}")
     typing = rng.sample(personas.typing.read_text().splitlines(), len(cast))
     return [p.model_copy(update={"typing": Typing.model_validate_json(t)}) for p, t in zip(cast, typing)]
 
 
-class Persona(StrictModel):
-    id: SafeId
-    role: NonEmptyText
-    seniority: NonEmptyText
-    timezone: Annotated[str, AfterValidator(zone)]
-    voice: NonEmptyText
-    seed_id: SafeId | None = None
-    # Attached by code from the seeded cast, never written by the synthesizer.
-    profile: SkipJsonSchema[SeedPersona | None] = None
+def quota(taxonomy: dict, styles: list[str], seed: int, count: int) -> list[tuple[str, int, str, str]]:
+    """Entropy comes from code: a world's (category, level) mix walks a seeded shuffle of every taxonomy cell, and
+    each cell draws a concept from its level's list and a question style, as DataDesigner's category and
+    subcategory samplers do."""
+    rng = random.Random(seed)
+    cells = [(name, level) for name, c in taxonomy.items() for level in range(1, len(c.levels) + 1)]
+    order = rng.sample(cells, len(cells))
+    picked = [order[i % len(order)] for i in range(count)]
+    return [
+        (c, level, rng.choice(taxonomy[c].concepts[level - 1]), rng.choice(styles)) for c, level in picked
+    ]
 
 
-class Fact(StrictModel):
-    id: SafeId
-    group_id: SafeId
-    subject: NonEmptyText
-    predicate: NonEmptyText
-    value: NonEmptyText
-    valid_from: Timestamp
-    valid_until: Timestamp | None = None
-    description: NonEmptyText
-
-    @model_validator(mode="after")
-    def interval(self) -> Self:
-        if self.valid_until is not None and self.valid_until <= self.valid_from:
-            raise ValueError("fact intervals are half-open and must have positive duration")
-        return self
+def user_id(seed_uuid: str) -> str:
+    return "U" + digest(["user", seed_uuid])[:10].upper()
 
 
-class PlannedTask(StrictModel):
-    id: SafeId
-    group_id: SafeId
-    question: NonEmptyText
-    actor_id: SafeId
-    answer: AnswerSpec
-    fact_ids: list[SafeId] = Field(min_length=1)
-    reasoning: NonEmptyText
+def channel_id(kind: str, name: str | None, members: list[str]) -> str:
+    prefix = {"public": "C", "private": "G", "mpim": "G", "im": "D"}[kind]
+    return prefix + digest(["channel", name or sorted(members)])[:10].upper()
 
 
-class WorkGroup(StrictModel):
-    id: SafeId
-    description: NonEmptyText
+# ---------------------------------------------------------------------- the documents agents write
 
-
-class Catalog(StrictModel):
-    workspace_id: SafeId
-    sector: NonEmptyText
-    company: NonEmptyText
-    overview: NonEmptyText
-    people: list[User] = Field(min_length=1)
-    personas: list[Persona] = Field(default_factory=list)
-    groups: list[WorkGroup] = Field(min_length=1)
-    facts: list[Fact] = Field(min_length=1)
-    tasks: list[PlannedTask] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def references(self) -> Self:
-        for label, values in (("task", self.tasks), ("fact", self.facts), ("group", self.groups)):
-            if len({v.id for v in values}) != len(values):
-                raise ValueError(f"duplicate {label} ID")
-        if self.personas and sorted(p.id for p in self.personas) != sorted(p.id for p in self.people):
-            raise ValueError("personas must describe every person exactly once")
-        facts = {v.id for v in self.facts}
-        groups = {v.id for v in self.groups}
-        if unknown := {f.id for f in self.facts if f.group_id not in groups}:
-            raise ValueError(f"facts in unknown groups: {sorted(unknown)}")
-        if len({p.id for p in self.people}) != len(self.people):
-            raise ValueError("duplicate person ID")
-        questions: set[str] = set()
-        directory_leaks = []
-        for task in self.tasks:
-            if task.group_id not in groups or set(task.fact_ids) - facts:
-                raise ValueError(f"unknown group/fact in {task.id}")
-            if task.actor_id not in {p.id for p in self.people}:
-                raise ValueError(f"unknown task reader: {task.actor_id}")
-            key = normalized(task.question)
-            if key in questions:
-                raise ValueError(f"duplicate or contradictory QA question: {task.id}")
-            questions.add(key)
-            if task.answer.kind in {"entity", "date"}:
-                leaking = [
-                    p.id
-                    for p in self.people
-                    if reveals_answer(p.id, task.answer.canonical_answer, task.question)
-                ]
-                if leaking:
-                    directory_leaks.append(f"{task.id}: {leaking}")
-        if directory_leaks:
-            raise ValueError(
-                "catalog person IDs encode answer content; rename these IDs and their actor references: "
-                + "; ".join(directory_leaks)
-            )
-        # Catalogs contain hundreds of facts; replace this quadratic scan with an interval index at larger scales.
-        for index, left in enumerate(self.facts):
-            for right in self.facts[index + 1 :]:
-                if (normalized(left.subject), normalized(left.predicate)) != (
-                    normalized(right.subject),
-                    normalized(right.predicate),
-                ):
-                    continue
-                overlap = max(left.valid_from, right.valid_from) < min(
-                    left.valid_until or "9999", right.valid_until or "9999"
-                )
-                if overlap and normalized(left.value) != normalized(right.value):
-                    raise ValueError(f"contradictory overlapping facts: {left.id}, {right.id}")
-        return self
-
-
-class ClaimEvidence(StrictModel):
-    claim_index: int = Field(ge=0)
-    message_ids: list[SafeId] = Field(default_factory=list)
-    user_ids: list[SafeId] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def nonempty(self) -> Self:
-        if not self.message_ids and not self.user_ids:
-            raise ValueError("a claim needs message or directory evidence")
-        return self
-
-
-class Binding(StrictModel):
-    task_id: SafeId
-    claims: list[ClaimEvidence] = Field(min_length=1)
-    gold_calls: list[ReadCall] = Field(min_length=1)
-
-
-class Candidate(StrictModel):
-    snapshot: SlackWorld
-    bindings: list[Binding]
-
-    @model_validator(mode="after")
-    def unique(self) -> Self:
-        if len({b.task_id for b in self.bindings}) != len(self.bindings):
-            raise ValueError("duplicate task binding")
-        return self
-
-
-class Beat(StrictModel):
-    fact_id: SafeId
-    author_id: SafeId
-
-
-class ScenePlan(StrictModel):
-    id: SafeId
-    conversation_id: SafeId
-    participant_ids: list[SafeId] = Field(min_length=1)
-    start: Timestamp
-    end: Timestamp
-    situation: NonEmptyText
-    beats: list[Beat] = Field(default_factory=list)
-    length: int = Field(ge=1, le=60)
-    revision_note: str = ""
-
-    @model_validator(mode="after")
-    def ordered(self) -> Self:
-        if self.end <= self.start:
-            raise ValueError(f"{self.id}: end must come after start")
-        return self
-
-
-class Detail(StrictModel):
-    value: NonEmptyText
-    since: Timestamp | None = None
-    at: Timestamp | None = None
-
-
-class Plan(StrictModel):
-    conversations: list[Conversation] = Field(min_length=1)
-    scenes: list[ScenePlan] = Field(min_length=1)
-    details: dict[NonEmptyText, Detail] = Field(default_factory=dict)
+Clock = Annotated[str, Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]
+Zone = Annotated[str, AfterValidator(zone)]
+Part = Literal["early", "morning", "afternoon", "evening", "night"]
+# A part of the day on the company clock: [start hour, end hour). Quoted in the builder's guide in these words.
+PARTS = {"early": (6, 9), "morning": (9, 12), "afternoon": (12, 17), "evening": (17, 21), "night": (21, 24)}
 
 
 def listed(value):
@@ -441,16 +222,186 @@ def noted(value):
     return [", ".join(str(v) for v in n.values()) if isinstance(n, dict) else n for n in listed(value)]
 
 
-Conveys = Annotated[list[SafeId], BeforeValidator(listed)]
+Ids = Annotated[list[SafeId], BeforeValidator(listed)]
 Notes = Annotated[list[NonEmptyText], BeforeValidator(noted)]
+
+
+class Moment(StrictModel):
+    """A moment the story is about: a calendar day, a time on a clock, and that clock's IANA zone."""
+
+    day: int = Field(ge=1)
+    time: Clock
+    zone: Zone
+
+
+class Person(StrictModel):
+    user_id: SafeId
+    title: NonEmptyText
+    team: NonEmptyText
+
+
+class Routine(StrictModel):
+    kind: NonEmptyText
+    probability: float = Field(gt=0, le=1)
+
+
+class Channel(StrictModel):
+    name: str | None = None
+    type: Literal["public", "private", "mpim", "im"]
+    topic: str = ""
+    purpose: str = ""
+    members: Ids = Field(min_length=2)
+    routines: list[Routine] = Field(default_factory=list)
+
+
+class Organization(StrictModel):
+    people: list[Person] = Field(min_length=3)
+    channels: list[Channel] = Field(min_length=1)
+    dm_routines: list[Routine] = Field(default_factory=list)
+
+
+class Storyline(StrictModel):
+    id: SafeId
+    summary: NonEmptyText
+
+
+class Place(StrictModel):
+    channel_id: SafeId
+    author_id: SafeId
+    probability: float = Field(gt=0, le=1)
+
+
+class Fact(StrictModel):
+    id: SafeId
+    storyline: SafeId
+    subject: NonEmptyText
+    attribute: NonEmptyText
+    value: NonEmptyText
+    anchor: str | None = None
+    places: list[Place] = Field(min_length=1, max_length=3)
+    day: int = Field(ge=1)
+    after: Ids = Field(default_factory=list)
+    supersedes: SafeId | None = None
+    happened_at: Moment | None = None
+    scheduled_for: Moment | None = None
+    decoy: bool = False
+    summary: NonEmptyText
+
+    @model_validator(mode="after")
+    def one_moment(self) -> Self:
+        if self.happened_at and self.scheduled_for:
+            raise ValueError(f"{self.id}: a fact has happened_at or scheduled_for, not both")
+        return self
+
+
+class Task(StrictModel):
+    id: SafeId
+    category: NonEmptyText
+    level: int = Field(ge=1)
+    actor_id: SafeId
+    question: NonEmptyText
+    answer_type: Literal["text", "set", "number", "refusal"]
+    gold_sql: NonEmptyText
+    facts: Ids = Field(default_factory=list)
+    probability: float = Field(default=1.0, gt=0, le=1)
+
+
+class Ledger(StrictModel):
+    storylines: list[Storyline] = Field(min_length=1)
+    channels: list[Channel] = Field(default_factory=list)
+    facts: list[Fact] = Field(min_length=1)
+    tasks: list[Task] = Field(default_factory=list)
+
+
+class TaskSet(StrictModel):
+    tasks: list[Task] = Field(default_factory=list)
+
+
+class Beat(StrictModel):
+    fact: SafeId
+    author_id: SafeId
+
+
+class Scene(StrictModel):
+    id: SafeId
+    channel_id: SafeId
+    participants: Ids = Field(min_length=1)
+    day: int = Field(ge=1)
+    part: Part
+    during: SafeId | None = None
+    situation: NonEmptyText
+    length: int = Field(ge=1, le=60)
+    beats: list[Beat] = Field(default_factory=list)
+    revision_note: str = ""
+
+
+class ScenePlan(StrictModel):
+    scenes: list[Scene] = Field(min_length=1)
+
+
+class Reaction(StrictModel):
+    user_id: SafeId
+    emoji: Annotated[str, Field(pattern=r"^[a-z0-9_+'-]{1,40}$")]
 
 
 class Line(StrictModel):
     author_id: SafeId
     text: NonEmptyText
-    local_time: Annotated[str, AfterValidator(wall_clock)]
     reply_to: int | None = Field(default=None, ge=0)
-    conveys: Conveys = Field(default_factory=list)
+    conveys: Ids = Field(default_factory=list)
+    pause: Literal["", "hours"] = ""
+    reactions: list[Reaction] = Field(default_factory=list)
+
+
+SHORT, LONG = (
+    4,
+    20,
+)  # words: a short line has at most 4, a long one more than 20, as the typing profiles measure
+
+
+class Layout(StrictModel):
+    """Code's part of a scene, sampled from the activity targets and people's typing: its thread shape, how many
+    of its lines carry reactions, which other members may react, at least how many lines are short and at most how
+    many are long. "free" and no length budget leave those to the writer."""
+
+    shape: Literal["flat", "thread", "free"] = "free"
+    reactions: int = Field(default=0, ge=0)
+    audience: Ids = Field(default_factory=list)
+    short: int = Field(default=0, ge=0)
+    long: int | None = Field(default=None, ge=0)
+
+
+def layout(world, scene: "Scene", activity, rng: random.Random, typing: dict | None = None) -> Layout:
+    """A scene's layout from the targets: a thread with the chance that makes replies `reply_share` of messages,
+    each line reacted to at `reaction_rate`, up to five other members of the conversation as its audience, and, when
+    every participant has a typing profile, a length budget: each line's author drawn among the participants and its
+    length from that author's short and long shares, counted."""
+    kind = world.db.execute("SELECT type FROM channels WHERE id = ?", (scene.channel_id,)).fetchone()[0]
+    lines = scene.length
+    threaded = kind not in ("im", "mpim") and rng.random() < activity.reply_share * lines / max(lines - 1, 1)
+    others = [
+        r[0]
+        for r in world.db.execute(
+            "SELECT user_id FROM members WHERE channel_id = ? AND left_us IS NULL ORDER BY user_id",
+            (scene.channel_id,),
+        )
+        if r[0] not in scene.participants
+    ]
+
+    def band(t):
+        u = rng.random()
+        return "short" if u < t.short_share else "long" if u < t.short_share + t.long_share else "medium"
+
+    budget = {}
+    if typing and all(p in typing for p in scene.participants):
+        bands = Counter(band(typing[rng.choice(scene.participants)]) for _ in range(lines))
+        budget = {"short": bands["short"], "long": bands["long"]}
+    return Layout(
+        shape="thread" if threaded else "flat",
+        reactions=sum(rng.random() < activity.reaction_rate for _ in range(lines)),
+        audience=rng.sample(others, min(5, len(others))),
+        **budget,
+    )
 
 
 class WrittenScene(StrictModel):
@@ -459,209 +410,964 @@ class WrittenScene(StrictModel):
     promises: Notes = Field(default_factory=list)
 
 
-class SceneRecord(StrictModel):
-    key: str
-    scene: WrittenScene
+# ---------------------------------------------------------------------- time: code owns every timestamp
+
+PLACEHOLDER = re.compile(r"\{at:([A-Za-z0-9][A-Za-z0-9_.-]*)\}")
+MENTION = re.compile(r"<@([A-Za-z0-9]+)>")
+# ponytail: clock times and calendar dates only; relative words ("tomorrow", "Friday") are left to the judge,
+# and "may 2" (the verb) is read as a date.
+TIME_LITERAL = re.compile(
+    r"\b(?:\d{1,2}:\d{2}|\d{1,2}\s?[ap]\.?m\b\.?|\d{4}-\d{2}-\d{2}|"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|"
+    r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s\d{1,2}(?:st|nd|rd|th)?\b)",
+    re.IGNORECASE,
+)
 
 
-class BindOutput(StrictModel):
-    bindings: list[Binding]
+def us(moment: datetime) -> int:
+    return int(moment.timestamp() * 1_000_000)
 
 
-def first_mentions(plan: Plan) -> dict[str, str]:
-    """fact_id → the earliest scene that has a beat for it."""
-    first = {}
-    for scene in sorted(plan.scenes, key=lambda s: (s.start, s.id)):
-        for beat in scene.beats:
-            first.setdefault(beat.fact_id, scene.id)
-    return first
+def company_zone(cast: list[SeedPersona], chosen: list[str]) -> str:
+    """The company clock: the timezone most of its people live in (alphabetical on a tie)."""
+    counts = Counter(p.timezone for p in cast if user_id(p.uuid) in chosen)
+    return min(counts, key=lambda z: (-counts[z], z))
 
 
-def timed(catalog: Catalog) -> dict[str, str]:
-    """Facts with a time of day: the world first states each in the minute of its valid_from. Date-only facts
-    (00:00:00Z) are not timed."""
-    return {f.id: f.valid_from for f in catalog.facts if not f.valid_from.endswith("T00:00:00Z")}
+def calendar(seed: int, settings, place: str) -> list[dict]:
+    """Day 1 is a Monday of the configured year picked by the run seed; days are company-clock midnights."""
+    first = date(settings.year, 1, 1)
+    mondays = [first + timedelta(days=d) for d in range(366) if (first + timedelta(days=d)).weekday() == 0]
+    start, tz = random.Random(seed).choice(mondays), ZoneInfo(place)
+    days = [start + timedelta(days=n) for n in range(settings.days + 1)]
+    return [
+        {
+            "day": n + 1,
+            "date": d.isoformat(),
+            "start_us": us(datetime(d.year, d.month, d.day, tzinfo=tz)),
+            "end_us": us(datetime(nd.year, nd.month, nd.day, tzinfo=tz)),
+        }
+        for n, (d, nd) in enumerate(zip(days, days[1:]))
+    ]
 
 
-def check_plan(catalog: Catalog, plan: Plan, frozen: list[ScenePlan] = ()) -> Plan:
-    """`frozen` scenes belong to the approved world: the plan keeps them and may only change their revision_note."""
-    conversations = {c.id: c for c in plan.conversations}
-    facts = {f.id: f for f in catalog.facts}
+def at(world, moment: Moment) -> int:
+    row = world.db.execute("SELECT date FROM calendar WHERE day = ?", (moment.day,)).fetchone()
+    if row is None:
+        raise ValueError(f"day {moment.day} is outside the calendar")
+    d, (hour, minute) = date.fromisoformat(row[0]), map(int, moment.time.split(":"))
+    return us(datetime(d.year, d.month, d.day, hour, minute, tzinfo=ZoneInfo(moment.zone)))
+
+
+def window(world, day: int, part: str) -> tuple[int, int]:
+    """A part of a calendar day on the company clock, in microseconds."""
+    row = world.db.execute("SELECT date FROM calendar WHERE day = ?", (day,)).fetchone()
+    if row is None:
+        raise ValueError(f"day {day} is outside the calendar")
+    d, tz = date.fromisoformat(row[0]), ZoneInfo(world_meta(world, "zone"))
+    start, end = PARTS[part]
+    return us(datetime(d.year, d.month, d.day, start, tzinfo=tz)), us(
+        datetime(d.year, d.month, d.day, tzinfo=tz) + timedelta(hours=end)
+    )
+
+
+def clock(world, moment_us: int) -> str:
+    """A moment on the company clock, as an author reads it."""
+    return (
+        f"{datetime.fromtimestamp(moment_us / 1e6, ZoneInfo(world_meta(world, 'zone'))):%a %Y-%m-%d %H:%M %Z}"
+    )
+
+
+def world_meta(world, key: str) -> str:
+    return world.db.execute("SELECT value FROM world_meta WHERE key = ?", (key,)).fetchone()[0]
+
+
+def render(moment_us: int, place: str, said_us: int) -> str:
+    """A moment as its writer reads it on their own clock; the day is named when it is not the day of writing."""
+    tz = ZoneInfo(place)
+    when, said = datetime.fromtimestamp(moment_us / 1e6, tz), datetime.fromtimestamp(said_us / 1e6, tz)
+    return f"{when:%H:%M %Z}" if when.date() == said.date() else f"{when:%a %b} {when.day} {when:%H:%M %Z}"
+
+
+class Gaps:
+    """How long real Slack users take to answer: seconds between consecutive messages of a channel, as quantiles
+    (scripts/worldgen_slack/personas.sql). A line with no pause takes a gap under an hour; "hours" takes one above."""
+
+    def __init__(self, path: Path):
+        self.quantiles = json.loads(path.read_text().splitlines()[0])["quantiles"]
+        self.hour = bisect.bisect_left(self.quantiles, 3600) / (len(self.quantiles) - 1)
+
+    def sample(self, rng: random.Random, pause: str) -> int:
+        u = rng.random() * self.hour if pause == "" else self.hour + rng.random() * (1 - self.hour)
+        position = u * (len(self.quantiles) - 1)
+        low = int(position)
+        high = min(low + 1, len(self.quantiles) - 1)
+        seconds = self.quantiles[low] + (self.quantiles[high] - self.quantiles[low]) * (position - low)
+        return int(seconds * 1_000_000) + rng.randrange(1, 1_000_000)
+
+
+# ---------------------------------------------------------------------- documents → rows, checked
+
+LEDGER_TABLES = {"facts", "fact_relations", "evidence"}
+STRUCTURE = {"channels", "members", "messages", "message_mentions", "reactions", "thread_stats"}
+
+
+def channel_rows(world, channels: list[Channel], created_us: int) -> tuple[list[dict], list[dict]]:
+    people = {r[0] for r in world.db.execute("SELECT id FROM users")}
+    rows, members = [], []
+    for c in channels:
+        if c.name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", c.name):
+            raise ValueError(f"channel {c.name!r}: a name is lowercase letters, digits, - and _")
+        if unknown := set(c.members) - people:
+            raise ValueError(f"channel {c.name or c.members}: unknown members {sorted(unknown)}")
+        if (c.type in ("im", "mpim")) != (c.name is None):
+            raise ValueError(
+                f"channel {c.name or c.members}: public and private channels have a name; DMs do not"
+            )
+        if c.type == "im" and len(set(c.members)) != 2 or c.type == "mpim" and len(set(c.members)) < 3:
+            raise ValueError(f"{c.members}: a DM has exactly 2 members, a group DM at least 3")
+        identifier = channel_id(c.type, c.name, c.members)
+        rows.append(
+            dict(id=identifier, name=c.name, type=c.type, topic=c.topic, purpose=c.purpose)
+            | dict(creator_id=c.members[0], created_us=created_us)
+        )
+        members += [
+            dict(channel_id=identifier, user_id=m, joined_us=created_us) for m in dict.fromkeys(c.members)
+        ]
+    return rows, members
+
+
+def organize(world, org: Organization, cast: list[SeedPersona], premise: Premise, settings) -> None:
+    """S1: people chosen from the candidates and the company's channels. Code adds ids, handles, emails, display
+    names, timezones and the calendar."""
+    pool = {user_id(p.uuid): p for p in cast}
+    chosen = [p.user_id for p in org.people]
+    if unknown := set(chosen) - pool.keys():
+        raise ValueError(f"people are candidates: {sorted(unknown)} is no candidate's user_id")
+    if missing := pool.keys() - set(chosen):
+        raise ValueError(f"people are every candidate: {sorted(missing)} has no title and team")
+    for c in org.channels:
+        if c.name is not None and not 3 <= len(c.routines) <= 5:
+            raise ValueError(f"channel {c.name}: routines lists 3 to 5 recurring kinds of conversation")
+    if not 3 <= len(org.dm_routines) <= 5:
+        raise ValueError("dm_routines lists 3 to 5 recurring kinds of direct conversation")
+    place = company_zone(cast, chosen)
+    days = calendar(settings.seed, settings.calendar, place)
+    start = days[0]["start_us"]
+    domain = "".join(words(premise.company)[:2]) + ".example"
+    handles = Counter()
+    users = []
+    for person in org.people:
+        seed = pool[person.user_id]
+        handle = ".".join(words(seed.name))
+        handles[handle] += 1
+        handle += str(handles[handle]) if handles[handle] > 1 else ""
+        users.append(
+            dict(id=person.user_id, handle=handle, real_name=seed.name, display_name=seed.name.split()[0])
+            | dict(
+                email=f"{handle}@{domain}", title=person.title, tz=seed.timezone, created_us=start - 365 * DAY
+            )
+            | dict(profile_json=json.dumps({"Team": person.team}))
+        )
+    meta = {
+        "schema_version": "1",
+        "company": premise.company,
+        "zone": place,
+        "now_us": str(days[-1]["end_us"]),
+    }
+    with world.batch():
+        world.insert("world_meta", [{"key": k, "value": v} for k, v in meta.items()])
+        world.insert("calendar", days)
+        world.insert("users", users)
+        channels = [*org.channels, *direct_messages(org, settings)]
+        rows, members = channel_rows(world, channels, start - 30 * DAY)
+        world.insert("channels", rows)
+        world.insert("members", members)
+
+
+def direct_messages(org: Organization, settings) -> list[Channel]:
+    """Code's DMs: the seed draws pairs of people, weighted by the channels they share and by a shared team, until
+    the company has `dms_per_person` DMs per person."""
+    rng = random.Random(digest([settings.seed, "dms"]))
+    team = {p.user_id: p.team for p in org.people}
+    shared = Counter(
+        pair for c in org.channels if c.name is not None for pair in combinations(sorted(set(c.members)), 2)
+    )
+    have = {tuple(sorted(c.members)) for c in org.channels if c.type == "im"}
+    pairs = [p for p in combinations(sorted(team), 2) if p not in have]
+    weights = [1 + shared[p] + 2 * (team[p[0]] == team[p[1]]) for p in pairs]
+    picked = []
+    while pairs and len(picked) < round(settings.activity.dms_per_person * len(team)) - len(have):
+        i = rng.choices(range(len(pairs)), weights)[0]
+        picked.append(pairs.pop(i))
+        weights.pop(i)
+    return [Channel(type="im", members=list(p)) for p in picked]
+
+
+def background_plan(world, org: Organization, activity, seed: int) -> list[Scene]:
+    """The company's other conversations, placed by code from the activity targets: the messages the storylines
+    left of the budget, in conversations of about `conversation_lines` lines, in channels by Zipf weight on their
+    members and in DMs by `dm_share`, on workdays by the parts' rhythm. Each takes its kind from its conversation's
+    routines, drawn by their stated probabilities."""
+    rng = random.Random(digest([seed, "background"]))
+    budget = activity.messages - world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    routines = {channel_id(c.type, c.name, c.members): c.routines for c in org.channels if c.routines}
+    named = sorted(
+        routines,
+        key=lambda c: (
+            -world.db.execute("SELECT COUNT(*) FROM members WHERE channel_id = ?", (c,)).fetchone()[0],
+            c,
+        ),
+    )
+    dms = [r[0] for r in world.db.execute("SELECT id FROM channels WHERE type = 'im' ORDER BY id")]
+    channel_share = 1 - (activity.dm_share if dms and org.dm_routines else 0)
+    zipf = [1 / (rank + 1) ** activity.channel_skew for rank in range(len(named))]
+    weights = [channel_share * z / sum(zipf) for z in zipf] + [(1 - channel_share) / len(dms)] * len(
+        dms
+    ) * bool(org.dm_routines)
+    places = named + dms * bool(org.dm_routines)
+    workdays = [
+        d
+        for d, day in world.db.execute("SELECT day, date FROM calendar")
+        if date.fromisoformat(day).weekday() < 5
+    ]
+    scenes = []
+    while places and workdays and budget >= 2:
+        length = min(20, budget, 2 + int(rng.expovariate(1 / max(activity.conversation_lines - 2, 0.5))))
+        place = rng.choices(places, weights)[0]
+        kinds = routines.get(place, org.dm_routines)
+        members = [
+            r[0]
+            for r in world.db.execute(
+                "SELECT user_id FROM members WHERE channel_id = ? AND left_us IS NULL ORDER BY user_id",
+                (place,),
+            )
+        ]
+        talkers = min(len(members), 2 + min(int(rng.expovariate(1.0)), 2))
+        scenes.append(
+            Scene(
+                id=f"bg-{len(scenes) + 1:03d}",
+                channel_id=place,
+                participants=rng.sample(members, talkers),
+                day=rng.choice(workdays),
+                part=rng.choices(list(activity.parts), list(activity.parts.values()))[0],
+                situation=rng.choices([k.kind for k in kinds], [k.probability for k in kinds])[0],
+                length=length,
+            )
+        )
+        budget -= length
+    return scenes
+
+
+DAY = 86_400_000_000
+
+
+def same_rows(rows: list[dict], again: list[dict], back) -> bool:
+    """Whether a renumbered copy's rows, their message ids mapped back, are the world's rows."""
+    mapped = [
+        r | {"message_id": back(r["message_id"])} if r.get("message_id") is not None else r for r in again
+    ]
+    return sorted(map(canonical, rows)) == sorted(map(canonical, mapped))
+
+
+def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
+    """T1-T5, and T7 given the world `renumbered`: the gold query runs as the task's actor, reads what the task's
+    category promises, and finds its messages by what they say; the rows are the gold answer. Returns them."""
+    category = settings.taxonomy.get(task.category)
+    if category is None:
+        raise ValueError(f"{task.id}: category must be one of {sorted(settings.taxonomy)}")
+    if not 1 <= task.level <= len(category.levels) or task.answer_type not in category.answer_types:
+        raise ValueError(
+            f"{task.id}: a {task.category} task has a level from 1 to {len(category.levels)} and an answer type in "
+            f"{category.answer_types}"
+        )
+    try:
+        out = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)
+    except LookupError:
+        raise ValueError(f"{task.id}: actor_id {task.actor_id} is not a person in the world") from None
+    except ValueError as error:
+        raise ValueError(f"{task.id}: {error}") from None
+    read, rows = set(out["tables"]), out["rows"]
+    if renumbered is not None:
+        copy, back = renumbered
+        try:
+            again = copy.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)["rows"]
+        except ValueError:
+            again = None
+        if again is None or not same_rows(rows, again, back):
+            raise ValueError(
+                f"{task.id}: the gold query finds messages by what the question names (words, people, channels, "
+                "threads, reactions, times), never by a message id or by id order"
+            )
+    if category.gold == "sql" and read & LEDGER_TABLES:
+        raise ValueError(
+            f"{task.id}: a {task.category} gold query reads only the workspace, not {sorted(read & LEDGER_TABLES)}"
+        )
+    if category.gold in ("ledger", "hybrid") and not read & LEDGER_TABLES:
+        raise ValueError(f"{task.id}: a {task.category} gold query reads the facts it answers from")
+    if category.gold == "hybrid" and not read & STRUCTURE:
+        raise ValueError(
+            f"{task.id}: a hybrid gold query also reads the workspace (messages, members, reactions)"
+        )
+    if category.gold in ("ledger", "hybrid") and not task.facts:
+        raise ValueError(f"{task.id}: name the facts its answer rests on in facts")
+    if task.answer_type == "refusal":
+        if rows:
+            raise ValueError(
+                f"{task.id}: a refusal's gold query returns no rows as its actor; it returns {len(rows)}"
+            )
+        return rows
+    if "answer" not in out["columns"]:
+        raise ValueError(f"{task.id}: the gold query returns an `answer` column")
+    if not 1 <= len(rows) <= settings.tasks.max_answer_rows:
+        raise ValueError(
+            f"{task.id}: the gold query returns 1 to {settings.tasks.max_answer_rows} rows as its actor, not "
+            f"{len(rows) if len(rows) <= settings.tasks.max_answer_rows else 'more'}"
+        )
+    if task.answer_type != "set" and len(rows) != 1:
+        raise ValueError(
+            f"{task.id}: a {task.answer_type} answer is one row; use answer_type set for several"
+        )
+    if given := [
+        str(r["answer"])
+        for r in rows
+        if task.answer_type != "number"
+        and not _meaningful_tokens(str(r["answer"])) - _meaningful_tokens(task.question)
+    ]:
+        raise ValueError(f"{task.id}: the question gives away its answer {given}")
+    return rows
+
+
+def record_tasks(world, candidates: list[Task], settings, cells: list[tuple[str, int]]) -> None:
+    """T6: one to three candidates per cell, each with the probability that a task of its cell is like it. Code
+    checks every candidate (readable facts, T1-T5, T7) and the run seed picks a valid one per cell, favoring the
+    less probable; the picks are inserted with their gold rows. Run inside `World.trial()`."""
+    wanted = Counter((c[0], c[1]) for c in cells)
+    concepts = defaultdict(list)
+    for c in cells:
+        concepts[(c[0], c[1])].append(c[2])
+    drawn = Counter((t.category, t.level) for t in candidates)
+    if any(not wanted[c] <= n <= 3 * wanted[c] for c, n in drawn.items()):
+        raise ValueError(f"write 1 to 3 candidate tasks for each (category, level) of {sorted(wanted)}")
+    if len({t.id for t in candidates}) < len(candidates):
+        raise ValueError("candidate task ids are unique")
+    asked = {normalized(r[0]) for r in world.db.execute("SELECT question FROM tasks")}
+    valid, errors, gold = defaultdict(list), defaultdict(list), {}
+    with world.renumbered() as renumbered:
+        for t in candidates:
+            try:
+                if normalized(t.question) in asked:
+                    raise ValueError(f"{t.id}: a task asks a question no other task asks")
+                for fact in t.facts:
+                    row = world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()
+                    if row and not readable(world, t.actor_id, row[0]):
+                        raise ValueError(f"{t.id}: its actor cannot read {row[0]}, where {fact} is stated")
+                spec = settings.taxonomy.get(t.category)
+                need = spec.spread[t.level - 1] if spec and spec.spread and t.level <= len(spec.spread) else 1
+                marks = ", ".join("?" * len(t.facts))
+                (spread,) = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", t.facts).fetchone()  # fmt: skip
+                if need > 1 and spread < need:
+                    raise ValueError(
+                        f"{t.id}: a level-{t.level} {t.category} task rests on facts first stated in at least {need} "
+                        "channels; give its facts places in other channels"
+                    )
+                gold[t.id] = check_task(world, t, settings, renumbered)
+                valid[(t.category, t.level)].append(t)
+            except ValueError as error:
+                errors[(t.category, t.level)].append(str(error))
+    if short := [c for c in sorted(wanted) if len(valid[c]) < wanted[c]]:
+        raise ValueError(
+            "; ".join(
+                f"no valid candidate for {c}: " + ("; ".join(errors[c]) or "write 1 to 3") for c in short
+            )
+        )
+    picks = []
+    for cell in sorted(wanted):
+        rng = random.Random(digest([settings.seed, list(cell), [t.id for t in valid[cell]]]))
+        pool = list(valid[cell])
+        for _ in range(wanted[cell]):
+            if pool:
+                picks.append(rng.choices(pool, [1.05 - t.probability for t in pool])[0])
+                pool = [t for t in pool if normalized(t.question) != normalized(picks[-1].question)]
+    questions = {normalized(t.question) for t in picks}
+    if len(picks) < sum(wanted.values()) or len(questions) < len(picks):
+        raise ValueError("a task asks a question no other task asks: candidates of different cells share one")
+    with world.batch():
+        world.insert(
+            "tasks",
+            [task_row(t, settings) | {"concept": concepts[(t.category, t.level)].pop(0)} for t in picks],
+        )
+        world.insert(
+            "task_facts", [dict(task_id=t.id, fact_id=f) for t in picks for f in dict.fromkeys(t.facts)]
+        )
+    for t in picks:
+        world.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(gold[t.id]), t.id))
+
+
+def measures(world, task_id: str, rows: list[dict], tables) -> dict:
+    """What makes a task hard, measured for its actor: how many read_channel pages deep its evidence sits, the
+    tables its gold query reads, and its evidence's best rank when the actor searches the question's own words."""
+    task = world.db.execute("SELECT actor_id, question FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    evidence = [r["message_id"] for r in rows if r.get("message_id") is not None]
+    evidence += [
+        r[0]
+        for r in world.db.execute(
+            """SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id
+            WHERE tf.task_id = ? AND e.role = 'anchor'""",
+            (task_id,),
+        )
+    ]
+    reader = World(world.path, actor=task["actor_id"])
+    pages = [
+        reader.db.execute(
+            """SELECT COUNT(*) / 50 + 1 FROM messages m, messages e
+            WHERE e.id = ? AND m.channel_id = e.channel_id AND m.parent_id IS NULL
+            AND m.ts_us > (SELECT ts_us FROM messages WHERE id = COALESCE(e.parent_id, e.id))""",
+            (message_id,),
+        ).fetchone()[0]
+        for message_id in dict.fromkeys(evidence)
+    ]
+    return {
+        "evidence_pages": max(pages, default=None),
+        "tables": sorted(tables),
+        "bm25_rank": reader.rank(task["question"], evidence),
+    }
+
+
+def task_row(task: Task, settings) -> dict:
+    return task.model_dump(
+        include={"id", "category", "level", "actor_id", "question", "answer_type", "gold_sql"}
+    ) | {
+        "gold_source": settings.taxonomy[task.category].gold if task.category in settings.taxonomy else "sql"
+    }
+
+
+def record_ledger(world, ledger: Ledger, settings, cells: list[tuple[str, int]]) -> None:
+    """S2: storylines, any added channels, facts placed on the organization, and the ledger categories' tasks."""
+    storylines = -(-settings.tasks.count // settings.tasks.per_storyline)
+    if len(ledger.storylines) != storylines:
+        raise ValueError(f"plan exactly {storylines} storylines")
+    facts = {f.id: f for f in ledger.facts}
+    check_facts(ledger.facts, {s.id for s in ledger.storylines})
+    position = {s.id: i for i, s in enumerate(ledger.storylines)}
+    for fact in ledger.facts:
+        for earlier in [*fact.after, *([fact.supersedes] if fact.supersedes else [])]:
+            if position[facts[earlier].storyline] > position[fact.storyline]:
+                raise ValueError(
+                    f"{fact.id} comes after {earlier}, whose storyline is built later; list storylines in build order"
+                )
+    start = world.db.execute("SELECT start_us FROM calendar WHERE day = 1").fetchone()[0]
+    with world.batch():
+        rows, members = channel_rows(world, ledger.channels, start - 30 * DAY)
+        world.insert("channels", rows)
+        world.insert("members", members)
+        world.insert(
+            "storylines", [s.model_dump() | {"position": i} for i, s in enumerate(ledger.storylines, 1)]
+        )
+        placed = place_facts(world, ledger, settings)
+        world.insert(
+            "facts",
+            [
+                f.model_dump(include={"id", "storyline", "subject", "attribute", "value", "anchor"})
+                | dict(channel_id=placed[f.id].channel_id, author_id=placed[f.id].author_id, day=f.day)
+                | dict(is_decoy=int(f.decoy), summary=f.summary)
+                | moment_columns(world, f)
+                for f in ledger.facts
+            ],
+        )
+        world.insert(
+            "fact_relations",
+            [
+                dict(src_fact=f.id, dst_fact=d, kind="after")
+                for f in ledger.facts
+                for d in dict.fromkeys(f.after)
+            ]
+            + [
+                dict(src_fact=f.id, dst_fact=f.supersedes, kind="supersedes")
+                for f in ledger.facts
+                if f.supersedes
+            ],
+        )
+    record_tasks(world, ledger.tasks, settings, cells)
+
+
+def check_facts(facts: list, storylines: set[str]) -> None:
+    """A ledger's facts: a value with no time in it, a known storyline, an anchor made of words of the value, and
+    relations to facts of the same ledger."""
+    known = {f.id for f in facts}
+    for fact in facts:
+        if TIME_LITERAL.search(fact.value):
+            raise ValueError(
+                f"{fact.id}: a value has no time or date in it; its moment is planned apart from it"
+            )
+        if fact.storyline not in storylines:
+            raise ValueError(f"{fact.id}: storyline {fact.storyline} is not in storylines")
+        if fact.anchor and f" {normalized(fact.anchor)} " not in f" {normalized(fact.value)} ":
+            raise ValueError(
+                f"{fact.id}: an anchor is words of its value; {fact.anchor!r} is not in {fact.value!r}"
+            )
+        if unknown := set(fact.after) - known | ({fact.supersedes} - known - {None}):
+            raise ValueError(
+                f"{fact.id}: after and supersedes name facts of this ledger; unknown {sorted(unknown)}"
+            )
+
+
+def place_facts(world, ledger: Ledger, settings) -> dict[str, Place]:
+    """Code places each fact, as it draws routine kinds: one of the fact's stated places, drawn by their probabilities
+    with the seed, among those whose author is a member of the channel and whose channel every actor of a task
+    resting on the fact can read. A task whose level has a spread gets its facts drawn into distinct channels;
+    `record_tasks` refuses the task when its places did not allow enough."""
+    members = {
+        (r[0], r[1])
+        for r in world.db.execute("SELECT channel_id, user_id FROM members WHERE left_us IS NULL")
+    }
+    actors = defaultdict(set)
+    for task in ledger.tasks:
+        for fact in task.facts:
+            actors[fact].add(task.actor_id)
+    spread = {
+        t.id: (need, t)
+        for t in ledger.tasks
+        if (spec := settings.taxonomy.get(t.category))
+        and spec.spread
+        and (need := spec.spread[t.level - 1]) > 1
+    }
+    rng, placed, errors = random.Random(digest([settings.seed, "places"])), {}, []
+    for fact in ledger.facts:
+        options = [
+            p
+            for p in fact.places
+            if (p.channel_id, p.author_id) in members
+            and all(readable(world, a, p.channel_id) for a in actors[fact.id])
+        ]
+        if not options:
+            errors.append(
+                f"{fact.id}: a place's author is a member of its channel, and every actor of a task resting on the "
+                "fact can read it; none of its places is"
+            )
+            continue
+        used = set()
+        for need, task in spread.values():
+            if fact.id in task.facts:
+                taken = {placed[f].channel_id for f in task.facts if f in placed}
+                if len(taken) < need and sum(f not in placed for f in task.facts) <= need - len(taken):
+                    used |= taken
+        fresh = [p for p in options if p.channel_id not in used] or options
+        placed[fact.id] = rng.choices(fresh, [p.probability for p in fresh])[0]
+    if errors:
+        raise ValueError("; ".join(errors))
+    return placed
+
+
+def moment_columns(world, fact: Fact) -> dict:
+    moment, kind = (fact.happened_at, "happened") if fact.happened_at else (fact.scheduled_for, "scheduled")
+    if moment is None:
+        return {}
+    return dict(moment_us=at(world, moment), moment_zone=moment.zone, moment_kind=kind)
+
+
+def readable(world, actor: str, channel: str) -> bool:
+    return bool(
+        world.db.execute(
+            """SELECT 1 FROM channels c WHERE c.id = ? AND (c.type = 'public' OR EXISTS (SELECT 1 FROM members m
+            WHERE m.channel_id = c.id AND m.user_id = ? AND m.left_us IS NULL))""",
+            (channel, actor),
+        ).fetchone()
+    )
+
+
+class PlanError(ValueError):
+    """A defect of the scene plan found while writing a scene; its builder, not its writer, fixes it."""
+
+
+TIMING_RULES = ("stated_off_day", "before_it_happened", "future_message")
+PART_ORDER = list(PARTS)
+
+
+def check_plan(world, plan: ScenePlan, storyline: str, frozen: dict[str, Scene]) -> ScenePlan:
+    """Deterministic plan rules: placement on the organization, each fact first stated where, by whom and on the
+    day the ledger says, and in the order its relations require. `frozen` scenes are approved: kept unchanged
+    except their revision_note."""
     scenes = {s.id: s for s in plan.scenes}
-    for old in frozen:
-        new = scenes.get(old.id)
-        if new is None or new.model_copy(update={"revision_note": ""}) != old.model_copy(
+    if len(scenes) != len(plan.scenes):
+        raise ValueError("scene ids are unique")
+    for old in frozen.values():
+        if old.id not in scenes or scenes[old.id].model_copy(update={"revision_note": ""}) != old.model_copy(
             update={"revision_note": ""}
         ):
             raise ValueError(
-                f"{old.id} is part of the approved world: keep it unchanged; set its revision_note to revise its text"
+                f"{old.id} is approved: keep it unchanged; set its revision_note to revise its text"
             )
-    if len(conversations) != len(plan.conversations):
-        raise ValueError("duplicate conversation ID")
-    if len({s.id for s in plan.scenes}) != len(plan.scenes):
-        raise ValueError("duplicate scene ID")
-    if unknown := {m for c in plan.conversations for m in c.member_ids} - {p.id for p in catalog.people}:
-        raise ValueError(f"conversation members outside the catalog: {sorted(unknown)}")
-    for scene in plan.scenes:
-        conversation = conversations.get(scene.conversation_id)
-        if conversation is None:
-            raise ValueError(f"{scene.id}: unknown conversation {scene.conversation_id}")
-        if outside := set(scene.participant_ids) - set(conversation.member_ids):
-            raise ValueError(f"{scene.id}: participants are not members: {sorted(outside)}")
+    facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
+    members = {
+        (r[0], r[1])
+        for r in world.db.execute("SELECT channel_id, user_id FROM members WHERE left_us IS NULL")
+    }
+    days = {r[0] for r in world.db.execute("SELECT day FROM calendar")}
+    first: dict[str, tuple] = {}
+    for position, scene in enumerate(plan.scenes):
+        if scene.day not in days:
+            raise ValueError(f"{scene.id}: day {scene.day} is outside the calendar")
+        if outside := [p for p in scene.participants if (scene.channel_id, p) not in members]:
+            raise ValueError(f"{scene.id}: participants are members of {scene.channel_id}; not {outside}")
+        if scene.during and (facts.get(scene.during) or {}).get("moment_us") is None:
+            raise ValueError(f"{scene.id}: during names a fact with happened_at or scheduled_for")
+        if scene.during:
+            start, end = world.db.execute(
+                "SELECT start_us, end_us FROM calendar WHERE day = ?", (scene.day,)
+            ).fetchone()
+            if not start <= facts[scene.during]["moment_us"] < end:
+                raise ValueError(f"{scene.id}: a scene during {scene.during} is on the day of its moment")
         for beat in scene.beats:
-            if beat.fact_id not in facts or beat.author_id not in scene.participant_ids:
-                raise ValueError(f"{scene.id}: beat needs a catalog fact and a participant author")
-    starts, minutes = {s.id: s.start for s in plan.scenes}, timed(catalog)
-    for fact_id, scene_id in first_mentions(plan).items():
-        if (minute := minutes.get(fact_id)) and starts[scene_id][:16] > minute[:16]:
+            fact = facts.get(beat.fact)
+            if fact is None or fact["storyline"] != storyline:
+                raise ValueError(
+                    f"{scene.id}: beats place facts of storyline {storyline}; {beat.fact} is not one"
+                )
+            if beat.author_id not in scene.participants:
+                raise ValueError(f"{scene.id}: the author of beat {beat.fact} is a participant")
+            key = (scene.day, PART_ORDER.index(scene.part), position)
+            if beat.fact not in first or key < first[beat.fact][0]:
+                first[beat.fact] = (key, scene, beat)
+    for fact_id, fact in facts.items():
+        if fact["storyline"] != storyline:
+            continue
+        if fact_id not in first:
+            raise ValueError(f"{fact_id} needs a beat")
+        (day, part, _), scene, beat = first[fact_id]
+        placed = (scene.channel_id, beat.author_id, scene.day)
+        if placed != (fact["channel_id"], fact["author_id"], fact["day"]):
             raise ValueError(
-                f"{scene_id}: fact {fact_id} is stated at {facts[fact_id].valid_from}; the earliest scene "
-                "stating it must start by then"
+                f"{fact_id} is first stated in {fact['channel_id']} by {fact['author_id']} on day {fact['day']}; its "
+                f"first beat is in {placed[0]} by {placed[1]} on day {placed[2]}"
+            )
+        if fact["moment_kind"] == "happened" and scene.during != fact_id:
+            if window(world, scene.day, scene.part)[0] < fact["moment_us"]:
+                raise ValueError(
+                    f"{fact_id} happens at {clock(world, fact['moment_us'])}: state it in a later part, or during it"
+                )
+    for src, dst in world.db.execute(
+        "SELECT src_fact, dst_fact FROM fact_relations WHERE kind IN ('after', 'supersedes')"
+    ):
+        if src not in first:
+            continue
+        (day, part, _), scene, _ = first[src]
+        if dst in first:
+            (other_day, other_part, _), other, _ = first[dst]
+            if scene is not other and (day, part) <= (other_day, other_part):
+                raise ValueError(
+                    f"{src} comes after {dst}: state it in a later part or day, or in the same scene"
+                )
+        elif (
+            said := world.db.execute(
+                """SELECT MIN(m.ts_us) FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?""",
+                (dst,),
+            ).fetchone()[0]
+        ) and window(world, day, PART_ORDER[part])[0] <= said:
+            raise ValueError(
+                f"{src} comes after {dst}, which is already stated; state it in a later part or day"
             )
     return plan
 
 
-def check_scene(
-    plan: ScenePlan, scene: WrittenScene, zones: dict[str, str], timely: dict[str, str] | None = None
-) -> list[str]:
-    """`timely` maps facts first stated in this scene to the UTC minute they must be stated in."""
-    errors = []
-    if outside := {line.author_id for line in scene.lines} - set(plan.participant_ids):
-        errors.append(f"authors must be participants; not participants: {sorted(outside)}")
+def placed_lines(world, scene: Scene, written: WrittenScene, rng: random.Random, gaps: Gaps) -> list[int]:
+    """Timestamps for a scene's lines: it starts in its part of its day (or at the moment it is during), after any
+    other scene of its channel it would interleave with; each line follows the last after a real reply gap."""
+    early, late = window(world, scene.day, scene.part)
+    if scene.during:
+        start = world.db.execute("SELECT moment_us FROM facts WHERE id = ?", (scene.during,)).fetchone()[0]
     else:
-        zone = clock(plan, zones)
-        times = [to_utc(line.local_time, zone) for line in scene.lines]
-        if times[0] < plan.start:
+        start = early + int(rng.random() * (late - early) / 2)
+    while True:
+        stamps = [start]
+        for line in written.lines[1:]:
+            stamps.append(stamps[-1] + gaps.sample(rng, line.pause))
+        clash = world.db.execute(
+            "SELECT MAX(ts_us) FROM messages WHERE channel_id = ? AND ts_us BETWEEN ? AND ?",
+            (scene.channel_id, stamps[0] - 60_000_000, stamps[-1] + 60_000_000),
+        ).fetchone()[0]
+        if clash is None:
+            return stamps
+        start = clash + gaps.sample(rng, "")
+
+
+def check_lines(world, scene: Scene, written: WrittenScene, layout: Layout) -> None:
+    """The writer's contract: participants speak, replies point back and keep the layout's shape, the layout's
+    reactions come from its people, beats are conveyed by their authors, times appear only as {at:fact}, mentions
+    name people."""
+    errors = []
+    if layout.shape == "flat" and (
+        replies := [i for i, x in enumerate(written.lines) if x.reply_to is not None]
+    ):
+        errors.append(f"this conversation is flat: no line replies in a thread; lines {replies} set reply_to")
+    if layout.shape == "thread" and (
+        tops := [i for i, x in enumerate(written.lines[1:], 1) if x.reply_to is None]
+    ):
+        errors.append(
+            f"this conversation is one thread: every line after the first replies; lines {tops} do not"
+        )
+    want = min(layout.reactions, len(written.lines))
+    if (reacted := sum(bool(x.reactions) for x in written.lines)) != want:
+        errors.append(f"exactly {want} lines carry reactions; {reacted} do")
+    reactors = set(scene.participants) | set(layout.audience)
+    sizes = [len(line.text.split()) for line in written.lines]
+    if (short := sum(n <= SHORT for n in sizes)) < min(layout.short, len(sizes)):
+        errors.append(f"at least {layout.short} lines are short, at most {SHORT} words; {short} are")
+    if layout.long is not None and (long := sum(n > LONG for n in sizes)) > layout.long:
+        errors.append(f"at most {layout.long} lines are long, more than {LONG} words; {long} are")
+    for i, line in enumerate(written.lines):
+        if wrong := sorted({r.user_id for r in line.reactions} - (reactors - {line.author_id})):
             errors.append(
-                f"line 0 is at {scene.lines[0].local_time}, before the scene start {to_local(plan.start, zone)}"
+                f"line {i}: participants and the audience react, never the line's author; not {wrong}"
             )
-        if times[-1] > plan.end:
+    if outside := {line.author_id for line in written.lines} - set(scene.participants):
+        errors.append(f"authors are participants; not {sorted(outside)}")
+    moments = {r[0] for r in world.db.execute("SELECT id FROM facts WHERE moment_us IS NOT NULL")}
+    errors += text_errors(world, written.lines, {b.fact for b in scene.beats}, moments)
+    for beat in scene.beats:
+        if not any(beat.fact in line.conveys and line.author_id == beat.author_id for line in written.lines):
+            errors.append(f"{beat.author_id} states fact {beat.fact} in a line that conveys it")
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
+def text_errors(world, lines, conveyable: set[str], moments: set[str]) -> list[str]:
+    """Each line's text rules: a reply points at an earlier line, conveys names only facts the conversation may
+    state, a time or a date appears only as {at:id} of a moment, no line names a fact or event id, and mentions name
+    people."""
+    ids = [r[0] for r in world.db.execute("SELECT id FROM facts UNION SELECT id FROM events")]
+    people = {r[0] for r in world.db.execute("SELECT id FROM users")}
+    errors = []
+    for i, line in enumerate(lines):
+        if line.reply_to is not None and line.reply_to >= i:
+            errors.append(f"line {i}: reply_to names an earlier line of this conversation")
+        if extra := set(line.conveys) - conveyable:
             errors.append(
-                f"the last line is at {scene.lines[-1].local_time}, after the scene end {to_local(plan.end, zone)}"
+                f"line {i}: conveys lists only facts this conversation may state; not {sorted(extra)}"
             )
-        errors += [
-            f"line {i} is at {scene.lines[i].local_time}, before line {i - 1} at {scene.lines[i - 1].local_time}; "
-            "messages must follow each other in time"
-            for i in range(1, len(times))
-            if times[i] < times[i - 1]
-        ]
-        for fact_id, minute in (timely or {}).items():
-            stated = [(t, line) for t, line in zip(times, scene.lines) if fact_id in line.conveys]
-            if stated and stated[0][0][:16] != minute[:16]:
-                first = stated[0][1]
-                errors.append(
-                    f"fact {fact_id}: the first line stating it is at {first.local_time} but must be in "
-                    f"the minute {to_local(minute, zone, '%Y-%m-%d %H:%M')}"
-                )
-    for index, line in enumerate(scene.lines):
-        if line.reply_to is not None and line.reply_to >= index:
-            errors.append(f"line {index}: reply_to {line.reply_to} must name an earlier line of this scene")
-    beats = {b.fact_id for b in plan.beats}
-    if extra := {f for line in scene.lines for f in line.conveys} - beats:
-        errors.append(f"conveys may only list beat fact IDs; unknown: {sorted(extra)}")
-    for beat in plan.beats:
-        if not any(beat.fact_id in line.conveys and line.author_id == beat.author_id for line in scene.lines):
-            errors.append(f"{beat.author_id} must state fact {beat.fact_id} in a line that conveys it")
+        if unknown := set(PLACEHOLDER.findall(line.text)) - moments:
+            errors.append(f"line {i}: {{at:...}} names a moment; not {sorted(unknown)}")
+        if literal := TIME_LITERAL.findall(PLACEHOLDER.sub(" ", line.text)):
+            errors.append(f"line {i}: write times and dates only as {{at:id}}; found {literal}")
+        if named := [
+            f
+            for f in ids
+            if re.search(rf"(?<![\w{{:]){re.escape(f)}(?![\w}}])", PLACEHOLDER.sub(" ", line.text))
+        ]:
+            errors.append(f"line {i}: no line names a fact or event id; found {named}")
+        if strangers := set(MENTION.findall(line.text)) - people:
+            errors.append(f"line {i}: <@...> names a person's user_id; not {sorted(strangers)}")
     return errors
 
 
-def assemble(catalog: Catalog, plan: Plan, scenes: dict[str, WrittenScene]) -> tuple[SlackWorld, dict]:
-    """Deterministic scene → message mapping; returns the world and fact_id → conveying message IDs."""
-    zones = {p.id: p.timezone for p in catalog.personas}
-    messages, conveyed, placed = [], defaultdict(list), {}
-    for scene_plan in plan.scenes:
-        lines = scenes[scene_plan.id].lines
-
-        def root(index, lines=lines):
-            """Slack threads are one level deep: replying to a reply joins its thread."""
-            return index if lines[index].reply_to is None else root(lines[index].reply_to)
-
-        ids = placed[scene_plan.id] = [
-            "m" + digest([scene_plan.id, index])[:10] for index in range(len(scenes[scene_plan.id].lines))
-        ]
-        for message_id, line in zip(ids, scenes[scene_plan.id].lines, strict=True):
-            messages.append(
-                Message(
-                    id=message_id,
-                    conversation_id=scene_plan.conversation_id,
-                    author_id=line.author_id,
-                    text=line.text,
-                    timestamp=to_utc(line.local_time, clock(scene_plan, zones)),
-                    thread_root_id=None if line.reply_to is None else ids[root(line.reply_to)],
+def unplanned(world, written: WrittenScene) -> None:
+    """A background conversation adds no evidence: it names no {at:} moment and states no planned fact's value or
+    anchor, so no task gains a second answer."""
+    facts = world.db.execute("SELECT subject, attribute, value, anchor FROM facts").fetchall()
+    errors = []
+    for i, line in enumerate(written.lines):
+        said = f" {normalized(line.text)} "
+        if PLACEHOLDER.search(line.text):
+            errors.append(f"line {i}: a background conversation names no {{at:...}} moment")
+        for fact in facts:
+            words_ = [normalized(t) for t in (fact["value"], fact["anchor"]) if t and normalized(t)]
+            if hit := next((w for w in words_ if f" {w} " in said), None):
+                errors.append(
+                    f"line {i}: a background conversation states no planned fact; "
+                    f"{hit!r} is {fact['subject']}'s {fact['attribute']}"
                 )
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
+def write_scene(
+    world, storyline: str | None, scene: Scene, written: WrittenScene, key: str, rng, gaps: Gaps, layout=None
+) -> None:
+    """Insert a written scene: rendered text, code timestamps, evidence, mentions and reactions. Rule failures
+    about timing are the plan's (PlanError); the rest are the writer's (ValueError)."""
+    layout = layout or Layout()
+    check_lines(world, scene, written, layout)
+    if storyline is None:
+        unplanned(world, written)
+    stamps = placed_lines(world, scene, written, rng, gaps)
+    facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
+    # The ledger's placement makes the anchor: its channel and day, the first line of its author conveying it.
+    first = {
+        f
+        for f, fact in facts.items()
+        if (fact["channel_id"], fact["day"]) == (scene.channel_id, scene.day)
+        and any(f == b.fact and b.author_id == fact["author_id"] for b in scene.beats)
+    }
+    row = dict(
+        id=scene.id, channel_id=scene.channel_id, storyline=storyline, day=scene.day, part=scene.part
+    ) | dict(slot_start_us=stamps[0], slot_end_us=stamps[-1] + 1, situation=scene.situation, key=key)
+    plan = (
+        scene.model_dump()
+        | {"layout": layout.model_dump()}
+        | written.model_dump(include={"introduces", "promises"})
+    )
+    moments = {f: fact["moment_us"] for f, fact in facts.items()}
+    try:
+        with world.batch():
+            insert_lines(
+                world, row | {"plan_json": json.dumps(plan)}, written.lines, stamps, moments, first, rng, gaps
             )
-            for fact_id in line.conveys:
-                conveyed[fact_id].append(message_id)
-    messages.sort(key=lambda m: (m.timestamp, m.id))
-    world = SlackWorld(users=catalog.people, conversations=plan.conversations, messages=messages)
-    return world, {"conveyed": dict(conveyed), "scene_messages": placed}
+    except ValueError as error:
+        if any(str(error).startswith(rule) or f"; {rule}" in str(error) for rule in TIMING_RULES):
+            raise PlanError(f"scene {scene.id}: {error}") from None
+        raise
 
 
-def style(world: SlackWorld, personas: list[Persona]) -> dict:
-    """Surface statistics of voice and timing; people are compared with their personas by the judge."""
-    zones = {p.id: ZoneInfo(p.timezone) for p in personas}
+def insert_lines(
+    world, scene: dict, lines, stamps, moments, first, rng, gaps, thread=None, latest=None
+) -> list[int]:
+    """Insert one conversation at code's timestamps: its scenes row, each line's text with {at:id} rendered on its
+    author's clock, replies in their thread (or every line in `thread`), mentions, reactions after their message
+    (and before `latest`), and evidence: a fact in `first` is anchored by its author's first line conveying it."""
+    facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
+    zones = {r[0]: r[1] for r in world.db.execute("SELECT id, tz FROM users")}
+    world.insert("scenes", [scene])
+    ids = [None] * len(lines)
+    for i, (line, ts) in enumerate(zip(lines, stamps)):
+        text = PLACEHOLDER.sub(lambda m: render(moments[m[1]], zones[line.author_id], ts), line.text)
+        root = i
+        while lines[root].reply_to is not None:
+            root = lines[root].reply_to
+        parent = thread if thread is not None else ids[root] if root != i else None
+        (ids[i],) = world.insert(
+            "messages",
+            [
+                dict(
+                    channel_id=scene["channel_id"],
+                    ts_us=ts,
+                    user_id=line.author_id,
+                    text=text,
+                    parent_id=parent,
+                )
+            ],
+        )
+        world.insert("scene_messages", [dict(message_id=ids[i], scene_id=scene["id"])])
+        world.insert(
+            "message_mentions",
+            [dict(message_id=ids[i], user_id=u) for u in dict.fromkeys(MENTION.findall(text))],
+        )
+        reacted = [(r, ts + 1 + gaps.sample(rng, "")) for r in line.reactions]
+        world.insert(
+            "reactions",
+            [
+                dict(message_id=ids[i], user_id=r.user_id, emoji=r.emoji)
+                | dict(created_us=min(at, max(ts + 1, latest - 1)) if latest else at)
+                for r, at in reacted
+            ],
+        )
+        for fact_id in dict.fromkeys(line.conveys):
+            fact = facts[fact_id]
+            token = fact["anchor"] or (
+                render(fact["moment_us"], zones[line.author_id], ts)
+                if fact["moment_us"] is not None
+                else None
+            )
+            role = "anchor" if fact_id in first and line.author_id == fact["author_id"] else "supporting"
+            if role == "anchor":
+                first.discard(fact_id)
+            world.insert(
+                "evidence", [dict(fact_id=fact_id, message_id=ids[i], role=role, anchor_token=token)]
+            )
+    return ids
 
-    def share(values):
-        values = list(values)
-        return round(sum(values) / len(values), 2) if values else None
 
-    def measure(messages):
-        texts = [m.text.strip() for m in messages]
-        local = [
-            datetime.fromisoformat(m.timestamp).astimezone(zones[m.author_id])
-            for m in messages
-            if m.author_id in zones
-        ]
-        return {
-            "messages": len(texts),
-            "median_words": statistics.median(len(t.split()) for t in texts),
-            "lowercase_start": share(t[:1].islower() for t in texts),
-            "period_end": share(t.endswith(".") for t in texts),
-            "question": share("?" in t for t in texts),
-            "short": share(len(t.split()) <= 4 for t in texts),
-            "seconds_zero": share(m.timestamp.endswith(":00Z") for m in messages),
-            "off_hours": share(t.hour < 7 or t.hour >= 20 or t.weekday() >= 5 for t in local),
-        }
+EMOJI = re.compile(r":[a-z0-9_+\-]+:|[☀-➿\U0001F300-\U0001FAFF]")
 
-    live = [m for m in world.messages if not m.deleted]
-    if not live:
-        return {}
-    by_author = defaultdict(list)
-    for message in live:
-        by_author[message.author_id].append(message)
-    return measure(live) | {
-        "authors": {author: measure(items) for author, items in sorted(by_author.items())}
+
+def activity(world, start_us: int | None = None, end_us: int | None = None) -> dict:
+    """The workspace's shape as `[activity]` measures it, over all messages or those in [start_us, end_us): how many,
+    and the shares that are thread replies, carry a reaction, sit in DMs, mention someone or carry an emoji."""
+    span = (start_us if start_us is not None else -1 << 62, end_us if end_us is not None else 1 << 62)
+    rows = world.db.execute(
+        """SELECT m.id, m.parent_id IS NOT NULL AS reply, c.type IN ('im', 'mpim') AS dm, m.text,
+        EXISTS (SELECT 1 FROM reactions r WHERE r.message_id = m.id) AS reacted,
+        EXISTS (SELECT 1 FROM message_mentions x WHERE x.message_id = m.id) AS mentions
+        FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.ts_us >= ? AND m.ts_us < ?""",
+        span,
+    ).fetchall()
+    share = lambda values: round(sum(values) / len(rows), 3) if rows else 0.0  # noqa: E731
+    return {
+        "messages": len(rows),
+        "reply_share": share([r["reply"] for r in rows]),
+        "reaction_rate": share([r["reacted"] for r in rows]),
+        "dm_share": share([r["dm"] for r in rows]),
+        "mention_rate": share([r["mentions"] for r in rows]),
+        "emoji_rate": share([bool(EMOJI.search(r["text"])) for r in rows]),
     }
 
 
+def style(world) -> dict:
+    """Surface statistics of voice and timing, overall and per author; the world judge compares them with people's
+    typing."""
+    rows = world.db.execute(
+        "SELECT m.user_id, m.text, m.ts_us, u.tz FROM messages m JOIN users u ON u.id = m.user_id WHERE m.is_deleted = 0"
+    ).fetchall()
+
+    def measure(items):
+        texts = [r["text"].strip() for r in items]
+        local = [datetime.fromtimestamp(r["ts_us"] / 1e6, ZoneInfo(r["tz"])) for r in items]
+        share = lambda values: round(sum(values) / len(values), 2)  # noqa: E731
+        return {
+            "messages": len(texts),
+            "median_words": statistics.median(len(t.split()) for t in texts),
+            "short": share([len(t.split()) <= 4 for t in texts]),
+            "long": share([len(t.split()) > 20 for t in texts]),
+            "question": share(["?" in t for t in texts]),
+            "lowercase_start": share([t[:1].islower() for t in texts]),
+            "off_hours": share([t.hour < 7 or t.hour >= 20 or t.weekday() >= 5 for t in local]),
+        }
+
+    if not rows:
+        return {}
+    by_author = defaultdict(list)
+    for r in rows:
+        by_author[r["user_id"]].append(r)
+    return measure(rows) | {"authors": {a: measure(items) for a, items in sorted(by_author.items())}}
+
+
+# ---------------------------------------------------------------------- reviews
+
+
 class Issue(StrictModel):
-    owner: Literal["synthesizer", "builder"]
-    artifact: Literal["catalog", "workspace", "bindings"]
-    task_ids: list[SafeId] = Field(default_factory=list)
-    fact_ids: list[SafeId] = Field(default_factory=list)
-    message_ids: list[SafeId] = Field(default_factory=list)
+    """A defect a judge reports. Its artifact decides who repairs it: the ledger and tasks are the synthesizer's,
+    the workspace (messages) the builder's."""
+
+    artifact: Literal["ledger", "tasks", "workspace"]
+    task_ids: Ids = Field(default_factory=list)
+    fact_ids: Ids = Field(default_factory=list)
+    message_ids: list[int] = Field(default_factory=list)  # the messages to change
+    evidence_message_ids: list[int] = Field(
+        default_factory=list
+    )  # the messages that show the defect; they stay
     defect: NonEmptyText
     requested_change: NonEmptyText
     blocking: bool = True
-
-    @model_validator(mode="after")
-    def ownership(self) -> Self:
-        expected = "synthesizer" if self.artifact == "catalog" else "builder"
-        if self.owner != expected:
-            raise ValueError(f"{self.artifact} defects belong to {expected}")
-        return self
 
 
 class TaskReview(StrictModel):
     task_id: SafeId
     valid: bool
-    answer_complete: bool
-    supported_claims: list[int]
     reason: NonEmptyText
+    level_fit: int | None = Field(default=None, ge=0, le=4)
+
+
+# A task review scores one task; a world review scores the workspace text.
+PHASE_CRITERIA = {
+    "task": ("question_fit", "discoverability", "shortcut_free"),
+    "world": ("scenario_alignment", "world_coherence", "professional_realism"),
+}
+QUALITY_CRITERIA = tuple(name for names in PHASE_CRITERIA.values() for name in names)
+# The artifacts a review can route a repair to. Before the build, no message exists to repair.
+ARTIFACTS = get_args(Issue.model_fields["artifact"].annotation)
+PHASE_ARTIFACTS = {"ledger": ("ledger", "tasks")}
 
 
 class Verdict(StrictModel):
-    reviewed_hash: str
     approved: bool
     tasks: list[TaskReview]
     issues: list[Issue]
@@ -676,19 +1382,11 @@ class Verdict(StrictModel):
             raise ValueError("duplicate task review")
         if any(not 0 <= value <= 1 for value in self.criteria.values()):
             raise ValueError("criteria must be finite scores from zero to one")
-        blocking = any(i.blocking for i in self.issues)
-        if self.approved and (blocking or any(not t.valid or not t.answer_complete for t in self.tasks)):
+        if self.approved and (any(i.blocking for i in self.issues) or any(not t.valid for t in self.tasks)):
             raise ValueError("approval contradicts blocking defects")
         if not self.approved and not self.issues:
             raise ValueError("rejection must include actionable issues")
         return self
-
-
-# A task review scores one task's evidence; a world review scores the workspace text.
-PHASE_CRITERIA = {
-    "task": ("discoverability", "shortcut_free", "evidence_composition"),
-    "world": ("scenario_alignment", "world_coherence", "professional_realism"),
-}
 
 
 def verdict_schema(phase: str, task_ids: list[str]) -> dict:
@@ -697,7 +1395,8 @@ def verdict_schema(phase: str, task_ids: list[str]) -> dict:
     schema["properties"]["tasks"] |= {"minItems": len(task_ids), "maxItems": len(task_ids)}
     if task_ids:
         schema["$defs"]["TaskReview"]["properties"]["task_id"]["enum"] = task_ids
-    names = PHASE_CRITERIA.get(phase, QUALITY_CRITERIA)
+    schema["$defs"]["Issue"]["properties"]["artifact"]["enum"] = list(PHASE_ARTIFACTS.get(phase, ARTIFACTS))
+    names = PHASE_CRITERIA.get(phase, ())
     schema["properties"]["criteria"] = {
         "type": "object",
         "properties": {name: {"type": "number", "minimum": 0, "maximum": 1} for name in names},
@@ -706,6 +1405,8 @@ def verdict_schema(phase: str, task_ids: list[str]) -> dict:
     if phase in PHASE_CRITERIA:
         schema["properties"]["criteria"]["required"] = list(names)
         schema["required"].append("criteria")
+    if phase == "task":
+        schema["$defs"]["TaskReview"]["required"].append("level_fit")
     return schema
 
 
@@ -715,47 +1416,18 @@ def quality(verdict: Verdict) -> float:
     return sum(verdict.criteria.values()) / len(verdict.criteria)
 
 
-def private_tokens(answer: str, question: str) -> set[str]:
-    """Answer words the question does not give away."""
-    return {
-        token for token in _meaningful_tokens(answer) - _meaningful_tokens(question) if not token.isdigit()
-    }
-
-
-def reveals_answer(identifier: str, answer: str, question: str) -> bool:
-    return _identifier_reveals(identifier, answer, match_tokens=False) or any(
-        _identifier_reveals(identifier, token, match_tokens=False)
-        for token in private_tokens(answer, question)
-    )
-
-
 def validate_verdict(verdict: Verdict, payload: dict) -> None:
-    if verdict.reviewed_hash != digest(payload):
-        raise ValueError("stale review: candidate hash differs")
     if payload["phase"] in PHASE_CRITERIA and set(verdict.criteria) != set(PHASE_CRITERIA[payload["phase"]]):
         raise ValueError(
             f"a {payload['phase']} review scores exactly {list(PHASE_CRITERIA[payload['phase']])}"
         )
-    tasks = {t["id"]: t for t in payload["tasks"]}
-    if {r.task_id for r in verdict.tasks} != set(tasks):
+    if {r.task_id for r in verdict.tasks} != {t["id"] for t in payload["tasks"]}:
         raise ValueError("judge must review every requested task exactly once")
-    for review in verdict.tasks:
-        expected = set(range(len(tasks[review.task_id]["answer"]["required_claims"])))
-        if (
-            len(review.supported_claims) != len(set(review.supported_claims))
-            or set(review.supported_claims) - expected
-        ):
-            raise ValueError("invalid supported claim indices")
-        if verdict.approved and set(review.supported_claims) != expected:
-            raise ValueError("approval requires support for every canonical answer claim")
-
-
-def review_key(catalog: Catalog, candidate: Candidate, task_id: str, outputs: list) -> str:
-    """What a task review depends on: the task, its facts, its binding and what its gold route observes."""
-    task = next(t for t in catalog.tasks if t.id == task_id)
-    binding = next(b for b in candidate.bindings if b.task_id == task_id)
-    facts = [f.model_dump(mode="json") for f in catalog.facts if f.id in task.fact_ids]
-    return digest([task.model_dump(mode="json"), facts, binding.model_dump(mode="json"), outputs])
+    if payload["phase"] == "task" and any(r.level_fit is None for r in verdict.tasks):
+        raise ValueError("a task review scores each task's level_fit from 0 to 4")
+    allowed = PHASE_ARTIFACTS.get(payload["phase"], ARTIFACTS)
+    if any(i.artifact not in allowed for i in verdict.issues):
+        raise ValueError(f"a {payload['phase']} review reports issues on {' or '.join(allowed)} only")
 
 
 def deciding(verdict: Verdict, acceptance) -> list[Issue]:
@@ -763,16 +1435,12 @@ def deciding(verdict: Verdict, acceptance) -> list[Issue]:
     return [i for i in verdict.issues if i.blocking or acceptance.minor_issues_block]
 
 
-def accepted(verdict: Verdict, payload: dict, acceptance) -> bool:
+def accepted(verdict: Verdict, acceptance) -> bool:
     """Blocking issues decide (`config.Acceptance`); the judge's scores are reported, not thresholds."""
-    claims = {t["id"]: len(t["answer"]["required_claims"]) for t in payload["tasks"]}
-    return all(
-        t.valid and t.answer_complete and len(set(t.supported_claims)) == claims[t.task_id]
-        for t in verdict.tasks
-    ) and not deciding(verdict, acceptance)
+    return all(t.valid for t in verdict.tasks) and not deciding(verdict, acceptance)
 
 
-def accepted_task(verdict: Verdict, payload: dict, acceptance, task_id: str) -> bool:
+def accepted_task(verdict: Verdict, acceptance, task_id: str) -> bool:
     """One task of a batched review passes on its own review and the issues that name it or no task."""
     return accepted(
         verdict.model_copy(
@@ -781,148 +1449,5 @@ def accepted_task(verdict: Verdict, payload: dict, acceptance, task_id: str) -> 
                 "issues": [i for i in verdict.issues if task_id in i.task_ids or not i.task_ids],
             }
         ),
-        {"tasks": [t for t in payload["tasks"] if t["id"] == task_id]},
         acceptance,
     )
-
-
-def validate_candidate(catalog: Catalog, candidate: Candidate, task_ids: list[str]) -> dict:
-    """Structural and replay checks. Entailment and naturalness remain agentic judgments."""
-    errors = []
-    world = candidate.snapshot
-    counts = {key: len(getattr(world, key)) for key in ("users", "conversations", "messages", "reactions")}
-    limits = {"users": 200, "conversations": 100, "messages": 10_000, "reactions": 20_000}
-    if (
-        any(counts[key] > limits[key] for key in limits)
-        or len(canonical(world.model_dump(mode="json"))) > 20_000_000
-    ):
-        errors.append("workspace exceeds bounded v2 size limits")
-    tasks = {t.id: t for t in catalog.tasks}
-    bindings = {b.task_id: b for b in candidate.bindings}
-    if set(bindings) - set(tasks):
-        errors.append("binding references unknown task")
-    messages = {m.id: m for m in world.messages}
-    users = {u.id: u for u in world.users}
-    for person in catalog.people:
-        if users.get(person.id) != person:
-            errors.append(f"shared directory differs from approved person {person.id}")
-    routes = {}
-    public_text = "\n".join(
-        [
-            *(m.text for m in world.messages),
-            *(u.name for u in world.users),
-            *(c.topic + " " + c.purpose + " " + (c.name or "") for c in world.conversations),
-        ]
-    )
-    for task in catalog.tasks:
-        if len(task.question) >= 12 and normalized(task.question) in normalized(public_text):
-            errors.append(f"{task.id}: literal benchmark question in workspace")
-        if task.answer.kind in {"entity", "date"}:
-            identifiers = [
-                *(u.id for u in world.users),
-                *(c.id for c in world.conversations),
-                *(m.id for m in world.messages),
-            ]
-            leaking = [
-                identifier
-                for identifier in identifiers
-                if reveals_answer(identifier, task.answer.canonical_answer, task.question)
-            ]
-            if leaking:
-                errors.append(f"{task.id}: identifiers encode private answer content: {leaking}")
-    if any(
-        '"' + field + '"' in public_text
-        for field in ("canonical_answer", "required_claims", "gold_calls", "fact_ids")
-    ):
-        errors.append("serialized private contract fields in workspace")
-    for task_id in task_ids:
-        task, binding = tasks.get(task_id), bindings.get(task_id)
-        if task is None or binding is None:
-            errors.append(f"{task_id}: missing task/binding")
-            continue
-        try:
-            api = SlackAPI(world, task.actor_id)
-            indices = [c.claim_index for c in binding.claims]
-            if sorted(indices) != list(range(len(task.answer.required_claims))):
-                raise ValueError("bind every claim exactly once")
-            required_messages = {m for claim in binding.claims for m in claim.message_ids}
-            required_users = {u for claim in binding.claims for u in claim.user_ids}
-            for message_id in required_messages:
-                message = messages.get(message_id)
-                if (
-                    message is None
-                    or message.deleted
-                    or not api.is_conversation_visible(message.conversation_id)
-                ):
-                    raise ValueError(f"missing or invisible evidence {message_id}")
-            for user_id in required_users:
-                api.get_user(user_id)
-            outputs = []
-            observed_text = task.question
-            private = private_tokens(task.answer.canonical_answer, task.question)
-            for call in binding.gold_calls:
-                query = call.arguments.get("query")
-                if query and (
-                    leaked := _meaningful_tokens(str(query)) & private - _meaningful_tokens(observed_text)
-                ):
-                    raise ValueError(
-                        f"gold search {query!r} uses answer terms {sorted(leaked)} that neither the question nor "
-                        "earlier outputs reveal; search with the question's clues and discover the answer"
-                    )
-                for name in ("conversation_id", "root_message_id", "user_id", "author_id", "cursor"):
-                    value = call.arguments.get(name)
-                    if value is not None and not re.search(
-                        r"(?<![\w.-])" + re.escape(str(value)) + r"(?![\w.-])", observed_text
-                    ):
-                        raise ValueError(
-                            f"gold route uses undiscovered {name}={value!r}; begin with global search "
-                            "or list_conversations, then use IDs/cursors from prior observations"
-                        )
-                output = api.execute(call)
-                outputs.append(output)
-                observed_text += "\n" + canonical(output).decode()
-            observed_messages = {
-                item["message_id"]
-                for output in outputs
-                for item in output.get("items", [])
-                if "message_id" in item
-            }
-            observed_users = {output["user_id"] for output in outputs if "user_id" in output}
-            if required_messages - observed_messages or required_users - observed_users:
-                raise ValueError(
-                    "gold route misses bound evidence: "
-                    f"message_ids={sorted(required_messages - observed_messages)}, "
-                    f"user_ids={sorted(required_users - observed_users)}"
-                )
-            routes[task_id] = outputs
-        except (ValueError, TypeError, LookupError) as exc:
-            errors.append(f"{task_id}: {exc}")
-    replies = [m for m in world.messages if m.thread_root_id and not m.deleted]
-    delays = Counter(
-        int(
-            (
-                datetime.fromisoformat(m.timestamp)
-                - datetime.fromisoformat(messages[m.thread_root_id].timestamp)
-            ).total_seconds()
-        )
-        for m in replies
-    )
-    thread_sizes = Counter(Counter(m.thread_root_id for m in replies).values())
-    texts = [normalized(m.text) for m in world.messages if not m.deleted]
-    activity = {
-        "distinct_message_texts": len(set(texts)),
-        "duplicate_message_excess": len(texts) - len(set(texts)),
-        "replies": len(replies),
-        "threads_by_reply_count": dict(sorted(thread_sizes.items())),
-        "common_reply_delays_seconds": [
-            {"seconds": delay, "count": count} for delay, count in delays.most_common(5)
-        ],
-        "style": style(world, catalog.personas),
-    }
-    return {
-        "ok": not errors,
-        "errors": errors,
-        "counts": counts,
-        "activity": activity,
-        "gold_outputs": routes,
-    }

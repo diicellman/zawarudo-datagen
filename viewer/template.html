@@ -183,6 +183,7 @@ function index(run) {
     if (e.event === 'candidate_reused') routed[e.attempt] = 'reuse';
     if (e.event === 'interrupted') interrupted[e.attempt] = true;
     if (e.event === 'premise_selected') { win.premise = [t0, e.time]; outcome.premise = true; }
+    if (e.event === 'organization_built') outcome.organization = true;
   }
   for (const a of attemptsInOrder) {
     if (outcome[a.id] === undefined) {
@@ -202,8 +203,9 @@ function index(run) {
 }
 const personName = id => X.people[id]?.name || id;
 function column(id) {
-  if (id === 'premise') return 'premise';
-  if (id.startsWith('catalog')) return 'catalog';
+  if (id === 'premise' || id === 'organization') return id;
+  if (id.startsWith('ledger')) return 'ledger';
+  if (id.startsWith('tasks')) return 'tasks';
   if (id.startsWith('final')) return 'final';
   const m = id.match(/^build-(.+)-\d+$/);
   return m ? m[1] : 'other';
@@ -211,8 +213,10 @@ function column(id) {
 function routeOf(a, i, all) {
   const col = column(a.id), prev = all[i - 1];
   if (col === 'premise') return 'seed pick';
+  if (col === 'organization') return 'organization';
   if (prev && X.interrupted[prev.id] && X.outcome[prev.id] === undefined) return 'resume';
-  if (col === 'catalog') return !prev || column(prev.id) === 'premise' ? 'catalog' : column(prev.id) === 'catalog' ? 'repair' : 'catalog repair';
+  if (col === 'ledger') return !prev || ['premise', 'organization'].includes(column(prev.id)) ? 'ledger' : column(prev.id) === 'ledger' ? 'repair' : 'ledger repair';
+  if (col === 'tasks') return prev && column(prev.id) === 'tasks' ? 'repair' : 'tasks';
   if (col === 'final') return 'final review';
   const r = X.routed[a.id];
   if (prev && column(prev.id) === col) return r === 'plan' || !r ? 're-plan' : r;
@@ -257,7 +261,7 @@ function overview() {
   const tiles = [
     ['Status', sum.status || R.phase, sum.reason ? short(sum.reason, 40) : 'phase ' + R.phase],
     ['Messages', num(list(X.world.messages).length), num(list(X.world.conversations).length) + ' conversations'],
-    ['Tasks', num(list(cat.tasks).length), num(list(cat.groups).length) + ' groups · ' + num(list(cat.facts).length) + ' facts'],
+    ['Tasks', num(list(cat.tasks).length), num(list(cat.groups).length) + ' storylines · ' + num(list(cat.facts).length) + ' facts'],
     ['People', num(list(cat.people).length), list(cat.personas).filter(x => x.profile).length ? 'seeded from personas' : 'written by synthesizer'],
     ['Attempts', num(R.attempts.length), rejected + ' rejected'],
     ['Cost', usd(sum.reported_model_cost), 'priced calls only'],
@@ -284,21 +288,22 @@ function overview() {
           : empty('No summary yet'))),
     h('section', {class: 'grid2'},
       h('div', {class: 'card'}, label('Premise'), Object.entries(p).map(([k, v]) => h('p', {}, h('span', {class: 'label', text: k + ' '}), h('span', {text: v})))),
-      h('div', {class: 'card'}, label('Workstreams'), list(cat.groups).map(g => h('p', {}, h('span', {class: 'chip', text: g.id}), g.description)))));
+      h('div', {class: 'card'}, label('Storylines'), list(cat.groups).map(g => h('p', {}, h('span', {class: 'chip', text: g.id}), g.description)),
+        label('Task mix (category · level, drawn by the seed)'), h('p', {}, list(R.quota).map(([c, l]) => h('span', {class: 'chip', text: `${c} · L${l}`}))))));
 }
 
 /* ---------- lineage ---------- */
 function lineage() {
   const attempts = R.attempts;
-  const order = ['premise', 'catalog', ...list(X.cat.groups).map(g => g.id), 'final'];
+  const order = ['premise', 'organization', 'ledger', ...list(X.cat.groups).map(g => g.id), 'tasks', 'final'];
   const cols = {};
   attempts.forEach((a, i) => (cols[column(a.id)] ||= []).push([a, i]));
   const keys = [...order.filter(k => cols[k]), ...Object.keys(cols).filter(k => !order.includes(k))];
   const graph = h('div', {class: 'graph', id: 'graph'},
-    keys.map(k => h('div', {class: 'col'}, h('div', {class: 'colhead', text: k === 'premise' || k === 'catalog' || k === 'final' ? k : 'group · ' + k}),
+    keys.map(k => h('div', {class: 'col'}, h('div', {class: 'colhead', text: ['premise', 'organization', 'ledger', 'tasks', 'final'].includes(k) ? k : 'storyline · ' + k}),
       cols[k].map(([a, i]) => node(a, i, attempts)))),
     R.phase === 'done' ? h('div', {class: 'col'}, h('div', {class: 'colhead', text: 'release'}),
-      h('div', {class: 'node good', id: 'n-publish'}, h('div', {class: 'id', text: 'publish'}), h('div', {class: 'steps', text: 'snapshot · tasks · answers · manifest'}))) : null);
+      h('div', {class: 'node good', id: 'n-publish'}, h('div', {class: 'id', text: 'publish'}), h('div', {class: 'steps', text: 'world.sqlite · tasks · answers · manifest'}))) : null);
   const sel = attempts.find(a => a.id === S.attempt);
   return h('div', {},
     h('section', {}, label('Pipeline lineage'), h('p', {class: 'small muted', text: 'Each card is one attempt, in the order it ran. The edge label names the route the pipeline took next; select a card for its reviews, issues and world changes.'}),
@@ -560,7 +565,6 @@ function tasks() {
 function taskDetail(t) {
   const reader = X.people[t.actor_id], persona = X.personas[t.actor_id];
   const binding = R.bindings?.[t.id];
-  const chain = R.chains?.[t.id];
   const solves = solvesFor(t.id);
   let verdict = null;
   for (const a of [...R.attempts].reverse()) {
@@ -575,7 +579,7 @@ function taskDetail(t) {
   return h('div', {},
     h('div', {class: 'card'}, label(`${t.id} · ${t.group_id}`), h('div', {class: 'q', text: t.question}),
       h('span', {class: 'chip', text: 'reader · ' + (reader?.name || t.actor_id) + (persona ? ' · ' + persona.role : '')}),
-      h('span', {class: 'chip', text: 'kind · ' + t.answer.kind}),
+      h('span', {class: 'chip', text: `${t.category} · level ${t.level}`}),
       h('span', {class: 'chip', text: 'solve rate · ' + pct(R.task_reviews?.[t.id]?.solve_rate)})),
     h('div', {class: 'card', style: 'margin-top:12px'}, label('Answer'),
       spoil(h('p', {style: 'font-size:16px', text: t.answer.canonical_answer})),
@@ -588,13 +592,8 @@ function taskDetail(t) {
       spoil(h('p', {class: 'small muted'}, h('span', {class: 'label', text: 'Reasoning  '}), t.reasoning)),
       S.spoilers ? h('div', {}, label('Facts'), list(t.fact_ids).map(f => X.facts[f] ? h('p', {class: 'small'}, h('span', {class: 'chip', text: f}),
         `${X.facts[f].subject} · ${X.facts[f].predicate}: ${X.facts[f].value}`, h('span', {class: 'faint mono', text: `  from ${X.facts[f].valid_from}${X.facts[f].valid_until ? ' until ' + X.facts[f].valid_until : ''}`})) : null)) : null),
-    h('div', {class: 'card', style: 'margin-top:12px'}, label('Gold route'), h('p', {class: 'small muted', text: 'The replayed read calls that establish the answer from the reader’s view. Violet results are bound evidence; “feeds” marks IDs a later call uses.'}),
-      chain ? chain.map((s, k) => h('div', {class: 'step'}, h('div', {class: 'k', text: String(k + 1).padStart(2, '0')}),
-        h('div', {}, h('code', {class: 'small', text: `${s.call.action}(${Object.entries(s.call.arguments || {}).filter(([, v]) => v !== null).map(([a, v]) => `${a}=${JSON.stringify(v)}`).join(', ')})`}),
-          h('div', {class: 'small muted', text: `returned ${s.returned} · ${s.evidence.length} evidence`}),
-          list(s.feeds).map(f => h('span', {class: 'chip', text: 'feeds ' + f})),
-          S.spoilers ? s.evidence.map(id => evidenceCard(id)) : null)))
-        : empty('No saved route outputs for the current binding')),
+    h('div', {class: 'card', style: 'margin-top:12px'}, label('Gold query'), h('p', {class: 'small muted', text: 'Runs as the reader sees the world: channels they cannot read do not exist for it. Its rows are the answer.'}),
+      t.gold_sql ? spoil(h('pre', {class: 'small mono', style: 'white-space:pre-wrap', text: t.gold_sql})) : empty('No gold query')),
     h('div', {class: 'card', style: 'margin-top:12px'}, label(`Independent solves (${solves.length})`),
       solves.length ? h('div', {class: 'solves'}, solves.map((s, k) => solveCard(s, k, evidence))) : empty('No solves recorded')),
     verdict ? h('div', {class: 'card', style: 'margin-top:12px'}, label(`Task judge · ${verdict[0]}`), status(verdict[1].approved),

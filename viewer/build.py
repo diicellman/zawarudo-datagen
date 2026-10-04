@@ -2,22 +2,56 @@
 
 import argparse
 import json
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
-from worldgen_slack.slack.api import digest
+from worldgen_slack.db import digest
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 QUIET = {"heartbeat", "agent_progress", "author_started"}
-DISCOVERED = ("conversation_id", "root_message_id", "user_id", "author_id", "cursor")
+KIND = {"public": "public_channel", "private": "private_channel", "im": "dm", "mpim": "group_dm"}
 
 
 def read_json(path):
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def artifact(run, reference):
-    return read_json(run / "artifacts" / f"{reference}.json") if isinstance(reference, str) else reference
+def connect(path: Path) -> sqlite3.Connection:
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def iso(us: int) -> str:
+    return datetime.fromtimestamp(us / 1e6, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def snapshot(path: Path) -> dict:
+    """A world file as the page draws it: people, conversations and messages."""
+    db = connect(path)
+    members = {}
+    for channel, user in db.execute(
+        "SELECT channel_id, user_id FROM members WHERE left_us IS NULL ORDER BY user_id"
+    ):
+        members.setdefault(channel, []).append(user)
+    world = {
+        "users": [
+            {"id": r["id"], "name": r["real_name"], "display_name": r["display_name"], "team": json.loads(r["profile_json"]).get("Team")}
+            for r in db.execute("SELECT * FROM users ORDER BY id")
+        ],
+        "conversations": [
+            {"id": r["id"], "name": r["name"], "kind": KIND[r["type"]], "topic": r["topic"], "purpose": r["purpose"], "member_ids": members.get(r["id"], [])}
+            for r in db.execute("SELECT * FROM channels ORDER BY id")
+        ],
+        "messages": [
+            {"id": str(r["id"]), "conversation_id": r["channel_id"], "author_id": r["user_id"], "text": r["text"], "timestamp": iso(r["ts_us"]), "thread_root_id": str(r["parent_id"]) if r["parent_id"] else None, "deleted": bool(r["is_deleted"])}
+            for r in db.execute("SELECT * FROM messages ORDER BY ts_us")
+        ],
+    }  # fmt: skip
+    db.close()
+    return world
 
 
 def summarize(record, full):
@@ -28,7 +62,7 @@ def summarize(record, full):
         "id": record["id"],
         "role": record["agent"]["name"],
         "model": record["agent"]["config"].get("model"),
-        "attempt": data.get("candidate_id") or None,
+        "attempt": data.get("attempt") or None,
         "task_id": data.get("task_id") or None,
         "scene_id": info.get("scene_id"),
         "start": timing.get("start"),
@@ -43,12 +77,7 @@ def summarize(record, full):
     if "evaluation" in info:
         row["evaluation"] = info["evaluation"]
         row["route"] = [
-            {
-                "call": o["call"],
-                "messages": [
-                    i["message_id"] for i in (o.get("output") or {}).get("items", []) if "message_id" in i
-                ],
-            }
+            {"call": {"action": o["tool"], "arguments": o["arguments"]}, "messages": []}
             for o in info.get("observations", [])
         ]
     if "verdict" in info:
@@ -60,99 +89,103 @@ def summarize(record, full):
     return row
 
 
-def chain(binding, outputs):
-    """The gold route step by step: what each call returns, which results are bound evidence, and which
-    returned IDs a later call uses."""
-    evidence = {m for claim in binding["claims"] for m in claim["message_ids"]}
-    steps = []
-    for call, output in zip(binding["gold_calls"], outputs):
-        items = output.get("items", [output] if "user_id" in output else [])
-        text = json.dumps(output)
-        steps.append(
-            {
-                "call": call,
-                "returned": len(items),
-                "evidence": [i["message_id"] for i in items if i.get("message_id") in evidence],
-                "text": text,
-            }
-        )
-    for index, step in enumerate(steps):
-        later = [(name, s["call"]["arguments"].get(name)) for s in steps[index + 1 :] for name in DISCOVERED]
-        step["feeds"] = sorted(
-            {f"{name}={value}" for name, value in later if value and str(value) in step["text"]}
-        )
-    for step in steps:
-        del step["text"]
-    return steps
+def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict]:
+    """The world file's answer key as the page draws it: catalog (people, storylines, facts, tasks), evidence per
+    task, scenes, and each message's scene."""
+    db = connect(path)
+    cast = {c["uuid"]: c for c in state.get("cast", [])}
+    from_seed = {"U" + digest(["user", uuid])[:10].upper(): c for uuid, c in cast.items()}
+    users = db.execute("SELECT * FROM users ORDER BY id").fetchall()
+    facts = [dict(r) for r in db.execute("SELECT * FROM facts ORDER BY day, id")]
+    storyline_of = {f["id"]: f["storyline"] for f in facts}
+    tasks, bindings = [], {}
+    for t in db.execute("SELECT * FROM tasks ORDER BY id").fetchall():
+        gold = json.loads(t["gold_json"])
+        fact_ids = [r[0] for r in db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (t["id"],))]
+        evidence = {str(r["message_id"]) for r in gold if r.get("message_id") is not None}
+        evidence |= {str(r[0]) for r in db.execute("SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id WHERE tf.task_id = ? AND e.role = 'anchor'", (t["id"],))}  # fmt: skip
+        claims = [str(r.get("answer")) for r in gold] or ["(refusal: nothing to find)"]
+        tasks.append(
+            {"id": t["id"], "group_id": next((storyline_of[f] for f in fact_ids), "tasks"), "question": t["question"], "actor_id": t["actor_id"], "fact_ids": fact_ids, "reasoning": f"{t['category']} · level {t['level']} · {t['answer_type']}", "gold_sql": t["gold_sql"], "category": t["category"], "level": t["level"], "answer": {"canonical_answer": "; ".join(claims), "required_claims": claims}}
+        )  # fmt: skip
+        bindings[t["id"]] = {"claims": [{"claim_index": k, "message_ids": sorted(evidence), "user_ids": []} for k in range(len(claims))], "gold_calls": []}  # fmt: skip
+    catalog = {
+        "company": (db.execute("SELECT value FROM world_meta WHERE key = 'company'").fetchone() or [None])[0],
+        "people": [{"id": u["id"], "name": u["real_name"], "display_name": u["display_name"], "team": json.loads(u["profile_json"]).get("Team")} for u in users],
+        "personas": [{"id": u["id"], "role": u["title"], "seniority": "", "timezone": u["tz"], "voice": "", "profile": from_seed.get(u["id"])} for u in users],
+        "groups": [{"id": r["id"], "description": r["summary"]} for r in db.execute("SELECT * FROM storylines ORDER BY position")],
+        "facts": [
+            {"id": f["id"], "group_id": f["storyline"], "subject": f["subject"], "predicate": f["attribute"], "value": f["value"], "valid_from": f"day {f['day']}" + (f" · {f['moment_kind']} {iso(f['moment_us'])}" if f["moment_us"] else ""), "valid_until": None, "description": f["summary"]}
+            for f in facts
+        ],
+        "tasks": tasks,
+    }  # fmt: skip
+    scenes, owner = [], {}
+    for s in db.execute("SELECT * FROM scenes ORDER BY slot_start_us").fetchall():
+        plan = json.loads(s["plan_json"])
+        ids = [str(r[0]) for r in db.execute("SELECT sm.message_id FROM scene_messages sm JOIN messages m ON m.id = sm.message_id WHERE sm.scene_id = ? ORDER BY m.ts_us", (s["id"],))]  # fmt: skip
+        owner.update(dict.fromkeys(ids, s["id"]))
+        # A v6 scene keeps its plan; a v7 conversation keeps its lines, whose authors, statements and promises it shows.
+        lines = plan.get("lines", [])
+        participants = plan.get("participants") or list(dict.fromkeys(line["author_id"] for line in lines))
+        beats = [{"fact_id": b["fact"], "author_id": b["author_id"]} for b in plan.get("beats", [])] + [{"fact_id": f, "author_id": line["author_id"]} for line in lines for f in line.get("conveys", [])]  # fmt: skip
+        promises = plan.get("promises") or [c["text"] for line in lines for c in line.get("commits", [])]
+        scenes.append(
+            {"id": s["id"], "conversation_id": s["channel_id"], "participant_ids": participants, "start": iso(s["slot_start_us"]), "end": iso(s["slot_end_us"]), "situation": s["situation"], "beats": beats, "messages": ids, "promises": promises, "revision_note": plan.get("revision_note", "")}
+        )  # fmt: skip
+    db.close()
+    return catalog, bindings, scenes, owner
 
 
 def load_run(path, full=False):
-    """Everything the page shows, read from the run's saved files."""
+    """Everything the page shows, read from the run's saved files and world snapshots."""
     run = path.resolve()
     state = read_json(run / "state.json")
-    if state is None:
-        raise ValueError(f"No run checkpoint in {run}")
-    catalog, candidate = artifact(run, state["catalog"]), artifact(run, state["candidate"])
+    if state is None or not (run / "world.sqlite").exists():
+        raise ValueError(f"No v6 run (state.json and world.sqlite) in {run}")
+    catalog, bindings, scenes, owner = ledger(run / "world.sqlite", state)
     events = [json.loads(line) for line in (run / "progress.jsonl").read_text().splitlines()]
     order = {e["attempt"]: i for i, e in reversed(list(enumerate(events))) if e.get("attempt")}
     events = [e for e in events if e["event"] not in QUIET]
     traces = [summarize(read_json(p), full) for p in (run / "traces").glob("*.json")]
-    snapshots, attempts, gold = {}, [], {}
-    folders = sorted(
-        (p for p in (run / "attempts").iterdir() if p.is_dir()),
-        key=lambda p: (order.get(p.name, 1e9), p.name),
-    )
+    snapshots, attempts = {}, []
+    folders = sorted((p for p in (run / "attempts").iterdir() if p.is_dir()), key=lambda p: (order.get(p.name, -1 if p.name in ("premise", "organization") else 1e9), p.name))  # fmt: skip
     for folder in folders:
         files = {p.stem: read_json(p) for p in folder.glob("*.json")}
-        world = (files.get("review_input") or files.get("review_input-world") or {}).get("candidate")
-        key = digest(world["snapshot"])[:12] if world else None
-        if world:
-            snapshots[key] = world["snapshot"]
+        key = None
+        if (folder / "world.sqlite").exists():
+            key = folder.name
+            snapshots[key] = snapshot(folder / "world.sqlite")
         validation = files.get("validation") or {}
-        for task_id, outputs in validation.get("gold_outputs", {}).items():
-            gold[task_id] = outputs
         labels = sorted(name.removeprefix("verdict-") for name in files if name.startswith("verdict-"))
         attempts.append(
             {
                 "id": folder.name,
                 "snapshot": key,
-                "verdict": files.get("verdict"),
+                "verdict": files.get("verdict") or (files.get(f"verdict-{labels[0]}") if len(labels) == 1 else None),
                 "acceptance": files.get("acceptance"),
-                "validation": {k: validation.get(k) for k in ("ok", "errors", "counts")}
-                if validation
-                else None,
+                "validation": {k: validation.get(k) for k in ("ok", "errors")} if validation else None,
                 "corrections": files.get("corrections"),
                 "reviews": {
                     label: {
                         "verdict": files[f"verdict-{label}"],
                         "solves": (files.get(f"review_input-{label}") or {}).get("solves"),
-                        "changed_messages": (files.get(f"review_input-{label}") or {}).get(
-                            "changed_messages"
-                        ),
+                        "changed_messages": [str(m) for m in (files.get(f"review_input-{label}") or {}).get("changed_messages") or []],
                     }
                     for label in labels
                 },
             }
-        )
-    scenes, owner = [], {}
-    for scene in (state.get("plan") or {}).get("scenes", []):
-        written = state["scenes"].get(scene["id"], {}).get("scene", {})
-        ids = ["m" + digest([scene["id"], i])[:10] for i in range(len(written.get("lines", [])))]
-        owner.update(dict.fromkeys(ids, scene["id"]))
-        scenes.append(scene | {"messages": ids, "promises": written.get("promises", [])})
-    bindings = {b["task_id"]: b for b in (candidate or {}).get("bindings", [])}
+        )  # fmt: skip
     return {
         "name": f"{run.parent.name}/{run.name}",
         "summary": read_json(run / "summary.json"),
         "phase": state["phase"],
         "premise": state.get("premise"),
+        "quota": state.get("quota"),
         "catalog": catalog,
-        "world": (candidate or {}).get("snapshot"),
+        "world": snapshot(run / "world.sqlite"),
         "bindings": bindings,
-        # Saved route outputs belong to the current bindings only when every gold call has its output.
-        "chains": {
-            t: chain(b, gold[t]) for t, b in bindings.items() if len(gold.get(t, [])) == len(b["gold_calls"])
-        },
+        "chains": {},
         "task_reviews": state.get("task_reviews") or {},
         "scenes": scenes,
         "scene_of": owner,

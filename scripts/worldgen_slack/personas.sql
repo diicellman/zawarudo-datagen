@@ -90,19 +90,34 @@ COPY (
     FROM sample JOIN zones USING (state) ORDER BY uuid
 ) TO 'data/seeds/personas-usa.jsonl' (FORMAT json);
 
+-- The corpus stores every message three times; each statistic counts a message once.
+CREATE TABLE slack AS
+SELECT DISTINCT workspace, channel, ts, "user", text
+FROM 'hf://datasets/spencer/software_slacks@2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a/data/*.parquet';
+
 -- How real people type: surface statistics of every user with at least 30 non-empty messages. Users are keyed
 -- by a digest, so no source identifier is copied.
 COPY (
     WITH messages AS (
         SELECT workspace, "user", trim(text) AS text, len(string_split(trim(text), ' ')) AS words
-        FROM 'hf://datasets/spencer/software_slacks@2e889c0d2b754d96a396fbc1e4b16a37f19e7d7a/data/*.parquet'
+        FROM slack
         WHERE "user" IS NOT NULL AND trim(coalesce(text, '')) <> ''
     )
     SELECT md5(workspace || '/' || "user")[:12] AS id, count(*) AS messages,
            median(words) AS median_words,
            round(avg((words <= 4)::int), 3) AS short_share,
+           round(avg((words > 20)::int), 3) AS long_share,
            round(avg(contains(text, '?')::int), 3) AS question_share,
            round(avg(regexp_matches(text, '^[a-z]')::int), 3) AS lowercase_share,
            round(avg(regexp_matches(text, ':[a-z0-9_+\-]+:|\p{So}')::int), 3) AS emoji_share
     FROM messages GROUP BY workspace, "user" HAVING count(*) >= 30 ORDER BY id
 ) TO 'data/seeds/typing-profiles.jsonl' (FORMAT json);
+
+-- How long people take to answer: the seconds between consecutive messages of a channel, as 1001 quantiles.
+COPY (
+    WITH gaps AS (
+        SELECT epoch(ts::TIMESTAMP - lag(ts::TIMESTAMP) OVER (PARTITION BY workspace, channel ORDER BY ts::TIMESTAMP)) AS s
+        FROM slack WHERE ts IS NOT NULL
+    )
+    SELECT quantile_cont(s, list_transform(range(1001), x -> x / 1000)) AS quantiles FROM gaps WHERE s IS NOT NULL
+) TO 'data/seeds/reply-gaps.json' (FORMAT json);

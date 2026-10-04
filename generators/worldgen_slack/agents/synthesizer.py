@@ -1,39 +1,93 @@
+"""The synthesizer: the company, its people and conversations, the fact ledger, and the tasks."""
+
+from ..contracts import Ledger, Organization, Premises, TaskSet, census, pick_premise, user_id
 from .author import AuthorTask
-from ..contracts import Catalog, Premises, census, pick_premise
 
-SYNTHESIZER_GUIDE = """Phase premise: propose exactly premise_count companies for the requested sector. One is chosen at
-random, so each must support the whole task collection. Make them genuinely different from each other:
-company identity, niche within the sector, country/region and working language, size and maturity, working
-culture (formality, pace, remote/office), and the cast (who works there, backgrounds fitting the region).
-used_names lists companies and people already used elsewhere in this corpus: do not reuse or echo them.
-The company can be anywhere, but its working language is `language`, and all text you write uses it.
-When input.json has country, every company is based in that country and its people may live anywhere in it.
-When input.json has occupations (people available per occupation), each company lists in occupations the ones
-it employs; its people are drawn from them.
-
-Phase catalog: plan the whole task collection for the selected premise before Slack messages are built.
-The company is exactly premise.company; people fit its region, size and culture and never reuse used_names.
-Use stable opaque identifiers. Use opaque person IDs such as u_001, not names such as usr_maya. Update actor
-references consistently. Give every person one persona: role, seniority, IANA timezone, and voice. Voice
-describes how that person actually writes in Slack (length, formality, punctuation, habits) and differs
-between people as it would in that company, from terse or casual to careful, as its culture allows.
-When input.json has candidates, every person is a distinct candidate: the persona's seed_id is the candidate's,
-and the person keeps the candidate's name and timezone. Role, team and seniority fit the candidate's occupation,
-education and age; the voice follows from their profile and their typing (how they type in Slack).
-Create people (User schema), workstream groups, and facts, each in the group of the workstream it belongs to,
-with subject/predicate/value and UTC validity intervals [valid_from, valid_until). valid_from is when someone
-first states the fact in Slack; an event time an answer needs belongs in the value. Choose moments as the people
-involved live them on their own local clocks. Give conflicting values non-overlapping intervals. A fact description
-explains the event and authority. Tasks specify a complete canonical answer, only requested answer claims,
-fact_ids, reader actor_id, group_id, and reasoning. Every actor must be in people.
-Set list_order_matters=false unless the question explicitly requires an ordered answer.
-Tasks can share facts but must ask meaningfully different questions. Cover a natural mix of lookups, temporal reasoning,
-cross-thread/channel joins, identity resolution, scoped lists, comparisons, and exceptions.
-Group questions around connected work. Do not invent 100 unrelated answer snippets. Give public questions
-enough clues for discovery without leaking the answer. Resolve time scope, authority, and list scope.
-Avoid repeatedly reskinning one question. A plan, request, or constraint does not establish a decision.
+PREMISE_GUIDE = """Phase premise: propose exactly premise_count companies in `sector`; the run seed picks one, and the
+rest of the run builds that company's Slack workspace. A premise has:
+- company: its name, whose first word differs from the other premises' first words and from every name in used_names;
+- niche, region, size and culture: what it does, where in `country` it is, how big it is (it employs `pool` people)
+  and how it works;
+- cast: the kinds of people who work there;
+- staffing: how many people of each occupation in `occupations` it employs. The counts add up to exactly `pool`, each
+  at most that occupation's count in `occupations`; code hires exactly these people.
+Write in `language`.
 """
 
+ORGANIZATION_GUIDE = """Phase organization: give the company's people their jobs, and choose its conversations.
+- people: every candidate in `candidates` once, by user_id. A person keeps the candidate's name and timezone. title and
+  team are the job they hold here.
+- channels: the conversations the company works in. A public channel is readable by every person, a private channel
+  only by its members; an im is a direct message between exactly 2 people, an mpim a group DM of 3 or more. Public and
+  private channels have a name of lowercase letters, digits, - and _, and a topic and purpose in `language`; DMs have
+  no name. members are user_ids of chosen people. Code adds more direct messages between people who work together.
+- routines: for each public and private channel, 3 to 5 recurring kinds of conversation people have there, each with
+  the probability that one of the channel's everyday conversations is of that kind. dm_routines: the same for direct
+  messages. Code draws each everyday conversation's kind from them; the storylines are written apart.
+The ledger review checks that each title and team fit the person's occupation, education and age.
+"""
+
+GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor sees it: channels, members, messages,
+  message_mentions, reactions and thread_stats hold only what the actor can read; users, calendar, storylines, facts,
+  fact_relations and evidence are whole. local(us) writes a time on the actor's clock, local(us, zone) on another.
+  It returns the answer in a column named answer, and may name the evidence in message_id and user_id columns.
+- What the gold query reads follows the category's gold in `taxonomy`: a sql query reads only the workspace, a
+  ledger query reads the facts it answers from, a hybrid query reads both.
+- The gold query finds messages by what the question names (words, people, channels, threads, reactions, times),
+  never by a message id or by id order: code checks that it answers the same with the messages renumbered.
+- answer_type: text or number is one row; set is 1 to max_answer_rows rows; refusal is no rows as the actor.
+- question is what actor_id asks, in `language`; it does not contain its answer.
+"""
+
+GOLD = (
+    GOLD_SQL
+    + """- Each cell of `cells` gives a category, a level, the concept its task requires, and the style its question is asked
+  in. Write 1 to 3 candidate tasks for each cell, with distinct ids. probability is how likely a
+  task of that cell is to be like this one. Code checks every candidate and the run seed picks a valid one per cell,
+  favoring the less likely.
+"""
+)
+
+LEDGER_GUIDE = (
+    """Phase ledger: plan what the company's Slack will state, before any message is written, and the tasks whose
+answers come from it. world.sqlite holds the people (users) and conversations (channels, members).
+- storylines: exactly storyline_count workstreams, in the order they will be built.
+- facts: what someone states in Slack.
+  - subject, attribute and value say what is stated. value is the answer it gives, with no time or date in it.
+  - anchor: words of value that every message stating the fact contains exactly, or null.
+  - places: 1 to 3 places where it could first be stated, each a channel_id, an author_id who is a member of it, and
+    the probability of that place. Code draws one with the run seed, among places every actor of a task resting on
+    the fact can read; a level with a spread in `taxonomy` has its task's facts drawn into that many channels.
+  - day: on which day of `calendar` it is first stated.
+  - after: facts first stated before this one. supersedes: the earlier fact whose value this one replaces. Both name
+    facts of the same or an earlier storyline.
+  - Facts with the same subject and attribute and different values form a supersedes chain, or all but one are decoy.
+  - happened_at: when the event it reports happened; it is stated only after that moment. scheduled_for: the moment it
+    plans. A moment is a day of `calendar`, a time "HH:MM" and an IANA zone; code writes it into each message on its
+    reader's clock.
+  - summary: what the fact means and on whose authority.
+- tasks: for the cells in `cells`; `taxonomy` defines each category and level. Messages do not exist yet, so a gold
+  query reads facts. facts names the facts a task's answer rests on.
+"""
+    + GOLD
+    + """The ledger review checks that the facts fit the premise and the people's roles, that each fact's authority is
+plausible, and that each task asks one clear question its gold query answers exactly.
+"""
+)
+
+TASKS_GUIDE = (
+    """Phase tasks: the workspace is written. Add tasks for the cells in `cells`; `taxonomy` defines
+each category and level. world.sqlite holds the whole workspace, and the facts with the messages stating them
+(evidence).
+"""
+    + GOLD
+    + """- facts: for a hybrid task, the facts its answer starts from; for the others, none.
+- A task asks a question no task in existing_questions asks.
+The task review checks that each gold query answers its question as asked, that the actor can find the answer with
+Slack's read tools, that nothing hands the answer over outside its evidence, and that each task is as hard as its
+level says, measured: how deep its evidence sits, the tables its query reads, its evidence's search rank.
+"""
+)
 
 CARD = set(
     "name sex age education_level bachelors_field occupation city state timezone professional_persona".split()
@@ -41,104 +95,108 @@ CARD = set(
 
 
 class SynthesizerTask(AuthorTask):
-    outputs = {"premise": Premises, "catalog": Catalog}
-    instructions = SYNTHESIZER_GUIDE
-
-
-def workspace_id(settings, state) -> str:
-    return state.catalog.workspace_id if state.catalog else f"workspace-{settings.seed}"
+    outputs = {"premise": Premises, "organization": Organization, "ledger": Ledger, "tasks": TaskSet}
+    guides = {
+        "premise": PREMISE_GUIDE,
+        "organization": ORGANIZATION_GUIDE,
+        "ledger": LEDGER_GUIDE,
+        "tasks": TASKS_GUIDE,
+    }
 
 
 def premise_context(settings, used) -> dict:
+    countries, occupations = census(settings.personas, used["people"])
     return {
         "phase": "premise",
         "sector": settings.sector,
         "language": settings.language,
         "premise_count": settings.premise_count,
         "used_names": used,
-        "workspace_id": f"workspace-{settings.seed}",
-        "feedback": "",
-    } | (supply(settings.personas) if settings.personas else {})
+        "country": ", ".join(countries),
+        "occupations": dict(occupations.most_common()),
+        "pool": settings.personas.pool,
+    }
 
 
-def supply(personas) -> dict:
-    countries, occupations = census(personas)
-    return {"country": ", ".join(countries), "occupations": dict(occupations.most_common())}
+def parse_premise(raw: str, settings, used):
+    """The synthesizer proposes distinct premises; the run seed, not the model, picks one."""
+    premises = Premises.model_validate_json(raw)
+    available, pool = census(settings.personas, used["people"])[1], settings.personas.pool
+    for p in premises.premises:
+        if sum(p.staffing.values()) != pool:
+            raise ValueError(
+                f"{p.company}: staffing counts add up to exactly {pool}, not {sum(p.staffing.values())}"
+            )
+        for occupation, count in p.staffing.items():
+            if count > available[occupation]:
+                raise ValueError(f"{p.company}: only {available[occupation]} unused people are {occupation}")
+    return pick_premise(premises, settings.premise_count, used["companies"], settings.seed)
 
 
 def candidates(cast) -> list[dict]:
-    """The cards people are chosen by; code attaches the full profile to each chosen persona."""
+    """The cards people are chosen by; code keeps the full profile and pairs it with the chosen person."""
     return [
-        {"seed_id": p.uuid}
+        {"user_id": user_id(p.uuid)}
         | p.model_dump(include=CARD)
         | {"typing": p.typing.model_dump(exclude={"id", "messages"})}
         for p in cast
     ]
 
 
-def parse_premise(raw, settings, used):
-    """The synthesizer proposes distinct premises; the run seed, not the model, picks one."""
-    premises = Premises.model_validate_json(raw)
-    if settings.personas:
-        available = census(settings.personas)[1]
-        for p in premises.premises:
-            if sum(available[o] for o in set(p.occupations)) < settings.personas.pool:
-                raise ValueError(
-                    f"{p.company}: list occupations from input.json whose people total {settings.personas.pool} or more"
-                )
-    return pick_premise(premises, settings.premise_count, used["companies"], settings.seed)
-
-
-def catalog_context(settings, state, used) -> dict:
+def organization_context(settings, state, used) -> dict:
     return {
-        "phase": "catalog",
-        "sector": settings.sector,
-        "task_count": settings.task_count,
-        "group_size": settings.group_size,
+        "phase": "organization",
+        "premise": state.premise.model_dump(),
         "language": settings.language,
-        "premise": state.premise.model_dump() if state.premise else None,
-        "used_names": used,
-        "workspace_id": workspace_id(settings, state),
+        "candidates": candidates(state.cast),
+        "used_names": used["people"],
         "feedback": state.feedback,
-        "previous_output": state.catalog.model_dump(mode="json") if state.catalog else None,
-        "instructions": "Create the whole catalog. On repair preserve task IDs, group IDs, and assignments.",
-    } | ({"candidates": candidates(state.cast)} if state.cast else {})
+    }
 
 
-def cast_personas(catalog, cast) -> Catalog:
-    """Each human persona names a distinct candidate and keeps its name and timezone; its profile is attached."""
-    pool, people = {p.uuid: p for p in cast}, {p.id: p for p in catalog.people}
-    humans = [p for p in catalog.personas if not people[p.id].is_bot]
-    chosen = [p.seed_id for p in humans]
-    if set(chosen) - pool.keys() or len(set(chosen)) != len(chosen):
-        raise ValueError("every person needs a distinct seed_id from candidates")
-    if mismatched := [
-        f"{p.id} is {pool[p.seed_id].name} ({pool[p.seed_id].timezone})"
-        for p in humans
-        if (people[p.id].name, p.timezone) != (pool[p.seed_id].name, pool[p.seed_id].timezone)
-    ]:
-        raise ValueError("people keep their candidate's name and timezone: " + "; ".join(mismatched))
-    profiles = {p.id: pool[p.seed_id] for p in humans}
-    personas = [p.model_copy(update={"profile": profiles.get(p.id)}) for p in catalog.personas]
-    return catalog.model_copy(update={"personas": personas})
+def definitions(settings, cells) -> dict:
+    """The taxonomy as data: each requested category's definition, and the meaning and fact spread of its requested
+    levels."""
+    out = {}
+    for category, level, *_ in cells:
+        spec = settings.taxonomy[category]
+        entry = out.setdefault(category, {"gold": spec.gold, "definition": spec.definition, "levels": {}})
+        entry["levels"][level] = spec.levels[level - 1]
+        if spec.spread:
+            entry.setdefault("spread", {})[level] = spec.spread[level - 1]
+    return out
 
 
-def check_catalog(raw, settings, state, used) -> Catalog:
-    catalog = Catalog.model_validate_json(raw)
-    if len(catalog.tasks) != settings.task_count or catalog.sector.casefold() != settings.sector.casefold():
-        raise ValueError("catalog must match requested task count and sector")
-    if catalog.workspace_id != workspace_id(settings, state):
-        raise ValueError("workspace ID must remain stable")
-    if len(catalog.groups) != (settings.task_count + settings.group_size - 1) // settings.group_size:
-        raise ValueError("catalog has the wrong number of groups")
-    if any(sum(t.group_id == g.id for t in catalog.tasks) > settings.group_size for g in catalog.groups):
-        raise ValueError("group exceeds configured task count")
-    if state.catalog and {(t.id, t.group_id) for t in catalog.tasks} != {
-        (t.id, t.group_id) for t in state.catalog.tasks
-    }:
-        raise ValueError("catalog repair must preserve task IDs and group assignments")
-    if not catalog.personas or catalog.company != state.premise.company:
-        raise ValueError("catalog must use premise.company and give every person a persona")
-    if reused := {p.name for p in catalog.people} & set(used["people"]):
-        raise ValueError(f"people reuse names from used_names: {sorted(reused)}")
-    return cast_personas(catalog, state.cast) if state.cast else catalog
+def requested(cells) -> list[dict]:
+    """The cells to write tasks for: each with the concept its task requires and the style its question is in."""
+    return [dict(zip(("category", "level", "concept", "style"), c)) for c in cells]
+
+
+def ledger_context(settings, state, calendar: list[dict]) -> dict:
+    cells = [c for c in state.quota if settings.taxonomy[c[0]].gold == "ledger"]
+    return {
+        "phase": "ledger",
+        "premise": state.premise.model_dump(),
+        "language": settings.language,
+        "storyline_count": -(-settings.tasks.count // settings.tasks.per_storyline),
+        "calendar": calendar,
+        "cells": requested(cells),
+        "taxonomy": definitions(settings, cells),
+        "max_answer_rows": settings.tasks.max_answer_rows,
+        "feedback": state.feedback,
+        "previous_output": state.drafts.get("ledger"),
+    }
+
+
+def tasks_context(settings, state, questions: list[str]) -> dict:
+    cells = [c for c in state.quota if settings.taxonomy[c[0]].gold != "ledger"]
+    return {
+        "phase": "tasks",
+        "language": settings.language,
+        "cells": requested(cells),
+        "taxonomy": definitions(settings, cells),
+        "max_answer_rows": settings.tasks.max_answer_rows,
+        "existing_questions": questions,
+        "feedback": state.feedback,
+        "previous_output": state.drafts.get("tasks"),
+    }

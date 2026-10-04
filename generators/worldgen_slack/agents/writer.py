@@ -1,75 +1,46 @@
-"""Scene writer: one conversation scene per fresh chat, without tools or code execution."""
+"""The scene writer: one scene's messages per fresh chat, without tools; code checks and places them."""
 
 import json
 import random
-import verifiers.v1 as vf
-from datetime import datetime, timedelta
-from worldgen_slack.slack.api import digest
-from ..contracts import (
-    Catalog,
-    Plan,
-    Premise,
-    SceneRecord,
-    ScenePlan,
-    SeedPacket,
-    SeedPersona,
-    WrittenScene,
-    check_scene,
-    clock,
-    first_mentions,
-    timed,
-    to_local,
-    to_utc,
-)
-from worldgen_slack.slack.models import Conversation
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-WRITER_GUIDE = """Write one scene of a company's Slack workspace: the messages coworkers post while they work.
-The brief gives the company, the conversation, the participants with personas, the situation, recent
-messages, and beats. recent_messages come earlier in this conversation; seen_elsewhere are recent messages
-the participants saw in other conversations; established_facts are true at the scene start; world_details and established_details are fixed facts of this
-workspace. Never contradict any of them, and restate them only when the work calls for it. commitments are
-promises made earlier: keep them, or have someone explicitly change them. A participant's profile is who they are
-outside their role; typing is how they type in Slack, measured on a real person: median words per message and
-the shares of their messages with at most four words, a question, a lowercase start, or an emoji. Their lines
-follow those numbers. Each person writes in their own voice as their persona describes; people differ in
-length, capitalization, punctuation, formality, abbreviations and emoji. Slack is chat, not email: most
-messages are one line, many are a few words (acks, quick questions, "on it", "hmm"), people split a thought
-across several messages, and multi-paragraph posts are rare. Write in the brief's language. Continue the
-recent messages naturally without repeating them. Write about `length` messages, fewer or more if the
-situation calls for it.
-Beats are facts that must come up. The beat's author states the fact in their own words as part of the work,
-explicitly enough that a reader of that message alone learns the value (names, numbers, dates as people
-write them). A beat with state_at happens right then: the line stating it is written in that minute.
-Mark each such message with conveys: [fact_id]. Do not contradict any beat or state other
-decisions as settled. Never mention fact IDs, evidence, questions, or that this is generated.
-Every time in the brief and every local_time you write is on the scene clock (scene.clock); people's own timezones
-are in their personas. local_time is YYYY-MM-DD HH:MM:SS with irregular seconds; the scene runs from scene.start to scene.end.
-Times people schedule or promise come from world_details, beats and earlier messages; do not invent new ones.
-Messages follow each other in time. Gaps follow the work: quick
-exchanges take seconds or minutes; waiting can take hours or the next working day.
-The first message is a top-level post. reply_to is the 0-based index of an earlier line of this scene; the message
-joins that line's thread. null posts a new top-level message.
-style_references are real Slack excerpts from other workplaces. Borrow their texture, such as fragments,
-follow-ups, hedges and corrections; never copy their wording, names, or topics.
-If the brief has previous_version and revision_note, revise that version to satisfy the note.
-In introduces, list each new concrete detail the scene invents (names, versions, times, numbers, document or ticket
-IDs); in promises, list each commitment still open when the scene ends (who, what, by when).
-Reply with JSON only: {"lines": [{"author_id", "text", "local_time", "reply_to", "conveys"}], "introduces": [],
-"promises": []}.
+import verifiers.v1 as vf
+
+from ..contracts import Layout, PlanError, Scene, SeedPacket, SeedPersona, WrittenScene, window, world_meta
+
+WRITER_GUIDE = """Write one scene of a company's Slack: the messages its participants post. The brief gives the
+company, the conversation, the participants, the scene and what came before it.
+- participants may post. profile is who a person is outside their job; typing is how they type in Slack, measured on
+  a real person: median words per message, and the shares of messages with at most four words, with a question,
+  starting lowercase, and with an emoji. The world review compares each person's messages with their typing.
+- recent_messages came earlier in this conversation; seen_elsewhere are messages the participants saw elsewhere in the
+  day before; established and commitments are details and open promises of earlier scenes they saw. The world review
+  checks that no message contradicts them and that promises are kept or explicitly changed.
+- beats are facts the scene states: the beat's author_id states it in a line whose conveys lists its fact_id, and
+  when the fact has an anchor, that line contains the anchor exactly.
+- A time or a date appears only as {at:fact_id} for a fact in `moments`; code writes it on each reader's clock.
+  Mentions are <@user_id>. No line names a fact id.
+- reply_to is the index of an earlier line of this scene whose thread the line joins; null posts a new message.
+  layout.shape says how the conversation is threaded: "flat" posts every line as a new message, "thread" makes every
+  line after the first a reply in its thread, "free" leaves it to you.
+- reactions are emoji reactions to a line: {"user_id", "emoji"} with an emoji name such as "eyes". Exactly
+  layout.reactions lines carry reactions, from participants or layout.audience, never from the line's author.
+- layout.short: at least this many lines are short, at most 4 words. layout.long, when set: at most this many lines
+  are long, more than 20 words. Which lines, and whose, is yours.
+- pause is "hours" when an hour or more passes before the line, and "" otherwise.
+- style_references are real Slack excerpts from other workplaces: borrow their texture, never their wording, names or
+  topics.
+- previous_version and revision_note, when present: revise that version as the note asks.
+- introduces lists each new concrete detail the scene invents (a name, a version, a number, a document); promises
+  lists each commitment still open when the scene ends.
+Write in `language`, about `length` lines. Reply with JSON only:
+{"lines": [{"author_id", "text", "reply_to", "conveys", "pause", "reactions"}], "introduces": [], "promises": []}.
 """
 
 
-def excerpts(seeds: SeedPacket | None, key: str, count: int = 2) -> list[str]:
-    if seeds is None:
-        return []
-    chosen = random.Random(key).sample(seeds.examples, min(count, len(seeds.examples)))
-    return ["\n".join(f"{m.speaker or 'someone'}: {m.text}" for m in e.messages[:14]) for e in chosen]
-
-
-def portrait(profile: SeedPersona | None) -> dict:
-    """A seeded person beyond their role, and how they type in Slack."""
-    if profile is None:
-        return {}
+def portrait(profile: SeedPersona) -> dict:
+    """A seeded person beyond their job, and how they type in Slack."""
     return {
         "profile": {
             "age": profile.age,
@@ -83,122 +54,110 @@ def portrait(profile: SeedPersona | None) -> dict:
     }
 
 
+def excerpts(seeds: SeedPacket | None, key: str, count: int = 2) -> list[str]:
+    if seeds is None:
+        return []
+    chosen = random.Random(key).sample(seeds.examples, min(count, len(seeds.examples)))
+    return ["\n".join(f"{m.speaker or 'someone'}: {m.text}" for m in e.messages[:14]) for e in chosen]
+
+
 def brief(
-    catalog: Catalog,
-    premise: Premise,
-    plan: Plan,
-    scene: ScenePlan,
-    observed: dict[str, list],
-    references: list[str],
-    previous: SceneRecord | None,
-    language: str,
-    timely: dict[str, str],
-) -> str:
-    """`observed` holds (utc, conversation name, line) for this conversation ("recent") and others ("elsewhere"),
-    plus the details and commitments of earlier scenes the participants could see."""
-    conversation = next(c for c in plan.conversations if c.id == scene.conversation_id)
-    people = {p.id: p for p in catalog.people}
-    personas = {p.id: p for p in catalog.personas}
-    facts = {f.id: f for f in catalog.facts}
-    zone = personas[scene.participant_ids[0]].timezone
+    world,
+    scene: Scene,
+    premise: dict,
+    profiles: dict[str, SeedPersona],
+    references,
+    language,
+    previous=None,
+    layout: Layout | None = None,
+    background: bool = False,
+):
+    """Everything one scene is written from, read from the world: who, where, which facts, and what came before."""
+    zone = ZoneInfo(world_meta(world, "zone"))
+    start = window(world, scene.day, scene.part)[0]
+    if scene.during:
+        start = world.db.execute("SELECT moment_us FROM facts WHERE id = ?", (scene.during,)).fetchone()[0]
+    channel = dict(
+        world.db.execute(
+            "SELECT name, type, topic, purpose FROM channels WHERE id = ?", (scene.channel_id,)
+        ).fetchone()
+    )
+    users = {r["id"]: r for r in world.db.execute("SELECT * FROM users")}
+    seen = {r[0] for r in world.db.execute(f"SELECT DISTINCT channel_id FROM members WHERE user_id IN ({', '.join('?' * len(scene.participants))})", scene.participants)}  # fmt: skip
 
-    def on(utc: str, form: str = "%A %Y-%m-%d %H:%M") -> str:
-        """Every time in the brief is on the scene clock."""
-        return to_local(utc, zone, form)
-
-    def shown(entries):
+    def shown(rows):
         return [
-            {
-                "conversation": c,
-                "author": people[x.author_id].name,
-                "time": on(u, "%A %Y-%m-%d %H:%M:%S"),
-                "text": x.text,
-            }
-            for u, c, x in entries
-        ]
+            {"author": users[r["user_id"]]["real_name"], "time": f"{datetime.fromtimestamp(r['ts_us'] / 1e6, zone):%a %H:%M}", "text": r["text"]}
+            for r in rows
+        ]  # fmt: skip
 
+    recent = world.db.execute(
+        "SELECT * FROM messages WHERE channel_id = ? AND ts_us < ? AND is_deleted = 0 ORDER BY ts_us DESC LIMIT 15",
+        (scene.channel_id, start),
+    ).fetchall()[::-1]
+    elsewhere = [
+        r
+        for r in world.db.execute(
+            "SELECT * FROM messages WHERE channel_id <> ? AND ts_us BETWEEN ? AND ? AND is_deleted = 0 ORDER BY ts_us",
+            (scene.channel_id, start - 86_400_000_000, start),
+        ).fetchall()
+        if r["channel_id"] in seen
+    ][-20:]
+    earlier = [
+        json.loads(r[0])
+        for r in world.db.execute(
+            "SELECT plan_json FROM scenes WHERE slot_start_us < ? ORDER BY slot_start_us", (start,)
+        )
+        if json.loads(r[0]).get("channel_id") in seen
+    ]
+    facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
+    moments = [
+        {"fact_id": f, "about": f"{x['subject']}: {x['attribute']}"}
+        for f, x in facts.items()
+        if x["moment_us"] is not None
+        and not background
+        and (x["day"] <= scene.day or f in {b.fact for b in scene.beats})
+    ]
     value = {
         "language": language,
-        "company": premise.model_dump() | {"overview": catalog.overview},
-        "conversation": conversation.model_dump(include={"name", "kind", "topic", "purpose"}),
+        "company": premise,
+        "conversation": channel,
         "participants": [
-            {"author_id": i, "name": people[i].name, "team": people[i].team}
-            | personas[i].model_dump(exclude={"id", "seed_id", "profile"})
-            | portrait(personas[i].profile)
-            for i in scene.participant_ids
-        ],
+            {
+                "user_id": u,
+                "name": users[u]["real_name"],
+                "title": users[u]["title"],
+                "team": json.loads(users[u]["profile_json"]).get("Team"),
+            }
+            | portrait(profiles[u])
+            for u in scene.participants
+        ],  # fmt: skip
         "scene": {
             "situation": scene.situation,
-            "clock": zone,
-            "start": on(scene.start, "%Y-%m-%d %H:%M:%S"),
-            "weekday": on(scene.start, "%A"),
-            "end": on(scene.end, "%Y-%m-%d %H:%M:%S"),
+            "day": scene.day,
+            "weekday": f"{datetime.fromtimestamp(start / 1e6, zone):%A}",
+            "part": scene.part,
             "length": scene.length,
             "beats": [
-                {"author_id": b.author_id}
-                | facts[b.fact_id].model_dump(exclude={"id", "valid_from", "valid_until"})
-                | {"fact_id": b.fact_id}
-                | ({"state_at": on(timely[b.fact_id], "%Y-%m-%d %H:%M")} if b.fact_id in timely else {})
+                {"fact_id": b.fact, "author_id": b.author_id}
+                | {k: facts[b.fact][k] for k in ("subject", "attribute", "value", "anchor", "summary")}
                 for b in scene.beats
             ],
         },
-        # ponytail: every currently valid fact; filter by workstream once catalogs reach hundreds of facts.
-        "established_facts": [
-            f.model_dump(include={"subject", "predicate", "value"}) | {"since": on(f.valid_from)}
-            for f in catalog.facts
-            if f.valid_from <= scene.start and (f.valid_until is None or f.valid_until > scene.start)
-        ],
-        "world_details": {
-            name: d.value if d.at is None else {"value": d.value, "at": on(d.at)}
-            for name, d in plan.details.items()
-            if d.since is None or d.since <= scene.start
+        "layout": (layout or Layout()).model_dump()
+        | {
+            "audience": [{"user_id": u, "name": users[u]["real_name"]} for u in (layout or Layout()).audience]
         },
-        "established_details": observed["established"],
-        "commitments": observed["commitments"],
-        "recent_messages": shown(observed["recent"]),
-        "seen_elsewhere": shown(observed["elsewhere"]),
+        "moments": moments,
+        "recent_messages": shown(recent),
+        "seen_elsewhere": shown(elsewhere),
+        "established": [d for e in earlier for d in e.get("introduces", [])],
+        "commitments": [p for e in earlier for p in e.get("promises", [])],
         "style_references": references,
     }
     if previous is not None and scene.revision_note:
-        value |= {
-            "previous_version": previous.scene.model_dump()["lines"],
-            "revision_note": scene.revision_note,
-        }
+        value |= {"previous_version": previous, "revision_note": scene.revision_note}
     return json.dumps(value, ensure_ascii=False, indent=1)
-
-
-def visible(other: ScenePlan, scene: ScenePlan, conversations: dict[str, Conversation]) -> bool:
-    """Whether `scene` may depend on `other`: it comes earlier and the participants could have seen it."""
-    if (other.start, other.id) >= (scene.start, scene.id):
-        return False
-    shared = set(conversations[other.conversation_id].member_ids) & set(scene.participant_ids)
-    return other.conversation_id == scene.conversation_id or bool(shared)
-
-
-def observed(catalog: Catalog, plan: Plan, written: dict[str, WrittenScene], scene: ScenePlan) -> dict:
-    """What the participants saw before the scene: its own conversation, the last day elsewhere, and every
-    concrete detail earlier visible scenes established."""
-    zones = {p.id: p.timezone for p in catalog.personas}
-    conversations = {c.id: c for c in plan.conversations}
-    day_before = (datetime.fromisoformat(scene.start) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    recent, elsewhere, established, commitments = [], [], [], []
-    for other in plan.scenes:
-        if other.id not in written or not visible(other, scene, conversations):
-            continue
-        conversation = conversations[other.conversation_id]
-        same = other.conversation_id == scene.conversation_id
-        established += written[other.id].introduces
-        commitments += written[other.id].promises
-        for line in written[other.id].lines:
-            utc = to_utc(line.local_time, clock(other, zones))
-            if utc <= scene.start and (same or utc >= day_before):
-                (recent if same else elsewhere).append((utc, conversation.name or conversation.kind, line))
-    return {
-        "recent": sorted(recent, key=lambda e: e[0])[-15:],
-        "elsewhere": sorted(elsewhere, key=lambda e: e[0])[-20:],
-        "established": established,
-        "commitments": commitments,
-    }
 
 
 def writer_task() -> vf.Task:
@@ -209,11 +168,9 @@ def reply_json(text: str) -> str:
     return text[text.find("{") : text.rfind("}") + 1]
 
 
-async def compose(
-    agent, prompt: str, scene: ScenePlan, catalog: Catalog, timely: dict[str, str]
-) -> tuple[WrittenScene | None, list[str], vf.Trace]:
-    """One fresh writer chat; up to two correction turns when the reply breaks the scene contract."""
-    zones = {p.id: p.timezone for p in catalog.personas}
+async def compose(agent, prompt: str, accept) -> tuple[WrittenScene | None, list[str], vf.Trace]:
+    """One fresh writer chat. `accept` checks and stores a reply; what it rejects goes back as a correction turn,
+    twice at most. A PlanError is the plan's to fix and ends the chat."""
     written, errors = None, ["the writer ended without a reply"]
     async with agent.interaction(writer_task()) as interaction:
         for _ in range(3):
@@ -222,7 +179,10 @@ async def compose(
                 break
             try:
                 written = WrittenScene.model_validate_json(reply_json(segment.last_reply))
-                errors = check_scene(scene, written, zones, timely)
+                accept(written)
+                errors = []
+            except PlanError:
+                raise
             except ValueError as error:
                 written, errors = None, [str(error)[:4000]]
             if not errors:
@@ -231,46 +191,3 @@ async def compose(
                 errors
             )
     return written, errors, interaction.trace
-
-
-def scene_key(catalog: Catalog, plan: Plan, scene: ScenePlan) -> tuple[str, dict[str, str]]:
-    """Digest of what a scene is written from, plus the minutes its first-stated timed facts must land in."""
-    facts = {f.id: f for f in catalog.facts}
-    personas = {p.id: p for p in catalog.personas}
-    minutes = timed(catalog)
-    timely = {
-        f: minutes[f] for f, where in first_mentions(plan).items() if where == scene.id and f in minutes
-    }
-    key = digest(
-        [
-            scene.model_dump(mode="json"),
-            [facts[b.fact_id].model_dump(mode="json") for b in scene.beats],
-            [personas[i].model_dump(mode="json") for i in scene.participant_ids],
-            timely,
-        ]
-    )
-    return key, timely
-
-
-def current(state) -> bool:
-    """Whether every written scene still matches the catalog, so the candidate can be reviewed again."""
-    return all(
-        (record := state.scenes.get(s.id)) and record.key == scene_key(state.catalog, state.plan, s)[0]
-        for s in state.plan.scenes
-    )
-
-
-def frozen(state) -> list[ScenePlan]:
-    """Scenes exactly as approved: a later plan keeps them and may only change their revision_note."""
-    if state.plan is None:
-        return []
-    return [
-        s
-        for s in state.plan.scenes
-        if state.frozen_scenes.get(s.id) == scene_key(state.catalog, state.plan, s)[0]
-    ]
-
-
-def changed(state) -> list[str]:
-    """Scenes written since the world was last approved."""
-    return [s.id for s in state.plan.scenes if state.frozen_scenes.get(s.id) != state.scenes[s.id].key]
