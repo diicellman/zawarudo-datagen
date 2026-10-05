@@ -2131,10 +2131,13 @@ async def check_author(root):
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
     summary = store.summary("complete")
-    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1}, (
+    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1, "witness_right": 1.0, "level_fit": 3, "level": 3, "band": [0.0, 0.5], "in_band": True, "rounds": 0}, (
         "difficulty is the right-answer rate, the strict rate reported beside it; a try that crashed twice is counted, "
-        "and left out of the rates"
+        "and left out of the rates; the band it landed in"
     )  # fmt: skip
+    # t1 (level 2) stayed too easy; t0 was rewritten at the fix, to 2 of 3 right; t3 is in its level-1 band
+    assert summary["in_band"] == {"1": [1, 1], "2": [1, 2], "3": [1, 1]}, summary["in_band"]
+    assert summary["crashed_solves"] == 1 and summary["witness_tries"] == 2, summary
     assert abs(summary["mean_learnability"] - 17 / 36) < 1e-9, summary["mean_learnability"]  # t0 2/3, t2 1/2
 
     # The witness tries only the task whose band starts at 0, twice; the judge reads its tries; they count in no rate.
@@ -2189,6 +2192,11 @@ async def check_author(root):
     store.publish()
     world, rows, answers = load_release(store.root / "release")
     assert len(rows) == 4 and World(world).db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert json.loads((store.root / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v7"
+    assert all((r.right_rate, r.strict_rate, r.tries, r.solver) == (state.task_reviews[r.task_id]["right_rate"], state.task_reviews[r.task_id]["strict_rate"], state.task_reviews[r.task_id]["tries"], settings.env.solver.model) for r in rows), "each task's rates are published"  # fmt: skip
+    assert {r.task_id: (r.witness, r.witness_right) for r in rows if r.witness} == {
+        t2: (settings.env.witness.model, 1.0)
+    }
     assert all(a.rows or a.answer_type == "refusal" for a in answers.values())
     ledger = [r for r in rows if settings.taxonomy[r.category].gold == "ledger"]
     assert ledger and all(answers[r.task_id].rows == [{"answer": "Owen"}] and answers[r.task_id].messages for r in ledger)  # fmt: skip

@@ -20,7 +20,7 @@ from worldgen_slack.dataset import (
 )
 from worldgen_slack.db import World, canonical
 
-from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, measures
+from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, band_move, measures
 
 
 def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
@@ -78,6 +78,7 @@ class ReviewLimit(RuntimeError):
 class Store:
     def __init__(self, root: Path, config: dict):
         self.root = root.resolve()
+        self.settings = config.get("config", {})  # the run's configuration, as its manifest records it
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = (self.root / ".lock").open("a")
         fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -199,7 +200,16 @@ class Store:
         events = []
         if (self.root / "progress.jsonl").exists():
             events = [json.loads(line) for line in (self.root / "progress.jsonl").read_text().splitlines()]
-        rates = {task: {k: review[k] for k in ("right_rate", "strict_rate", "coverage", "tries", "crashed")} for task, review in self.state.task_reviews.items()}  # fmt: skip
+        bands, levels = self.settings.get("tasks", {}).get("bands"), dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())  # fmt: skip
+        rates, in_band = {}, {}
+        for task, review in self.state.task_reviews.items():
+            rates[task] = {k: review.get(k) for k in ("right_rate", "strict_rate", "coverage", "tries", "crashed", "witness_right", "level_fit")}  # fmt: skip
+            if bands and task in levels:
+                band = bands[levels[task] - 1]
+                landed = band_move(review | {"approved": True, "band": band}) is None
+                rates[task] |= {"level": levels[task], "band": band, "in_band": landed, "rounds": self.state.task_rounds.get(task, 0)}  # fmt: skip
+                count = in_band.setdefault(levels[task], [0, 0])
+                count[0], count[1] = count[0] + landed, count[1] + 1
         right = [r["right_rate"] for r in rates.values()]
         count = lambda sql: self.world.db.execute(sql).fetchone()[0]  # noqa: E731
         summary = {
@@ -216,6 +226,11 @@ class Store:
                 for r in self.world.db.execute("SELECT category, level, COUNT(*) FROM tasks GROUP BY 1, 2")
             ],
             "rates": rates,
+            "in_band": {
+                str(level): count for level, count in sorted(in_band.items())
+            },  # level: [in its band, of]
+            "crashed_solves": sum(r["crashed"] or 0 for r in rates.values()),
+            "witness_tries": sum(len(w["results"]) for w in self.state.witness.values()),
             "mean_learnability": sum(4 * p * (1 - p) for p in right) / len(right) if right else None,
             "usage_by_role": usage,
             "reported_model_cost": sum(r["reported_cost"] for r in usage.values()),
@@ -275,8 +290,10 @@ class Store:
                     f"SELECT channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us", sorted(ids)
                 )
             ]
+            review, env = self.state.task_reviews.get(task["id"]), self.settings.get("env", {})
+            measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "right_rate", "strict_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
             rows.append(
-                PublicTask(task_id=task["id"], question=task["question"], actor_id=task["actor_id"], category=task["category"], level=task["level"], answer_type=task["answer_type"], world_hash=world_hash)
+                PublicTask(task_id=task["id"], question=task["question"], actor_id=task["actor_id"], category=task["category"], level=task["level"], answer_type=task["answer_type"], world_hash=world_hash, **measured)
             )  # fmt: skip
             answers[task["id"]] = PrivateAnswer(
                 answer_type=task["answer_type"],

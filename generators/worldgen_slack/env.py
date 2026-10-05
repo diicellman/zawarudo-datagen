@@ -42,6 +42,7 @@ from .contracts import (
     accepted,
     accepted_task,
     background_plan,
+    band_move,
     cards,
     clock,
     deciding,
@@ -109,19 +110,6 @@ def rates(results: list[dict]) -> dict:
         "tries": len(finished),
         "crashed": len(results) - len(finished),
     }
-
-
-def band_move(probe: dict) -> str | None:
-    """What a probed task needs: a fix the judge asks for, or to be harder or easier to land in its level's band of
-    right-answer rates. A band that starts at 0 also needs the witness to answer it: one even it fails is too hard."""
-    (lo, hi), right, witness = probe["band"], probe["right_rate"], probe.get("witness_right")
-    if not probe["approved"]:
-        return "fix"
-    if right > hi:
-        return "harder"
-    if right < lo or (lo == 0 and witness == 0):
-        return "easier"
-    return None
 
 
 def merged(verdicts: list[Verdict]) -> Verdict:

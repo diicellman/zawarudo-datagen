@@ -53,6 +53,10 @@ def sha256(path: Path) -> str:
 
 
 class PublicTask(StrictModel):
+    """A task as a solver gets it, with how hard it measured: the solver model's tries at the release, its share of
+    right answers and of right and grounded ones, the gold evidence the tries saw, and the witness's share of right
+    answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns."""
+
     task_id: SafeId
     question: NonEmptyText
     actor_id: SafeId
@@ -60,6 +64,14 @@ class PublicTask(StrictModel):
     level: int
     answer_type: Literal["text", "set", "number", "refusal"]
     world_hash: str
+    solver: str | None = None
+    tries: int | None = None
+    crashed: int | None = None
+    right_rate: float | None = None
+    strict_rate: float | None = None
+    coverage: float | None = None
+    witness: str | None = None
+    witness_right: float | None = None
 
 
 class PrivateAnswer(StrictModel):
@@ -73,7 +85,9 @@ class PrivateAnswer(StrictModel):
 
 
 class Manifest(StrictModel):
-    format: Literal["worldgen-slack.v6"] = "worldgen-slack.v6"
+    format: Literal["worldgen-slack.v6", "worldgen-slack.v7"] = (
+        "worldgen-slack.v7"  # v7: tasks carry their rates
+    )
     world_hash: str
     files: dict[str, str]
 

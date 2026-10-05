@@ -729,6 +729,19 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
     } | fact_measures(world, facts, task["actor_id"])
 
 
+def band_move(probe: dict) -> str | None:
+    """What a probed task needs: a fix the judge asks for, or to be harder or easier to land in its level's band of
+    right-answer rates. A band that starts at 0 also needs the witness to answer it: one even it fails is too hard."""
+    (lo, hi), right, witness = probe["band"], probe["right_rate"], probe.get("witness_right")
+    if not probe["approved"]:
+        return "fix"
+    if right > hi:
+        return "harder"
+    if right < lo or (lo == 0 and witness == 0):
+        return "easier"
+    return None
+
+
 def task_row(task: Task, settings) -> dict:
     return task.model_dump(
         include={"id", "category", "level", "actor_id", "question", "answer_type", "gold_sql"}
