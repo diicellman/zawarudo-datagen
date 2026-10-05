@@ -196,7 +196,8 @@ class Store:
         events = []
         if (self.root / "progress.jsonl").exists():
             events = [json.loads(line) for line in (self.root / "progress.jsonl").read_text().splitlines()]
-        rates = {task: review["solve_rate"] for task, review in self.state.task_reviews.items()}
+        rates = {task: {k: review[k] for k in ("right_rate", "strict_rate", "coverage", "tries")} for task, review in self.state.task_reviews.items()}  # fmt: skip
+        right = [r["right_rate"] for r in rates.values()]
         count = lambda sql: self.world.db.execute(sql).fetchone()[0]  # noqa: E731
         summary = {
             "status": status,
@@ -211,8 +212,8 @@ class Store:
                 list(r)
                 for r in self.world.db.execute("SELECT category, level, COUNT(*) FROM tasks GROUP BY 1, 2")
             ],
-            "solve_rates": rates,
-            "mean_learnability": sum(4 * p * (1 - p) for p in rates.values()) / len(rates) if rates else None,
+            "rates": rates,
+            "mean_learnability": sum(4 * p * (1 - p) for p in right) / len(right) if right else None,
             "usage_by_role": usage,
             "reported_model_cost": sum(r["reported_cost"] for r in usage.values()),
             "elapsed_seconds": events[-1]["time"] - events[0]["time"] if events else 0,
@@ -227,7 +228,7 @@ class Store:
 
     def difficulty(self) -> dict:
         """Each task's intended level beside how hard it measures on the final world: the judge's level_fit, the
-        solve rate, and code's measures (evidence pages, tables read, search rank)."""
+        solver's right-answer and strict rates, and code's measures (evidence pages, tables read, search rank)."""
         out = {}
         for task in self.world.db.execute(
             "SELECT id, category, level, concept, actor_id, gold_sql FROM tasks"
@@ -242,7 +243,8 @@ class Store:
                 {k: task[k] for k in ("category", "level", "concept")}
                 | {
                     "level_fit": review.get("level_fit"),
-                    "solve_rate": review.get("solve_rate"),
+                    "right_rate": review.get("right_rate"),
+                    "strict_rate": review.get("strict_rate"),
                 }
                 | measured
             )

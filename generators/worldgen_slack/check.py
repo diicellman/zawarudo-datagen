@@ -1702,7 +1702,9 @@ async def check_author(root):
 
         async def solve(self, agents, task):
             solved[self.store.state.active_attempt, task.data.task_id] += 1
-            return {"semantic_correctness": 0.5, "correct": True, "grounded": True, "execution_ok": True, "calls": 3, "reason": "r"}, SimpleNamespace(id="solve", to_record=lambda: {"nodes": []})  # fmt: skip
+            # Every other try is right; t2's right answers are never grounded, so only its strict rate is 0.
+            right, grounded = solved[self.store.state.active_attempt, task.data.task_id] % 2 == 1, task.data.task_id != "t2"  # fmt: skip
+            return {"semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "execution_ok": True, "calls": 3, "reason": "r"}, SimpleNamespace(id="solve", to_record=lambda: {"nodes": []})  # fmt: skip
 
         async def review(self, agents, payload, attempt, files=None, label=""):
             seen.append(("review", attempt, payload["phase"], "written_through" in payload, "ledger" in payload, bool(payload.get("previous_issues")), tuple(t["id"] for t in payload["tasks"])))  # fmt: skip
@@ -1816,6 +1818,7 @@ async def check_author(root):
             assert '"level_fit": 3' in prompt and '"evidence_pages"' in prompt and '"concept"' in prompt, (
                 "hardening reads the judge's level fit and code's measures"
             )
+            assert '"right_rate": 0.5' in prompt and '"strict_rate": 0.0' in prompt, "and both rates"
             for i, (category, level, *_) in list(enumerate(json.loads(tools.config.context)["cells"]))[1:3]:
                 task = scripted_task(settings, i, category, level, a)
                 await call(
@@ -1915,7 +1918,11 @@ async def check_author(root):
     assert store.world.violations(complete=True) == [] and set(state.task_reviews) == {t for (t,) in store.world.db.execute("SELECT id FROM tasks")}  # fmt: skip
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
-    difficulty = store.summary("complete")["difficulty"]
+    summary = store.summary("complete")
+    assert summary["mean_learnability"] == 1.0 and summary["rates"]["t2"] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 4}, (
+        "difficulty is the right-answer rate; the strict rate is reported beside it"
+    )  # fmt: skip
+    difficulty = summary["difficulty"]
     assert set(difficulty) == set(state.task_reviews) and all(
         d["level_fit"] == 3 and "evidence_pages" in d and d["concept"] for d in difficulty.values()
     ), "the summary reports each task's measured difficulty beside its level"

@@ -256,7 +256,7 @@ function render() {
 function overview() {
   const sum = R.summary || {}, p = R.premise || {}, cat = X.cat;
   const reviews = Object.values(R.task_reviews || {});
-  const rates = reviews.map(r => r.solve_rate).filter(v => v !== undefined);
+  const rates = reviews.map(r => r.right_rate ?? r.solve_rate).filter(v => v !== undefined);
   const rejected = R.attempts.filter(a => X.outcome[a.id] === false).length;
   const tiles = [
     ['Status', sum.status || R.phase, sum.reason ? short(sum.reason, 40) : 'phase ' + R.phase],
@@ -266,7 +266,7 @@ function overview() {
     ['Attempts', num(R.attempts.length), rejected + ' rejected'],
     ['Cost', usd(sum.reported_model_cost), 'priced calls only'],
     ['Wall time', dur(sum.elapsed_seconds ?? (X.t1 - X.t0)), 'first to last event'],
-    ['Solve rate', rates.length ? pct(rates.reduce((a, b) => a + b, 0) / rates.length) : '–', rates.length + ' tasks reviewed'],
+    ['Right answers', rates.length ? pct(rates.reduce((a, b) => a + b, 0) / rates.length) : '–', rates.length + ' tasks reviewed'],
   ];
   const usage = Object.entries(sum.usage_by_role || {});
   return h('div', {},
@@ -275,9 +275,9 @@ function overview() {
       cat.overview ? h('p', {text: cat.overview}) : null),
     h('section', {}, h('div', {class: 'tiles'}, tiles.map(([k, v, s]) => h('div', {class: 'tile'}, label(k), h('div', {class: 'v', text: v}), h('div', {class: 's', text: s}))))),
     h('section', {class: 'grid2'},
-      h('div', {class: 'card'}, label('Solve rate by task'), h('p', {class: 'small faint', text: 'Share of independent solves that were correct and grounded.'}),
+      h('div', {class: 'card'}, label('Right answers by task'), h('p', {class: 'small faint', text: 'Share of independent solves whose answer was right: the task\'s difficulty. The strict share (right and grounded) is the reward.'}),
         list(cat.tasks).map(t => {
-          const r = R.task_reviews?.[t.id]?.solve_rate;
+          const r = R.task_reviews?.[t.id]?.right_rate ?? R.task_reviews?.[t.id]?.solve_rate;
           return h('div', {class: 'hbar'}, h('button', {class: 'linkish', text: t.id, onclick: () => go('tasks', {task: t.id})}),
             h('div', {class: 'track'}, h('i', {style: `width:${Math.round((r || 0) * 100)}%`})), h('span', {class: 'mono small', text: pct(r)}));
         })),
@@ -580,7 +580,8 @@ function taskDetail(t) {
     h('div', {class: 'card'}, label(`${t.id} · ${t.group_id}`), h('div', {class: 'q', text: t.question}),
       h('span', {class: 'chip', text: 'reader · ' + (reader?.name || t.actor_id) + (persona ? ' · ' + persona.role : '')}),
       h('span', {class: 'chip', text: `${t.category} · level ${t.level}`}),
-      h('span', {class: 'chip', text: 'solve rate · ' + pct(R.task_reviews?.[t.id]?.solve_rate)})),
+      h('span', {class: 'chip', text: 'right answers · ' + pct(R.task_reviews?.[t.id]?.right_rate ?? R.task_reviews?.[t.id]?.solve_rate)}),
+      R.task_reviews?.[t.id]?.strict_rate !== undefined ? h('span', {class: 'chip', text: 'right and grounded · ' + pct(R.task_reviews[t.id].strict_rate)}) : null),
     h('div', {class: 'card', style: 'margin-top:12px'}, label('Answer'),
       spoil(h('p', {style: 'font-size:16px', text: t.answer.canonical_answer})),
       list(t.answer.required_claims).map((claim, k) => {

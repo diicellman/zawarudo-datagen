@@ -381,7 +381,8 @@ def task_page(world, task: dict) -> str:
     out = [
         f"- [[{task['id']}]] {task['category']} level {task['level']} ({task['concept']}), asked by [[{task['actor_id']}]]: "
         f"{task['question']}",
-        f"  gold {task['gold_json']}; solve rate {task['solve_rate']}, fewest calls {task['min_calls']}",
+        f"  gold {task['gold_json']}; right answers {task['right_rate']}, right and grounded {task['strict_rate']}, "
+        f"fewest calls {task['min_calls']}",
     ]
     return "\n".join(out)
 
@@ -840,8 +841,9 @@ def tasks_prompt(settings) -> str:
 
 def harden_prompt(results: dict, left: int) -> str:
     return (
-        "Each task's cell, the solver's tries, the judge's review (level_fit from 0 to 4: how fully answering it needs "
-        "its level and concept) and code's measures (evidence pages, tables read, search rank): "
+        "Each task's cell, the solver's tries (right_rate, the share of right answers, is how hard the task is; "
+        "strict_rate also needs every claim grounded), the judge's review (level_fit from 0 to 4: how fully answering "
+        "it needs its level and concept) and code's measures (evidence pages, tables read, search rank): "
         f"{json.dumps(results, ensure_ascii=False)}\nKeep each task, or replace it in its cell to fit its level, so "
         "that answering it needs its level and concept with no easier route: reword it, or rest it on other evidence; "
         "world_revise can remove a giveaway from a message. Changed tasks are tried and reviewed again "

@@ -94,6 +94,18 @@ def observable(record: dict) -> dict:
     return record
 
 
+def rates(results: list[dict]) -> dict:
+    """A task's tries in numbers: how often the answer was right (the task's difficulty), how often it was right and
+    grounded (the released reward), and how much of the gold evidence the tries saw."""
+    seen = [r["evidence_coverage"] for r in results if r.get("evidence_coverage") is not None]
+    return {
+        "right_rate": sum(bool(r["correct"]) for r in results) / len(results),
+        "strict_rate": sum(r["semantic_correctness"] for r in results) / len(results),
+        "coverage": sum(seen) / len(seen) if seen else None,
+        "tries": len(results),
+    }
+
+
 class GenerationEnv(vf.Env[PipelineConfig]):
     def __init__(self, settings: Config, store: Store):
         self.settings, self.store = settings, store
@@ -476,12 +488,13 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         judged = await self.review(agents, payload, attempt, files, "tasks")
         for task_id in due:
             results = runs[task_id]["results"]
-            rate = sum(r["semantic_correctness"] for r in results) / len(results)
+            rate = rates(results)
             approved = accepted_task(judged, self.settings.acceptance, task_id)
             fit = next(r.level_fit for r in judged.tasks if r.task_id == task_id)
             if approved:
-                state.task_reviews[task_id] = {"key": keys[task_id], "solve_rate": rate, "level_fit": fit, "results": results}  # fmt: skip
-            self.store.event("task_reviewed", attempt=attempt, task_id=task_id, approved=approved, solve_rate=rate, learnability=4 * rate * (1 - rate))  # fmt: skip
+                state.task_reviews[task_id] = {"key": keys[task_id], **rate, "level_fit": fit, "results": results}  # fmt: skip
+            right = rate["right_rate"]
+            self.store.event("task_reviewed", attempt=attempt, task_id=task_id, approved=approved, **rate, learnability=4 * right * (1 - right))  # fmt: skip
         return runs, judged
 
     def keep_solves(self, task_id: str, key: str, runs: list) -> None:
@@ -511,20 +524,21 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         results = {}
         for task_id in due:
             outcomes = runs[task_id]["results"]
-            rate = sum(o["semantic_correctness"] for o in outcomes) / n
+            rate = rates(outcomes)
             fewest = min((o["calls"] for o in outcomes if o["correct"]), default=None)
             self.world.db.execute(
-                "UPDATE tasks SET solve_rate = ?, min_calls = ? WHERE id = ?", (rate, fewest, task_id)
+                "UPDATE tasks SET right_rate = ?, strict_rate = ?, min_calls = ? WHERE id = ?",
+                (rate["right_rate"], rate["strict_rate"], fewest, task_id),
             )
             review = next(r for r in judged.tasks if r.task_id == task_id)
             results[task_id] = (
-                {k: v for k, v in measured[task_id].items() if k not in ("level_fit", "solve_rate")}
-                | {"solve_rate": rate, "tries": [{k: o.get(k) for k in ("correct", "calls", "reason")} for o in outcomes]}
+                {k: v for k, v in measured[task_id].items() if k not in ("level_fit", "right_rate", "strict_rate")}
+                | rate | {"tries": [{k: o.get(k) for k in ("correct", "grounded", "calls", "reason")} for o in outcomes]}
                 | {"level_fit": review.level_fit, "valid": review.valid, "review": review.reason}
                 | {"issues": [f"{i.defect} {i.requested_change}" for i in judged.issues if task_id in i.task_ids]}
             )  # fmt: skip
         state.probe_solves += n * len(due)
-        self.store.event("probe", attempt=attempt, rates={t: r["solve_rate"] for t, r in results.items()})
+        self.store.event("probe", attempt=attempt, rates={t: r["right_rate"] for t, r in results.items()})
         self.store.save()
         return results
 

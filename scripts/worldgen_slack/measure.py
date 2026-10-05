@@ -140,7 +140,7 @@ def measure(run: Path) -> dict:
         "overall": {k: stats.get(k) for k in ("messages", *TYPING, "off_hours")},
         "authors": authors,
         "task_mix": summary.get("task_mix"),
-        "solve_rates": summary.get("solve_rates"),
+        "rates": summary.get("rates", summary.get("solve_rates")),
         "difficulty": summary.get("difficulty"),
         "cost": summary.get("reported_model_cost"),
         "minutes": round(summary.get("elapsed_seconds", 0) / 60, 1),
