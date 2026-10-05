@@ -641,19 +641,20 @@ def unmet(needs, measured: dict) -> list[str]:
 
 def needs_text(needs) -> str:
     """A level's needs, as the author reads them in now.md."""
+    many = lambda n, word: f"{n} {word}" + ("s" if n > 1 else "")  # noqa: E731
     out = []
     if needs.rank > 1:
-        out.append(f"evidence below the question's first {needs.rank - 1} search hits")
+        out.append("evidence not the question's first search hit" if needs.rank == 2 else f"evidence not among the question's first {needs.rank - 1} search hits")  # fmt: skip
     if needs.depth:
         out.append(f"evidence under {needs.depth:.0%} of its busiest channel's messages")
     if needs.channels:
-        out.append(f"facts first stated in {needs.channels} channels")
+        out.append(f"facts first stated in {many(needs.channels, 'channel')}")
     if needs.relations:
-        out.append(f"{needs.relations} relations among its facts")
+        out.append(f"{many(needs.relations, 'relation')} among its facts")
     if needs.decoys:
-        out.append(f"{needs.decoys} readable decoys on their subjects")
+        out.append(f"{many(needs.decoys, 'readable decoy')} on their subjects")
     if needs.named is not None:
-        out.append(f"a question naming at most {needs.named} of its evidence's channels and identifiers")
+        out.append("a question that names none of its evidence's channels and identifiers" if needs.named == 0 else f"a question naming at most {needs.named} of its evidence's channels and identifiers")  # fmt: skip
     return "; ".join(out)
 
 

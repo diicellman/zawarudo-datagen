@@ -139,8 +139,8 @@ Voice
 Tasks (after the last day, world_add_task)
 - One task for each slot of now.md, with the slot's id: a question an actor asks, as hard as its level and concept
   say, in its style. Nothing can be posted after the last day, so plan from day 1 what each slot will rest on (the
-  plan's board, checked against each level's needs): facts in several
-  channels, decoys, buried or split evidence, private conversations.
+  plan's board, checked against each level's needs): facts in several channels, decoys, buried or split evidence,
+  private conversations.
 """
     + GOLD_SQL
     + """- world_add_task checks the task, refuses it below its level's needs (now.md lists each slot's), and returns its
