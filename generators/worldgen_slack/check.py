@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import statistics
 import subprocess
 import sys
 import tarfile
@@ -1094,6 +1095,19 @@ def check_clock(root):
     still = math.ceil(ways["closes"][0] / big.activity.conversation_lines)
     waits = [opening(world, big, random.Random(i), night, 2) for i in range(200)]
     assert max(waits) <= (end - night) // (still + 1) + 60_000_000, (max(waits), still)
+    # Four conversations in the morning's first 90 minutes: the next keeps that pace, not half the time left.
+    morning, noon = window(world, 2, "morning")
+    later = morning + 90 * 60_000_000
+    try:
+        with world.trial() as copy:
+            for k in range(4):
+                stamp = morning + k * 20 * 60_000_000
+                copy.db.execute("INSERT INTO scenes (id, channel_id, day, part, slot_start_us, slot_end_us, situation) VALUES (?, ?, 2, 'morning', ?, ?, 'work')", (f"p{k}", ops, stamp, stamp + 1))  # fmt: skip
+            waits = [opening(copy, big, random.Random(i), later, 2) for i in range(200)]
+            assert statistics.mean(waits) < (noon - later) / 4, (statistics.mean(waits), noon - later)
+            raise LookupError("drop the trial")
+    except LookupError:
+        pass
     assert today_line(world, big, 2).endswith("15 h 0 min left today"), today_line(world, big, 2)
 
     def posted_with(cfg, conversation):

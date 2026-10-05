@@ -500,12 +500,18 @@ def record_plan(world, plan: Plan, settings) -> None:
 
 def opening(world, settings, rng, now: int, day: int) -> int:
     """How long the present waits before a conversation starts: the part's remaining time, spread over the
-    conversations its quota still holds; never longer than the day can spare, the rest of the day spread over the
-    conversations it still needs to close."""
+    conversations it can still expect (what its quota still holds, or what its pace so far brings in the time left,
+    whichever is more); never longer than the day can spare, the rest of the day spread over the conversations it
+    still needs to close. An author who writes past a part's quota keeps its pace: each conversation does not halve
+    the time left, which bunched S1's conversations at the end of the morning and of the evening."""
     part = part_of(world, now)
     start, end = window(world, day, part)
-    left = max(quotas(world, settings)[day]["parts"][part] - posted(world, start, now), 1)
-    conversations = max(1, round(left / settings.activity.conversation_lines))
+    left = max(quotas(world, settings)[day]["parts"][part] - posted(world, start, now), 0)
+    started = world.db.execute(
+        "SELECT COUNT(*) FROM scenes WHERE slot_start_us >= ? AND slot_start_us < ?", (start, now)
+    ).fetchone()[0]
+    pace = started * (end - now) / (now - start) if now > start else 0.0
+    conversations = max(1.0, left / settings.activity.conversation_lines, pace)
     wait = int(rng.random() * 2 * max(end - now, 0) / (conversations + 1))
     if (ways := room(world, settings, day)) is not None and (need := ways["closes"][0] - tally(world, day)["messages"]) > 0:  # fmt: skip
         still = math.ceil(need / settings.activity.conversation_lines)
