@@ -39,7 +39,20 @@ from ..chronicle import (
     today_line,
 )
 from ..config import Config
-from ..contracts import LONG, SHORT, Gaps, Part, Task, cards, channel_id, clock, selves, window, world_meta
+from ..contracts import (
+    LONG,
+    SHORT,
+    Gaps,
+    Part,
+    Slot,
+    Task,
+    cards,
+    channel_id,
+    clock,
+    selves,
+    window,
+    world_meta,
+)
 
 GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor sees it: channels, members, messages,
   message_mentions, reactions and thread_stats hold only what the actor can read; users, calendar, storylines, facts,
@@ -63,10 +76,10 @@ world_read(actor_id, tool, arguments) read the world as it is now.
 
 Memory and notes
 - /task/memory/ is code's, rendered from the world before every turn: now.md (the present, today's quota, the
-  conversations code drew for today, each storyline's facts, events, open promises, task cells, style drift),
+  conversations code drew for today, each storyline's facts, events, open promises, task slots, style drift),
   ledger.json (the ledger as world_plan takes it), and a page per person, channel, storyline and event. Pages name
   each other as [[id]]; grep them. Every time in them is on the company clock, as a weekday and a date.
-- /task/notes/ is yours: plan.md (the story's arcs day by day, and a board of what each task cell will rest on) and
+- /task/notes/ is yours: plan.md (the story's arcs day by day, and a board of what each task slot will rest on) and
   recap.md (what happened today, what is open). Besides the world, they are all you keep from one turn to the next.
 
 Time
@@ -121,8 +134,8 @@ Voice
 - A line that states a fact contains the fact's anchor words; the rest of the line is still in its author's voice.
 
 Tasks (after the last day, world_add_task)
-- One task for each cell of now.md: a question an actor asks, as hard as its level and concept say, in its style.
-  Nothing can be posted after the last day, so plan from day 1 what each cell will rest on: facts in several
+- One task for each slot of now.md, with the slot's id: a question an actor asks, as hard as its level and concept
+  say, in its style. Nothing can be posted after the last day, so plan from day 1 what each slot will rest on: facts in several
   channels, decoys, buried or split evidence, private conversations.
 """
     + GOLD_SQL
@@ -264,12 +277,13 @@ def now_page(world, settings, context: dict) -> str:
             f"(made in [[m{c['message_id']}]])"
             for c in promises
         ]
-    out += ["", "## Task cells (written after the last day)"]
-    for category, level, concept, style in context.get("cells", []):
-        spec = settings.taxonomy[category]
+    out += ["", "## Task slots (written after the last day; a task's id is its slot's)"]
+    for slot in context.get("slots", []):
+        spec, level = settings.taxonomy[slot["category"]], slot["level"]
         spread = spec.spread[level - 1] if spec.spread else 1
         out.append(
-            f"- {category} level {level}: {spec.levels[level - 1]}; concept: {concept}; style: {style}"
+            f"- {slot['id']}: {slot['category']} level {level}: {spec.levels[level - 1]}; concept: {slot['concept']}; "
+            f"style: {slot['style']}"
             + (f"; its facts first stated in at least {spread} channels" if spread > 1 else "")
         )
     if notes := drift(world, context.get("cards", {})):
@@ -516,7 +530,7 @@ class AuthoringToolsConfig(vf.ToolsetConfig):
     db_path: str = ""
     db_hash: str = ""
     context: str = (
-        "{}"  # settings, cells, typing cards, the day's drawn conversations, routines, the call log
+        "{}"  # settings, task slots, typing cards, the day's drawn conversations, routines, the call log
     )
 
 
@@ -564,7 +578,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
             raise ValueError("world file hash mismatch")
         self.context = json.loads(self.config.context)
         self.settings = Config.model_validate(self.context["settings"])
-        self.cells = [tuple(c) for c in self.context.get("cells", [])]
+        self.slots = [Slot.model_validate(s) for s in self.context.get("slots", [])]
         self.gaps = Gaps(self.settings.personas.gaps)
         self.posted = None  # the last post: its conversation, the present it left, and its result
 
@@ -655,7 +669,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
     @vf.tool
     async def now(self) -> str:
         """The one-pager: the present, today's quota and drawn conversations, each storyline's facts, events, open
-        promises, task cells and style drift."""
+        promises, task slots and style drift."""
         return self._logged("now", {}, lambda: now_page(self._world(), self.settings, self.context))
 
     @vf.tool
@@ -754,12 +768,12 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def add_task(self, task: Task) -> dict:
-        """Write the task of one cell (it replaces the cell's task, if any): checked, then its gold rows and code's
-        measures returned."""
+        """Write the task of one slot, with the slot's id (it replaces the slot's task, if any): checked, then its gold
+        rows and code's measures returned."""
         return self._logged(
             "add_task",
             {"task": task.model_dump(mode="json")},
-            lambda: self._write(lambda copy: add_task(copy, task, self.settings, self.cells)),
+            lambda: self._write(lambda copy: add_task(copy, task, self.settings, self.slots)),
             "tasks",
         )
 
@@ -805,11 +819,11 @@ def rejected(feedback: str, restored: str = "") -> str:
 
 
 def plan_prompt(world, settings, feedback: str = "") -> str:
-    count = settings.tasks.storylines
+    count = settings.storylines
     return (
         f"Before day 1 ({clock(world, bounds(world, 1)[0])[:14]}): plan the ledger with world_plan: exactly {count} "
         "storylines, their events and their facts, over the calendar in now.md. Then write /task/notes/plan.md: each "
-        "storyline's arc day by day, and a board of what each task cell in now.md will rest on. End your turn when the "
+        "storyline's arc day by day, and a board of what each task slot in now.md will rest on. End your turn when the "
         f"ledger is planned.{rejected(feedback)}"
     )
 
@@ -834,7 +848,8 @@ def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") 
 
 def tasks_prompt(settings) -> str:
     return (
-        "The last day is closed: nothing more is posted. Write one task for each cell in now.md with world_add_task; "
+        "The last day is closed: nothing more is posted. Write one task for each slot in now.md with world_add_task, "
+        "with the slot's id; "
         f"it returns the task's gold rows and code's measures. After this turn a solver tries each task "
         f"{settings.author.probe_solves} times."
     )
@@ -842,10 +857,10 @@ def tasks_prompt(settings) -> str:
 
 def harden_prompt(results: dict, left: int) -> str:
     return (
-        "Each task's cell, the solver's tries (right_rate, the share of right answers, is how hard the task is; "
+        "Each task's slot, the solver's tries (right_rate, the share of right answers, is how hard the task is; "
         "strict_rate also needs every claim grounded), the judge's review (level_fit from 0 to 4: how fully answering "
         "it needs its level and concept) and code's measures (evidence pages, tables read, search rank): "
-        f"{json.dumps(results, ensure_ascii=False)}\nKeep each task, or replace it in its cell to fit its level, so "
+        f"{json.dumps(results, ensure_ascii=False)}\nKeep each task, or rewrite it in its slot to fit its level, so "
         "that answering it needs its level and concept with no easier route: reword it, or rest it on other evidence; "
         "world_revise can remove a giveaway from a message. Changed tasks are tried and reviewed again "
         f"({left} tries left). End your turn when the tasks stand."
@@ -861,7 +876,7 @@ def fix_prompt(issues: list) -> str:
 
 
 def context_of(settings, state, store_root: Path, organization: dict | None) -> dict:
-    """What the author's tools are configured with: the settings, the world's task cells, each person's typing card
+    """What the author's tools are configured with: the settings, the world's task slots, each person's typing card
     and seeded self, the conversations code drew per day, the channels' routines, and the call log."""
     routines = {}
     if organization:
@@ -876,7 +891,7 @@ def context_of(settings, state, store_root: Path, organization: dict | None) -> 
     }
     return {
         "settings": json.loads(settings.model_dump_json()),
-        "cells": state.quota,
+        "slots": [s.model_dump(mode="json") for s in state.quota],
         "cards": cards(state.cast),
         "selves": selves(state.cast),
         "agenda": agenda,

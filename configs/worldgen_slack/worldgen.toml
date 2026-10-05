@@ -5,6 +5,7 @@
 sector = "IT for a business-to-business software company: cloud platform operations, service releases, and customer incident coordination"
 seed = 20261008
 output = "data/v7-01/software"
+storylines = 2            # the plot the ledger plans before day 1
 
 # One author writes the world in time order.
 [author]
@@ -36,8 +37,7 @@ emoji_rate = 0.08         # measured, same corpus; scorecard only
 parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 0.03 }  # workday rhythm (estimate)
 
 [tasks]
-count = 10
-per_storyline = 5
+per_100 = 2.5             # tasks per 100 messages: 10 for S1's 400
 max_answer_rows = 5
 # How a question is asked; the seed draws one per task, as DataDesigner draws instruction styles.
 styles = [

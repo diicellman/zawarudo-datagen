@@ -85,7 +85,10 @@ def main() -> int:
         pick_cast(config.personas, config.seed, [], {occupation: config.personas.pool})
         plan = {
             "config": config.model_dump(mode="json"),
-            "quota": quota(config.taxonomy, config.tasks.styles, config.seed, config.tasks.count),
+            "quota": [
+                s.model_dump()
+                for s in quota(config.taxonomy, config.tasks.styles, config.seed, config.task_count)
+            ],
         }
         dates = [d["date"] for d in calendar(config.seed, config.calendar, "UTC")]
         plan["daily"] = dict(zip(dates, daily(dates, config)))  # each date's messages and their parts

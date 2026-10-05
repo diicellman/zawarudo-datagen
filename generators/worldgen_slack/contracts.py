@@ -123,17 +123,32 @@ def pick_cast(personas, seed: int, used: list[str], staffing: dict[str, int]) ->
     return [p.model_copy(update={"typing": Typing.model_validate_json(t)}) for p, t in zip(cast, typing)]
 
 
-def quota(taxonomy: dict, styles: list[str], seed: int, count: int) -> list[tuple[str, int, str, str]]:
-    """Entropy comes from code: a world's (category, level) mix walks a seeded shuffle of every taxonomy cell, and
-    each cell draws a concept from its level's list and a question style, as DataDesigner's category and
+class Slot(StrictModel):
+    """One task a world holds, drawn by the run seed: its id (the task's id), its taxonomy cell, the concept it
+    requires and how it is asked."""
+
+    id: SafeId
+    category: NonEmptyText
+    level: int = Field(ge=1)
+    concept: NonEmptyText
+    style: NonEmptyText
+
+
+def quota(taxonomy: dict, styles: list[str], seed: int, count: int) -> list[Slot]:
+    """Entropy comes from code: a world's tasks walk a seeded shuffle of every taxonomy cell, again and again when it
+    holds more tasks than cells. A cell's repeats take its level's concepts in a seeded order, so a repeat requires
+    another concept while one is left, and every task draws a question style, as DataDesigner's category and
     subcategory samplers do."""
     rng = random.Random(seed)
     cells = [(name, level) for name, c in taxonomy.items() for level in range(1, len(c.levels) + 1)]
     order = rng.sample(cells, len(cells))
-    picked = [order[i % len(order)] for i in range(count)]
-    return [
-        (c, level, rng.choice(taxonomy[c].concepts[level - 1]), rng.choice(styles)) for c, level in picked
-    ]
+    concepts = {(c, level): rng.sample(taxonomy[c].concepts[level - 1], len(taxonomy[c].concepts[level - 1])) for c, level in order}  # fmt: skip
+    slots = []
+    for i in range(count):
+        (category, level), n = order[i % len(order)], i // len(order)
+        pool = concepts[(category, level)]
+        slots.append(Slot(id=f"{category}-l{level}-{n + 1}", category=category, level=level, concept=pool[n % len(pool)], style=rng.choice(styles)))  # fmt: skip
+    return slots
 
 
 def cards(cast: list) -> dict[str, dict]:
@@ -231,7 +246,6 @@ class Task(StrictModel):
     answer_type: Literal["text", "set", "number", "refusal"]
     gold_sql: NonEmptyText
     facts: Ids = Field(default_factory=list)
-    probability: float = Field(default=1.0, gt=0, le=1)
 
 
 class Scene(StrictModel):
@@ -577,70 +591,36 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
     return rows
 
 
-def record_tasks(world, candidates: list[Task], settings, cells: list[tuple[str, int]]) -> None:
-    """T6: one to three candidates per cell, each with the probability that a task of its cell is like it. Code
-    checks every candidate (readable facts, T1-T5, T7) and the run seed picks a valid one per cell, favoring the
-    less probable; the picks are inserted with their gold rows. Run inside `World.trial()`."""
-    wanted = Counter((c[0], c[1]) for c in cells)
-    concepts = defaultdict(list)
-    for c in cells:
-        concepts[(c[0], c[1])].append(c[2])
-    drawn = Counter((t.category, t.level) for t in candidates)
-    if any(not wanted[c] <= n <= 3 * wanted[c] for c, n in drawn.items()):
-        raise ValueError(f"write 1 to 3 candidate tasks for each (category, level) of {sorted(wanted)}")
-    if len({t.id for t in candidates}) < len(candidates):
-        raise ValueError("candidate task ids are unique")
-    asked = {normalized(r[0]) for r in world.db.execute("SELECT question FROM tasks")}
-    valid, errors, gold = defaultdict(list), defaultdict(list), {}
-    with world.renumbered() as renumbered:
-        for t in candidates:
-            try:
-                if normalized(t.question) in asked:
-                    raise ValueError(f"{t.id}: a task asks a question no other task asks")
-                for fact in t.facts:
-                    row = world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()
-                    if row and not readable(world, t.actor_id, row[0]):
-                        raise ValueError(f"{t.id}: its actor cannot read {row[0]}, where {fact} is stated")
-                spec = settings.taxonomy.get(t.category)
-                need = spec.spread[t.level - 1] if spec and spec.spread and t.level <= len(spec.spread) else 1
-                marks = ", ".join("?" * len(t.facts))
-                (spread,) = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", t.facts).fetchone()  # fmt: skip
-                if need > 1 and spread < need:
-                    raise ValueError(
-                        f"{t.id}: a level-{t.level} {t.category} task rests on facts first stated in at least {need} "
-                        "channels; give its facts places in other channels"
-                    )
-                gold[t.id] = check_task(world, t, settings, renumbered)
-                valid[(t.category, t.level)].append(t)
-            except ValueError as error:
-                errors[(t.category, t.level)].append(str(error))
-    if short := [c for c in sorted(wanted) if len(valid[c]) < wanted[c]]:
+def record_task(world, task: Task, settings, slot: Slot) -> None:
+    """T6: a task fills its slot. Code checks it (its slot's cell, a question no other task asks, facts its actor can
+    read, its level's spread, T1-T5, T7) and inserts it with its slot's concept and its gold rows. Run inside
+    `World.trial()`."""
+    if (task.id, task.category, task.level) != (slot.id, slot.category, slot.level):
+        raise ValueError(f"{slot.id} is a {slot.category} level {slot.level} task, with the slot's id")
+    asked = {
+        normalized(r[0]) for r in world.db.execute("SELECT question FROM tasks WHERE id != ?", (task.id,))
+    }
+    if normalized(task.question) in asked:
+        raise ValueError(f"{task.id}: a task asks a question no other task asks")
+    for fact in task.facts:
+        row = world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()
+        if row and not readable(world, task.actor_id, row[0]):
+            raise ValueError(f"{task.id}: its actor cannot read {row[0]}, where {fact} is stated")
+    spec = settings.taxonomy.get(task.category)
+    need = spec.spread[task.level - 1] if spec and spec.spread and task.level <= len(spec.spread) else 1
+    marks = ", ".join("?" * len(task.facts))
+    (spread,) = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", task.facts).fetchone()  # fmt: skip
+    if need > 1 and spread < need:
         raise ValueError(
-            "; ".join(
-                f"no valid candidate for {c}: " + ("; ".join(errors[c]) or "write 1 to 3") for c in short
-            )
+            f"{task.id}: a level-{task.level} {task.category} task rests on facts first stated in at least {need} "
+            "channels; give its facts places in other channels"
         )
-    picks = []
-    for cell in sorted(wanted):
-        rng = random.Random(digest([settings.seed, list(cell), [t.id for t in valid[cell]]]))
-        pool = list(valid[cell])
-        for _ in range(wanted[cell]):
-            if pool:
-                picks.append(rng.choices(pool, [1.05 - t.probability for t in pool])[0])
-                pool = [t for t in pool if normalized(t.question) != normalized(picks[-1].question)]
-    questions = {normalized(t.question) for t in picks}
-    if len(picks) < sum(wanted.values()) or len(questions) < len(picks):
-        raise ValueError("a task asks a question no other task asks: candidates of different cells share one")
+    with world.renumbered() as renumbered:
+        gold = check_task(world, task, settings, renumbered)
     with world.batch():
-        world.insert(
-            "tasks",
-            [task_row(t, settings) | {"concept": concepts[(t.category, t.level)].pop(0)} for t in picks],
-        )
-        world.insert(
-            "task_facts", [dict(task_id=t.id, fact_id=f) for t in picks for f in dict.fromkeys(t.facts)]
-        )
-    for t in picks:
-        world.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(gold[t.id]), t.id))
+        world.insert("tasks", [task_row(task, settings) | {"concept": slot.concept}])
+        world.insert("task_facts", [dict(task_id=task.id, fact_id=f) for f in dict.fromkeys(task.facts)])
+    world.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(gold), task.id))
 
 
 def measures(world, task_id: str, rows: list[dict], tables) -> dict:

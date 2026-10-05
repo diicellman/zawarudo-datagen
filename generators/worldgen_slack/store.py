@@ -20,9 +20,7 @@ from worldgen_slack.dataset import (
 )
 from worldgen_slack.db import World, canonical
 
-from .contracts import Issue, Premise, SeedPersona, Verdict, measures
-
-Cell = tuple[str, int, str, str]  # category, level, concept, question style
+from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, measures
 
 
 def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
@@ -46,7 +44,7 @@ class RunState(StrictModel):
     phase: Literal["premise", "organization", "plan", "day", "review", "tasks", "final", "done"] = "premise"
     premise: Premise | None = None
     cast: list[SeedPersona] = Field(default_factory=list)
-    quota: list[Cell] = Field(default_factory=list)
+    quota: list[Slot] = Field(default_factory=list)  # the world's tasks, one per slot
     organization: list[str] = Field(default_factory=list)  # the channels the organization made
     drafts: dict[str, dict] = Field(default_factory=dict)  # each setup phase's last document
     plans: dict[str, dict] = Field(

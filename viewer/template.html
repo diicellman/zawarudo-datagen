@@ -289,7 +289,7 @@ function overview() {
     h('section', {class: 'grid2'},
       h('div', {class: 'card'}, label('Premise'), Object.entries(p).map(([k, v]) => h('p', {}, h('span', {class: 'label', text: k + ' '}), h('span', {text: v})))),
       h('div', {class: 'card'}, label('Storylines'), list(cat.groups).map(g => h('p', {}, h('span', {class: 'chip', text: g.id}), g.description)),
-        label('Task mix (category · level, drawn by the seed)'), h('p', {}, list(R.quota).map(([c, l]) => h('span', {class: 'chip', text: `${c} · L${l}`}))))));
+        label('Task mix (category · level, drawn by the seed)'), h('p', {}, list(R.quota).map(q => Array.isArray(q) ? q : [q.category, q.level]).map(([c, l]) => h('span', {class: 'chip', text: `${c} · L${l}`}))))));
 }
 
 /* ---------- lineage ---------- */

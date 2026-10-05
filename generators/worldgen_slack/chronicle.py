@@ -31,7 +31,7 @@ from .contracts import (
     insert_lines,
     measures,
     normalized,
-    record_tasks,
+    record_task,
     render,
     text_errors,
     window,
@@ -379,7 +379,7 @@ def record_plan(world, plan: Plan, settings) -> None:
     """The ledger in time order. Storylines are fixed once planned (summaries may change); an event, once planned,
     never moves or goes; a stated fact keeps everything but its summary, while an unstated one may change or go and is
     planned for today or later. A fact about an event carries the event's moment."""
-    count = settings.tasks.storylines
+    count = settings.storylines
     if len(plan.storylines) != count:
         raise ValueError(f"plan exactly {count} storylines")
     ids = [x.id for x in (*plan.storylines, *plan.events, *plan.facts)]
@@ -788,21 +788,17 @@ def revise(world, message_id: int, text: str) -> dict:
     return {"message": message_id, "text": rendered}
 
 
-def add_task(world, task: Task, settings, cells: list[tuple]) -> dict:
-    """One task for one of the world's cells, on the finished world; it replaces the cell's task, if any. Its gold
-    query is checked as every task is (T1-T7, readable facts, the level's spread). Returns its gold rows and
+def add_task(world, task: Task, settings, slots: list) -> dict:
+    """One task for one of the slots being written, on the finished world; it replaces the slot's task, if any. Its
+    gold query is checked as every task is (T1-T7, readable facts, the level's spread). Returns its gold rows and
     code's measures of how hard it is."""
     if today(world) is not None:
         raise ValueError("tasks are written once the calendar is closed")
-    cell = next((c for c in cells if (c[0], c[1]) == (task.category, task.level)), None)
-    if cell is None:
-        raise ValueError(f"a task fills one of the cells {[(c[0], c[1]) for c in cells]}")
-    replaced = [
-        r[0] for r in world.db.execute("SELECT id FROM tasks WHERE category = ? AND level = ?", cell[:2])
-    ]
-    marks = ", ".join("?" * len(replaced))
-    world.db.execute(f"DELETE FROM task_facts WHERE task_id IN ({marks})", replaced)
-    world.db.execute(f"DELETE FROM tasks WHERE id IN ({marks})", replaced)
-    record_tasks(world, [task], settings, [cell])  # every planned fact is stated once the calendar is closed
+    slot = next((s for s in slots if s.id == task.id), None)
+    if slot is None:
+        raise ValueError(f"a task's id is one of the slots you write now: {[s.id for s in slots]}")
+    world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
+    world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
+    record_task(world, task, settings, slot)  # every planned fact is stated once the calendar is closed
     gold = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)
     return {"task": task.id, "gold": gold["rows"]} | measures(world, task.id, gold["rows"], gold["tables"])

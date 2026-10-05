@@ -82,6 +82,7 @@ from .contracts import (
     Premise,
     Premises,
     SeedPersona,
+    Slot,
     Storyline,
     Task,
     TaskReview,
@@ -98,7 +99,7 @@ from .contracts import (
     organize,
     pick_cast,
     quota,
-    record_tasks,
+    record_task,
     render,
     user_id,
     validate_verdict,
@@ -607,12 +608,8 @@ def contracts_settings(root):
             "seed": 3,
             "output": str(root / "run"),
             "personas": {"path": str(root / "p.jsonl"), "typing": str(root / "t.jsonl"), "gaps": str(gaps)},
-            "tasks": {
-                "count": 4,
-                "per_storyline": 2,
-                "max_answer_rows": 2,
-                "styles": spec["tasks"]["styles"],
-            },
+            "storylines": 2,
+            "tasks": {"per_100": 1, "max_answer_rows": 2, "styles": spec["tasks"]["styles"]},  # 4 tasks
             "taxonomy": spec["taxonomy"],
         }
     )
@@ -641,20 +638,23 @@ def check_contracts(root):
     root.mkdir(parents=True)
     settings = contracts_settings(root)
     styles = settings.tasks.styles
-    cells = quota(settings.taxonomy, styles, 3, 17)
-    order = [c[:2] for c in cells]
-    assert cells == quota(settings.taxonomy, styles, 3, 17) and order != [c[:2] for c in quota(settings.taxonomy, styles, 4, 17)]  # fmt: skip
-    assert len({(c, level) for c, level, *_ in cells}) == 17, "every (category, level) once"
-    assert all(concept in settings.taxonomy[c].concepts[level - 1] and style in styles for c, level, concept, style in cells), "concepts come from their own level"  # fmt: skip
+    slots, cells = (
+        quota(settings.taxonomy, styles, 3, 40),
+        sum(len(c.levels) for c in settings.taxonomy.values()),
+    )
+    assert slots == quota(settings.taxonomy, styles, 3, 40) and [s.id for s in slots] != [s.id for s in quota(settings.taxonomy, styles, 4, 40)]  # fmt: skip
+    assert (
+        len({s.id for s in slots}) == 40 and len({(s.category, s.level) for s in slots[:cells]}) == cells
+    ), "every cell once before any twice, each slot its own id"
+    assert all(s.concept in settings.taxonomy[s.category].concepts[s.level - 1] and s.style in styles for s in slots), "concepts come from their own level"  # fmt: skip
+    repeats = [(slots[i], slots[i + cells]) for i in range(min(cells, 40 - cells))]
+    assert all(r.id == f"{s.category}-l{s.level}-2" and (r.concept != s.concept or len(settings.taxonomy[s.category].concepts[s.level - 1]) == 1) for s, r in repeats), "a repeat requires another concept while one is left"  # fmt: skip
     for wrong in ({"concepts": [["x"]]}, {"spread": [1]}, {"concepts": [["x"], [], ["y"]]}):
         fails(Category.model_validate, settings.taxonomy["semantic"].model_dump() | wrong)
     whole = settings.model_dump(mode="json")
-    assert (
-        Config.model_validate(whole | {"tasks": whole["tasks"] | {"count": 17}}).tasks.storylines == 9
-    )  # 2 per storyline
-    fails(
-        Config.model_validate, whole | {"tasks": whole["tasks"] | {"count": 18}}
-    )  # one task per cell, 17 cells
+    assert Config.model_validate(whole | {"tasks": whole["tasks"] | {"per_100": 10}}).task_count == 40, (
+        "10 tasks per 100 messages, of 400"
+    )
     jobs = ["software_developer"] * 3 + ["accountant_or_auditor"] * 2 + ["manager"]
     people = [seed_person(i).model_copy(update={"occupation": job}) for i, job in enumerate(jobs)]
     (root / "p.jsonl").write_text("".join(p.model_dump_json() + "\n" for p in people))
@@ -749,8 +749,8 @@ def check_contracts(root):
         start_clock(copy)
         record_plan(copy, ledger_plan(ops, leads, a, b), settings)
 
-    def cell(category, level):
-        return (category, level, "a concept", "a style")
+    def slot(category, level, id="t1"):
+        return Slot(id=id, category=category, level=level, concept="a concept", style="a style")
 
     def task(
         id="t1",
@@ -761,79 +761,59 @@ def check_contracts(root):
     ):
         return Task(id=id, category=category, level=1, actor_id=c, question="Which way did the release go?", answer_type="text", gold_sql=sql, facts=list(facts)) .model_copy(update=extra)  # fmt: skip
 
-    def picked(candidates, cells_, seed=3):
-        """The tasks recorded from these candidates, on a dropped trial."""
+    def recorded(task_, slot_):
+        """The tasks once this one is recorded into its slot, on a dropped trial."""
         try:
             with world.trial() as copy:
-                record_tasks(copy, candidates, settings.model_copy(update={"seed": seed}), cells_)
+                record_task(copy, task_, settings, slot_)
                 raise LookupError([r[0] for r in copy.db.execute("SELECT id FROM tasks ORDER BY id")])
         except LookupError as out:
             return out.args[0]
 
-    search = task()
-    found = [cell("search", 1)]
+    search, found = task(), slot("search", 1)
     rejected = {
-        "T6 cells": ([search], [cell("search", 2)]),
-        "T2 sql reads facts": ([task(category="lookup")], [cell("lookup", 1)]),
-        "T2 ledger reads no facts": ([task(sql="SELECT real_name AS answer FROM users LIMIT 1")], found),
-        "T2 hybrid reads no workspace": ([task(category="hybrid")], [cell("hybrid", 1)]),
-        "T4 no facts": ([task(facts=())], found),
-        "T3 refusal with rows": (
-            [task(category="robustness", answer_type="refusal", sql="SELECT 1 AS answer", facts=())],
-            [cell("robustness", 1)],
-        ),
-        "T3 too many rows": ([task(answer_type="set", sql="SELECT value AS answer FROM facts")], found),
-        "T3 text answer of 2 rows": ([task(sql="SELECT value AS answer FROM facts LIMIT 2")], found),
-        "T3 no answer column": ([task(sql="SELECT value FROM facts WHERE id = 'f1'")], found),
-        "T5 giveaway": ([task(question="Was it a rollback for the release?")], found),
-        "T6 four candidates": (
-            [task(id=f"t{i}", question=f"Which way did release {i} go?") for i in range(4)],
-            found,
-        ),  # fmt: skip
-        "T6 candidate ids": ([task(), task(question="Where did the release go?")], found),
-        "unreadable fact": (
-            [task(sql="SELECT value AS answer FROM facts WHERE id = 'f3'", facts=("f3",))],
-            found,
-        ),  # fmt: skip
-    }
-    for name, (candidates, cells_) in rejected.items():
+        "T6 its slot's cell": (search, slot("search", 2)),
+        "T6 its slot's id": (search, slot("search", 1, id="t2")),
+        "T2 sql reads facts": (task(category="lookup"), slot("lookup", 1)),
+        "T2 ledger reads no facts": (task(sql="SELECT real_name AS answer FROM users LIMIT 1"), found),
+        "T2 hybrid reads no workspace": (task(category="hybrid"), slot("hybrid", 1)),
+        "T4 no facts": (task(facts=()), found),
+        "T3 refusal with rows": (task(category="robustness", answer_type="refusal", sql="SELECT 1 AS answer", facts=()), slot("robustness", 1)),
+        "T3 too many rows": (task(answer_type="set", sql="SELECT value AS answer FROM facts"), found),
+        "T3 text answer of 2 rows": (task(sql="SELECT value AS answer FROM facts LIMIT 2"), found),
+        "T3 no answer column": (task(sql="SELECT value FROM facts WHERE id = 'f1'"), found),
+        "T5 giveaway": (task(question="Was it a rollback for the release?"), found),
+        "unreadable fact": (task(sql="SELECT value AS answer FROM facts WHERE id = 'f3'", facts=("f3",)), found),
+    }  # fmt: skip
+    for name, (task_, slot_) in rejected.items():
         try:
-            picked(candidates, cells_)
-            raise AssertionError(f"tasks accepted: {name}")
+            recorded(task_, slot_)
+            raise AssertionError(f"task accepted: {name}")
         except ValueError:
             pass
-    invalid = task(id="bad", sql="SELECT value FROM facts WHERE id = 'f1'")  # no answer column
-    rare = task(id="rare", question="Where did the release go?", probability=0.05)
-    for candidates, kept, least in (
-        ([invalid, task(id="good", question="Where did the release go?")], "good", 20),
-        ([task(id="usual", probability=1.0), rare], "rare", 16),
-    ):  # the run seed picks: only valid candidates, mostly the less likely
-        chosen = [t for seed in range(20) for t in picked(candidates, found, seed)]
-        assert chosen.count(kept) >= least, (kept, chosen)
     with world.trial() as copy:
-        record_tasks(copy, [search], settings, found)
+        record_task(copy, search, settings, found)
     assert json.loads(world.db.execute("SELECT gold_json FROM tasks").fetchone()[0]) == [
         {"answer": "rollback"}
     ]
     assert world.db.execute("SELECT concept FROM tasks").fetchone()[0] == "a concept", (
-        "the cell's concept is stored"
+        "the slot's concept is stored"
     )
+    fails(record_task, world, task(id="t2"), settings, slot("search", 1, id="t2"))  # t1 asks it
 
     def settled(facts):  # a level-3 semantic task needs its facts first stated in 2 channels
         sql = f"SELECT value AS answer FROM facts WHERE id = '{facts[-1]}'"
         return Task(id="t9", category="semantic", level=3, actor_id=a, question="What did the review settle?", answer_type="text", gold_sql=sql, facts=facts)  # fmt: skip
 
-    fails(record_tasks, world, [settled(["f1", "f4"])], settings, [cell("semantic", 3)])  # both in #ops
-    assert "t9" in picked([settled(["f1", "f3"])], [cell("semantic", 3)])  # #ops and #leads
+    fails(record_task, world, settled(["f1", "f4"]), settings, slot("semantic", 3, id="t9"))  # both in #ops
+    assert "t9" in recorded(settled(["f1", "f3"]), slot("semantic", 3, id="t9"))  # #ops and #leads
     hybrid = dict(category="hybrid", level=1, actor_id=c, answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages m, facts f WHERE f.id = 'f1'")  # fmt: skip
     unread = Task(
         id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
     )  # in leads
-    read = Task(id="h2", question="How many messages surround the rollback?", facts=["f1"], **hybrid)
-    picks = [
-        t for seed in range(20) for t in picked([unread, read], [cell("hybrid", 1)], seed) if t[0] == "h"
-    ]
-    assert picks == ["h2"] * 20, ("a candidate whose actor cannot read its facts is never picked", picks)
+    fails(record_task, world, unread, settings, slot("hybrid", 1, id="h1"))  # its actor cannot read its fact
+    read = Task(id="h1", question="How many messages surround the rollback?", facts=["f1"], **hybrid)
+    assert "h1" in recorded(read, slot("hybrid", 1, id="h1"))
     small = settings.activity.model_copy(update={"conversation_lines": 4})
     plan = background_plan(world, org(), small, 7, 2, 12)  # a day's agenda: 12 messages of everyday talk
     members = {(r[0], r[1]) for r in world.db.execute("SELECT channel_id, user_id FROM members")}
@@ -983,12 +963,12 @@ def check_clock(root):
     refused("keep ['s1', 's2']", recorded, plan(storylines=[Storyline(id="s3", summary="x"), Storyline(id="s2", summary="y")]))  # fmt: skip
     rng = random.Random(5)
 
-    cells = [("semantic", 3, "a concept", "a style"), ("lookup", 1, "a concept", "a style")]
+    slots = [Slot(id="t1", category="semantic", level=3, concept="a concept", style="a style"), Slot(id="t2", category="lookup", level=1, concept="a concept", style="a style")]  # fmt: skip
     owner = Task(id="t1", category="semantic", level=3, actor_id=a, question="Who owns the audit after the dry run?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f4'", facts=["f3", "f4"])  # fmt: skip
 
     def tasked(task):
         with world.trial() as copy:
-            return add_task(copy, task, settings, cells)
+            return add_task(copy, task, settings, slots)
 
     refused("once the calendar is closed", tasked, owner)
 
@@ -1182,13 +1162,14 @@ def check_clock(root):
     measured = close_day(world, settings.model_copy(update={"author": settings.author.model_copy(update={"share_tolerance": 0.0})}), 1)  # fmt: skip
     assert any("3 of today's 4 messages are thread replies" in e for e in measured), measured
     refused("at least 2 channels", tasked, owner.model_copy(update={"facts": ["f1", "f4"]}))  # both in #ops
-    refused("fills one of the cells", tasked, owner.model_copy(update={"level": 2}))
+    refused("t1 is a semantic level 3 task", tasked, owner.model_copy(update={"level": 2}))
+    refused("one of the slots you write now: ['t1', 't2']", tasked, owner.model_copy(update={"id": "t9"}))
     result = tasked(owner)
     assert result["gold"] == [{"answer": "Owen"}] and "bm25_rank" in result
     replier = Task(id="t2", category="lookup", level=1, actor_id=c, question="Who said thanks in #ops?", answer_type="text", gold_sql="SELECT u.real_name AS answer FROM messages m JOIN users u ON u.id = m.user_id WHERE m.text = 'thanks'")  # fmt: skip
-    tasked(replier)
-    tasked(replier.model_copy(update={"id": "t3"}))  # the cell's task is replaced
-    assert [r[0] for r in world.db.execute("SELECT id FROM tasks ORDER BY id")] == ["t1", "t3"]
+    tasked(replier.model_copy(update={"question": "Who said thanks?"}))
+    tasked(replier)  # the slot's task is replaced
+    assert [tuple(r) for r in world.db.execute("SELECT id, question FROM tasks ORDER BY id")] == [("t1", owner.question), ("t2", replier.question)]  # fmt: skip
     thanks = world.db.execute("SELECT id FROM messages WHERE text = 'thanks'").fetchone()[0]
     stated = world.db.execute("SELECT message_id FROM evidence WHERE fact_id = 'f4'").fetchone()[0]
 
@@ -1196,7 +1177,7 @@ def check_clock(root):
         with world.trial() as copy:
             return revise(copy, message, text)
 
-    refused("changes task t3", revised, thanks, "thank you")  # t3's gold answer reads that text
+    refused("changes task t2", revised, thanks, "thank you")  # t2's gold answer reads that text
     refused(
         "anchor_token_missing", revised, stated, "the audit has an owner"
     )  # f4's evidence keeps its token
@@ -1212,7 +1193,10 @@ def check_clock(root):
 def author_context(settings, cast, org, root, agenda=None):
     """What WorldTools are configured with, as the driver builds it; `agenda` maps a day to its drawn scenes."""
     state = SimpleNamespace(
-        quota=[("semantic", 3, "a concept", "a style"), ("lookup", 1, "a concept", "a style")],
+        quota=[
+            Slot(id=f"t{i}", category=c, level=n, concept="a concept", style="a style")
+            for i, (c, n) in enumerate((("semantic", 3), ("lookup", 1)), 1)
+        ],  # fmt: skip
         cast=cast,
         plans={
             "agenda": {
@@ -1278,7 +1262,7 @@ async def check_tools(root):
     call = lambda tools, name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
     page = await call(day1, "now")
     assert (
-        page.startswith("# Now: ") and "day 1 of 10" in page and "[[f1]]" in page and "## Task cells" in page
+        page.startswith("# Now: ") and "day 1 of 10" in page and "[[f1]]" in page and "## Task slots" in page
     )
     assert "everyday conversations code drew for today" in page and agenda[1]
     assert "- today: 0 messages today (thread replies 0, reacted to 0, in DMs 0); it closes with" in page
@@ -1704,6 +1688,7 @@ async def check_author(root):
         update={
             "calendar": base.calendar.model_copy(update={"days": 4}),
             "activity": base.activity.model_copy(update={"messages": 16}),
+            "tasks": base.tasks.model_copy(update={"per_100": 25}),  # 4 tasks
             "author": base.author.model_copy(
                 update={
                     "tolerance": 1.0,
@@ -1717,8 +1702,12 @@ async def check_author(root):
         }
     )
     seen, crash, solved, finished = [], {"armed": True, "review": True, "plans": 0}, Counter(), Counter()
+    t0, t1, t2, t3 = [
+        s.id for s in quota(settings.taxonomy, settings.tasks.styles, settings.seed, settings.task_count)
+    ]
+    again, untried = sorted([t1, t2])  # the hardened two; the probe's budget tries only the first by id again
     # Runs that crash: t0's first is run again; one try of t3 crashes twice and is left out of its rates.
-    crashes = {("tasks-01", "t0"): {1}, ("tasks-01", "t3"): {2, 3}}
+    crashes = {("tasks-01", t0): {1}, ("tasks-01", t3): {2, 3}}
 
     class ScriptedSolver(ScriptedAgent):
         async def run(self, task):
@@ -1727,8 +1716,8 @@ async def check_author(root):
             if solved[key] in crashes.get(key, ()):
                 return SimpleNamespace(ok=False, info={}, errors=[SimpleNamespace(message="model stream ended")], task=task, last_reply="", id="crash")  # fmt: skip
             finished[key] += 1
-            # Every other try is right; t2's right answers are never grounded, so only its strict rate is 0.
-            right, grounded = finished[key] % 2 == 1, task.data.task_id != "t2"
+            # Every other try is right; one task's right answers are never grounded, so only its strict rate is 0.
+            right, grounded = finished[key] % 2 == 1, task.data.task_id != untried
             evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "calls": 3, "reason": "r"}  # fmt: skip
             return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id="solve")  # fmt: skip
 
@@ -1755,7 +1744,7 @@ async def check_author(root):
                 issues = [Issue(artifact="workspace", message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
             # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
-            reviews = [TaskReview(task_id=t["id"], valid=(attempt, t["id"]) != ("tasks-01", "t3"), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
+            reviews = [TaskReview(task_id=t["id"], valid=(attempt, t["id"]) != ("tasks-01", t3), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
             issues += [Issue(artifact="tasks", task_ids=[r.task_id], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
             verdict = Verdict(approved=not any(i.blocking for i in issues) and all(r.valid for r in reviews), tasks=reviews, issues=issues, criteria=criteria, summary="s")  # fmt: skip
             validate_verdict(verdict, payload)
@@ -1847,15 +1836,15 @@ async def check_author(root):
             await close()
             await runtime.write("/task/notes/recap.md", f"day {day}: done".encode())
         elif prompt.startswith("The last day is closed"):
-            for i, (category, level, *_) in enumerate(json.loads(tools.config.context)["cells"]):
-                await call("add_task", task=scripted_task(settings, i, category, level, a))
-        elif prompt.startswith("Each task's cell"):
+            for slot in json.loads(tools.config.context)["slots"]:
+                await call("add_task", task=scripted_task(settings, slot, a))
+        elif prompt.startswith("Each task's slot"):
             assert '"level_fit": 3' in prompt and '"evidence_pages"' in prompt and '"concept"' in prompt, (
                 "hardening reads the judge's level fit and code's measures"
             )
             assert '"right_rate": 0.5' in prompt and '"strict_rate": 0.0' in prompt, "and both rates"
-            for i, (category, level, *_) in list(enumerate(json.loads(tools.config.context)["cells"]))[1:3]:
-                task = scripted_task(settings, i, category, level, a)
+            for slot in json.loads(tools.config.context)["slots"][1:3]:
+                task = scripted_task(settings, slot, a)
                 await call(
                     "add_task", task=task.model_copy(update={"question": "Asked again: " + task.question})
                 )
@@ -1865,8 +1854,9 @@ async def check_author(root):
                 for message in issue.get("message_ids", []):
                     await call("revise", message_id=message, text="ok, the notes come tomorrow")
             seen.append(("fixed", [m for i in issues for m in i.get("message_ids", [])]))
-            category, level, *_ = json.loads(tools.config.context)["cells"][0]
-            task = scripted_task(settings, 9, category, level, a)  # t9 replaces t0 in its cell
+            task = scripted_task(
+                settings, json.loads(tools.config.context)["slots"][0], a
+            )  # t0, rewritten in its slot
             await call("add_task", task=task.model_copy(update={"question": "Asked anew: " + task.question}))
 
     agents = SimpleNamespace(judge=ScriptedAgent(), solver=ScriptedSolver(), author=ScriptedAuthor(script))
@@ -1925,23 +1915,23 @@ async def check_author(root):
     assert store.world.db.execute("SELECT text FROM messages WHERE id = ?", (second,)).fetchone()[0] == "ok, the notes come tomorrow"  # fmt: skip
     assert "rollback" in store.world.db.execute("SELECT text FROM messages WHERE id = ?", (first,)).fetchone()[0], "the evidence stays"  # fmt: skip
     assert state.probe_solves == 10, state.probe_solves
-    # The probes try every task, then the hardened t1 again (the budget leaves t2 untried); the final reviews solve
-    # only what changed since: t2, then t9, which a fix replaced t0 with.
-    assert solved == {("tasks-01", "t0"): 3, ("tasks-01", "t1"): 4, ("tasks-01", "t2"): 2, ("tasks-01", "t3"): 3, ("final-01", "t2"): 4, ("final-02", "t9"): 4}, solved  # fmt: skip
-    assert set(state.solves) == {"t1", "t2", "t3", "t9"}, "a replaced task's runs go with it"
+    # The probes try every task, then one hardened task again (the budget leaves the other untried); the final reviews
+    # solve only what changed since: the untried one, then t0, which a fix rewrote.
+    assert solved == {("tasks-01", t0): 3, ("tasks-01", again): 4, ("tasks-01", untried): 2, ("tasks-01", t3): 3, ("final-01", untried): 4, ("final-02", t0): 4}, solved  # fmt: skip
+    assert set(state.solves) == {t0, t1, t2, t3}, "a rewritten task's runs are its new ones"
     assert ("review", "review-02-02", "world", True, True, False, ()) in seen
     assert ("review", "final-01", "world", False, True, False, ()) in seen
     assert ("review", "final-02", "world", False, True, True, ()) in seen, (
         "the final review checks the last issues"
     )
-    assert ("review", "final-02", "task", False, False, False, ("t9",)) in seen, (
+    assert ("review", "final-02", "task", False, False, False, (t0,)) in seen, (
         "only the changed task is reviewed again"
     )
     probed = [s[6] for s in seen if s[:3] == ("review", "tasks-01", "task")]
-    assert probed == [("t0", "t1", "t2", "t3"), ("t1",)], "the judge reviews each probe's tasks"
-    assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [("t2", "t3")], (
-        "the final review judges only what changed or failed since its probe's review"
-    )
+    assert probed == [tuple(sorted((t0, t1, t2, t3))), (again,)], "the judge reviews each probe's tasks"
+    assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [
+        tuple(sorted((untried, t3)))
+    ], "the final review judges only what changed or failed since its probe's review"
     assert any(e["event"] == "candidate_finished" and e["attempt"] == "tasks-01" and e["approved"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines())), "the tasks attempt is closed"  # fmt: skip
     assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"
     days = [json.loads(line) for line in (store.root / "progress.jsonl").read_text().splitlines()]
@@ -1951,22 +1941,20 @@ async def check_author(root):
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
     summary = store.summary("complete")
-    assert summary["rates"]["t2"] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 4, "crashed": 0}, (
+    assert summary["rates"][untried] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 4, "crashed": 0}, (
         "difficulty is the right-answer rate; the strict rate is reported beside it"
     )  # fmt: skip
-    assert summary["rates"]["t3"] == {"right_rate": 1.0, "strict_rate": 1.0, "coverage": None, "tries": 1, "crashed": 1}, (
+    assert summary["rates"][t3] == {"right_rate": 1.0, "strict_rate": 1.0, "coverage": None, "tries": 1, "crashed": 1}, (
         "a try that crashed twice is counted, and left out of the rates"
     )  # fmt: skip
-    assert summary["mean_learnability"] == 0.75, summary[
-        "mean_learnability"
-    ]  # t1, t2 and t9 at 0.5; t3 at 1.0
+    assert summary["mean_learnability"] == 0.75, summary["mean_learnability"]  # t0, t1, t2 at 0.5; t3 at 1.0
 
     class Crashing(ScriptedAgent):
         async def run(self, task):
             return SimpleNamespace(ok=False, info={"grading_started": True}, errors=[SimpleNamespace(message="judge timeout")], task=task, last_reply="", id="crash")  # fmt: skip
 
     try:
-        await env.solves(SimpleNamespace(solver=Crashing()), ["t1"], "final-02", 2)
+        await env.solves(SimpleNamespace(solver=Crashing()), [t1], "final-02", 2)
         raise AssertionError("a task whose every try crashed was kept")
     except RuntimeError as error:
         assert "crashed twice" in str(error), error
@@ -2009,10 +1997,11 @@ async def check_author(root):
     )
 
 
-def scripted_task(settings, i, category, level, actor):
-    """A valid task for any cell of the scripted world: its gold follows the category's source."""
+def scripted_task(settings, slot, actor):
+    """A valid task for any slot of the scripted world: its gold follows the category's source."""
+    category, level = slot["category"], slot["level"]
     gold, spec = settings.taxonomy[category].gold, settings.taxonomy[category]
-    question = f"Question {i} about the {category} level {level} work?"
+    question = f"Question {slot['id']} about the {category} level {level} work?"
     if category == "robustness":
         sql, kind, facts = "SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", "refusal", []
     elif gold == "ledger":
@@ -2022,7 +2011,7 @@ def scripted_task(settings, i, category, level, actor):
     else:
         sql, kind, facts = "SELECT COUNT(*) AS answer FROM messages", "number", []
     assert kind in spec.answer_types
-    return Task(id=f"t{i}", category=category, level=level, actor_id=actor, question=question, answer_type=kind, gold_sql=sql, facts=facts)  # fmt: skip
+    return Task(id=slot["id"], category=category, level=level, actor_id=actor, question=question, answer_type=kind, gold_sql=sql, facts=facts)  # fmt: skip
 
 
 if __name__ == "__main__":

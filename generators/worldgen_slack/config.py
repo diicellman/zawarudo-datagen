@@ -71,15 +71,9 @@ class CalendarConfig(Section):
 
 
 class TasksConfig(Section):
-    count: int = Field(gt=0, le=100)
-    per_storyline: int = Field(default=5, gt=0, le=20)
+    per_100: float = Field(gt=0, le=100)  # tasks per 100 messages: a bigger world holds more tasks
     max_answer_rows: int = Field(default=5, ge=1, le=50)
     styles: list[Text] = Field(min_length=1)
-
-    @property
-    def storylines(self) -> int:
-        """How many storylines a world plans: one for every `per_storyline` tasks."""
-        return -(-self.count // self.per_storyline)
 
 
 class ActivityConfig(Section):
@@ -171,6 +165,7 @@ class Config(Section):
     personas: PersonasConfig
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
     activity: ActivityConfig = Field(default_factory=ActivityConfig)
+    storylines: int = Field(default=2, ge=1, le=20)  # the plot the ledger plans before day 1
     tasks: TasksConfig
     taxonomy: dict[Annotated[str, Field(pattern=r"^[a-z_]+$")], Category] = Field(min_length=1)
     review_rounds: ReviewRounds = Field(default_factory=ReviewRounds)
@@ -180,13 +175,10 @@ class Config(Section):
     env: PipelineConfig = Field(default_factory=PipelineConfig)
     answer_judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
 
-    @model_validator(mode="after")
-    def cells(self):
-        """Each task fills its own (category, level) cell, so a world has at most as many tasks as the taxonomy has
-        cells."""
-        if self.tasks.count > (cells := sum(len(c.levels) for c in self.taxonomy.values())):
-            raise ValueError(f"tasks.count is at most the taxonomy's {cells} cells, not {self.tasks.count}")
-        return self
+    @property
+    def task_count(self) -> int:
+        """How many tasks the world holds: `[tasks].per_100` for every 100 messages, and at least one."""
+        return max(1, round(self.activity.messages * self.tasks.per_100 / 100))
 
     @model_validator(mode="after")
     def secure(self):

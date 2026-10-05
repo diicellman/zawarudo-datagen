@@ -193,10 +193,12 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 raise ReviewLimit(f"the author proposed no valid premise: {error}") from None
             first = False
             state.cast = pick_cast(cfg.personas, cfg.seed, self.used["people"], state.premise.staffing)
-            state.quota = quota(cfg.taxonomy, cfg.tasks.styles, cfg.seed, cfg.tasks.count)
+            state.quota = quota(cfg.taxonomy, cfg.tasks.styles, cfg.seed, cfg.task_count)
             state.phase = "organization"
             self.store.save()
-            self.store.event("premise_selected", company=state.premise.company, quota=state.quota)
+            self.store.event(
+                "premise_selected", company=state.premise.company, quota=[s.id for s in state.quota]
+            )
         if state.phase == "organization":
             try:
                 await self.author(
@@ -313,9 +315,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         state, n = self.store.state, self.settings.solves_per_task
         self.refresh_gold()
         keys = {t: self.task_key(t) for (t,) in self.world.db.execute("SELECT id FROM tasks ORDER BY id")}
-        # A task replaced since its review is gone from the world, and so are its review and its runs.
-        state.task_reviews = {t: r for t, r in state.task_reviews.items() if t in keys}
-        state.solves = {t: r for t, r in state.solves.items() if t in keys}
         due = [t for t, key in keys.items() if state.task_reviews.get(t, {}).get("key") != key]
         previous = state.last_verdict.issues if state.last_verdict else []
         people = cards(state.cast)
@@ -391,7 +390,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 start_clock(copy)
         attempt = self.store.reserve("plan", cfg.author.plan_attempts)
         task = WorldAuthorTask.create("plan", 0, self.world.path, self.author_context(), attempt)
-        count = cfg.tasks.storylines
+        count = cfg.storylines
         async with agents.author.interaction(task, runtime=runtime) as interaction:
             prompt, errors = plan_prompt(self.world, cfg, state.feedback), []
             for _ in range(3):
@@ -559,7 +558,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         final = lambda: f"final-{state.rounds.get('final', 0):02d}"  # noqa: E731
         attempt = self.store.reserve("tasks", cfg.review_rounds.final) if state.phase == "tasks" else final()
         task = WorldAuthorTask.create("tasks", 0, self.world.path, self.author_context(), attempt)
-        cells = {tuple(c[:2]) for c in state.quota}
+        slots = {s.id for s in state.quota}
         async with agents.author.interaction(task, runtime=runtime) as interaction:
 
             async def turn(prompt, label=attempt):
@@ -569,10 +568,10 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 prompt = tasks_prompt(cfg)
                 for _ in range(3):
                     await turn(prompt)
-                    written = {tuple(r) for r in self.world.db.execute("SELECT category, level FROM tasks")}
-                    if not (missing := sorted(cells - written)):
+                    written = {r[0] for r in self.world.db.execute("SELECT id FROM tasks")}
+                    if not (missing := sorted(slots - written)):
                         break
-                    prompt = f"These cells have no task yet: {missing}. Write them with world_add_task, then end your turn."
+                    prompt = f"These slots have no task yet: {missing}. Write them with world_add_task, then end your turn."
                 if missing:
                     raise ReviewLimit(f"the author wrote no task for {missing}")
                 for left in range(cfg.author.probe_rounds, -1, -1):
