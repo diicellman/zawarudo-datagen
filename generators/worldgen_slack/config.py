@@ -36,6 +36,10 @@ class PipelineConfig(vf.EnvConfig):
     solver: vf.AgentConfig = role("z-ai/glm-5.2", solver=True).model_copy(
         update={"runtime": vf.SubprocessConfig()}
     )
+    # A stronger solver with the same tools, for the tasks GLM rarely answers: hard, or broken?
+    witness: vf.AgentConfig = role("openai/gpt-6-sol", solver=True).model_copy(
+        update={"runtime": vf.SubprocessConfig()}
+    )
     retries: RetryConfig = RetryConfig(max_retries=0)
     # The episode's agents at once. GLM, whose account allows 8 concurrent requests, is gated on its own by
     # [author] solvers, so the judge's reviews run beside its solves.
@@ -156,11 +160,12 @@ class AuthorSettings(Section):
     )  # the judge reviews the world after these days
     # The solver's tries of a task, each time it is probed or reviewed; the turns a task outside its band comes back
     # to the author; the tasks in one judge review (a batch's reviews run side by side); GLM solves at once, as the
-    # account allows 8 concurrent requests.
+    # account allows 8 concurrent requests; the witness's tries of a task below its band's floor.
     tries: int = Field(default=4, ge=1, le=16)
     task_rounds: int = Field(default=3, ge=0, le=10)
     review_chunk: int = Field(default=5, ge=1, le=50)
     solvers: int = Field(default=8, ge=1, le=64)
+    witness_tries: int = Field(default=2, ge=0, le=8)
     day_attempts: int = Field(
         default=2, ge=1, le=5
     )  # a day that cannot close is written again from its start
@@ -203,7 +208,7 @@ class Config(Section):
     def secure(self):
         if self.env.retries.max_retries:
             raise ValueError("whole-pipeline retries would replay mutable work")
-        for name in ("author", "judge", "solver"):
+        for name in ("author", "judge", "solver", "witness"):
             agent = getattr(self.env, name)
             runtime = agent.runtime
             if not isinstance(agent.harness, NullHarnessConfig) and (

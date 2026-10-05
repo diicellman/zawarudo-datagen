@@ -62,7 +62,7 @@ from .chronicle import (
     today,
     today_line,
 )
-from .env import GenerationEnv
+from .env import GenerationEnv, band_move
 from .generate import failure, provenance, run_label
 from .store import Store
 from .config import ROOT, Acceptance, Category, Config
@@ -1701,7 +1701,10 @@ async def check_author(root):
         update={
             "calendar": base.calendar.model_copy(update={"days": 4}),
             "activity": base.activity.model_copy(update={"messages": 16}),
-            "tasks": base.tasks.model_copy(update={"per_100": 25, "batch": 2}),  # 4 tasks, in 2 batches
+            # 4 tasks in 2 batches; level 3's band starts at 0, so the witness tries its task
+            "tasks": base.tasks.model_copy(
+                update={"per_100": 25, "batch": 2, "bands": [(0.75, 1.0), (0.5, 0.75), (0.0, 0.5)]}
+            ),  # fmt: skip
             "author": base.author.model_copy(
                 update={
                     "tolerance": 1.0,
@@ -1741,6 +1744,17 @@ async def check_author(root):
             record = {"id": name, "agent": {"name": "solver", "config": {}}, "task": {"data": {"task_id": task.data.task_id}}, "ok": True, "nodes": [], "info": {"observations": observations, "evaluation": evaluation}}  # fmt: skip
             return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id=name, record=record)  # fmt: skip
 
+    witnessed = Counter()
+
+    class ScriptedWitness(ScriptedAgent):  # the stronger solver answers right
+        async def run(self, task):
+            key = (store.state.active_attempt, task.data.task_id)
+            witnessed[key] += 1
+            name = "-".join(["witness", *key, str(witnessed[key])])
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r"}  # fmt: skip
+            record = {"id": name, "agent": {"name": "witness", "config": {}}, "task": {"data": {"task_id": task.data.task_id}}, "ok": True, "nodes": [], "info": {"observations": [], "evaluation": evaluation}}  # fmt: skip
+            return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id=name, record=record)  # fmt: skip
+
     class AuthorEnv(GenerationEnv):
         async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
             if context["phase"] == "premise":
@@ -1752,6 +1766,8 @@ async def check_author(root):
 
         async def review(self, agents, payload, attempt, files=None, label=""):
             seen.append(("review", attempt, payload["phase"], "written_through" in payload, "ledger" in payload, bool(payload.get("previous_issues")), tuple(t["id"] for t in payload["tasks"])))  # fmt: skip
+            if payload.get("witness"):
+                seen.append(("witnessed", attempt, tuple(t["id"] for t in payload["tasks"]), len(payload["witness"]), tuple(sorted(f for f in files if f.startswith("witness_")))))  # fmt: skip
             if attempt == "review-02-01" and crash["review"]:
                 crash["review"] = False
                 raise KeyboardInterrupt("simulated crash in a review")
@@ -1908,7 +1924,7 @@ async def check_author(root):
             )  # t0, rewritten in its slot
             await call("add_task", task=task.model_copy(update={"question": "Asked anew: " + task.question}))
 
-    agents = SimpleNamespace(judge=ScriptedAgent(), solver=ScriptedSolver(), author=ScriptedAuthor(script))
+    agents = SimpleNamespace(judge=ScriptedAgent(), solver=ScriptedSolver(), witness=ScriptedWitness(), author=ScriptedAuthor(script))  # fmt: skip
     manifest = provenance(settings)
     store = TestStore(settings.output, manifest)
     env = AuthorEnv(settings, store)
@@ -2010,6 +2026,19 @@ async def check_author(root):
         "and left out of the rates"
     )  # fmt: skip
     assert abs(summary["mean_learnability"] - 17 / 36) < 1e-9, summary["mean_learnability"]  # t0 2/3, t2 1/2
+
+    # The witness tries only the task whose band starts at 0, twice; the judge reads its tries; they count in no rate.
+    assert witnessed == {("tasks-03", t2): 2}, witnessed
+    assert ("witnessed", "tasks-03", (t2,), 2, (f"witness_{t2}_1.json", f"witness_{t2}_2.json")) in seen
+    assert state.probes[t2]["witness_right"] == 1.0 and state.probes[t0]["witness_right"] is None
+    assert (await env.witness(agents, [t2], {t2: env.task_key(t2)}, "final-02"))[t2]["results"] and witnessed == {("tasks-03", t2): 2}, "an unchanged task keeps its witness"  # fmt: skip
+    probe = {"approved": True, "band": (0.0, 0.25), "right_rate": 0.0}
+    assert [band_move(probe | {"witness_right": w}) for w in (0.0, 0.5, None)] == ["easier", None, None], (
+        "a task whose band starts at 0 lands in it only if the witness answers it"
+    )
+    assert (
+        band_move(probe | {"approved": False}) == "fix" and band_move(probe | {"right_rate": 0.5}) == "harder"
+    )
 
     class Slow(ScriptedAgent):  # GLM's gate holds its solves to [author] solvers, whatever the episode allows
         active, peak = 0, 0

@@ -165,5 +165,8 @@ model = "openai/gpt-6-sol"
 [env.solver]
 model = "z-ai/glm-5.3-flash"
 
+[env.witness]             # tries the tasks GLM rarely answers: hard, or broken? (the user's decision, 2026-10-05)
+model = "openai/gpt-6-sol"
+
 [answer_judge]
 model = "openai/gpt-6-sol"

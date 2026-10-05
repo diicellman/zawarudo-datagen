@@ -28,7 +28,9 @@ holds the present (`world_meta.now_us`), and nothing is written before it.
    facts, the level's spread) and code's measures of its difficulty come back. The GLM solver tries each task
    `[author] tries` times and the judge reviews it. A task whose share of right answers misses its level's
    `[tasks] bands`, or that the judge does not approve, comes back to the author, for up to `task_rounds` turns.
-   The slots are written in batches of `[tasks] batch`, each in an author interaction of its own.
+   The slots are written in batches of `[tasks] batch`, each in an author interaction of its own. A stronger solver,
+   the witness (`[env.witness]`), tries each task GLM answers right less often than its band's floor: one it answers
+   is hard, not broken. Its tries go to the judge and count in no rate.
 6. **Final review.** The judge reviews every task (with the solver's runs) and the whole world. Issues go back to
    the same author session until the judge approves or `review_rounds.final` runs out. Then the release is
    published.

@@ -111,6 +111,19 @@ def rates(results: list[dict]) -> dict:
     }
 
 
+def band_move(probe: dict) -> str | None:
+    """What a probed task needs: a fix the judge asks for, or to be harder or easier to land in its level's band of
+    right-answer rates. A band that starts at 0 also needs the witness to answer it: one even it fails is too hard."""
+    (lo, hi), right, witness = probe["band"], probe["right_rate"], probe.get("witness_right")
+    if not probe["approved"]:
+        return "fix"
+    if right > hi:
+        return "harder"
+    if right < lo or (lo == 0 and witness == 0):
+        return "easier"
+    return None
+
+
 def merged(verdicts: list[Verdict]) -> Verdict:
     """Several reviews as one verdict: approved when each is, with every task review and issue; a rejection's feedback
     carries only the rejecting reviews' words."""
@@ -157,7 +170,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         return self.store.world
 
     async def setup(self, agents):
-        for name in ("author", "judge", "solver"):
+        for name in ("author", "judge", "solver", "witness"):
             getattr(agents, name).trainable = False
 
     # ------------------------------------------------------------------ authors
@@ -326,23 +339,23 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         rows, answers = self.store.release_rows(sha256(world))
         return rows, [answers[r.task_id] for r in rows]
 
-    async def solve(self, agents, task):
-        """One independent solve of a task, graded for correctness and grounding. A solve that crashed runs once more;
-        crashed again, it is kept as crashed, and the task's rates leave it out."""
+    async def solve(self, agents, task, seat: str = "solver"):
+        """One independent solve of a task by `seat` (GLM, or the witness), graded for correctness and grounding. A
+        solve that crashed runs once more; crashed again, it is kept as crashed, and the task's rates leave it out."""
         for _ in range(2):
-            async with self.glm:
-                trace = await agents.solver.run(task)
+            async with self.glm if seat == "solver" else contextlib.nullcontext():
+                trace = await getattr(agents, seat).run(task)
             self.store.trace(trace)
             if not (outcome := SolverTask.outcome(trace))["crashed"]:
                 break
         return outcome, trace
 
-    async def solves(self, agents, task_ids, attempt, n) -> dict:
-        """`n` independent solves of each task, on a solver copy of the world kept with the attempt."""
-        copy = self.store.path(attempt, "solver.sqlite")
+    async def solves(self, agents, task_ids, attempt, n, seat: str = "solver") -> dict:
+        """`n` independent solves of each task by `seat`, on a solver copy of the world kept with the attempt."""
+        copy = self.store.path(attempt, f"{seat}.sqlite")
         copy.unlink(missing_ok=True)
         self.world.solver_copy(copy)
-        runs = await asyncio.gather(*(asyncio.gather(*(self.solve(agents, self.solver_task(t, copy)) for _ in range(n))) for t in task_ids))  # fmt: skip
+        runs = await asyncio.gather(*(asyncio.gather(*(self.solve(agents, self.solver_task(t, copy), seat) for _ in range(n))) for t in task_ids))  # fmt: skip
         if dead := [t for t, tries in zip(task_ids, runs) if all(o["crashed"] for o, _ in tries)]:
             raise RuntimeError(f"every try of {dead} crashed twice: the solver or its grading is failing")
         return dict(zip(task_ids, runs))
@@ -521,16 +534,19 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         for task_id, task_runs in (await self.solves(agents, fresh, attempt, n)).items():
             self.keep_solves(task_id, keys[task_id], task_runs)
         runs = {t: state.solves[t] for t in due}
+        witnessed = await self.witness(agents, due, keys, attempt)
         size = self.settings.author.review_chunk
         chunks = [due[i : i + size] for i in range(0, len(due), size)]
 
         async def judged(k: int, chunk: list[str]) -> Verdict:
+            witness = [result for t in chunk for result in witnessed.get(t, {}).get("results", [])]
             payload = review_payload(
                 self.world, "task", chunk, self.settings.taxonomy,
                 solves=[result for t in chunk for result in runs[t]["results"]],
                 previous_issues=[i.model_dump(mode="json") for i in previous if set(i.task_ids) & set(chunk)],
+                **({"witness": witness} if witness else {}),
             )  # fmt: skip
-            files = {f"solver_{t}_{k}.json": record for t in chunk for k, trace_id in enumerate(runs[t]["traces"], 1) if (record := self.saved_trace(trace_id))}  # fmt: skip
+            files = {f"{seat}_{t}_{k}.json": record for seat, tried in (("solver", runs), ("witness", witnessed)) for t in chunk if t in tried for k, trace_id in enumerate(tried[t]["traces"], 1) if (record := self.saved_trace(trace_id))}  # fmt: skip
             return await self.review(
                 agents, payload, attempt, files, "tasks" if len(chunks) == 1 else f"tasks-{k}"
             )
@@ -543,11 +559,34 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             rate = rates(results)
             approved = accepted_task(verdict_of[task_id], self.settings.acceptance, task_id)
             fit = next(r.level_fit for r in verdict_of[task_id].tasks if r.task_id == task_id)
+            seen = rates(witnessed[task_id]["results"])["right_rate"] if task_id in witnessed else None
             if approved:
-                state.task_reviews[task_id] = {"key": keys[task_id], **rate, "level_fit": fit, "results": results}  # fmt: skip
+                state.task_reviews[task_id] = {"key": keys[task_id], **rate, "witness_right": seen, "level_fit": fit, "results": results}  # fmt: skip
             right = rate["right_rate"]
             self.store.event("task_reviewed", attempt=attempt, task_id=task_id, approved=approved, **rate, learnability=4 * right * (1 - right))  # fmt: skip
         return runs, merged(verdicts)
+
+    async def witness(self, agents, due, keys, attempt) -> dict:
+        """A stronger solver's tries of each task GLM answers right less often than its band's floor, and of each task
+        whose band starts at 0: a task it answers is hard, not broken. Its tries are kept with the task's key and count
+        in no rate. Returns the tries of each low task."""
+        state, cfg = self.store.state, self.settings
+        level = dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())
+
+        def low(t: str) -> bool:
+            floor = cfg.tasks.bands[level[t] - 1][0]
+            return floor == 0 or rates(state.solves[t]["results"])["right_rate"] < floor
+
+        if cfg.author.witness_tries and (fresh := [t for t in due if low(t) and state.witness.get(t, {}).get("key") != keys[t]]):  # fmt: skip
+            for t, runs in (
+                await self.solves(agents, fresh, attempt, cfg.author.witness_tries, "witness")
+            ).items():
+                state.witness[t] = {
+                    "key": keys[t],
+                    "results": [r for r, _ in runs],
+                    "traces": [x.id for _, x in runs],
+                }
+        return {t: state.witness[t] for t in due if low(t) and state.witness.get(t, {}).get("key") == keys[t]}
 
     def keep_solves(self, task_id: str, key: str, runs: list) -> None:
         """A task's solver runs, kept with what the task was when they ran."""
@@ -586,6 +625,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     | {"level_fit": review.level_fit, "valid": review.valid, "review": review.reason}
                     | {"issues": [f"{i.defect} {i.requested_change}" for i in judged.issues if task_id in i.task_ids]}
                     | {"approved": accepted_task(judged, cfg.acceptance, task_id), "band": cfg.tasks.bands[measured[task_id]["level"] - 1]}
+                    | {"witness_right": rates(state.witness[task_id]["results"])["right_rate"] if state.witness.get(task_id, {}).get("key") == keys[task_id] else None}
                 )  # fmt: skip
             self.store.event("probe", attempt=attempt, rates={t: state.probes[t]["right_rate"] for t in due})
             self.store.save()
@@ -600,8 +640,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         for turns in itertools.count():
             back = {}
             for t, r in (await self.probe(agents, attempt, ids)).items():
-                (lo, hi), right = r["band"], r["right_rate"]
-                move = "fix" if not r["approved"] else "harder" if right > hi else "easier" if right < lo else None  # fmt: skip
+                move = band_move(r)
                 given = state.task_rounds.get(t, 0)
                 if move == "fix" or (move and given < cfg.author.task_rounds):
                     back[t] = r | {"move": move, "rounds_left": max(0, cfg.author.task_rounds - given - 1)}

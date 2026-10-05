@@ -15,7 +15,8 @@ from .inspection import ReviewState, ReviewTools, ReviewToolsConfig
 REVIEW_PROMPT = """Review what /task/input.json names, as /task/review.md says. /task/world.sqlite is the workspace
 with its facts and tasks; /task/schema.sql is its schema. inspect_check runs code's checks and re-runs the reviewed
 tasks' gold queries; inspect_read reads Slack as a task's actor; inspect_sql runs SQL as a task's actor. Other JSON
-files in /task are agents' traces: solver_<task_id>_<n>.json are independent solves of that task. Write the verdict to
+files in /task are agents' traces: solver_<task_id>_<n>.json are independent solves of that task, and
+witness_<task_id>_<n>.json a stronger solver's tries of a task the solves rarely answer. Write the verdict to
 /task/verdict.json following /task/schemas.json.
 """
 
@@ -37,7 +38,8 @@ and its gold rows are the complete, correct answer. Score each criterion of sche
 - question_fit: each gold query answers its question as asked; test variants with inspect_sql.
 - discoverability: the actor can find the answer with Slack's read tools; try inspect_read, and read the solves.
   Solvers that answer differently or fail can reveal ambiguity or a missing time scope; a mistake the evidence rules
-  out is the solver's.
+  out is the solver's. When input.json has witness, a stronger solver tried the tasks the solves rarely answer: one
+  it answers is hard, not broken; one it fails too may be ambiguous or unanswerable as asked.
 - shortcut_free: nothing in the workspace hands over the answer outside its evidence.
 - level_fit, on each task's review, from 0 to 4: how fully answering it needs the level and concept its `means`
   names. 4: it needs them, with no shortcut; 3: it needs them, but one route is easier than the level; 2: partly;
