@@ -57,7 +57,8 @@ styles = [
 # `concepts`, one list per level, are concrete things a task of that level requires; the seed draws one per slot
 # (DataDesigner's complexity -> concept subcategories). `needs`, one table per level, is what code checks a task for
 # when it is written: `rank`, its evidence's best search rank for the question's own words (evidence they never find
-# passes); `depth`, how many newer top-level messages (and earlier replies in its thread) it sits under; `channels`,
+# passes); `depth`, how many newer top-level messages (and earlier replies in its thread) it sits under, as a share of
+# the busiest channel the asker can read, so it scales with the world; `channels`,
 # the channels its facts are first stated in; `relations`, supersedes and after links among its facts; `decoys`, decoy
 # facts on their subjects the asker can read; `named`, at most how many of its evidence's channel names and
 # identifiers (words with digits, as PWSQL-03) the question names. S1's questions named their channels and IDs, and
@@ -78,7 +79,7 @@ concepts = [
   ["a message several pages back in a busy channel", "the earliest or the latest of many similar messages", "a reply deep in a long thread"],
   ["the message just before or after a described one in a busy channel", "one of several near-identical messages, told apart by who reacted or replied", "a reply deep in a long thread, described by the discussion around it"],
 ]
-needs = [{}, {}, {depth = 15}, {depth = 25, rank = 10}]
+needs = [{}, {}, {depth = 0.3}, {depth = 0.5, rank = 10}]
 
 [taxonomy.search]
 gold = "ledger"

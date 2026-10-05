@@ -626,8 +626,8 @@ def unmet(needs, measured: dict) -> list[str]:
     out = []
     if (rank := measured.get("bm25_rank")) is not None and rank < needs.rank:
         out.append(f"its evidence below the first {needs.rank - 1} search hits for the question's own words (it is hit {rank})")  # fmt: skip
-    if "depth" in measured and measured["depth"] < needs.depth:
-        out.append(f"its evidence under at least {needs.depth} newer messages of its channel or earlier replies of its thread (it is under {measured['depth']})")  # fmt: skip
+    if "depth_share" in measured and measured["depth_share"] < needs.depth:
+        out.append(f"its evidence under at least {needs.depth:.0%} as many messages as the busiest channel its actor reads holds, newer in its channel or earlier in its thread (it is under {measured['depth_share']:.0%}, {measured['depth']} messages)")  # fmt: skip
     if measured["channels"] < needs.channels:
         out.append(f"its facts first stated in at least {needs.channels} channels (they are in {measured['channels']})")  # fmt: skip
     if measured["relations"] < needs.relations:
@@ -645,7 +645,7 @@ def needs_text(needs) -> str:
     if needs.rank > 1:
         out.append(f"evidence below the question's first {needs.rank - 1} search hits")
     if needs.depth:
-        out.append(f"evidence under {needs.depth} newer messages")
+        out.append(f"evidence under {needs.depth:.0%} of its busiest channel's messages")
     if needs.channels:
         out.append(f"facts first stated in {needs.channels} channels")
     if needs.relations:
@@ -720,9 +720,11 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
         for message_id in dict.fromkeys(evidence)
     ]
     facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
+    (busiest,) = reader.db.execute("SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM messages WHERE parent_id IS NULL GROUP BY channel_id)").fetchone()  # fmt: skip
     return {
         "evidence_pages": max(pages, default=None),
         "depth": max(under, default=0),
+        "depth_share": round(max(under, default=0) / busiest, 3) if busiest else 0.0,
         "tables": sorted(tables),
         "bm25_rank": reader.rank(task["question"], evidence),
         "named": named(world, task["question"], list(dict.fromkeys(evidence))),

@@ -117,12 +117,13 @@ class ActivityConfig(Section):
 class Needs(Section):
     """What code checks a task of one level for when it is written: its evidence's best search rank for the
     question's own words (evidence the words never find passes); how deep its evidence sits (newer top-level messages
-    in its channel, and earlier replies in its thread); the channels its facts are first stated in; the relations
+    in its channel, and earlier replies in its thread), as a share of the busiest channel its actor can read, so the
+    need scales with the world; the channels its facts are first stated in; the relations
     among its facts; the decoys its actor can read on their subjects; and at most how many of its evidence's channel
     names and identifiers (words with digits, as PWSQL-03) the question names."""
 
     rank: int = Field(default=1, ge=1)
-    depth: int = Field(default=0, ge=0)
+    depth: float = Field(default=0, ge=0, lt=1)
     channels: int = Field(default=0, ge=0)
     relations: int = Field(default=0, ge=0)
     decoys: int = Field(default=0, ge=0)

@@ -1272,10 +1272,13 @@ def check_clock(root):
     level3 = lambda **needs: needing(settings, "semantic", 3, **needs)  # noqa: E731
     refused("first stated in at least 2 channels", tasked, owner.model_copy(update={"facts": ["f1", "f4"]}), level3(channels=2))  # fmt: skip  # both in #ops
     refused(f"for the question's own words (it is hit {result['bm25_rank']})", tasked, owner, level3(rank=result["bm25_rank"] + 1))  # fmt: skip
-    refused(f"or earlier replies of its thread (it is under {result['depth']})", tasked, owner, level3(depth=result["depth"] + 1))  # fmt: skip
+    refused(f"(it is under {result['depth_share']:.0%}, {result['depth']} messages)", tasked, owner, level3(depth=result["depth_share"] + 0.01))  # fmt: skip
     leads_named = owner.model_copy(update={"question": "Who owns the audit after the dry run in #leads?"})
     refused("naming at most 0 of its evidence's channels and identifiers (it names 1)", tasked, leads_named, level3(named=0))  # fmt: skip
-    assert tasked(leads_named, level3(named=1, rank=result["bm25_rank"], depth=result["depth"]))["named"] == 1
+    assert (
+        tasked(leads_named, level3(named=1, rank=result["bm25_rank"], depth=result["depth_share"]))["named"]
+        == 1
+    )
     tasked(owner)
     replier = Task(id="t2", category="lookup", level=1, actor_id=c, question="Who said thanks in #ops?", answer_type="text", gold_sql="SELECT u.real_name AS answer FROM messages m JOIN users u ON u.id = m.user_id WHERE m.text = 'thanks'")  # fmt: skip
     tasked(replier.model_copy(update={"question": "Who said thanks?"}))
