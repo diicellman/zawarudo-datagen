@@ -34,6 +34,7 @@ def digest(value) -> str:
 ANSWER_KEY = (
     "commitments",
     "task_facts",
+    "board",
     "tasks",
     "evidence",
     "fact_relations",

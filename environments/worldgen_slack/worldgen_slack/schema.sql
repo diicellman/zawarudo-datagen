@@ -221,6 +221,12 @@ CREATE TABLE task_facts (
   PRIMARY KEY (task_id, fact_id)
 );
 
+CREATE TABLE board (                                 -- the plan's facts for each ledger and hybrid task slot
+  slot    TEXT NOT NULL,
+  fact_id TEXT NOT NULL REFERENCES facts(id),
+  PRIMARY KEY (slot, fact_id)
+);
+
 CREATE TABLE commitments (                           -- what someone promised in a message, and how it ended
   id         TEXT PRIMARY KEY,
   owner_id   TEXT NOT NULL REFERENCES users(id),

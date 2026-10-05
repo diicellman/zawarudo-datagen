@@ -11,8 +11,10 @@ holds the present (`world_meta.now_us`), and nothing is written before it.
    draws the cast from the persona file for the occupations it names. The author then writes the organization:
    titles, teams, channels with members and their everyday routines. Code adds direct messages and the calendar.
 2. **Plan.** With `world_plan`, the author writes the ledger: storylines, events (a moment each, never moved once
-   planned) and facts (what is stated, by whom, in which channel, on which day, about which event). It also writes
-   `/task/notes/plan.md`: the arcs per day and a board of what each task cell will rest on.
+   planned) and facts (what is stated, by whom, in which channel, on which day, about which event), and the board:
+   the facts each ledger and hybrid task slot will rest on, checked against its level's needs (channels, relations,
+   decoys), so a hard backward task's material exists while it can still be posted. It also writes
+   `/task/notes/plan.md`: the arcs per day.
 3. **Days.** Each calendar day is one interaction. The author reads `/task/memory` (rendered by code before every
    turn: `now.md`, the ledger, a page per person, channel, storyline and event) and its own notes, then posts the
    day's conversations in time order with `world_post` and moves on with `world_advance`. Code times every line

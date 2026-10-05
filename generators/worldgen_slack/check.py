@@ -37,6 +37,7 @@ from .agents.judge import JudgeTask, review_payload
 from .agents.synthesizer import parse_premise
 from .agents.world import WorldAuthorTask, context_of, files, ledger_digest
 from .chronicle import (
+    BoardEntry,
     Close,
     Commit,
     Conversation,
@@ -859,7 +860,7 @@ def check_contracts(root):
     for facts, actor, needs, setup, refusal in (
         (["f1", "f4"], a, {"channels": 2}, None, "first stated in at least 2 channels (they are in 1)"),
         (["f3", "f4"], a, {"relations": 3}, None, "at least 3 supersedes or after relations among its facts (it has 2)"),
-        (["f2", "f4"], c, {"decoys": 1}, decoy(leads), "at least 1 decoy facts its actor can read"),  # c is not in #leads
+        (["f2", "f4"], c, {"decoys": 1}, decoy(leads), "at least 1 decoy facts on its facts' subjects, where its actor can read them (it has 0)"),  # c is not in #leads
     ):  # fmt: skip
         asked = settled(facts).model_copy(update={"actor_id": actor})
         refused(refusal, recorded, asked, nine, needing(settings, "semantic", 3, **needs), setup or (lambda copy: None))  # fmt: skip
@@ -1023,6 +1024,32 @@ def check_clock(root):
     )
     refused("planned events stay", recorded, plan(events=events[:1]))
     refused("keep ['s1', 's2']", recorded, plan(storylines=[Storyline(id="s3", summary="x"), Storyline(id="s2", summary="y")]))  # fmt: skip
+    # The board: each ledger and hybrid slot's planned facts, as many as its level needs; checked on every plan.
+    board_slots = [Slot(id=i, category=c, level=n, concept="a concept", style="a style") for i, c, n in (("t1", "semantic", 3), ("t3", "search", 1), ("t2", "lookup", 1))]  # fmt: skip
+    spread = needing(settings, "semantic", 3, channels=2)
+    entries = lambda *pairs: [BoardEntry(slot=slot, facts=ids) for slot, ids in pairs]  # noqa: E731
+
+    def boarded(document):
+        with world.trial() as copy:
+            record_plan(copy, document, spread, board_slots)
+
+    for expected, board in (
+        ("each ledger and hybrid slot will rest on; ['t1', 't3'] have none", []),
+        ("the ledger and hybrid slots of now.md; ['t2'] are not", entries(("t1", ["f3", "f4"]), ("t3", ["f4"]), ("t2", ["f1"]))),
+        ("the board names facts of the plan; ['f9'] are not", entries(("t1", ["f3", "f9"]), ("t3", ["f4"]))),
+        ("the board's t1 (level-3 semantic) needs its facts first stated in at least 2 channels (they are in 1)", entries(("t1", ["f1", "f4"]), ("t3", ["f4"]))),
+    ):  # fmt: skip
+        refused(expected, boarded, plan(board=board))
+    try:  # facts may be shared; a replan's board replaces the last; a fact the board rests on stays planned
+        with world.trial() as copy:
+            record_plan(copy, plan(board=entries(("t1", ["f3", "f4"]), ("t3", ["f4"]))), spread, board_slots)
+            record_plan(copy, plan(board=entries(("t1", ["f1", "f3"]), ("t3", ["f1"]))), spread, board_slots)
+            assert [tuple(r) for r in copy.db.execute("SELECT slot, fact_id FROM board ORDER BY 1, 2")] == [("t1", "f1"), ("t1", "f3"), ("t3", "f1")]  # fmt: skip
+            dropped = plan(facts=facts[:3], board=entries(("t1", ["f3", "f4"]), ("t3", ["f1"])))
+            refused("the board names facts of the plan; ['f4'] are not", record_plan, copy, dropped, spread, board_slots)  # fmt: skip
+            raise LookupError("drop the trial")
+    except LookupError:
+        pass
     rng = random.Random(5)
 
     slots = [Slot(id="t1", category="semantic", level=3, concept="a concept", style="a style"), Slot(id="t2", category="lookup", level=1, concept="a concept", style="a style")]  # fmt: skip
@@ -1292,6 +1319,7 @@ async def check_tools(root):
             "activity": base.activity.model_copy(update={"messages": 400}),
             "author": base.author.model_copy(update={"tolerance": 1.0, "share_tolerance": 1.0}),
             "personas": base.personas.model_copy(update={"gaps": quick}),
+            "taxonomy": needless(base.taxonomy),
         }
     )
     world, cast, org, (a, b, c, d) = organized(root, settings)
@@ -1307,6 +1335,7 @@ async def check_tools(root):
             PlanFact(id="f1", storyline="s1", subject="Release 4.2", attribute="decision", value="rollback", anchor="rollback", channel_id=ops, author_id=a, day=1, summary="s"),
             PlanFact(id="f2", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=leads, author_id=a, day=3, after=["f1"], event="e1", kind="scheduled", summary="s"),
         ],
+        board=[BoardEntry(slot="t1", facts=["f1", "f2"])],
     )  # fmt: skip
 
     def tools_for(mode, day):
@@ -1888,7 +1917,8 @@ async def check_author(root):
                 PlanFact(id="f3", storyline="s2", subject="Audit", attribute="window", value="dry run", anchor="dry run", channel_id=leads, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
                 PlanFact(id="f4", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=ops, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
             ]  # fmt: skip
-            await call("plan", ledger=Plan(storylines=[Storyline(id="s1", summary="the release"), Storyline(id="s2", summary="the audit")], events=events, facts=facts))  # fmt: skip
+            board = [BoardEntry(slot=t, facts=["f3", "f4"]) for t in (t0, t1, t2)]  # the ledger slots
+            await call("plan", ledger=Plan(storylines=[Storyline(id="s1", summary="the release"), Storyline(id="s2", summary="the audit")], events=events, facts=facts, board=board))  # fmt: skip
             await runtime.write("/task/notes/plan.md", b"arcs; board: semantic and search rest on f3 and f4")
         elif tools.config.mode == "day":
             day = tools.config.day

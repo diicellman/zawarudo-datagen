@@ -28,11 +28,13 @@ from .contracts import (
     Zone,
     at,
     clock,
+    fact_measures,
     insert_lines,
     normalized,
     record_task,
     render,
     text_errors,
+    unmet,
     window,
     world_meta,
 )
@@ -80,10 +82,18 @@ class PlanFact(StrictModel):
         return self
 
 
+class BoardEntry(StrictModel):
+    """The planned facts one ledger or hybrid task slot will rest on."""
+
+    slot: SafeId
+    facts: Ids = Field(min_length=1)
+
+
 class Plan(StrictModel):
     storylines: list[Storyline] = Field(min_length=1)
     events: list[Event] = Field(default_factory=list)
     facts: list[PlanFact] = Field(min_length=1)
+    board: list[BoardEntry] = Field(default_factory=list)
 
 
 class Commit(StrictModel):
@@ -374,10 +384,12 @@ def fact_row(fact: PlanFact, events: dict[str, Event], moment: dict[str, int], z
     }
 
 
-def record_plan(world, plan: Plan, settings) -> None:
+def record_plan(world, plan: Plan, settings, slots=()) -> None:
     """The ledger in time order. Storylines are fixed once planned (summaries may change); an event, once planned,
     never moves or goes; a stated fact keeps everything but its summary, while an unstated one may change or go and is
-    planned for today or later. A fact about an event carries the event's moment."""
+    planned for today or later. A fact about an event carries the event's moment. The board gives each ledger and
+    hybrid slot of `slots` the planned facts it will rest on, as many channels, relations and decoys as its level
+    needs: the material of a hard backward task exists before day 1, when it can still be posted."""
     count = settings.storylines
     if len(plan.storylines) != count:
         raise ValueError(f"plan exactly {count} storylines")
@@ -422,6 +434,18 @@ def record_plan(world, plan: Plan, settings) -> None:
     planned = {f.id: f for f in plan.facts}
     if gone := sorted(stated - planned.keys()):
         raise ValueError(f"stated facts stay in the ledger: {gone}")
+    backward = {s.id: s for s in slots if settings.taxonomy[s.category].gold in ("ledger", "hybrid")}
+    board = {e.slot: list(dict.fromkeys(e.facts)) for e in plan.board}
+    if len(board) < len(plan.board):
+        raise ValueError("the board has one entry for each slot")
+    if strays := sorted(board.keys() - backward.keys()):
+        raise ValueError(f"the board is for the ledger and hybrid slots of now.md; {strays} are not")
+    if missing := sorted(backward.keys() - board.keys()):
+        raise ValueError(
+            f"the board names the facts each ledger and hybrid slot will rest on; {missing} have none"
+        )
+    if unknown := sorted({f for facts in board.values() for f in facts} - planned.keys()):
+        raise ValueError(f"the board names facts of the plan; {unknown} are not")
     rows = {}
     for f in plan.facts:
         if f.event is not None and f.event not in events:
@@ -450,6 +474,7 @@ def record_plan(world, plan: Plan, settings) -> None:
         if later := [d for d in earlier if planned[d].day > f.day]:
             raise ValueError(f"{f.id} comes after {later}, which are first stated on a later day")
     with world.batch():
+        world.db.execute("DELETE FROM board")  # the plan's board is whole, as its facts are
         if kept:
             for s in plan.storylines:
                 world.db.execute("UPDATE storylines SET summary = ? WHERE id = ?", (s.summary, s.id))
@@ -490,6 +515,13 @@ def record_plan(world, plan: Plan, settings) -> None:
                 if f.supersedes
             ],
         )
+        world.insert("board", [dict(slot=s, fact_id=f) for s, facts in board.items() for f in facts])
+        for s, facts in board.items():
+            spec, level = settings.taxonomy[backward[s].category], backward[s].level
+            if spec.needs and (short := unmet(spec.needs[level - 1], fact_measures(world, facts))):
+                raise ValueError(
+                    f"the board's {s} (level-{level} {backward[s].category}) needs " + "; ".join(short)
+                )
         if room(world, settings, day) is None:  # inside the batch: the refusal takes the plan back
             raise ValueError(f"this plan leaves today no way to close: {today_line(world, settings, day)}")
 

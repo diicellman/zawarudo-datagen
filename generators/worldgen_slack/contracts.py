@@ -621,19 +621,20 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
 
 
 def unmet(needs, measured: dict) -> list[str]:
-    """Each of a level's needs that a task's measures fall short of, with what was measured."""
+    """Each of a level's needs that a task's measures fall short of, with what was measured; a need whose measure is
+    not given (a board entry has only its facts') is not checked."""
     out = []
-    if (rank := measured["bm25_rank"]) is not None and rank < needs.rank:
+    if (rank := measured.get("bm25_rank")) is not None and rank < needs.rank:
         out.append(f"its evidence below the first {needs.rank - 1} search hits for the question's own words (it is hit {rank})")  # fmt: skip
-    if measured["depth"] < needs.depth:
+    if "depth" in measured and measured["depth"] < needs.depth:
         out.append(f"its evidence under at least {needs.depth} newer messages of its channel or earlier replies of its thread (it is under {measured['depth']})")  # fmt: skip
     if measured["channels"] < needs.channels:
         out.append(f"its facts first stated in at least {needs.channels} channels (they are in {measured['channels']})")  # fmt: skip
     if measured["relations"] < needs.relations:
         out.append(f"at least {needs.relations} supersedes or after relations among its facts (it has {measured['relations']})")  # fmt: skip
     if measured["decoys"] < needs.decoys:
-        out.append(f"at least {needs.decoys} decoy facts its actor can read on its facts' subjects (it has {measured['decoys']})")  # fmt: skip
-    if needs.named is not None and measured["named"] > needs.named:
+        out.append(f"at least {needs.decoys} decoy facts on its facts' subjects, where its actor can read them (it has {measured['decoys']})")  # fmt: skip
+    if needs.named is not None and measured.get("named", 0) > needs.named:
         out.append(f"a question naming at most {needs.named} of its evidence's channels and identifiers (it names {measured['named']})")  # fmt: skip
     return out
 

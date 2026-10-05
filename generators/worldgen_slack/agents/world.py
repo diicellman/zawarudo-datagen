@@ -136,7 +136,8 @@ Voice
 
 Tasks (after the last day, world_add_task)
 - One task for each slot of now.md, with the slot's id: a question an actor asks, as hard as its level and concept
-  say, in its style. Nothing can be posted after the last day, so plan from day 1 what each slot will rest on: facts in several
+  say, in its style. Nothing can be posted after the last day, so plan from day 1 what each slot will rest on (the
+  plan's board, checked against each level's needs): facts in several
   channels, decoys, buried or split evidence, private conversations.
 """
     + GOLD_SQL
@@ -281,6 +282,9 @@ def now_page(world, settings, context: dict) -> str:
             for c in promises
         ]
     out += ["", "## Task slots (written after the last day; a task's id is its slot's)"]
+    board = {}
+    for slot, fact in world.db.execute("SELECT slot, fact_id FROM board ORDER BY fact_id"):
+        board.setdefault(slot, []).append(f"[[{fact}]]")
     for slot in context.get("slots", []):
         spec, level = settings.taxonomy[slot["category"]], slot["level"]
         needs = needs_text(spec.needs[level - 1]) if spec.needs else ""
@@ -288,6 +292,7 @@ def now_page(world, settings, context: dict) -> str:
             f"- {slot['id']}: {slot['category']} level {level}: {spec.levels[level - 1]}; concept: {slot['concept']}; "
             f"style: {slot['style']}"
             + (f"; needs: {needs}" if needs else "")
+            + (f"; the board rests it on {', '.join(board[slot['id']])}" if slot["id"] in board else "")
             + ("; written in this turn" if slot["id"] in context.get("writable", []) else "")
         )
     if notes := drift(world, context.get("cards", {})):
@@ -452,6 +457,7 @@ def ledger_document(world) -> dict:
         )
 
     relations = world.db.execute("SELECT src_fact, dst_fact, kind FROM fact_relations").fetchall()
+    board = world.db.execute("SELECT slot, fact_id FROM board ORDER BY slot, fact_id").fetchall()
     return {
         "storylines": [
             {"id": s, "summary": t}
@@ -461,6 +467,9 @@ def ledger_document(world) -> dict:
             {"id": e["id"], "storyline": e["storyline"], "title": e["title"]}
             | moment(e["moment_us"], e["zone"])
             for e in world.db.execute("SELECT * FROM events ORDER BY moment_us")
+        ],
+        "board": [
+            {"slot": s, "facts": [f for t, f in board if t == s]} for s in dict.fromkeys(t for t, _ in board)
         ],
         "facts": [
             {
@@ -582,7 +591,8 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
             raise ValueError("world file hash mismatch")
         self.context = json.loads(self.config.context)
         self.settings = Config.model_validate(self.context["settings"])
-        self.slots = [Slot.model_validate(s) for s in self.context.get("slots", []) if s["id"] in self.context.get("writable", [])]  # fmt: skip
+        self.every_slot = [Slot.model_validate(s) for s in self.context.get("slots", [])]
+        self.slots = [s for s in self.every_slot if s.id in self.context.get("writable", [])]
         self.gaps = Gaps(self.settings.personas.gaps)
         self.posted = None  # the last post: its conversation, the present it left, and its result
 
@@ -705,11 +715,12 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def plan(self, ledger: Plan) -> str:
-        """Plan the ledger, whole: storylines, events and facts. Planned events and stated facts stay as they are; the
-        rest may change. Returns what the ledger now holds."""
+        """Plan the ledger, whole: storylines, events, facts, and the board (the facts each ledger and hybrid task slot
+        will rest on, as its level needs). Planned events and stated facts stay as they are; the rest may change.
+        Returns what the ledger now holds."""
 
         def act():
-            self._write(lambda copy: record_plan(copy, ledger, self.settings))
+            self._write(lambda copy: record_plan(copy, ledger, self.settings, self.every_slot))
             world = self._world()
             counts = [
                 world.db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
@@ -826,8 +837,9 @@ def plan_prompt(world, settings, feedback: str = "") -> str:
     count = settings.storylines
     return (
         f"Before day 1 ({clock(world, bounds(world, 1)[0])[:14]}): plan the ledger with world_plan: exactly {count} "
-        "storylines, their events and their facts, over the calendar in now.md. Then write /task/notes/plan.md: each "
-        "storyline's arc day by day, and a board of what each task slot in now.md will rest on. End your turn when the "
+        "storylines, their events and their facts, over the calendar in now.md, and its board: the facts each ledger "
+        "and hybrid slot in now.md will rest on, as many channels, relations and decoys as its level needs. Then write "
+        "/task/notes/plan.md: each storyline's arc day by day, and how each slot will be asked. End your turn when the "
         f"ledger is planned.{rejected(feedback)}"
     )
 
