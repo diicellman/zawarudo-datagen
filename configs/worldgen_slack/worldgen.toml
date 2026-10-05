@@ -1,17 +1,17 @@
 # One generation run: uv run --frozen worldgen-slack --config configs/worldgen_slack/worldgen.toml
 # A new world needs a new `seed` and `output`; a run resumes only with the configuration it started with.
-# Now: the smoke run (S1a), 2 days, 80 messages, 2 tasks. The full world (S1) is output "data/v7-01/software",
-# [calendar] days = 10, [activity] messages = 400, [tasks] count = 10, and a budget set from the smoke's cost per day.
+# Now: the full world (S1), 10 days, 400 messages, 10 tasks, reviewed after days 3 and 6. A smoke run is 2 days,
+# 80 messages, 2 tasks, reviewed after day 1, with probe_budget = 16.
 sector = "IT for a business-to-business software company: cloud platform operations, service releases, and customer incident coordination"
-seed = 20261007
-output = "data/v7-03-smoke/software"
+seed = 20261008
+output = "data/v7-01/software"
 
 # One author writes the world in time order.
 [author]
-review_days = [1]         # the judge reviews the world after these days, and at the end
+review_days = [3, 6]      # the judge reviews the world after these days, and at the end
 probe_solves = 4
 probe_rounds = 1
-probe_budget = 16
+probe_budget = 80         # solver runs: every task tried once, and again after hardening
 
 # Built by: duckdb < scripts/worldgen_slack/personas.sql
 [personas]
@@ -20,11 +20,11 @@ typing = "data/seeds/typing-profiles.jsonl"
 gaps = "data/seeds/reply-gaps.json"
 
 [calendar]
-days = 2
+days = 10
 
 # The workspace's shape: code places conversations by these targets, and measure.py scores the world against them.
 [activity]
-messages = 80             # whole world, storylines included (estimate; 400 for a full world)
+messages = 400            # whole world, storylines included (estimate; 80 for a smoke)
 channel_skew = 1.1        # Zipf exponent over channels ranked by members (estimate)
 dms_per_person = 0.4      # direct-message pairs per person (estimate)
 dm_share = 0.25           # share of background messages in DMs (estimate)
@@ -36,7 +36,7 @@ emoji_rate = 0.08         # measured, same corpus; scorecard only
 parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 0.03 }  # workday rhythm (estimate)
 
 [tasks]
-count = 2
+count = 10
 per_storyline = 5
 max_answer_rows = 5
 # How a question is asked; the seed draws one per task, as DataDesigner draws instruction styles.
