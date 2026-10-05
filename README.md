@@ -19,9 +19,9 @@ uv run --frozen worldgen-slack --config configs/worldgen_slack/worldgen.toml > r
 ```
 
 - **Config** (`configs/worldgen_slack/worldgen.toml`): the sector, the seed, the calendar, the workspace's shape
-  (`[activity]`), the task count and taxonomy, and one model per agent (`[env.author]`, `[env.judge]`,
-  `[env.solver]`, `[answer_judge]`). `eval.toml` evaluates a released world. `configs/{eval,gepa,rl}` are Prime Lab
-  templates.
+  (`[activity]`), the tasks per 100 messages, each level's band of solver right-answer rates, the taxonomy with each
+  level's needs, and one model per agent (`[env.author]`, `[env.judge]`, `[env.solver]`, `[env.witness]`,
+  `[answer_judge]`). `eval.toml` evaluates a released world. `configs/{eval,gepa,rl}` are Prime Lab templates.
 - **Change `output` and `seed` for each new world.** Rerunning the same command resumes from `state.json`; resume is
   refused if the config differs from the run's `run.json`.
 - **Spend:** reported per role in `summary.json` and by `measure.py`; nothing caps it.

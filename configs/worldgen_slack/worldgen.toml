@@ -1,17 +1,19 @@
 # One generation run: uv run --frozen worldgen-slack --config configs/worldgen_slack/worldgen.toml
 # A new world needs a new `seed` and `output`; a run resumes only with the configuration it started with.
-# Now: the full world (S1), 10 days, 400 messages, 10 tasks, reviewed after days 3 and 6. A smoke run is 2 days,
-# 80 messages, 2 tasks, reviewed after day 1.
+# Now: the S2a smoke of the task changes (2026-10-05): 2 days, 80 messages, 8 tasks in batches of 4, reviewed after
+# day 1. S2 is S1's sector at S1's size with 40 tasks: seed 20261009, output "data/v7-02/software", storylines = 3,
+# [calendar] days = 10, [activity] messages = 400, [tasks] batch = 10, [author] review_days = [3, 6] and
+# task_rounds = 3. S1 (data/v7-01/software) was seed 20261008, 10 days, 400 messages, 10 tasks.
 sector = "IT for a business-to-business software company: cloud platform operations, service releases, and customer incident coordination"
-seed = 20261008
-output = "data/v7-01/software"
+seed = 20261010
+output = "data/v7-04-smoke/software"
 storylines = 2            # the plot the ledger plans before day 1
 
 # One author writes the world in time order.
 [author]
-review_days = [3, 6]      # the judge reviews the world after these days, and at the end
+review_days = [1]         # the judge reviews the world after these days, and at the end
 tries = 4                 # the solver's tries of a task, each time it is probed
-task_rounds = 3           # turns a task outside its level's band comes back to the author
+task_rounds = 2           # turns a task outside its level's band comes back to the author
 
 # Built by: duckdb < scripts/worldgen_slack/personas.sql
 [personas]
@@ -20,11 +22,11 @@ typing = "data/seeds/typing-profiles.jsonl"
 gaps = "data/seeds/reply-gaps.json"
 
 [calendar]
-days = 10
+days = 2
 
 # The workspace's shape: code places conversations by these targets, and measure.py scores the world against them.
 [activity]
-messages = 400            # whole world, storylines included (estimate; 80 for a smoke)
+messages = 80             # whole world, storylines included (estimate; 400 for a full world)
 channel_skew = 1.1        # Zipf exponent over channels ranked by members (estimate)
 dms_per_person = 0.4      # direct-message pairs per person (estimate)
 dm_share = 0.25           # share of background messages in DMs (estimate)
@@ -36,11 +38,11 @@ emoji_rate = 0.08         # measured, same corpus; scorecard only
 parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 0.03 }  # workday rhythm (estimate)
 
 [tasks]
-per_100 = 2.5             # tasks per 100 messages: 10 for S1's 400
+per_100 = 10              # tasks per 100 messages (the user's decision, 2026-10-05): 40 for S1's 400
 # Per level, the band of GLM's right-answer rate a task aims for (the user's decision, 2026-10-05): level 1 anchors
 # that most tries get right; level 4 tasks GLM rarely answers, and the witness must.
 bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5], [0.0, 0.25]]
-batch = 10                # slots written and hardened in one author interaction
+batch = 4                 # slots written and hardened in one author interaction (10 for a full world)
 max_answer_rows = 5
 # How a question is asked; the seed draws one per task, as DataDesigner draws instruction styles.
 styles = [

@@ -11,6 +11,12 @@ uv run eval @ configs/worldgen_slack/eval.toml -n 1 -r 2 --no-push --plain
 Set `--env.taskset.task.release_dir` to select another generated release. Public rows and the world's hash are
 validated before execution; private answers stay host-side.
 
+A release (format `worldgen-slack.v7`) carries, with each public task, how hard it measured when it was generated:
+the solver model and its tries (`tries`, `crashed`), its share of right answers (`right_rate`, the difficulty) and
+of right and grounded ones (`strict_rate`, the reward), the share of the gold evidence its tries saw (`coverage`),
+and, for a task the solver rarely answered, a stronger witness's share of right answers (`witness`,
+`witness_right`). A curriculum can filter on them. A `worldgen-slack.v6` release still loads, without them.
+
 ## The solver's tools
 
 `search_messages`, `search_users`, `search_channels`, `list_user_channels`, `read_channel`, `read_thread`,
