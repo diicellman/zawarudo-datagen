@@ -201,8 +201,8 @@ CREATE TABLE evidence (
 
 CREATE TABLE tasks (
   id           TEXT PRIMARY KEY,
-  category     TEXT NOT NULL CHECK (category IN ('lookup', 'search', 'semantic', 'join', 'hybrid', 'robustness')),
-  level        INTEGER NOT NULL CHECK (level BETWEEN 1 AND 3),
+  category     TEXT NOT NULL,                        -- a category of the run's taxonomy, which is data
+  level        INTEGER NOT NULL CHECK (level >= 1),
   concept      TEXT NOT NULL DEFAULT '',             -- what a task of its level requires, drawn by the seed
   actor_id     TEXT NOT NULL REFERENCES users(id),
   question     TEXT NOT NULL,

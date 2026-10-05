@@ -591,10 +591,10 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
     return rows
 
 
-def record_task(world, task: Task, settings, slot: Slot) -> None:
+def record_task(world, task: Task, settings, slot: Slot) -> dict:
     """T6: a task fills its slot. Code checks it (its slot's cell, a question no other task asks, facts its actor can
-    read, its level's spread, T1-T5, T7) and inserts it with its slot's concept and its gold rows. Run inside
-    `World.trial()`."""
+    read, T1-T5, T7, and its level's needs) and inserts it with its slot's concept and its gold rows. Returns its gold
+    rows and code's measures. Run inside `World.trial()`."""
     if (task.id, task.category, task.level) != (slot.id, slot.category, slot.level):
         raise ValueError(f"{slot.id} is a {slot.category} level {slot.level} task, with the slot's id")
     asked = {
@@ -606,26 +606,88 @@ def record_task(world, task: Task, settings, slot: Slot) -> None:
         row = world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()
         if row and not readable(world, task.actor_id, row[0]):
             raise ValueError(f"{task.id}: its actor cannot read {row[0]}, where {fact} is stated")
-    spec = settings.taxonomy.get(task.category)
-    need = spec.spread[task.level - 1] if spec and spec.spread and task.level <= len(spec.spread) else 1
-    marks = ", ".join("?" * len(task.facts))
-    (spread,) = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", task.facts).fetchone()  # fmt: skip
-    if need > 1 and spread < need:
-        raise ValueError(
-            f"{task.id}: a level-{task.level} {task.category} task rests on facts first stated in at least {need} "
-            "channels; give its facts places in other channels"
-        )
     with world.renumbered() as renumbered:
         gold = check_task(world, task, settings, renumbered)
     with world.batch():
         world.insert("tasks", [task_row(task, settings) | {"concept": slot.concept}])
         world.insert("task_facts", [dict(task_id=task.id, fact_id=f) for f in dict.fromkeys(task.facts)])
     world.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(gold), task.id))
+    tables = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)["tables"]
+    measured = measures(world, task.id, gold, tables)
+    spec = settings.taxonomy.get(task.category)
+    if spec and spec.needs and (short := unmet(spec.needs[task.level - 1], measured)):
+        raise ValueError(f"{task.id}: a level-{task.level} {task.category} task needs " + "; ".join(short))
+    return {"gold": gold} | measured
+
+
+def unmet(needs, measured: dict) -> list[str]:
+    """Each of a level's needs that a task's measures fall short of, with what was measured."""
+    out = []
+    if (rank := measured["bm25_rank"]) is not None and rank < needs.rank:
+        out.append(f"its evidence below the first {needs.rank - 1} search hits for the question's own words (it is hit {rank})")  # fmt: skip
+    if measured["depth"] < needs.depth:
+        out.append(f"its evidence under at least {needs.depth} newer messages of its channel or earlier replies of its thread (it is under {measured['depth']})")  # fmt: skip
+    if measured["channels"] < needs.channels:
+        out.append(f"its facts first stated in at least {needs.channels} channels (they are in {measured['channels']})")  # fmt: skip
+    if measured["relations"] < needs.relations:
+        out.append(f"at least {needs.relations} supersedes or after relations among its facts (it has {measured['relations']})")  # fmt: skip
+    if measured["decoys"] < needs.decoys:
+        out.append(f"at least {needs.decoys} decoy facts its actor can read on its facts' subjects (it has {measured['decoys']})")  # fmt: skip
+    if needs.named is not None and measured["named"] > needs.named:
+        out.append(f"a question naming at most {needs.named} of its evidence's channels and identifiers (it names {measured['named']})")  # fmt: skip
+    return out
+
+
+def needs_text(needs) -> str:
+    """A level's needs, as the author reads them in now.md."""
+    out = []
+    if needs.rank > 1:
+        out.append(f"evidence below the question's first {needs.rank - 1} search hits")
+    if needs.depth:
+        out.append(f"evidence under {needs.depth} newer messages")
+    if needs.channels:
+        out.append(f"facts first stated in {needs.channels} channels")
+    if needs.relations:
+        out.append(f"{needs.relations} relations among its facts")
+    if needs.decoys:
+        out.append(f"{needs.decoys} readable decoys on their subjects")
+    if needs.named is not None:
+        out.append(f"a question naming at most {needs.named} of its evidence's channels and identifiers")
+    return "; ".join(out)
+
+
+IDENTIFIER = re.compile(
+    r"(?<![\w-])(?=[\w-]*\d)(?=[\w-]*[^\W\d_])\w[\w-]*\w(?![\w-])"
+)  # PWSQL-03, CHG-2291, CU12
+
+
+def named(world, question: str, evidence: list[int]) -> int:
+    """How many of the evidence's channel names and identifiers the question names."""
+    marks = ", ".join("?" * len(evidence))
+    rows = world.db.execute(f"SELECT m.text, c.name FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id IN ({marks})", evidence).fetchall()  # fmt: skip
+    terms = {n.casefold() for _, n in rows if n} | {
+        t.casefold() for text, _ in rows for t in IDENTIFIER.findall(text)
+    }
+    return sum(bool(re.search(rf"(?<![\w-]){re.escape(t)}(?![\w-])", question, re.IGNORECASE)) for t in terms)
+
+
+def fact_measures(world, ids: list[str], actor: str | None = None) -> dict:
+    """What a task's facts give it: the channels they are first stated in, the relations among them, and the decoys
+    on their subjects (that `actor` can read, given one)."""
+    marks = ", ".join("?" * len(ids))
+    channels = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", ids).fetchone()[0]  # fmt: skip
+    relations = world.db.execute(f"SELECT COUNT(*) FROM fact_relations WHERE src_fact IN ({marks}) AND dst_fact IN ({marks})", [*ids, *ids]).fetchone()[0]  # fmt: skip
+    decoys = world.db.execute(f"SELECT channel_id FROM facts WHERE is_decoy = 1 AND lower(trim(subject)) IN (SELECT lower(trim(subject)) FROM facts WHERE id IN ({marks}))", ids).fetchall()  # fmt: skip
+    if actor:
+        decoys = [d for d in decoys if readable(world, actor, d[0])]
+    return {"channels": channels, "relations": relations, "decoys": len(decoys)}
 
 
 def measures(world, task_id: str, rows: list[dict], tables) -> dict:
-    """What makes a task hard, measured for its actor: how many read_channel pages deep its evidence sits, the
-    tables its gold query reads, and its evidence's best rank when the actor searches the question's own words."""
+    """What makes a task hard, measured for its actor: how many read_channel pages deep its evidence sits and how many
+    messages it sits under, the tables its gold query reads, its evidence's best rank when the actor searches the
+    question's own words, how many of its evidence's channels and identifiers the question names, and what its facts
+    give it (`fact_measures`)."""
     task = world.db.execute("SELECT actor_id, question FROM tasks WHERE id = ?", (task_id,)).fetchone()
     evidence = [r["message_id"] for r in rows if r.get("message_id") is not None]
     evidence += [
@@ -646,11 +708,24 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
         ).fetchone()[0]
         for message_id in dict.fromkeys(evidence)
     ]
+    under = [
+        reader.db.execute(
+            """SELECT (SELECT COUNT(*) FROM messages m WHERE m.channel_id = e.channel_id AND m.parent_id IS NULL
+            AND m.ts_us > (SELECT ts_us FROM messages WHERE id = COALESCE(e.parent_id, e.id)))
+            + (SELECT COUNT(*) FROM messages r WHERE r.parent_id = e.parent_id AND r.ts_us < e.ts_us)
+            FROM messages e WHERE e.id = ?""",
+            (message_id,),
+        ).fetchone()[0]
+        for message_id in dict.fromkeys(evidence)
+    ]
+    facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
     return {
         "evidence_pages": max(pages, default=None),
+        "depth": max(under, default=0),
         "tables": sorted(tables),
         "bm25_rank": reader.rank(task["question"], evidence),
-    }
+        "named": named(world, task["question"], list(dict.fromkeys(evidence))),
+    } | fact_measures(world, facts, task["actor_id"])
 
 
 def task_row(task: Task, settings) -> dict:

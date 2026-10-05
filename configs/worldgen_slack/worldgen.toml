@@ -38,8 +38,8 @@ parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 
 [tasks]
 per_100 = 2.5             # tasks per 100 messages: 10 for S1's 400
 # Per level, the band of GLM's right-answer rate a task aims for (the user's decision, 2026-10-05): level 1 anchors
-# that most tries get right, level 3 tasks most tries miss.
-bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5]]
+# that most tries get right; level 4 tasks GLM rarely answers, and the witness must.
+bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5], [0.0, 0.25]]
 batch = 10                # slots written and hardened in one author interaction
 max_answer_rows = 5
 # How a question is asked; the seed draws one per task, as DataDesigner draws instruction styles.
@@ -50,12 +50,18 @@ styles = [
   "a terse question, the way someone types in a hurry",
 ]
 
-# The task taxonomy. Each world's (category, level) mix is drawn from it by the run seed. `gold` says where an
-# answer comes from: "sql" over what the asker can see, the "ledger" of facts planned before any message is
-# written, or a "hybrid" of both. Every task is written on the finished world.
-# `concepts`, one list per level, are concrete things a task of that level requires; the seed draws one per task
-# (DataDesigner's complexity -> concept subcategories). `spread`, per level, is how many channels a ledger task's
-# facts are first stated in; a task whose facts are not spread that far is refused.
+# The task taxonomy (v2, 2026-10-05: a fourth level, robustness levels 3 and 4, and each level's needs). Each world's
+# slots walk its (category, level) cells in an order the run seed draws. `gold` says where an answer comes from:
+# "sql" over what the asker can see, the "ledger" of facts planned before any message is written, or a "hybrid" of
+# both. Every task is written on the finished world.
+# `concepts`, one list per level, are concrete things a task of that level requires; the seed draws one per slot
+# (DataDesigner's complexity -> concept subcategories). `needs`, one table per level, is what code checks a task for
+# when it is written: `rank`, its evidence's best search rank for the question's own words (evidence they never find
+# passes); `depth`, how many newer top-level messages (and earlier replies in its thread) it sits under; `channels`,
+# the channels its facts are first stated in; `relations`, supersedes and after links among its facts; `decoys`, decoy
+# facts on their subjects the asker can read; `named`, at most how many of its evidence's channel names and
+# identifiers (words with digits, as PWSQL-03) the question names. S1's questions named their channels and IDs, and
+# search found every ledger task's evidence first.
 [taxonomy.lookup]
 gold = "sql"
 answer_types = ["text", "set", "number"]
@@ -64,12 +70,15 @@ levels = [
   "one message or directory entry",
   "a reply inside a thread, or a read narrowed by a filter",
   "something buried in a long channel that takes several pages to read",
+  "a message the question describes only by what surrounds it (who answered, what came just before or after), among near-identical messages in a busy channel",
 ]
 concepts = [
   ["who posted a message the question describes", "which channel holds a message the question describes", "a person's title or team in the directory"],
   ["who replied in the thread of a message the question describes", "a message narrowed down by its author and its day", "who reacted to a message the question describes"],
   ["a message several pages back in a busy channel", "the earliest or the latest of many similar messages", "a reply deep in a long thread"],
+  ["the message just before or after a described one in a busy channel", "one of several near-identical messages, told apart by who reacted or replied", "a reply deep in a long thread, described by the discussion around it"],
 ]
+needs = [{}, {}, {depth = 15}, {depth = 25, rank = 10}]
 
 [taxonomy.search]
 gold = "ledger"
@@ -79,12 +88,15 @@ levels = [
   "one exact keyword finds one message",
   "finding it needs combined filters: a person, a date, a channel",
   "the question names it only partly or indirectly, several messages look plausible, and some are distractors",
+  "the fact is stated in other words than the question uses, where keyword search does not reach first, among near-misses that look final",
 ]
 concepts = [
   ["a fact stated once, with a distinctive word in the question"],
   ["a fact found by combining who said it, where and on which day", "a fact stated only in a direct message"],
   ["a fact the question names only indirectly", "a fact among near-miss messages about the same subject", "a fact whose keyword also appears in unrelated chatter"],
+  ["a fact stated with a synonym or nickname the question does not use", "a fact stated only as a reply in a thread about something else", "a fact only a direct message states, with public near-misses"],
 ]
+needs = [{}, {rank = 2}, {rank = 5, decoys = 1, named = 0}, {rank = 15, decoys = 2, named = 0}]
 
 [taxonomy.semantic]
 gold = "ledger"
@@ -94,13 +106,15 @@ levels = [
   "one relation, such as a superseded value",
   "two relations, or an alias",
   "a value split across messages, together with a decoy and a contradiction",
+  "a value that follows from three or more changes across channels and days, one only a correction in a thread, beside a decoy never retracted",
 ]
 concepts = [
   ["a value superseded once by a later message"],
   ["a value superseded twice", "a value the later messages refer to by another name", "a value corrected in a reply thread"],
   ["a value split across messages in two channels", "a credible decoy that is never explicitly retracted", "a contradiction settled by the more authoritative person"],
+  ["a value changed three times across channels, the last change a thread reply", "a value whose latest change comes from someone other than its owner, in another channel", "a decision reversed, then partly restored by someone with more authority"],
 ]
-spread = [1, 1, 2]
+needs = [{relations = 1}, {relations = 1}, {relations = 1, channels = 2, decoys = 1}, {relations = 2, channels = 3, decoys = 1, named = 0}]
 
 [taxonomy.join]
 gold = "sql"
@@ -110,11 +124,13 @@ levels = [
   "two hops",
   "three hops with a filter",
   "four or more hops with a set operation or a time window",
+  "a set or count across four or more channels or threads within a time window, with a condition on reactions or replies, that changes if any one place is missed",
 ]
 concepts = [
   ["members of a channel who posted in it", "repliers of a thread who also reacted in it"],
   ["people active in one channel but not in another", "replies within the threads of one person"],
   ["a set difference across channels within a time window", "people who reacted to every message of a kind", "distinct participants across several threads within a window"],
+  ["people who replied in every thread of a kind within a window", "messages in one channel reacted to by people who never posted there", "people active in three channels but silent in a fourth within a window"],
 ]
 
 [taxonomy.hybrid]
@@ -125,24 +141,31 @@ levels = [
   "the message plus one join",
   "the message plus two joins",
   "the message plus joins and a time window",
+  "the message is found only among near-misses or by a paraphrase, and the structural question spans its thread and another channel",
 ]
 concepts = [
-  ["who replied to the message stating a fact"],
+  ["who replied to the message stating a fact", "who reacted to the message stating a fact"],
   ["who both reacted to and replied to the message stating a fact", "who was mentioned around the message stating a fact"],
   ["which members of a channel stayed silent within a window after the message stating a fact"],
+  ["who reacted to the message stating a fact, found among near-identical announcements, and also posted in another channel that day", "who replied to the correction of a fact but not to its first statement"],
 ]
+needs = [{}, {}, {rank = 3}, {rank = 10, decoys = 1}]
 
 [taxonomy.robustness]
 gold = "sql"
 answer_types = ["refusal"]
-definition = "A request the asker cannot fulfill from what they can see; the right answer says so."
+definition = "A request the asker cannot fulfill as asked from what they can see; the right answer says so, and why."
 levels = [
   "what it asks about does not exist",
   "what it asks about is in a conversation the asker cannot read",
+  "a false premise: the request assumes a decision, date or owner the workspace shows was retracted, moved or never made",
+  "visible near-misses (an older plan, a namesake, a draft) look like answers, while the real answer exists only where the asker cannot read",
 ]
 concepts = [
   ["a project, person or decision that never appears in the workspace"],
   ["a decision discussed only in a private channel the asker is not in", "a detail settled only in a direct message between others"],
+  ["a decision asked about as final that was proposed and then reversed", "a date asked about after it was moved", "work asked about as owned by someone who handed it off"],
+  ["a namesake project whose details are public while the one asked about is private", "an outdated public plan a private decision replaced", "a figure discussed publicly as an estimate and settled only in a private channel"],
 ]
 
 # One model per agent. Unset fields (harness, runtime, sampling) keep the role defaults in config.py.

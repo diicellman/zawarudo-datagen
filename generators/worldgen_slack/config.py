@@ -114,24 +114,39 @@ class ActivityConfig(Section):
     emoji_rate: float = Field(default=0.08, ge=0, le=1)
 
 
+class Needs(Section):
+    """What code checks a task of one level for when it is written: its evidence's best search rank for the
+    question's own words (evidence the words never find passes); how deep its evidence sits (newer top-level messages
+    in its channel, and earlier replies in its thread); the channels its facts are first stated in; the relations
+    among its facts; the decoys its actor can read on their subjects; and at most how many of its evidence's channel
+    names and identifiers (words with digits, as PWSQL-03) the question names."""
+
+    rank: int = Field(default=1, ge=1)
+    depth: int = Field(default=0, ge=0)
+    channels: int = Field(default=0, ge=0)
+    relations: int = Field(default=0, ge=0)
+    decoys: int = Field(default=0, ge=0)
+    named: int | None = Field(default=None, ge=0)
+
+
 class Category(Section):
     """One task category: where its gold answer comes from, the answers it may have, what each level means, the
-    concrete concepts a task of each level may require (the seed draws one per task), and, for categories whose
-    answers rest on several facts, how many channels a level's facts are spread over."""
+    concrete concepts a task of each level may require (the seed draws one per task), and what code checks a task of
+    each level for."""
 
     gold: Literal["sql", "ledger", "hybrid"]
     answer_types: list[Literal["text", "set", "number", "refusal"]] = Field(min_length=1)
     definition: Text
     levels: list[Text] = Field(min_length=1)
     concepts: list[list[Text]]
-    spread: list[int] | None = None
+    needs: list[Needs] | None = None
 
     @model_validator(mode="after")
     def per_level(self):
         if len(self.concepts) != len(self.levels) or not all(self.concepts):
             raise ValueError("concepts has a non-empty list for each level")
-        if self.spread is not None and (len(self.spread) != len(self.levels) or min(self.spread) < 1):
-            raise ValueError("spread has a channel count of at least 1 for each level")
+        if self.needs is not None and len(self.needs) != len(self.levels):
+            raise ValueError("needs has a table for each level")
         return self
 
 

@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -65,11 +66,12 @@ from .chronicle import (
 from .env import GenerationEnv, band_move
 from .generate import failure, provenance, run_label
 from .store import Store
-from .config import ROOT, Acceptance, Category, Config
+from .config import ROOT, Acceptance, Category, Config, Needs
 from .contracts import (
     DAY,
     PARTS,
     PHASE_CRITERIA,
+    IDENTIFIER,
     TIME_LITERAL,
     Channel,
     Gaps,
@@ -239,6 +241,19 @@ async def check_world(root):
     root.mkdir(parents=True)
     world, at, message = world_fixture(root / "world.sqlite")
     assert world.violations(complete=True) == []
+    row = dict(id="t4", category="temporal", actor_id="U2", question="When?", answer_type="text", gold_source="sql", gold_sql="SELECT 1 AS answer")  # fmt: skip
+    try:  # the taxonomy is data: any category, any level from 1
+        with world.trial() as copy:
+            copy.insert("tasks", [row | {"level": 4}])
+            raise LookupError("drop the trial")
+    except LookupError:
+        pass
+    try:
+        with world.trial() as copy:
+            copy.insert("tasks", [row | {"level": 0}])
+        raise AssertionError("a level-0 task was inserted")
+    except sqlite3.IntegrityError:
+        pass
     tables = [
         "messages",
         "facts",
@@ -620,6 +635,19 @@ def contracts_settings(root):
     )
 
 
+def needing(settings, category, level, **needs):
+    """The settings with one level of a category needing only these."""
+    spec = settings.taxonomy[category]
+    tables = [Needs()] * len(spec.levels)
+    tables[level - 1] = Needs(**needs)
+    return settings.model_copy(update={"taxonomy": settings.taxonomy | {category: spec.model_copy(update={"needs": tables})}})  # fmt: skip
+
+
+def needless(taxonomy):
+    """The taxonomy without its levels' needs, for checks whose tasks are not built to them."""
+    return {name: c.model_copy(update={"needs": None}) for name, c in taxonomy.items()}
+
+
 def ledger_plan(ops, leads, a, b, **changes):
     """Two storylines on an organized world: a rollback decided on day 1 (f1), service back at e2 on day 2 (f2), and
     an audit's dry run and owner at e1 on day 3 (f3, f4)."""
@@ -654,7 +682,7 @@ def check_contracts(root):
     assert all(s.concept in settings.taxonomy[s.category].concepts[s.level - 1] and s.style in styles for s in slots), "concepts come from their own level"  # fmt: skip
     repeats = [(slots[i], slots[i + cells]) for i in range(min(cells, 40 - cells))]
     assert all(r.id == f"{s.category}-l{s.level}-2" and (r.concept != s.concept or len(settings.taxonomy[s.category].concepts[s.level - 1]) == 1) for s, r in repeats), "a repeat requires another concept while one is left"  # fmt: skip
-    for wrong in ({"concepts": [["x"]]}, {"spread": [1]}, {"concepts": [["x"], [], ["y"]]}):
+    for wrong in ({"concepts": [["x"]]}, {"needs": [{}]}, {"concepts": [["x"], [], ["y"]]}):
         fails(Category.model_validate, settings.taxonomy["semantic"].model_dump() | wrong)
     whole = settings.model_dump(mode="json")
     assert Config.model_validate(whole | {"tasks": whole["tasks"] | {"per_100": 10}}).task_count == 40, (
@@ -663,7 +691,7 @@ def check_contracts(root):
     fails(
         Config.model_validate, whole | {"tasks": whole["tasks"] | {"bands": whole["tasks"]["bands"][:2]}}
     )  # 3 levels
-    fails(Config.model_validate, whole | {"tasks": whole["tasks"] | {"bands": [[0.5, 0.25]] * 3}})
+    fails(Config.model_validate, whole | {"tasks": whole["tasks"] | {"bands": [[0.5, 0.25]] * len(whole["tasks"]["bands"])}})  # fmt: skip
     jobs = ["software_developer"] * 3 + ["accountant_or_auditor"] * 2 + ["manager"]
     people = [seed_person(i).model_copy(update={"occupation": job}) for i, job in enumerate(jobs)]
     (root / "p.jsonl").write_text("".join(p.model_dump_json() + "\n" for p in people))
@@ -770,11 +798,12 @@ def check_contracts(root):
     ):
         return Task(id=id, category=category, level=1, actor_id=c, question="Which way did the release go?", answer_type="text", gold_sql=sql, facts=list(facts)) .model_copy(update=extra)  # fmt: skip
 
-    def recorded(task_, slot_):
+    def recorded(task_, slot_, settings_=None, setup=lambda copy: None):
         """The tasks once this one is recorded into its slot, on a dropped trial."""
         try:
             with world.trial() as copy:
-                record_task(copy, task_, settings, slot_)
+                setup(copy)
+                record_task(copy, task_, settings_ or settings, slot_)
                 raise LookupError([r[0] for r in copy.db.execute("SELECT id FROM tasks ORDER BY id")])
         except LookupError as out:
             return out.args[0]
@@ -800,6 +829,12 @@ def check_contracts(root):
             raise AssertionError(f"task accepted: {name}")
         except ValueError:
             pass
+    directory = task(
+        category="lookup", sql=f"SELECT real_name AS answer FROM users WHERE id = '{d}'", facts=()
+    )
+    assert "t1" in recorded(directory, slot("lookup", 1)), (
+        "a task with no facts meets a level that needs none"
+    )
     with world.trial() as copy:
         record_task(copy, search, settings, found)
     assert json.loads(world.db.execute("SELECT gold_json FROM tasks").fetchone()[0]) == [
@@ -814,8 +849,24 @@ def check_contracts(root):
         sql = f"SELECT value AS answer FROM facts WHERE id = '{facts[-1]}'"
         return Task(id="t9", category="semantic", level=3, actor_id=a, question="What did the review settle?", answer_type="text", gold_sql=sql, facts=facts)  # fmt: skip
 
-    fails(record_task, world, settled(["f1", "f4"]), settings, slot("semantic", 3, id="t9"))  # both in #ops
-    assert "t9" in recorded(settled(["f1", "f3"]), slot("semantic", 3, id="t9"))  # #ops and #leads
+    # A level's needs, those its facts give: f1, f2 and f4 are first stated in #ops, f3 in #leads; f2 comes after f1,
+    # f4 after and over f3; a decoy counts where the task's actor can read it.
+    nine = slot("semantic", 3, id="t9")
+
+    def decoy(channel, id="f5"):
+        return lambda copy: copy.insert("facts", [dict(id=id, storyline="s2", subject="Audit", attribute="owner", value="Ines", channel_id=channel, author_id=a, day=3, summary="s", is_decoy=1)])  # fmt: skip
+
+    for facts, actor, needs, setup, refusal in (
+        (["f1", "f4"], a, {"channels": 2}, None, "first stated in at least 2 channels (they are in 1)"),
+        (["f3", "f4"], a, {"relations": 3}, None, "at least 3 supersedes or after relations among its facts (it has 2)"),
+        (["f2", "f4"], c, {"decoys": 1}, decoy(leads), "at least 1 decoy facts its actor can read"),  # c is not in #leads
+    ):  # fmt: skip
+        asked = settled(facts).model_copy(update={"actor_id": actor})
+        refused(refusal, recorded, asked, nine, needing(settings, "semantic", 3, **needs), setup or (lambda copy: None))  # fmt: skip
+    assert "t9" in recorded(settled(["f1", "f3"]), nine, needing(settings, "semantic", 3, channels=2))
+    assert "t9" in recorded(settled(["f3", "f4"]), nine, needing(settings, "semantic", 3, relations=2))
+    asked = settled(["f2", "f4"]).model_copy(update={"actor_id": c})
+    assert "t9" in recorded(asked, nine, needing(settings, "semantic", 3, decoys=1), decoy(ops))
     hybrid = dict(category="hybrid", level=1, actor_id=c, answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages m, facts f WHERE f.id = 'f1'")  # fmt: skip
     unread = Task(
         id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
@@ -845,6 +896,7 @@ def check_contracts(root):
         "Jun 15",
     ]
     assert TIME_LITERAL.findall("release 8.14 on v2.10, maybe 2 people") == []
+    assert IDENTIFIER.findall("PWSQL-03 to CU16 under CHG-2291, v2; release 4.2 at 10:00") == ["PWSQL-03", "CU16", "CHG-2291", "v2"]  # fmt: skip
     print(
         "PASS contracts: cast, premise, organization, task gold (T2-T7) on a planned ledger, agenda, no literal times"
     )
@@ -903,6 +955,7 @@ def check_clock(root):
         update={
             "activity": base.activity.model_copy(update={"messages": 12}),
             "author": base.author.model_copy(update={"tolerance": 1.0, "share_tolerance": 1.0}),
+            "taxonomy": needless(base.taxonomy),
         }
     )
     gaps = Gaps(settings.personas.gaps)
@@ -975,9 +1028,9 @@ def check_clock(root):
     slots = [Slot(id="t1", category="semantic", level=3, concept="a concept", style="a style"), Slot(id="t2", category="lookup", level=1, concept="a concept", style="a style")]  # fmt: skip
     owner = Task(id="t1", category="semantic", level=3, actor_id=a, question="Who owns the audit after the dry run?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f4'", facts=["f3", "f4"])  # fmt: skip
 
-    def tasked(task):
+    def tasked(task, cfg=None):
         with world.trial() as copy:
-            return add_task(copy, task, settings, slots)
+            return add_task(copy, task, cfg or settings, slots)
 
     refused("once the calendar is closed", tasked, owner)
 
@@ -1170,11 +1223,19 @@ def check_clock(root):
     refused("the calendar is closed", recorded, first_plan)
     measured = close_day(world, settings.model_copy(update={"author": settings.author.model_copy(update={"share_tolerance": 0.0})}), 1)  # fmt: skip
     assert any("3 of today's 4 messages are thread replies" in e for e in measured), measured
-    refused("at least 2 channels", tasked, owner.model_copy(update={"facts": ["f1", "f4"]}))  # both in #ops
     refused("t1 is a semantic level 3 task", tasked, owner.model_copy(update={"level": 2}))
     refused("one of the slots you write now: ['t1', 't2']", tasked, owner.model_copy(update={"id": "t9"}))
     result = tasked(owner)
-    assert result["gold"] == [{"answer": "Owen"}] and "bm25_rank" in result
+    assert result["gold"] == [{"answer": "Owen"}] and result["bm25_rank"] and result["channels"] == 2, result
+    # The needs its messages give: its evidence's search rank, the messages above it, what the question names.
+    level3 = lambda **needs: needing(settings, "semantic", 3, **needs)  # noqa: E731
+    refused("first stated in at least 2 channels", tasked, owner.model_copy(update={"facts": ["f1", "f4"]}), level3(channels=2))  # fmt: skip  # both in #ops
+    refused(f"for the question's own words (it is hit {result['bm25_rank']})", tasked, owner, level3(rank=result["bm25_rank"] + 1))  # fmt: skip
+    refused(f"or earlier replies of its thread (it is under {result['depth']})", tasked, owner, level3(depth=result["depth"] + 1))  # fmt: skip
+    leads_named = owner.model_copy(update={"question": "Who owns the audit after the dry run in #leads?"})
+    refused("naming at most 0 of its evidence's channels and identifiers (it names 1)", tasked, leads_named, level3(named=0))  # fmt: skip
+    assert tasked(leads_named, level3(named=1, rank=result["bm25_rank"], depth=result["depth"]))["named"] == 1
+    tasked(owner)
     replier = Task(id="t2", category="lookup", level=1, actor_id=c, question="Who said thanks in #ops?", answer_type="text", gold_sql="SELECT u.real_name AS answer FROM messages m JOIN users u ON u.id = m.user_id WHERE m.text = 'thanks'")  # fmt: skip
     tasked(replier.model_copy(update={"question": "Who said thanks?"}))
     tasked(replier)  # the slot's task is replaced
@@ -1697,8 +1758,13 @@ async def check_author(root):
     publish."""
     root.mkdir(parents=True)
     base = flow_settings(root, 3)
+    cut = {
+        "robustness": 2
+    }  # S1's 17 cells, without needs: the flow's scripted tasks are not built to taxonomy v2
+    flow = {n: c.model_copy(update={"levels": c.levels[: cut.get(n, 3)], "concepts": c.concepts[: cut.get(n, 3)], "needs": None}) for n, c in base.taxonomy.items()}  # fmt: skip
     settings = base.model_copy(
         update={
+            "taxonomy": flow,
             "calendar": base.calendar.model_copy(update={"days": 4}),
             "activity": base.activity.model_copy(update={"messages": 16}),
             # 4 tasks in 2 batches; level 3's band starts at 0, so the witness tries its task

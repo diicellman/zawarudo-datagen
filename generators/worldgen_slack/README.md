@@ -25,7 +25,7 @@ holds the present (`world_meta.now_us`), and nothing is written before it.
    open the author's next day, where `world_revise` rewrites a message in place.
 5. **Tasks.** After the last day, the author writes one task per slot with `world_add_task`: the seed draws
    `[tasks] per_100` slots per 100 messages over the taxonomy's cells. Its gold query is checked (T1-T7, readable
-   facts, the level's spread) and code's measures of its difficulty come back. The GLM solver tries each task
+   facts, the level's needs) and code's measures of its difficulty come back. The GLM solver tries each task
    `[author] tries` times and the judge reviews it. A task whose share of right answers misses its level's
    `[tasks] bands`, or that the judge does not approve, comes back to the author, for up to `task_rounds` turns.
    The slots are written in batches of `[tasks] batch`, each in an author interaction of its own. A stronger solver,

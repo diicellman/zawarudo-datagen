@@ -36,8 +36,9 @@ class AnswerJudge(vf.Judge[AnswerGrade]):
                 content=(
                     "Grade a Slack answer against the question and its reference. The reference's rows are the "
                     "answer: for a set every row is required and order does not matter; text and number are one "
-                    "value; a refusal is right when the response says the request cannot be fulfilled from what the "
-                    "asker can see. Accept equivalent wording and supported explanation. Separately decide whether "
+                    "value; a refusal is right when the response says the request cannot be fulfilled as asked from "
+                    "what the asker can see: what it asks about does not exist, is out of their sight, or rests on a "
+                    "premise the workspace contradicts. Accept equivalent wording and supported explanation. Separately decide whether "
                     "the solver's RECORDED observations support every material claim of its response; the reference "
                     "is not an observation, and no observations means ungrounded. Return correct, grounded and a "
                     "concise reason.\n" + json.dumps(fields, ensure_ascii=False)

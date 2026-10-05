@@ -49,6 +49,7 @@ from ..contracts import (
     cards,
     channel_id,
     clock,
+    needs_text,
     selves,
     window,
     world_meta,
@@ -139,8 +140,10 @@ Tasks (after the last day, world_add_task)
   channels, decoys, buried or split evidence, private conversations.
 """
     + GOLD_SQL
-    + """- world_add_task checks the task and returns its gold rows and code's measures (read_channel pages deep, tables
-  read, search rank). A solver then tries each task; reword a task, or rest it on other evidence, to fit its level.
+    + """- world_add_task checks the task, refuses it below its level's needs (now.md lists each slot's), and returns its
+  gold rows and code's measures (read_channel pages deep, messages above it, tables read, search rank, the channels
+  and identifiers the question names, its facts' channels, relations and decoys). A solver then tries each task;
+  reword a task, or rest it on other evidence, to fit its level.
 
 Reviews
 - An independent judge reviews the world after some days and at the end. Its issues come back to you: message_ids
@@ -280,11 +283,11 @@ def now_page(world, settings, context: dict) -> str:
     out += ["", "## Task slots (written after the last day; a task's id is its slot's)"]
     for slot in context.get("slots", []):
         spec, level = settings.taxonomy[slot["category"]], slot["level"]
-        spread = spec.spread[level - 1] if spec.spread else 1
+        needs = needs_text(spec.needs[level - 1]) if spec.needs else ""
         out.append(
             f"- {slot['id']}: {slot['category']} level {level}: {spec.levels[level - 1]}; concept: {slot['concept']}; "
             f"style: {slot['style']}"
-            + (f"; its facts first stated in at least {spread} channels" if spread > 1 else "")
+            + (f"; needs: {needs}" if needs else "")
             + ("; written in this turn" if slot["id"] in context.get("writable", []) else "")
         )
     if notes := drift(world, context.get("cards", {})):

@@ -29,7 +29,6 @@ from .contracts import (
     at,
     clock,
     insert_lines,
-    measures,
     normalized,
     record_task,
     render,
@@ -790,7 +789,7 @@ def revise(world, message_id: int, text: str) -> dict:
 
 def add_task(world, task: Task, settings, slots: list) -> dict:
     """One task for one of the slots being written, on the finished world; it replaces the slot's task, if any. Its
-    gold query is checked as every task is (T1-T7, readable facts, the level's spread). Returns its gold rows and
+    gold query is checked as every task is (T1-T7, readable facts, the level's needs). Returns its gold rows and
     code's measures of how hard it is."""
     if today(world) is not None:
         raise ValueError("tasks are written once the calendar is closed")
@@ -799,6 +798,4 @@ def add_task(world, task: Task, settings, slots: list) -> dict:
         raise ValueError(f"a task's id is one of the slots you write now: {[s.id for s in slots]}")
     world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
     world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
-    record_task(world, task, settings, slot)  # every planned fact is stated once the calendar is closed
-    gold = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)
-    return {"task": task.id, "gold": gold["rows"]} | measures(world, task.id, gold["rows"], gold["tables"])
+    return {"task": task.id} | record_task(world, task, settings, slot)  # every planned fact is stated by now
