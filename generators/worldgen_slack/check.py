@@ -1709,6 +1709,8 @@ async def check_author(root):
                     "review_days": [2],
                     "tries": 3,
                     "task_rounds": 1,
+                    "review_chunk": 1,
+                    "solvers": 2,
                 }  # fmt: skip
             ),
         }
@@ -1988,7 +1990,9 @@ async def check_author(root):
         "only the changed task is reviewed again"
     )
     probed = {a: [s[6] for s in seen if s[:3] == ("review", a, "task")] for a in ("tasks-01", "tasks-03")}
-    assert probed == {"tasks-01": [(t0, t1), (t1,)], "tasks-03": [(t2, t3), (t3,), (t3,)]}, "the judge reviews each probe's tasks"  # fmt: skip
+    assert probed == {"tasks-01": [(t0,), (t1,), (t1,)], "tasks-03": [(t2,), (t3,), (t3,), (t3,)]}, (
+        "the judge reviews each probe's tasks, one chunk at a time; each passes on its own"
+    )  # fmt: skip
     assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [(t3,)], (
         "the final review judges only what changed or failed since its probe's review"
     )
@@ -2006,6 +2010,20 @@ async def check_author(root):
         "and left out of the rates"
     )  # fmt: skip
     assert abs(summary["mean_learnability"] - 17 / 36) < 1e-9, summary["mean_learnability"]  # t0 2/3, t2 1/2
+
+    class Slow(ScriptedAgent):  # GLM's gate holds its solves to [author] solvers, whatever the episode allows
+        active, peak = 0, 0
+
+        async def run(self, task):
+            Slow.active += 1
+            Slow.peak = max(Slow.peak, Slow.active)
+            await asyncio.sleep(0.01)
+            Slow.active -= 1
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r"}  # fmt: skip
+            return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id="slow")  # fmt: skip
+
+    await env.solves(SimpleNamespace(solver=Slow()), [t0, t1], "final-02", 3)
+    assert Slow.peak == settings.author.solvers == 2, Slow.peak
 
     class Crashing(ScriptedAgent):
         async def run(self, task):

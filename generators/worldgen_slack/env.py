@@ -111,6 +111,19 @@ def rates(results: list[dict]) -> dict:
     }
 
 
+def merged(verdicts: list[Verdict]) -> Verdict:
+    """Several reviews as one verdict: approved when each is, with every task review and issue; a rejection's feedback
+    carries only the rejecting reviews' words."""
+    rejected = [v for v in verdicts if not v.approved]
+    return Verdict.model_construct(
+        approved=not rejected,
+        tasks=[r for v in verdicts for r in v.tasks],
+        issues=[i for v in verdicts for i in v.issues],
+        criteria={},
+        summary=" ".join(v.summary for v in rejected or verdicts),
+    )
+
+
 def try_digest(result: dict, record: dict | None, evidence: set) -> dict:
     """One solver try as the author reads it: its grade, each call with its arguments and what it returned, the step
     at which the gold evidence first appeared, and its answer."""
@@ -134,6 +147,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         self.settings, self.store = settings, store
         self.used = used_names(settings.corpus, store.root)
         self.writable: list[str] = []  # the slots the author's tasks turn may write
+        # GLM has its own gate, under the episode's: judges and the witness are not held up behind its solves.
+        self.glm = asyncio.Semaphore(settings.author.solvers)
         dialects.CAPABILITY_NOTICE = NETWORK_NOTICE  # read by append_user_notice on every request
         super().__init__(settings.env)
 
@@ -315,7 +330,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         """One independent solve of a task, graded for correctness and grounding. A solve that crashed runs once more;
         crashed again, it is kept as crashed, and the task's rates leave it out."""
         for _ in range(2):
-            trace = await agents.solver.run(task)
+            async with self.glm:
+                trace = await agents.solver.run(task)
             self.store.trace(trace)
             if not (outcome := SolverTask.outcome(trace))["crashed"]:
                 break
@@ -346,21 +362,12 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             world = group.create_task(self.review(agents, world_payload, attempt, {}, "world"))
             checked = group.create_task(self.judge_tasks(agents, due, keys, attempt, n, previous)) if due else None  # fmt: skip
         runs, judged = checked.result() if checked else ({}, None)
-        verdicts = [v for v in (judged, world.result()) if v is not None]
-        rejected = [v for v in verdicts if not v.approved]
-        merged = Verdict.model_construct(
-            approved=not rejected,
-            tasks=[r for v in verdicts for r in v.tasks],
-            issues=[i for v in verdicts for i in v.issues],
-            criteria={},
-            # A rejection's feedback carries only the rejecting reviews' words.
-            summary=" ".join(v.summary for v in rejected or verdicts),
-        )
-        self.store.artifact(attempt, "verdict", merged.model_dump(mode="json"))
+        verdict = merged([v for v in (judged, world.result()) if v is not None])
+        self.store.artifact(attempt, "verdict", verdict.model_dump(mode="json"))
         self.store.artifact(
-            attempt, "acceptance", {"approved": merged.approved, "reviewed_tasks": list(runs)}
+            attempt, "acceptance", {"approved": verdict.approved, "reviewed_tasks": list(runs)}
         )
-        return merged
+        return verdict
 
     # ------------------------------------------------------------------ the world, written in time order
     def author_context(self) -> dict:
@@ -514,23 +521,33 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         for task_id, task_runs in (await self.solves(agents, fresh, attempt, n)).items():
             self.keep_solves(task_id, keys[task_id], task_runs)
         runs = {t: state.solves[t] for t in due}
-        payload = review_payload(
-            self.world, "task", due, self.settings.taxonomy,
-            solves=[result for t in due for result in runs[t]["results"]],
-            previous_issues=[i.model_dump(mode="json") for i in previous if set(i.task_ids) & runs.keys()],
-        )  # fmt: skip
-        files = {f"solver_{t}_{k}.json": record for t in due for k, trace_id in enumerate(runs[t]["traces"], 1) if (record := self.saved_trace(trace_id))}  # fmt: skip
-        judged = await self.review(agents, payload, attempt, files, "tasks")
+        size = self.settings.author.review_chunk
+        chunks = [due[i : i + size] for i in range(0, len(due), size)]
+
+        async def judged(k: int, chunk: list[str]) -> Verdict:
+            payload = review_payload(
+                self.world, "task", chunk, self.settings.taxonomy,
+                solves=[result for t in chunk for result in runs[t]["results"]],
+                previous_issues=[i.model_dump(mode="json") for i in previous if set(i.task_ids) & set(chunk)],
+            )  # fmt: skip
+            files = {f"solver_{t}_{k}.json": record for t in chunk for k, trace_id in enumerate(runs[t]["traces"], 1) if (record := self.saved_trace(trace_id))}  # fmt: skip
+            return await self.review(
+                agents, payload, attempt, files, "tasks" if len(chunks) == 1 else f"tasks-{k}"
+            )
+
+        # A review of a few tasks at a time, the reviews side by side: each task passes on its own chunk's verdict.
+        verdicts = await asyncio.gather(*(judged(k, chunk) for k, chunk in enumerate(chunks, 1)))
+        verdict_of = {t: v for chunk, v in zip(chunks, verdicts) for t in chunk}
         for task_id in due:
             results = runs[task_id]["results"]
             rate = rates(results)
-            approved = accepted_task(judged, self.settings.acceptance, task_id)
-            fit = next(r.level_fit for r in judged.tasks if r.task_id == task_id)
+            approved = accepted_task(verdict_of[task_id], self.settings.acceptance, task_id)
+            fit = next(r.level_fit for r in verdict_of[task_id].tasks if r.task_id == task_id)
             if approved:
                 state.task_reviews[task_id] = {"key": keys[task_id], **rate, "level_fit": fit, "results": results}  # fmt: skip
             right = rate["right_rate"]
             self.store.event("task_reviewed", attempt=attempt, task_id=task_id, approved=approved, **rate, learnability=4 * right * (1 - right))  # fmt: skip
-        return runs, judged
+        return runs, merged(verdicts)
 
     def keep_solves(self, task_id: str, key: str, runs: list) -> None:
         """A task's solver runs, kept with what the task was when they ran."""

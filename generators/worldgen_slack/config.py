@@ -37,8 +37,9 @@ class PipelineConfig(vf.EnvConfig):
         update={"runtime": vf.SubprocessConfig()}
     )
     retries: RetryConfig = RetryConfig(max_retries=0)
-    # The GLM account allows 8 concurrent requests.
-    max_concurrent_agents: int | None = 8
+    # The episode's agents at once. GLM, whose account allows 8 concurrent requests, is gated on its own by
+    # [author] solvers, so the judge's reviews run beside its solves.
+    max_concurrent_agents: int | None = 16
 
 
 def rooted(path: Path) -> Path:
@@ -153,12 +154,13 @@ class AuthorSettings(Section):
     review_days: list[int] = Field(
         default_factory=lambda: [5]
     )  # the judge reviews the world after these days
-    tries: int = Field(
-        default=4, ge=1, le=16
-    )  # the solver's tries of a task, each time it is probed or reviewed
-    task_rounds: int = Field(
-        default=3, ge=0, le=10
-    )  # turns a task outside its band is given back to the author
+    # The solver's tries of a task, each time it is probed or reviewed; the turns a task outside its band comes back
+    # to the author; the tasks in one judge review (a batch's reviews run side by side); GLM solves at once, as the
+    # account allows 8 concurrent requests.
+    tries: int = Field(default=4, ge=1, le=16)
+    task_rounds: int = Field(default=3, ge=0, le=10)
+    review_chunk: int = Field(default=5, ge=1, le=50)
+    solvers: int = Field(default=8, ge=1, le=64)
     day_attempts: int = Field(
         default=2, ge=1, le=5
     )  # a day that cannot close is written again from its start
