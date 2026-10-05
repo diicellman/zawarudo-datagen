@@ -66,7 +66,8 @@ class RunState(StrictModel):
     probes: dict[str, dict] = Field(default_factory=dict)  # task → its latest probe, with its key
     task_rounds: dict[str, int] = Field(
         default_factory=dict
-    )  # task → the hardening turns it was given back in
+    )  # task → the turns it came back to the author in
+    batch: int = 0  # the batch of slots the tasks phase writes next
 
 
 class ReviewLimit(RuntimeError):

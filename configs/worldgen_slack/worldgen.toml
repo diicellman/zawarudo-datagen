@@ -40,6 +40,7 @@ per_100 = 2.5             # tasks per 100 messages: 10 for S1's 400
 # Per level, the band of GLM's right-answer rate a task aims for (the user's decision, 2026-10-05): level 1 anchors
 # that most tries get right, level 3 tasks most tries miss.
 bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5]]
+batch = 10                # slots written and hardened in one author interaction
 max_answer_rows = 5
 # How a question is asked; the seed draws one per task, as DataDesigner draws instruction styles.
 styles = [

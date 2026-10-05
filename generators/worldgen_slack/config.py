@@ -74,6 +74,7 @@ class TasksConfig(Section):
     per_100: float = Field(gt=0, le=100)  # tasks per 100 messages: a bigger world holds more tasks
     # Per level, the band of the solver's right-answer rate a task of that level aims for; hardening steers to it.
     bands: list[tuple[float, float]] = Field(min_length=1)
+    batch: int = Field(default=10, ge=1, le=50)  # slots written and hardened in one author interaction
     max_answer_rows: int = Field(default=5, ge=1, le=50)
     styles: list[Text] = Field(min_length=1)
 

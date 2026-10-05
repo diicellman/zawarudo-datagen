@@ -5,6 +5,7 @@ The rules live in `chronicle` and `contracts`, the author's tools in `agents/wor
 file, written only through `World.trial()`."""
 
 import asyncio
+import contextlib
 import io
 import itertools
 import json
@@ -114,6 +115,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
     def __init__(self, settings: Config, store: Store):
         self.settings, self.store = settings, store
         self.used = used_names(settings.corpus, store.root)
+        self.writable: list[str] = []  # the slots the author's tasks turn may write
         dialects.CAPABILITY_NOTICE = NETWORK_NOTICE  # read by append_user_notice on every request
         super().__init__(settings.env)
 
@@ -345,7 +347,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
     # ------------------------------------------------------------------ the world, written in time order
     def author_context(self) -> dict:
         state = self.store.state
-        return context_of(self.settings, state, self.store.root, state.drafts.get("organization"))
+        return context_of(
+            self.settings, state, self.store.root, state.drafts.get("organization"), self.writable
+        )
 
     async def author_step(self, interaction, runtime, prompt: str, attempt: str, mode: str) -> None:
         """One author turn: code's memory of the world, rendered fresh, then the turn; the author works through its
@@ -569,46 +573,65 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             self.store.save()
             await turn(harden_prompt(back))
 
-    async def finish_world(self, agents, runtime) -> None:
-        """After the last day, in one interaction: the tasks, the solver's tries and the author's hardening, then the
-        final review, whose issues the author fixes until the judge approves or the rounds run out."""
+    def batches(self) -> list[list[str]]:
+        """The world's slots in batches of `[tasks] batch`, each written and hardened in an interaction of its own."""
+        ids, size = [s.id for s in self.store.state.quota], self.settings.tasks.batch
+        return [ids[i : i + size] for i in range(0, len(ids), size)]
+
+    async def write_tasks(self, agents, runtime) -> None:
+        """One batch of tasks after the last day, in a fresh interaction that starts from the last block's notes: the
+        author writes the batch's slots (after a resume, only those still empty), and hardens them against the
+        solver's tries. A batch keeps one interaction within its limits however many tasks the world holds."""
         state, cfg = self.store.state, self.settings
+        ids, total = self.batches()[state.batch], len(self.batches())
         await self.bring_notes(runtime, state.restore_point)
-        final = lambda: f"final-{state.rounds.get('final', 0):02d}"  # noqa: E731
-        attempt = self.store.reserve("tasks", cfg.review_rounds.final) if state.phase == "tasks" else final()
+        attempt = self.store.reserve("tasks", 2 * total)  # a batch cut off is written again once
+        self.writable = ids
         task = WorldAuthorTask.create("tasks", 0, self.world.path, self.author_context(), attempt)
-        slots = {s.id for s in state.quota}
+        empty = lambda: [t for t in ids if not self.world.db.execute("SELECT 1 FROM tasks WHERE id = ?", (t,)).fetchone()]  # noqa: E731  # fmt: skip
         async with agents.author.interaction(task, runtime=runtime) as interaction:
 
-            async def turn(prompt, label=attempt):
-                await self.author_step(interaction, runtime, prompt, label, "tasks")
+            async def turn(prompt):
+                await self.author_step(interaction, runtime, prompt, attempt, "tasks")
 
-            if state.phase == "tasks":
-                prompt = tasks_prompt(cfg)
-                for _ in range(3):
-                    await turn(prompt)
-                    written = {r[0] for r in self.world.db.execute("SELECT id FROM tasks")}
-                    if not (missing := sorted(slots - written)):
-                        break
-                    prompt = f"These slots have no task yet: {missing}. Write them with world_add_task, then end your turn."
-                if missing:
-                    raise ReviewLimit(f"the author wrote no task for {missing}")
-                await self.harden(agents, turn, attempt, sorted(slots))
-                await self.keep_notes(runtime, attempt)
-                state.phase, state.restore_point = "final", attempt
-                self.store.finish_attempt(True)
+            for n in range(3):
+                if not (missing := empty()):
+                    break
+                await turn(tasks_prompt(cfg, missing) if n == 0 else f"These slots have no task yet: {missing}. Write them with world_add_task, then end your turn.")  # fmt: skip
+            if missing := empty():
+                raise ReviewLimit(f"the author wrote no task for {missing}")
+            await self.harden(agents, turn, attempt, ids)
+        self.store.trace(interaction.trace)
+        require_trace(interaction.trace)
+        await self.keep_notes(runtime, attempt)
+        state.batch, state.restore_point = state.batch + 1, attempt
+        if state.batch == total:
+            state.phase = "final"
+        self.store.finish_attempt(True)
+
+    async def fix_world(self, agents, runtime) -> None:
+        """The final review, until the judge approves or its rounds run out. Its issues go to the author in one more
+        interaction, opened at the first rejection, where every slot may be rewritten."""
+        state, cfg = self.store.state, self.settings
+        interaction = None
+        async with contextlib.AsyncExitStack() as stack:
             while state.phase == "final":
                 if (verdict := await self.final_world(agents)).approved:
                     break
+                attempt = f"final-{state.rounds.get('final', 0):02d}"
+                if interaction is None:
+                    await self.bring_notes(runtime, state.restore_point)
+                    self.writable = [s.id for s in state.quota]
+                    task = WorldAuthorTask.create("tasks", 0, self.world.path, self.author_context(), attempt)
+                    interaction = await stack.enter_async_context(
+                        agents.author.interaction(task, runtime=runtime)
+                    )
                 invalid = [{"task_id": r.task_id, "invalid": r.reason} for r in verdict.tasks if not r.valid]
-                await turn(
-                    fix_prompt(
-                        [i.model_dump(mode="json") for i in deciding(verdict, cfg.acceptance)] + invalid
-                    ),
-                    final(),
-                )
-        self.store.trace(interaction.trace)
-        require_trace(interaction.trace)
+                issues = [i.model_dump(mode="json") for i in deciding(verdict, cfg.acceptance)] + invalid
+                await self.author_step(interaction, runtime, fix_prompt(issues), attempt, "tasks")
+        if interaction is not None:
+            self.store.trace(interaction.trace)
+            require_trace(interaction.trace)
 
     async def final_world(self, agents) -> Verdict:
         """The final review: every stale task solved and judged, and the whole world judged."""
@@ -642,8 +665,10 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 await (
                     self.review_so_far(agents) if state.phase == "review" else self.write_day(agents, runtime)
                 )
-            if state.phase in ("tasks", "final"):
-                await self.finish_world(agents, runtime)
+            while state.phase == "tasks":
+                await self.write_tasks(agents, runtime)
+            if state.phase == "final":
+                await self.fix_world(agents, runtime)
 
     async def run(self, task, agents):
         return await self.author_world(agents)

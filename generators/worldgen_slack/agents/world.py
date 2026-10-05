@@ -285,6 +285,7 @@ def now_page(world, settings, context: dict) -> str:
             f"- {slot['id']}: {slot['category']} level {level}: {spec.levels[level - 1]}; concept: {slot['concept']}; "
             f"style: {slot['style']}"
             + (f"; its facts first stated in at least {spread} channels" if spread > 1 else "")
+            + ("; written in this turn" if slot["id"] in context.get("writable", []) else "")
         )
     if notes := drift(world, context.get("cards", {})):
         out += ["", "## Style drift (people far from their typing card)"]
@@ -578,7 +579,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
             raise ValueError("world file hash mismatch")
         self.context = json.loads(self.config.context)
         self.settings = Config.model_validate(self.context["settings"])
-        self.slots = [Slot.model_validate(s) for s in self.context.get("slots", [])]
+        self.slots = [Slot.model_validate(s) for s in self.context.get("slots", []) if s["id"] in self.context.get("writable", [])]  # fmt: skip
         self.gaps = Gaps(self.settings.personas.gaps)
         self.posted = None  # the last post: its conversation, the present it left, and its result
 
@@ -846,10 +847,11 @@ def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") 
     )
 
 
-def tasks_prompt(settings) -> str:
+def tasks_prompt(settings, ids: list[str]) -> str:
     return (
-        "The last day is closed: nothing more is posted. Write one task for each slot in now.md with world_add_task, "
-        "with the slot's id; it returns the task's gold rows and code's measures. After this turn a solver tries each "
+        f"The last day is closed: nothing more is posted. Write the tasks of these slots of now.md: {', '.join(ids)}; "
+        "one each, with world_add_task and the slot's id. It returns the task's gold rows and code's measures. The "
+        "other slots are written in turns of their own. After this turn a solver tries each "
         f"task {settings.author.tries} times and the judge reviews it; a task whose share of right answers misses its "
         "level's band, or that the judge does not approve, comes back to you."
     )
@@ -876,8 +878,9 @@ def fix_prompt(issues: list) -> str:
     )
 
 
-def context_of(settings, state, store_root: Path, organization: dict | None) -> dict:
-    """What the author's tools are configured with: the settings, the world's task slots, each person's typing card
+def context_of(settings, state, store_root: Path, organization: dict | None, writable=()) -> dict:
+    """What the author's tools are configured with: the settings, the world's task slots and those this turn writes,
+    each person's typing card
     and seeded self, the conversations code drew per day, the channels' routines, and the call log."""
     routines = {}
     if organization:
@@ -893,6 +896,7 @@ def context_of(settings, state, store_root: Path, organization: dict | None) -> 
     return {
         "settings": json.loads(settings.model_dump_json()),
         "slots": [s.model_dump(mode="json") for s in state.quota],
+        "writable": list(writable),
         "cards": cards(state.cast),
         "selves": selves(state.cast),
         "agenda": agenda,

@@ -1697,7 +1697,7 @@ async def check_author(root):
         update={
             "calendar": base.calendar.model_copy(update={"days": 4}),
             "activity": base.activity.model_copy(update={"messages": 16}),
-            "tasks": base.tasks.model_copy(update={"per_100": 25}),  # 4 tasks
+            "tasks": base.tasks.model_copy(update={"per_100": 25, "batch": 2}),  # 4 tasks, in 2 batches
             "author": base.author.model_copy(
                 update={
                     "tolerance": 1.0,
@@ -1709,7 +1709,7 @@ async def check_author(root):
             ),
         }
     )
-    seen, crash, solved, finished = [], {"armed": True, "review": True, "plans": 0}, Counter(), Counter()
+    seen, crash, solved, finished = [], {"armed": True, "review": True, "plans": 0, "tasks": True}, Counter(), Counter()  # fmt: skip
     t0, t1, t2, t3 = [
         s.id for s in quota(settings.taxonomy, settings.tasks.styles, settings.seed, settings.task_count)
     ]
@@ -1717,7 +1717,7 @@ async def check_author(root):
     # band, t3 (join level 1) is in its band. t2's right answers are never grounded, so only its strict rate is 0.
     always = {t1, t3}
     # Runs that crash: t0's first is run again; one try of t2 crashes twice and is left out of its rates.
-    crashes = {("tasks-01", t0): {1}, ("tasks-01", t2): {2, 3}}
+    crashes = {("tasks-01", t0): {1}, ("tasks-03", t2): {2, 3}}
 
     class ScriptedSolver(ScriptedAgent):
         async def run(self, task):
@@ -1753,7 +1753,7 @@ async def check_author(root):
                 issues = [Issue(artifact="workspace", message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
             # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
-            reviews = [TaskReview(task_id=t["id"], valid=(attempt, t["id"]) != ("tasks-01", t3), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
+            reviews = [TaskReview(task_id=t["id"], valid=not (attempt.startswith("tasks-") and t["id"] == t3), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
             issues += [Issue(artifact="tasks", task_ids=[r.task_id], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
             verdict = Verdict(approved=not any(i.blocking for i in issues) and all(r.valid for r in reviews), tasks=reviews, issues=issues, criteria=criteria, summary="s")  # fmt: skip
             validate_verdict(verdict, payload)
@@ -1845,8 +1845,26 @@ async def check_author(root):
             await close()
             await runtime.write("/task/notes/recap.md", f"day {day}: done".encode())
         elif prompt.startswith("The last day is closed"):
-            for slot in json.loads(tools.config.context)["slots"]:
-                await call("add_task", task=scripted_task(settings, slot, a))
+            context = json.loads(tools.config.context)
+            writable, slots = context["writable"], {s["id"]: s for s in context["slots"]}
+            seen.append(("tasks", tuple(writable), tuple(t for t in slots if t in prompt)))
+            if writable == [t0, t1]:
+                try:
+                    await call("add_task", task=scripted_task(settings, slots[t2], a))
+                    raise AssertionError("a slot of another batch was written")
+                except ValueError as error:
+                    assert "one of the slots you write now" in str(error), error
+                await runtime.write("/task/notes/recap.md", b"tasks: the first batch")
+            else:
+                assert runtime.files["/task/notes/recap.md"] == b"tasks: the first batch", (
+                    "the last batch's notes"
+                )
+            for t in writable:
+                if t in prompt:
+                    await call("add_task", task=scripted_task(settings, slots[t], a))
+                if t == t2 and crash["tasks"]:  # the second batch is cut off after its first task
+                    crash["tasks"] = False
+                    raise KeyboardInterrupt("simulated crash in a batch")
         elif prompt.startswith("These tasks come back"):
             back = json.loads(prompt[prompt.index("{") : prompt.index("\nRewrite")])
             assert all(r["level_fit"] == 3 and "evidence_pages" in r and r["concept"] and r["band"] and "right_rate" in r and "strict_rate" in r for r in back.values()), (
@@ -1899,6 +1917,14 @@ async def check_author(root):
     )  # a run resumes only with its own config
     store = TestStore(settings.output, manifest)
     assert store.state.phase == "day" and store.state.day == 3 and store.state.restore_point == "day-02-01"
+    try:
+        await AuthorEnv(settings, store).run(None, agents)
+        raise AssertionError("the simulated crash did not happen")
+    except KeyboardInterrupt:
+        pass
+    store.close()
+    store = TestStore(settings.output, manifest)
+    assert store.state.phase == "tasks" and store.state.batch == 1, "a batch cut off is written again"
     env = AuthorEnv(settings, store)
     await env.run(None, agents)
     state = store.state
@@ -1926,10 +1952,13 @@ async def check_author(root):
     assert "rollback" in store.world.db.execute("SELECT text FROM messages WHERE id = ?", (first,)).fetchone()[0], "the evidence stays"  # fmt: skip
     # Too easy, t1 comes back for its one round; t3, which the judge does not approve, comes back after it too. The
     # tasks in their bands never come back.
-    assert [s for s in seen if s[0] == "harden"] == [("harden", sorted([t1, t3]), ["fix", "harder"]), ("harden", [t3], ["fix"])]  # fmt: skip
+    assert [s for s in seen if s[0] == "harden"] == [("harden", [t1], ["harder"]), ("harden", [t3], ["fix"]), ("harden", [t3], ["fix"])]  # fmt: skip
     assert state.task_rounds == {t1: 1, t3: 2}, state.task_rounds
+    # Two batches, each in its own interaction; the second, cut off after t2, is written again: only t3 is asked for.
+    assert [s for s in seen if s[0] == "tasks"] == [("tasks", (t0, t1), (t0, t1)), ("tasks", (t2, t3), (t2, t3)), ("tasks", (t2, t3), (t3,))]  # fmt: skip
+    assert state.rounds["tasks"] == 3, state.rounds
     # Each probe tries what changed; the final reviews solve only what changed since: t0, which a fix rewrote.
-    assert solved == {("tasks-01", t0): 4, ("tasks-01", t1): 6, ("tasks-01", t2): 4, ("tasks-01", t3): 9, ("final-02", t0): 3}, solved  # fmt: skip
+    assert solved == {("tasks-01", t0): 4, ("tasks-01", t1): 6, ("tasks-03", t2): 4, ("tasks-03", t3): 9, ("final-02", t0): 3}, solved  # fmt: skip
     assert set(state.solves) == {t0, t1, t2, t3}, "a rewritten task's runs are its new ones"
     assert ("review", "review-02-02", "world", True, True, False, ()) in seen
     assert ("review", "final-01", "world", False, True, False, ()) in seen
@@ -1939,12 +1968,12 @@ async def check_author(root):
     assert ("review", "final-02", "task", False, False, False, (t0,)) in seen, (
         "only the changed task is reviewed again"
     )
-    probed = [s[6] for s in seen if s[:3] == ("review", "tasks-01", "task")]
-    assert probed == [tuple(sorted((t0, t1, t2, t3))), tuple(sorted((t1, t3))), (t3,)], "the judge reviews each probe's tasks"  # fmt: skip
+    probed = {a: [s[6] for s in seen if s[:3] == ("review", a, "task")] for a in ("tasks-01", "tasks-03")}
+    assert probed == {"tasks-01": [(t0, t1), (t1,)], "tasks-03": [(t2, t3), (t3,), (t3,)]}, "the judge reviews each probe's tasks"  # fmt: skip
     assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [(t3,)], (
         "the final review judges only what changed or failed since its probe's review"
     )
-    assert any(e["event"] == "candidate_finished" and e["attempt"] == "tasks-01" and e["approved"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines())), "the tasks attempt is closed"  # fmt: skip
+    assert {e["attempt"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines()) if e["event"] == "candidate_finished" and e["approved"]} >= {"tasks-01", "tasks-03"}, "each batch's attempt is closed"  # fmt: skip
     assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"
     days = [json.loads(line) for line in (store.root / "progress.jsonl").read_text().splitlines()]
     assert [e["day"] for e in days if e["event"] == "day_closed"] == [1, 2, 3, 4]
