@@ -103,6 +103,8 @@ The ledger (world_plan)
   another's comes after it. A value said again is the same fact conveyed again, not a new fact. A fact about an event
   with no anchor is stated with its time, {at:...}.
 - A stated fact never changes; an unstated one may be re-planned for today or later.
+- The facts run through the calendar: each third of it first states at least half its share of them, as it holds
+  of the world's messages, so the storylines unfold to the last day.
 
 Conversations (world_post)
 - One channel; lines by its members, each in its author's way (their typing card is on their page). reply_to is the

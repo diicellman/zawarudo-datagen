@@ -384,6 +384,29 @@ def fact_row(fact: PlanFact, events: dict[str, Event], moment: dict[str, int], z
     }
 
 
+def front_loaded(world, settings, facts: list, day: int) -> str | None:
+    """Why the plan's facts are front-loaded, if they are: each third of the calendar not yet over first states at
+    least half its share of them, its share of the world's messages (an event day weighs as a workday). S1's
+    storylines were told by day 8, and its last days had nothing left to state. A third still open can always take
+    more facts, today or later."""
+    shares = quotas(world, settings)
+    days = sorted(shares)
+    total = sum(q["messages"] for q in shares.values()) or 1
+    start = 0
+    for size in apportion(len(days), [1, 1, 1]):
+        third, start = days[start : start + size], start + size
+        if not third or third[-1] < day:
+            continue
+        share = len(facts) * sum(shares[d]["messages"] for d in third) / total
+        if (planned := sum(f.day in third for f in facts)) < (least := int(share / 2)):
+            return (
+                f"days {third[0]}-{third[-1]} first state {planned} of the plan's {len(facts)} facts; they hold "
+                f"{share / len(facts):.0%} of the world's messages, so they first state at least {least}: plan facts "
+                "for them, so the storylines run to the end"
+            )
+    return None
+
+
 def record_plan(world, plan: Plan, settings, slots=()) -> None:
     """The ledger in time order. Storylines are fixed once planned (summaries may change); an event, once planned,
     never moves or goes; a stated fact keeps everything but its summary, while an unstated one may change or go and is
@@ -515,6 +538,8 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
                 if f.supersedes
             ],
         )
+        if short := front_loaded(world, settings, plan.facts, day):
+            raise ValueError(short)
         world.insert("board", [dict(slot=s, fact_id=f) for s, facts in board.items() for f in facts])
         for s, facts in board.items():
             spec, level = settings.taxonomy[backward[s].category], backward[s].level

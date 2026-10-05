@@ -51,6 +51,7 @@ from .chronicle import (
     band,
     bounds,
     close_day,
+    front_loaded,
     opening,
     part_of,
     post,
@@ -1024,6 +1025,19 @@ def check_clock(root):
     )
     refused("planned events stay", recorded, plan(events=events[:1]))
     refused("keep ['s1', 's2']", recorded, plan(storylines=[Storyline(id="s3", summary="x"), Storyline(id="s2", summary="y")]))  # fmt: skip
+    # Facts run through the calendar: days 8-10 hold a quarter of the messages, so of 8 facts they first state 1.
+    extra = [PlanFact(id=f"f{k}", storyline="s1", subject=f"Topic {k}", attribute="state", value=f"state {k}", channel_id=ops, author_id=a, day=2, summary="s") for k in range(5, 9)]  # fmt: skip
+    refused("days 8-10 first state 0 of the plan's 8 facts; they hold 25% of the world's messages, so they first state at least 1", recorded, plan(facts=[*facts, *extra]))  # fmt: skip
+    try:
+        with world.trial() as copy:
+            record_plan(
+                copy, plan(facts=[*facts, *extra[:3], extra[3].model_copy(update={"day": 9})]), settings
+            )
+            raise LookupError("drop the trial")
+    except LookupError:
+        pass
+    late = [f.model_copy(update={"day": 9}) for f in [*facts, *extra]]
+    assert front_loaded(world, settings, late, 9) is None, "a third that is over is not held to its share"
     # The board: each ledger and hybrid slot's planned facts, as many as its level needs; checked on every plan.
     board_slots = [Slot(id=i, category=c, level=n, concept="a concept", style="a style") for i, c, n in (("t1", "semantic", 3), ("t3", "search", 1), ("t2", "lookup", 1))]  # fmt: skip
     spread = needing(settings, "semantic", 3, channels=2)
