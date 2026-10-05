@@ -957,6 +957,19 @@ def check_clock(root):
             raise LookupError("drop the trial")
     except LookupError:
         pass
+    try:  # a Saturday with a planned event weighs as a workday; the first plan fixes those days, the total stays
+        with world.trial() as copy:
+            window_event = Event(id="e3", storyline="s2", title="maintenance window", day=6, time="22:00")
+            record_plan(copy, plan(events=[*events, window_event]), settings)
+            busy = quotas(copy, settings)
+            assert busy[6]["messages"] >= min(busy[d]["messages"] for d in range(1, 6)) > shares[6]["messages"] == busy[7]["messages"], busy  # fmt: skip
+            assert sum(q["messages"] for q in busy.values()) == 12
+            cutover = Event(id="e4", storyline="s1", title="cutover", day=7, time="09:00")
+            record_plan(copy, plan(events=[*events, window_event, cutover]), settings)
+            assert quotas(copy, settings) == busy, "a later plan's event days leave the quotas as they were"
+            raise LookupError("drop the trial")
+    except LookupError:
+        pass
     recorded(first_plan)
     shared = world.db.execute("SELECT DISTINCT f.moment_us, e.moment_us FROM facts f JOIN events e ON e.id = f.event_id WHERE e.id = 'e1'").fetchall()  # fmt: skip
     assert len(shared) == 1 and shared[0][0] == shared[0][1] == at(world, Moment(day=3, time="10:00", zone=zone)), "facts share their event's moment"  # fmt: skip

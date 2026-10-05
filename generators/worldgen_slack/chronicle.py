@@ -172,10 +172,14 @@ def apportion(total: int, weights: list[float]) -> list[int]:
     return counts
 
 
-def daily(dates: list[str], settings) -> list[dict]:
+def daily(dates: list[str], settings, busy=()) -> list[dict]:
     """Code's share of the world per calendar date and part: `[activity].messages` over the dates, a weekend day
-    weighing `[author].weekend` of a workday, and each day split by the parts' rhythm."""
-    weights = [settings.author.weekend if date.fromisoformat(d).weekday() >= 5 else 1.0 for d in dates]
+    weighing `[author].weekend` of a workday unless it is `busy` (a day number with a planned event), and each day
+    split by the parts' rhythm."""
+    weights = [
+        1.0 if day in busy or date.fromisoformat(d).weekday() < 5 else settings.author.weekend
+        for day, d in enumerate(dates, 1)
+    ]
     rhythm = [settings.activity.parts.get(p, 0.0) for p in PARTS]
     return [
         {"messages": n, "parts": dict(zip(PARTS, apportion(n, rhythm)))}
@@ -184,8 +188,12 @@ def daily(dates: list[str], settings) -> list[dict]:
 
 
 def quotas(world, settings) -> dict[int, dict]:
+    """Each day's quota. A day the first plan put an event on weighs as a workday, so a storyline's busiest night is
+    not a quiet day's handful of messages; the days are fixed by that plan, so a closed day's quota never changes."""
     days = world.db.execute("SELECT day, date FROM calendar ORDER BY day").fetchall()
-    return {day: quota for (day, _), quota in zip(days, daily([d for _, d in days], settings))}
+    busy = world.db.execute("SELECT value FROM world_meta WHERE key = 'busy_days'").fetchone()
+    shares = daily([d for _, d in days], settings, json.loads(busy[0]) if busy else ())
+    return {day: quota for (day, _), quota in zip(days, shares)}
 
 
 # A day's shares, each checked on that day's own messages at its close, and named as the author reads them.
@@ -459,6 +467,10 @@ def record_plan(world, plan: Plan, settings) -> None:
                 for e in plan.events
                 if e.id not in old
             ],
+        )
+        world.db.execute(  # the first plan's event days, kept from then on
+            "INSERT OR IGNORE INTO world_meta (key, value) VALUES ('busy_days', ?)",
+            (json.dumps(sorted({e.day for e in plan.events})),),
         )
         world.db.execute("DELETE FROM fact_relations")
         unstated = [f for f in current if f not in stated]

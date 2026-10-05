@@ -101,7 +101,8 @@ Conversations (world_post)
 - commits opens a promise with the day it is due; closes ends one: kept, changed or dropped. Every promise ends by
   its due day.
 - Each day holds about the number of messages now.md gives, spread by the parts' rhythm, and its own shares of thread
-  replies, reacted messages and DMs; now.md's today line shows them, and what closing the day still takes. A
+  replies, reacted messages and DMs. A weekend day is quiet, unless your first plan puts an event on it: a day with
+  an event gets a workday's messages; now.md's today line shows them, and what closing the day still takes. A
   conversation or a plan after which the day could no longer close is refused. now.md lists the everyday
   conversations code drew for the day from the channels' routines; the storylines happen among them. Each person
   writes like their typing card; now.md reports who drifts from it.
