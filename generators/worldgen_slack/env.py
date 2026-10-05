@@ -6,6 +6,7 @@ file, written only through `World.trial()`."""
 
 import asyncio
 import io
+import itertools
 import json
 import tarfile
 import time
@@ -312,7 +313,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
 
     async def assess(self, agents, attempt):
         """The final review: every task whose review is stale is solved and judged, and the whole world is judged."""
-        state, n = self.store.state, self.settings.solves_per_task
+        state, n = self.store.state, self.settings.author.tries
         self.refresh_gold()
         keys = {t: self.task_key(t) for (t,) in self.world.db.execute("SELECT id FROM tasks ORDER BY id")}
         due = [t for t, key in keys.items() if state.task_reviews.get(t, {}).get("key") != key]
@@ -514,41 +515,59 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         path = self.store.root / "traces" / f"{trace_id}.json"
         return observable(json.loads(path.read_text())) if path.exists() else None
 
-    async def probe(self, agents, attempt: str) -> dict:
-        """The solver tries each task that changed since its last runs, within the world's probe budget, and the
-        judge reviews them on those runs. Each task's solve rate and fewest calls are kept on it; its runs and a valid
-        review are kept for the final review. Returns, per task, what hardening reads: its cell, the tries, the
-        judge's level fit and reason, and code's measures."""
+    async def probe(self, agents, attempt: str, ids: list[str]) -> dict:
+        """The solver tries each of `ids` that changed since its last probe, and the judge reviews it on those runs; a
+        task's latest probe is kept with its key, so a kept task, or a resume, is not probed again. A task's rates and
+        fewest calls are kept on it, its runs and a valid review for the final review. Returns, per task, what
+        hardening reads: its slot's cell, the tries, the judge's review, code's measures, whether the judge approved
+        it, and its level's band of right-answer rates."""
         state, cfg = self.store.state, self.settings
         self.refresh_gold()
-        keys = {t: self.task_key(t) for (t,) in self.world.db.execute("SELECT id FROM tasks ORDER BY id")}
-        n = cfg.author.probe_solves
-        due = [t for t, key in keys.items() if state.solves.get(t, {}).get("key") != key]
-        due = due[: max(0, cfg.author.probe_budget - state.probe_solves) // n]
-        if not due:
-            return {}
-        runs, judged = await self.judge_tasks(agents, due, keys, attempt, n)
-        measured = self.store.difficulty()
-        results = {}
-        for task_id in due:
-            outcomes = runs[task_id]["results"]
-            rate = rates(outcomes)
-            fewest = min((o["calls"] for o in outcomes if o["correct"]), default=None)
-            self.world.db.execute(
-                "UPDATE tasks SET right_rate = ?, strict_rate = ?, min_calls = ? WHERE id = ?",
-                (rate["right_rate"], rate["strict_rate"], fewest, task_id),
-            )
-            review = next(r for r in judged.tasks if r.task_id == task_id)
-            results[task_id] = (
-                {k: v for k, v in measured[task_id].items() if k not in ("level_fit", "right_rate", "strict_rate")}
-                | rate | {"tries": [{k: o.get(k) for k in ("correct", "grounded", "calls", "reason")} for o in outcomes]}
-                | {"level_fit": review.level_fit, "valid": review.valid, "review": review.reason}
-                | {"issues": [f"{i.defect} {i.requested_change}" for i in judged.issues if task_id in i.task_ids]}
-            )  # fmt: skip
-        state.probe_solves += n * len(due)
-        self.store.event("probe", attempt=attempt, rates={t: r["right_rate"] for t, r in results.items()})
-        self.store.save()
-        return results
+        keys = {t: self.task_key(t) for t in ids}
+        if due := [t for t in ids if state.probes.get(t, {}).get("key") != keys[t]]:
+            runs, judged = await self.judge_tasks(agents, due, keys, attempt, cfg.author.tries)
+            measured = self.store.difficulty()
+            for task_id in due:
+                outcomes = runs[task_id]["results"]
+                rate = rates(outcomes)
+                fewest = min((o["calls"] for o in outcomes if o["correct"]), default=None)
+                self.world.db.execute(
+                    "UPDATE tasks SET right_rate = ?, strict_rate = ?, min_calls = ? WHERE id = ?",
+                    (rate["right_rate"], rate["strict_rate"], fewest, task_id),
+                )
+                review = next(r for r in judged.tasks if r.task_id == task_id)
+                state.probes[task_id] = (
+                    {"key": keys[task_id]}
+                    | {k: v for k, v in measured[task_id].items() if k not in ("level_fit", "right_rate", "strict_rate")}
+                    | rate | {"solves": [{k: o.get(k) for k in ("correct", "grounded", "calls", "reason")} for o in outcomes]}
+                    | {"level_fit": review.level_fit, "valid": review.valid, "review": review.reason}
+                    | {"issues": [f"{i.defect} {i.requested_change}" for i in judged.issues if task_id in i.task_ids]}
+                    | {"approved": accepted_task(judged, cfg.acceptance, task_id), "band": cfg.tasks.bands[measured[task_id]["level"] - 1]}
+                )  # fmt: skip
+            self.store.event("probe", attempt=attempt, rates={t: state.probes[t]["right_rate"] for t in due})
+            self.store.save()
+        return {t: {k: v for k, v in state.probes[t].items() if k != "key"} for t in ids}
+
+    async def harden(self, agents, turn, attempt: str, ids: list[str]) -> None:
+        """The proposer and the solver: GLM tries each task and the judge reviews it; the author gets back each task
+        whose right-answer rate misses its level's band while it has rounds left, and each task the judge did not
+        approve, rewrites what it will, and the changed tasks are tried again, until none comes back. A task the judge
+        did not approve comes back after its last round too; the rounds bound the loop."""
+        state, cfg = self.store.state, self.settings
+        for turns in itertools.count():
+            back = {}
+            for t, r in (await self.probe(agents, attempt, ids)).items():
+                (lo, hi), right = r["band"], r["right_rate"]
+                move = "fix" if not r["approved"] else "harder" if right > hi else "easier" if right < lo else None  # fmt: skip
+                given = state.task_rounds.get(t, 0)
+                if move == "fix" or (move and given < cfg.author.task_rounds):
+                    back[t] = r | {"move": move, "rounds_left": max(0, cfg.author.task_rounds - given - 1)}
+            if not back or turns > cfg.author.task_rounds:
+                return
+            for t in back:
+                state.task_rounds[t] = state.task_rounds.get(t, 0) + 1
+            self.store.save()
+            await turn(harden_prompt(back))
 
     async def finish_world(self, agents, runtime) -> None:
         """After the last day, in one interaction: the tasks, the solver's tries and the author's hardening, then the
@@ -574,11 +593,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     prompt = f"These slots have no task yet: {missing}. Write them with world_add_task, then end your turn."
                 if missing:
                     raise ReviewLimit(f"the author wrote no task for {missing}")
-                for left in range(cfg.author.probe_rounds, -1, -1):
-                    results = await self.probe(agents, attempt)
-                    if not results or not left:
-                        break
-                    await turn(harden_prompt(results, (cfg.author.probe_budget - state.probe_solves) // cfg.author.probe_solves))  # fmt: skip
+                await self.harden(agents, turn, attempt, sorted(slots))
                 await self.keep_notes(runtime, attempt)
                 state.phase, state.restore_point = "final", attempt
                 self.store.finish_attempt(True)

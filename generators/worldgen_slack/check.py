@@ -609,7 +609,12 @@ def contracts_settings(root):
             "output": str(root / "run"),
             "personas": {"path": str(root / "p.jsonl"), "typing": str(root / "t.jsonl"), "gaps": str(gaps)},
             "storylines": 2,
-            "tasks": {"per_100": 1, "max_answer_rows": 2, "styles": spec["tasks"]["styles"]},  # 4 tasks
+            "tasks": {
+                "per_100": 1,
+                "bands": spec["tasks"]["bands"],
+                "max_answer_rows": 2,
+                "styles": spec["tasks"]["styles"],
+            },  # 4 tasks  # fmt: skip
             "taxonomy": spec["taxonomy"],
         }
     )
@@ -655,6 +660,10 @@ def check_contracts(root):
     assert Config.model_validate(whole | {"tasks": whole["tasks"] | {"per_100": 10}}).task_count == 40, (
         "10 tasks per 100 messages, of 400"
     )
+    fails(
+        Config.model_validate, whole | {"tasks": whole["tasks"] | {"bands": whole["tasks"]["bands"][:2]}}
+    )  # 3 levels
+    fails(Config.model_validate, whole | {"tasks": whole["tasks"] | {"bands": [[0.5, 0.25]] * 3}})
     jobs = ["software_developer"] * 3 + ["accountant_or_auditor"] * 2 + ["manager"]
     people = [seed_person(i).model_copy(update={"occupation": job}) for i, job in enumerate(jobs)]
     (root / "p.jsonl").write_text("".join(p.model_dump_json() + "\n" for p in people))
@@ -1680,7 +1689,7 @@ class ScriptedAuthor(ScriptedAgent):
 async def check_author(root):
     """One world written by a scripted author through the v7 driver: setup, the plan, days that close only when done,
     a review after day 2 whose issues open day 3, a crash in that review and in day 3 with resumes from day 2's world
-    and notes, tasks, probes within their budget and a hardening turn, a final rejection fixed in the same session,
+    and notes, tasks, probes and hardening toward each level's band, a final rejection fixed in the same session,
     publish."""
     root.mkdir(parents=True)
     base = flow_settings(root, 3)
@@ -1694,9 +1703,8 @@ async def check_author(root):
                     "tolerance": 1.0,
                     "share_tolerance": 1.0,
                     "review_days": [2],
-                    "probe_solves": 2,
-                    "probe_rounds": 1,
-                    "probe_budget": 10,
+                    "tries": 3,
+                    "task_rounds": 1,
                 }  # fmt: skip
             ),
         }
@@ -1705,9 +1713,11 @@ async def check_author(root):
     t0, t1, t2, t3 = [
         s.id for s in quota(settings.taxonomy, settings.tasks.styles, settings.seed, settings.task_count)
     ]
-    again, untried = sorted([t1, t2])  # the hardened two; the probe's budget tries only the first by id again
-    # Runs that crash: t0's first is run again; one try of t3 crashes twice and is left out of its rates.
-    crashes = {("tasks-01", t0): {1}, ("tasks-01", t3): {2, 3}}
+    # The solver: every other try is right, but t1 and t3 are right every time: t1 (search level 2) is too easy for its
+    # band, t3 (join level 1) is in its band. t2's right answers are never grounded, so only its strict rate is 0.
+    always = {t1, t3}
+    # Runs that crash: t0's first is run again; one try of t2 crashes twice and is left out of its rates.
+    crashes = {("tasks-01", t0): {1}, ("tasks-01", t2): {2, 3}}
 
     class ScriptedSolver(ScriptedAgent):
         async def run(self, task):
@@ -1716,8 +1726,7 @@ async def check_author(root):
             if solved[key] in crashes.get(key, ()):
                 return SimpleNamespace(ok=False, info={}, errors=[SimpleNamespace(message="model stream ended")], task=task, last_reply="", id="crash")  # fmt: skip
             finished[key] += 1
-            # Every other try is right; one task's right answers are never grounded, so only its strict rate is 0.
-            right, grounded = finished[key] % 2 == 1, task.data.task_id != untried
+            right, grounded = task.data.task_id in always or finished[key] % 2 == 1, task.data.task_id != t2
             evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "calls": 3, "reason": "r"}  # fmt: skip
             return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id="solve")  # fmt: skip
 
@@ -1838,16 +1847,17 @@ async def check_author(root):
         elif prompt.startswith("The last day is closed"):
             for slot in json.loads(tools.config.context)["slots"]:
                 await call("add_task", task=scripted_task(settings, slot, a))
-        elif prompt.startswith("Each task's slot"):
-            assert '"level_fit": 3' in prompt and '"evidence_pages"' in prompt and '"concept"' in prompt, (
-                "hardening reads the judge's level fit and code's measures"
-            )
-            assert '"right_rate": 0.5' in prompt and '"strict_rate": 0.0' in prompt, "and both rates"
-            for slot in json.loads(tools.config.context)["slots"][1:3]:
-                task = scripted_task(settings, slot, a)
-                await call(
-                    "add_task", task=task.model_copy(update={"question": "Asked again: " + task.question})
-                )
+        elif prompt.startswith("These tasks come back"):
+            back = json.loads(prompt[prompt.index("{") : prompt.index("\nRewrite")])
+            assert all(r["level_fit"] == 3 and "evidence_pages" in r and r["concept"] and r["band"] and "right_rate" in r and "strict_rate" in r for r in back.values()), (
+                "hardening reads the judge's level fit, code's measures, both rates and the level's band"
+            )  # fmt: skip
+            seen.append(("harden", sorted(back), sorted(r["move"] for r in back.values())))
+            for slot in json.loads(tools.config.context)["slots"]:
+                if slot["id"] in back:  # every task that came back is rewritten, so tried again
+                    task = scripted_task(settings, slot, a)
+                    asked = f"Asked again ({len(seen)}): " + task.question
+                    await call("add_task", task=task.model_copy(update={"question": asked}))
         elif prompt.startswith("The review rejected"):
             issues = json.loads(prompt[prompt.index("[") : prompt.index("]\n") + 1])
             for issue in issues:
@@ -1914,10 +1924,12 @@ async def check_author(root):
     )
     assert store.world.db.execute("SELECT text FROM messages WHERE id = ?", (second,)).fetchone()[0] == "ok, the notes come tomorrow"  # fmt: skip
     assert "rollback" in store.world.db.execute("SELECT text FROM messages WHERE id = ?", (first,)).fetchone()[0], "the evidence stays"  # fmt: skip
-    assert state.probe_solves == 10, state.probe_solves
-    # The probes try every task, then one hardened task again (the budget leaves the other untried); the final reviews
-    # solve only what changed since: the untried one, then t0, which a fix rewrote.
-    assert solved == {("tasks-01", t0): 3, ("tasks-01", again): 4, ("tasks-01", untried): 2, ("tasks-01", t3): 3, ("final-01", untried): 4, ("final-02", t0): 4}, solved  # fmt: skip
+    # Too easy, t1 comes back for its one round; t3, which the judge does not approve, comes back after it too. The
+    # tasks in their bands never come back.
+    assert [s for s in seen if s[0] == "harden"] == [("harden", sorted([t1, t3]), ["fix", "harder"]), ("harden", [t3], ["fix"])]  # fmt: skip
+    assert state.task_rounds == {t1: 1, t3: 2}, state.task_rounds
+    # Each probe tries what changed; the final reviews solve only what changed since: t0, which a fix rewrote.
+    assert solved == {("tasks-01", t0): 4, ("tasks-01", t1): 6, ("tasks-01", t2): 4, ("tasks-01", t3): 9, ("final-02", t0): 3}, solved  # fmt: skip
     assert set(state.solves) == {t0, t1, t2, t3}, "a rewritten task's runs are its new ones"
     assert ("review", "review-02-02", "world", True, True, False, ()) in seen
     assert ("review", "final-01", "world", False, True, False, ()) in seen
@@ -1928,10 +1940,10 @@ async def check_author(root):
         "only the changed task is reviewed again"
     )
     probed = [s[6] for s in seen if s[:3] == ("review", "tasks-01", "task")]
-    assert probed == [tuple(sorted((t0, t1, t2, t3))), (again,)], "the judge reviews each probe's tasks"
-    assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [
-        tuple(sorted((untried, t3)))
-    ], "the final review judges only what changed or failed since its probe's review"
+    assert probed == [tuple(sorted((t0, t1, t2, t3))), tuple(sorted((t1, t3))), (t3,)], "the judge reviews each probe's tasks"  # fmt: skip
+    assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [(t3,)], (
+        "the final review judges only what changed or failed since its probe's review"
+    )
     assert any(e["event"] == "candidate_finished" and e["attempt"] == "tasks-01" and e["approved"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines())), "the tasks attempt is closed"  # fmt: skip
     assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"
     days = [json.loads(line) for line in (store.root / "progress.jsonl").read_text().splitlines()]
@@ -1941,13 +1953,11 @@ async def check_author(root):
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
     summary = store.summary("complete")
-    assert summary["rates"][untried] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 4, "crashed": 0}, (
-        "difficulty is the right-answer rate; the strict rate is reported beside it"
+    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1}, (
+        "difficulty is the right-answer rate, the strict rate reported beside it; a try that crashed twice is counted, "
+        "and left out of the rates"
     )  # fmt: skip
-    assert summary["rates"][t3] == {"right_rate": 1.0, "strict_rate": 1.0, "coverage": None, "tries": 1, "crashed": 1}, (
-        "a try that crashed twice is counted, and left out of the rates"
-    )  # fmt: skip
-    assert summary["mean_learnability"] == 0.75, summary["mean_learnability"]  # t0, t1, t2 at 0.5; t3 at 1.0
+    assert abs(summary["mean_learnability"] - 17 / 36) < 1e-9, summary["mean_learnability"]  # t0 2/3, t2 1/2
 
     class Crashing(ScriptedAgent):
         async def run(self, task):

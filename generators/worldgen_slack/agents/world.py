@@ -849,21 +849,22 @@ def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") 
 def tasks_prompt(settings) -> str:
     return (
         "The last day is closed: nothing more is posted. Write one task for each slot in now.md with world_add_task, "
-        "with the slot's id; "
-        f"it returns the task's gold rows and code's measures. After this turn a solver tries each task "
-        f"{settings.author.probe_solves} times."
+        "with the slot's id; it returns the task's gold rows and code's measures. After this turn a solver tries each "
+        f"task {settings.author.tries} times and the judge reviews it; a task whose share of right answers misses its "
+        "level's band, or that the judge does not approve, comes back to you."
     )
 
 
-def harden_prompt(results: dict, left: int) -> str:
+def harden_prompt(back: dict) -> str:
     return (
-        "Each task's slot, the solver's tries (right_rate, the share of right answers, is how hard the task is; "
-        "strict_rate also needs every claim grounded), the judge's review (level_fit from 0 to 4: how fully answering "
-        "it needs its level and concept) and code's measures (evidence pages, tables read, search rank): "
-        f"{json.dumps(results, ensure_ascii=False)}\nKeep each task, or rewrite it in its slot to fit its level, so "
-        "that answering it needs its level and concept with no easier route: reword it, or rest it on other evidence; "
-        "world_revise can remove a giveaway from a message. Changed tasks are tried and reviewed again "
-        f"({left} tries left). End your turn when the tasks stand."
+        "These tasks come back to you, each with its slot's cell, the solver's tries (right_rate, the share of right "
+        "answers, is how hard the task is; strict_rate also needs every claim grounded), the judge's review (level_fit "
+        "from 0 to 4: how fully answering it needs its level and concept), code's measures (evidence pages, tables "
+        "read, search rank), its level's band of right-answer rates, and what it needs (move): harder, easier, or the "
+        f"fix the judge asks for: {json.dumps(back, ensure_ascii=False)}\nRewrite each in its slot so that answering it "
+        "needs its level and concept with no easier route, and lands in its band: reword it, or rest it on other "
+        "evidence; world_revise can remove a giveaway from a message. A task you change is tried and reviewed again; "
+        "one you keep stands as it is, and its round still counts (rounds_left). End your turn when the tasks stand."
     )
 
 

@@ -58,12 +58,15 @@ class RunState(StrictModel):
     last_verdict: Verdict | None = None
     # The world author: the day being written (or reviewed), the attempt whose world and notes it starts from, a
     # review's issues waiting for the author's next turn, the solver's runs of each task as it was when solved
-    # (probes and the final review share them), and the solver runs spent on probing tasks.
+    # (probes and the final review share them), each task's latest probe, and the rounds it was given back in.
     day: int = 0
     restore_point: str = ""
     issues: list[Issue] = Field(default_factory=list)
     solves: dict[str, dict] = Field(default_factory=dict)  # task → {key, results, traces}
-    probe_solves: int = 0
+    probes: dict[str, dict] = Field(default_factory=dict)  # task → its latest probe, with its key
+    task_rounds: dict[str, int] = Field(
+        default_factory=dict
+    )  # task → the hardening turns it was given back in
 
 
 class ReviewLimit(RuntimeError):

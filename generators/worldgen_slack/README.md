@@ -23,9 +23,11 @@ holds the present (`world_meta.now_us`), and nothing is written before it.
    the day, and a day that fails is written again from where the last one closed.
 4. **Reviews.** After the days in `[author] review_days`, the judge reviews the world written so far; its issues
    open the author's next day, where `world_revise` rewrites a message in place.
-5. **Tasks.** After the last day, the author writes one task per cell with `world_add_task`: its gold query is
-   checked (T1-T7, readable facts, the level's spread) and code's measures of its difficulty come back. The GLM
-   solver tries each task within `probe_budget`; the author hardens tasks that turn out easier than their level.
+5. **Tasks.** After the last day, the author writes one task per slot with `world_add_task`: the seed draws
+   `[tasks] per_100` slots per 100 messages over the taxonomy's cells. Its gold query is checked (T1-T7, readable
+   facts, the level's spread) and code's measures of its difficulty come back. The GLM solver tries each task
+   `[author] tries` times and the judge reviews it. A task whose share of right answers misses its level's
+   `[tasks] bands`, or that the judge does not approve, comes back to the author, for up to `task_rounds` turns.
 6. **Final review.** The judge reviews every task (with the solver's runs) and the whole world. Issues go back to
    the same author session until the judge approves or `review_rounds.final` runs out. Then the release is
    published.

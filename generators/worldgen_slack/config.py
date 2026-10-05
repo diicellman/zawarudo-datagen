@@ -72,8 +72,16 @@ class CalendarConfig(Section):
 
 class TasksConfig(Section):
     per_100: float = Field(gt=0, le=100)  # tasks per 100 messages: a bigger world holds more tasks
+    # Per level, the band of the solver's right-answer rate a task of that level aims for; hardening steers to it.
+    bands: list[tuple[float, float]] = Field(min_length=1)
     max_answer_rows: int = Field(default=5, ge=1, le=50)
     styles: list[Text] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def ordered(self):
+        if any(not 0 <= lo <= hi <= 1 for lo, hi in self.bands):
+            raise ValueError("a band is [low, high] within 0 to 1")
+        return self
 
 
 class ActivityConfig(Section):
@@ -144,9 +152,12 @@ class AuthorSettings(Section):
     review_days: list[int] = Field(
         default_factory=lambda: [5]
     )  # the judge reviews the world after these days
-    probe_solves: int = Field(default=4, ge=1, le=16)  # solver runs per task per probe
-    probe_rounds: int = Field(default=2, ge=0, le=5)  # turns to harden tasks after their probes
-    probe_budget: int = Field(default=120, ge=0, le=2000)  # solver runs for probing, per world
+    tries: int = Field(
+        default=4, ge=1, le=16
+    )  # the solver's tries of a task, each time it is probed or reviewed
+    task_rounds: int = Field(
+        default=3, ge=0, le=10
+    )  # turns a task outside its band is given back to the author
     day_attempts: int = Field(
         default=2, ge=1, le=5
     )  # a day that cannot close is written again from its start
@@ -171,9 +182,14 @@ class Config(Section):
     review_rounds: ReviewRounds = Field(default_factory=ReviewRounds)
     acceptance: Acceptance = Field(default_factory=Acceptance)
     author: AuthorSettings = Field(default_factory=AuthorSettings)
-    solves_per_task: int = Field(default=4, ge=1, le=16)
     env: PipelineConfig = Field(default_factory=PipelineConfig)
     answer_judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
+
+    @model_validator(mode="after")
+    def banded(self):
+        if short := [n for n, c in self.taxonomy.items() if len(c.levels) > len(self.tasks.bands)]:
+            raise ValueError(f"[tasks] bands has one band for each level of {short}")
+        return self
 
     @property
     def task_count(self) -> int:
