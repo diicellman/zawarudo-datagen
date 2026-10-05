@@ -860,7 +860,9 @@ def tasks_prompt(settings, ids: list[str]) -> str:
 def harden_prompt(back: dict) -> str:
     return (
         "These tasks come back to you, each with its slot's cell, the solver's tries (right_rate, the share of right "
-        "answers, is how hard the task is; strict_rate also needs every claim grounded), the judge's review (level_fit "
+        "answers, is how hard the task is; strict_rate also needs every claim grounded; solves, each try's calls and the "
+        "step at which the gold evidence first appeared: the route to beat; the whole tries are in "
+        "/task/memory/solves/<task>/), the judge's review (level_fit "
         "from 0 to 4: how fully answering it needs its level and concept), code's measures (evidence pages, tables "
         "read, search rank), its level's band of right-answer rates, and what it needs (move): harder, easier, or the "
         f"fix the judge asks for: {json.dumps(back, ensure_ascii=False)}\nRewrite each in its slot so that answering it "

@@ -1593,7 +1593,11 @@ async def check_reviews(root):
 
 class TestStore(Store):
     def trace(self, trace):
-        pass
+        if record := getattr(
+            trace, "record", None
+        ):  # a scripted solver's try, as the author and the judge read it
+            (self.root / "traces").mkdir(exist_ok=True)
+            (self.root / "traces" / f"{trace.id}.json").write_text(json.dumps(record))
 
 
 class ScriptedAgent:
@@ -1723,12 +1727,17 @@ async def check_author(root):
         async def run(self, task):
             key = (store.state.active_attempt, task.data.task_id)
             solved[key] += 1
+            name = "-".join([*key, str(solved[key])])
             if solved[key] in crashes.get(key, ()):
-                return SimpleNamespace(ok=False, info={}, errors=[SimpleNamespace(message="model stream ended")], task=task, last_reply="", id="crash")  # fmt: skip
+                return SimpleNamespace(ok=False, info={}, errors=[SimpleNamespace(message="model stream ended")], task=task, last_reply="", id=name)  # fmt: skip
             finished[key] += 1
             right, grounded = task.data.task_id in always or finished[key] % 2 == 1, task.data.task_id != t2
-            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "calls": 3, "reason": "r"}  # fmt: skip
-            return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id="solve")  # fmt: skip
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "calls": 2, "reason": "r"}  # fmt: skip
+            # A search that misses, then a read that shows the task's evidence, if it rests on any.
+            found = [{"channel": c, "ts": ts} for c, ts in task.config.reference.messages]
+            observations = [{"tool": "search_messages", "arguments": {"query": "release"}, "output": {"items": []}}, {"tool": "read_channel", "arguments": {"channel_id": "C1"}, "output": {"items": found}}]  # fmt: skip
+            record = {"id": name, "agent": {"name": "solver", "config": {}}, "task": {"data": {"task_id": task.data.task_id}}, "ok": True, "nodes": [], "info": {"observations": observations, "evaluation": evaluation}}  # fmt: skip
+            return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id=name, record=record)  # fmt: skip
 
     class AuthorEnv(GenerationEnv):
         async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
@@ -1871,6 +1880,16 @@ async def check_author(root):
                 "hardening reads the judge's level fit, code's measures, both rates and the level's band"
             )  # fmt: skip
             seen.append(("harden", sorted(back), sorted(r["move"] for r in back.values())))
+            for (
+                t,
+                r,
+            ) in back.items():  # each try as the author reads it: the route, and where the evidence showed
+                assert r["solves"] and all(s["steps"][0].startswith('search_messages {"query": "release"} → 0 items') for s in r["solves"]), r["solves"]  # fmt: skip
+                assert {s["evidence_at"] for s in r["solves"]} == ({2} if t == t1 else {None}), (
+                    t,
+                    r["solves"],
+                )  # t3 is a join
+                assert all(f"/task/memory/solves/{t}/{k}.json" in runtime.files for k in range(1, 4)), "the whole tries"  # fmt: skip
             for slot in json.loads(tools.config.context)["slots"]:
                 if slot["id"] in back:  # every task that came back is rewritten, so tried again
                     task = scripted_task(settings, slot, a)

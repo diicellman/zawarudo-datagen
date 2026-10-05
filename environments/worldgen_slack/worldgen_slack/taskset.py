@@ -12,6 +12,15 @@ from .dataset import NonEmptyText, PrivateAnswer, PublicTask, StrictModel, load_
 from .tools import CallState, SlackTools, WorldTaskData, WorldToolsConfig, stage_world
 
 
+def shown(call: dict) -> set[tuple[str, str]]:
+    """The messages one recorded call showed the solver, as (channel, ts)."""
+    return {
+        (item["channel"], item["ts"])
+        for item in call["output"].get("items", [])
+        if isinstance(item, dict) and "ts" in item
+    }
+
+
 class AnswerGrade(StrictModel):
     correct: bool
     grounded: bool
@@ -109,12 +118,7 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         grade = result.parsed
         if grade.grounded and not observations:
             raise ValueError("judge claimed grounding without observations")
-        seen = {
-            (item["channel"], item["ts"])
-            for c in observations
-            for item in c["output"].get("items", [])
-            if isinstance(item, dict) and "ts" in item
-        }
+        seen = set().union(*map(shown, observations))
         users = {c["output"].get("id") for c in observations if c["tool"] == "get_user"}
         needed = len(reference.messages) + len(reference.users)
         found = len({tuple(m) for m in reference.messages} & seen) + len(set(reference.users) & users)

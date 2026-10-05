@@ -17,7 +17,7 @@ from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
 from worldgen_slack.db import digest
-from worldgen_slack.taskset import SolverTask
+from worldgen_slack.taskset import SolverTask, shown
 
 from .agents import synthesizer
 from .agents.judge import JudgeTask, review_payload
@@ -108,6 +108,24 @@ def rates(results: list[dict]) -> dict:
         "coverage": sum(seen) / len(seen) if seen else None,
         "tries": len(finished),
         "crashed": len(results) - len(finished),
+    }
+
+
+def try_digest(result: dict, record: dict | None, evidence: set) -> dict:
+    """One solver try as the author reads it: its grade, each call with its arguments and what it returned, the step
+    at which the gold evidence first appeared, and its answer."""
+    steps, first = [], None
+    for k, call in enumerate(((record or {}).get("info") or {}).get("observations") or [], 1):
+        hits = shown(call) & evidence
+        first = first or (k if hits else None)
+        items = call["output"].get("items")
+        returned = f"{len(items)} items" if isinstance(items, list) else "one result"
+        steps.append(f"{call['tool']} {json.dumps(call['arguments'], ensure_ascii=False)} → {returned}" + (", evidence" if hits else ""))  # fmt: skip
+    return {k: result.get(k) for k in ("correct", "grounded", "crashed", "reason")} | {
+        "calls": len(steps),
+        "evidence_at": first,
+        "steps": steps,
+        "answer": (result.get("response") or "")[:400],
     }
 
 
@@ -351,10 +369,14 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             self.settings, state, self.store.root, state.drafts.get("organization"), self.writable
         )
 
-    async def author_step(self, interaction, runtime, prompt: str, attempt: str, mode: str) -> None:
-        """One author turn: code's memory of the world, rendered fresh, then the turn; the author works through its
-        tools, and the world file is code's again when the turn ends."""
-        await upload(runtime, files(self.world, self.settings, self.author_context(), mode), "/task/memory")
+    async def author_step(
+        self, interaction, runtime, prompt: str, attempt: str, mode: str, extra=None
+    ) -> None:
+        """One author turn: code's memory of the world, rendered fresh (with `extra` memory files, such as the solver's
+        tries), then the turn; the author works through its tools, and the world file is code's again when the turn
+        ends."""
+        memory = files(self.world, self.settings, self.author_context(), mode) | (extra or {})
+        await upload(runtime, memory, "/task/memory")
         self.store.event("author_turn", attempt=attempt, mode=mode, day=self.store.state.day)
         segment = await interaction.turn(prompt)
         self.store.trace(interaction.trace)
@@ -530,7 +552,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         keys = {t: self.task_key(t) for t in ids}
         if due := [t for t in ids if state.probes.get(t, {}).get("key") != keys[t]]:
             runs, judged = await self.judge_tasks(agents, due, keys, attempt, cfg.author.tries)
-            measured = self.store.difficulty()
+            measured, answers = self.store.difficulty(), self.store.release_rows("")[1]
             for task_id in due:
                 outcomes = runs[task_id]["results"]
                 rate = rates(outcomes)
@@ -543,7 +565,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 state.probes[task_id] = (
                     {"key": keys[task_id]}
                     | {k: v for k, v in measured[task_id].items() if k not in ("level_fit", "right_rate", "strict_rate")}
-                    | rate | {"solves": [{k: o.get(k) for k in ("correct", "grounded", "calls", "reason")} for o in outcomes]}
+                    | rate | {"solves": [try_digest(o, self.saved_trace(i), {tuple(m) for m in answers[task_id].messages}) for o, i in zip(outcomes, runs[task_id]["traces"])]}
                     | {"level_fit": review.level_fit, "valid": review.valid, "review": review.reason}
                     | {"issues": [f"{i.defect} {i.requested_change}" for i in judged.issues if task_id in i.task_ids]}
                     | {"approved": accepted_task(judged, cfg.acceptance, task_id), "band": cfg.tasks.bands[measured[task_id]["level"] - 1]}
@@ -571,7 +593,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             for t in back:
                 state.task_rounds[t] = state.task_rounds.get(t, 0) + 1
             self.store.save()
-            await turn(harden_prompt(back))
+            tries = {f"memory/solves/{t}/{k}.json": json.dumps(record, ensure_ascii=False) for t in back for k, i in enumerate(state.solves[t]["traces"], 1) if (record := self.saved_trace(i))}  # fmt: skip
+            await turn(harden_prompt(back), tries)
 
     def batches(self) -> list[list[str]]:
         """The world's slots in batches of `[tasks] batch`, each written and hardened in an interaction of its own."""
@@ -591,8 +614,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         empty = lambda: [t for t in ids if not self.world.db.execute("SELECT 1 FROM tasks WHERE id = ?", (t,)).fetchone()]  # noqa: E731  # fmt: skip
         async with agents.author.interaction(task, runtime=runtime) as interaction:
 
-            async def turn(prompt):
-                await self.author_step(interaction, runtime, prompt, attempt, "tasks")
+            async def turn(prompt, extra=None):
+                await self.author_step(interaction, runtime, prompt, attempt, "tasks", extra)
 
             for n in range(3):
                 if not (missing := empty()):
