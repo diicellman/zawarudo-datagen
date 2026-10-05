@@ -196,7 +196,7 @@ class Store:
         events = []
         if (self.root / "progress.jsonl").exists():
             events = [json.loads(line) for line in (self.root / "progress.jsonl").read_text().splitlines()]
-        rates = {task: {k: review[k] for k in ("right_rate", "strict_rate", "coverage", "tries")} for task, review in self.state.task_reviews.items()}  # fmt: skip
+        rates = {task: {k: review[k] for k in ("right_rate", "strict_rate", "coverage", "tries", "crashed")} for task, review in self.state.task_reviews.items()}  # fmt: skip
         right = [r["right_rate"] for r in rates.values()]
         count = lambda sql: self.world.db.execute(sql).fetchone()[0]  # noqa: E731
         summary = {

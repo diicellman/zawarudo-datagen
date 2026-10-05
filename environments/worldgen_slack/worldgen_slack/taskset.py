@@ -70,11 +70,12 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
 
     @staticmethod
     def outcome(trace: vf.Trace) -> dict:
-        """A finished solve's graded result; a solve that failed before grading scores zero."""
+        """A solve's graded result. One that crashed before its grade (its harness, its model stream or its grading
+        failed) scores zero and is marked crashed: its try tells nothing about the task."""
         result = trace.info.get("evaluation")
-        if result is None and trace.info.get("grading_started"):
-            raise RuntimeError("LLM answer grading failed: " + "; ".join(e.message for e in trace.errors))
+        crashed = result is None or not trace.ok
         if result is None:
+            failed = "grading failed: " if trace.info.get("grading_started") else ""
             result = {
                 "task_id": trace.task.data.task_id,
                 "execution_ok": False,
@@ -83,12 +84,12 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
                 "grounded": False,
                 "calls": len(trace.info.get("observations", [])),
                 "solver_trace_id": trace.id,
-                "reason": "; ".join(e.message for e in trace.errors),
+                "reason": failed + "; ".join(e.message for e in trace.errors),
                 "response": trace.last_reply,
             }
         if not trace.ok:
             result.update(execution_ok=False, semantic_correctness=0.0)
-        return result
+        return result | {"crashed": crashed}
 
     async def finalize(self, trace):
         trace.info["observations"] = [c.model_dump(mode="json") for c in trace.state.calls]

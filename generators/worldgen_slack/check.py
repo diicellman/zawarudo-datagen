@@ -1689,7 +1689,21 @@ async def check_author(root):
             ),
         }
     )
-    seen, crash, solved = [], {"armed": True, "review": True, "plans": 0}, Counter()
+    seen, crash, solved, finished = [], {"armed": True, "review": True, "plans": 0}, Counter(), Counter()
+    # Runs that crash: t0's first is run again; one try of t3 crashes twice and is left out of its rates.
+    crashes = {("tasks-01", "t0"): {1}, ("tasks-01", "t3"): {2, 3}}
+
+    class ScriptedSolver(ScriptedAgent):
+        async def run(self, task):
+            key = (store.state.active_attempt, task.data.task_id)
+            solved[key] += 1
+            if solved[key] in crashes.get(key, ()):
+                return SimpleNamespace(ok=False, info={}, errors=[SimpleNamespace(message="model stream ended")], task=task, last_reply="", id="crash")  # fmt: skip
+            finished[key] += 1
+            # Every other try is right; t2's right answers are never grounded, so only its strict rate is 0.
+            right, grounded = finished[key] % 2 == 1, task.data.task_id != "t2"
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "calls": 3, "reason": "r"}  # fmt: skip
+            return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id="solve")  # fmt: skip
 
     class AuthorEnv(GenerationEnv):
         async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
@@ -1699,12 +1713,6 @@ async def check_author(root):
             kinds = [Routine(kind=k, probability=0.5) for k in ("standup", "handoff", "lunch")]
             channels = [Channel(name="ops", type="public", members=ids, routines=kinds), Channel(name="leads", type="private", members=ids[:2], routines=kinds)]  # fmt: skip
             return Organization(people=[Person(user_id=u, title="Engineer", team="Platform") for u in ids], channels=channels, dm_routines=kinds).model_dump_json()  # fmt: skip
-
-        async def solve(self, agents, task):
-            solved[self.store.state.active_attempt, task.data.task_id] += 1
-            # Every other try is right; t2's right answers are never grounded, so only its strict rate is 0.
-            right, grounded = solved[self.store.state.active_attempt, task.data.task_id] % 2 == 1, task.data.task_id != "t2"  # fmt: skip
-            return {"semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "execution_ok": True, "calls": 3, "reason": "r"}, SimpleNamespace(id="solve", to_record=lambda: {"nodes": []})  # fmt: skip
 
         async def review(self, agents, payload, attempt, files=None, label=""):
             seen.append(("review", attempt, payload["phase"], "written_through" in payload, "ledger" in payload, bool(payload.get("previous_issues")), tuple(t["id"] for t in payload["tasks"])))  # fmt: skip
@@ -1834,10 +1842,7 @@ async def check_author(root):
             task = scripted_task(settings, 9, category, level, a)  # t9 replaces t0 in its cell
             await call("add_task", task=task.model_copy(update={"question": "Asked anew: " + task.question}))
 
-    agents = SimpleNamespace(
-        **{name: ScriptedAgent() for name in ("judge", "solver")},
-        author=ScriptedAuthor(script),
-    )
+    agents = SimpleNamespace(judge=ScriptedAgent(), solver=ScriptedSolver(), author=ScriptedAuthor(script))
     manifest = provenance(settings)
     store = TestStore(settings.output, manifest)
     env = AuthorEnv(settings, store)
@@ -1895,7 +1900,7 @@ async def check_author(root):
     assert state.probe_solves == 10, state.probe_solves
     # The probes try every task, then the hardened t1 again (the budget leaves t2 untried); the final reviews solve
     # only what changed since: t2, then t9, which a fix replaced t0 with.
-    assert solved == {("tasks-01", "t0"): 2, ("tasks-01", "t1"): 4, ("tasks-01", "t2"): 2, ("tasks-01", "t3"): 2, ("final-01", "t2"): 4, ("final-02", "t9"): 4}, solved  # fmt: skip
+    assert solved == {("tasks-01", "t0"): 3, ("tasks-01", "t1"): 4, ("tasks-01", "t2"): 2, ("tasks-01", "t3"): 3, ("final-01", "t2"): 4, ("final-02", "t9"): 4}, solved  # fmt: skip
     assert set(state.solves) == {"t1", "t2", "t3", "t9"}, "a replaced task's runs go with it"
     assert ("review", "review-02-02", "world", True, True, False, ()) in seen
     assert ("review", "final-01", "world", False, True, False, ()) in seen
@@ -1919,9 +1924,25 @@ async def check_author(root):
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
     summary = store.summary("complete")
-    assert summary["mean_learnability"] == 1.0 and summary["rates"]["t2"] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 4}, (
+    assert summary["rates"]["t2"] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 4, "crashed": 0}, (
         "difficulty is the right-answer rate; the strict rate is reported beside it"
     )  # fmt: skip
+    assert summary["rates"]["t3"] == {"right_rate": 1.0, "strict_rate": 1.0, "coverage": None, "tries": 1, "crashed": 1}, (
+        "a try that crashed twice is counted, and left out of the rates"
+    )  # fmt: skip
+    assert summary["mean_learnability"] == 0.75, summary[
+        "mean_learnability"
+    ]  # t1, t2 and t9 at 0.5; t3 at 1.0
+
+    class Crashing(ScriptedAgent):
+        async def run(self, task):
+            return SimpleNamespace(ok=False, info={"grading_started": True}, errors=[SimpleNamespace(message="judge timeout")], task=task, last_reply="", id="crash")  # fmt: skip
+
+    try:
+        await env.solves(SimpleNamespace(solver=Crashing()), ["t1"], "final-02", 2)
+        raise AssertionError("a task whose every try crashed was kept")
+    except RuntimeError as error:
+        assert "crashed twice" in str(error), error
     difficulty = summary["difficulty"]
     assert set(difficulty) == set(state.task_reviews) and all(
         d["level_fit"] == 3 and "evidence_pages" in d and d["concept"] for d in difficulty.values()

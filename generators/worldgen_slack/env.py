@@ -96,13 +96,16 @@ def observable(record: dict) -> dict:
 
 def rates(results: list[dict]) -> dict:
     """A task's tries in numbers: how often the answer was right (the task's difficulty), how often it was right and
-    grounded (the released reward), and how much of the gold evidence the tries saw."""
-    seen = [r["evidence_coverage"] for r in results if r.get("evidence_coverage") is not None]
+    grounded (the released reward), and how much of the gold evidence the tries saw. A crashed try tells nothing
+    about the task: it is counted, and left out."""
+    finished = [r for r in results if not r.get("crashed")]
+    seen = [r["evidence_coverage"] for r in finished if r.get("evidence_coverage") is not None]
     return {
-        "right_rate": sum(bool(r["correct"]) for r in results) / len(results),
-        "strict_rate": sum(r["semantic_correctness"] for r in results) / len(results),
+        "right_rate": sum(bool(r["correct"]) for r in finished) / len(finished),
+        "strict_rate": sum(r["semantic_correctness"] for r in finished) / len(finished),
         "coverage": sum(seen) / len(seen) if seen else None,
-        "tries": len(results),
+        "tries": len(finished),
+        "crashed": len(results) - len(finished),
     }
 
 
@@ -286,10 +289,14 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         return rows, [answers[r.task_id] for r in rows]
 
     async def solve(self, agents, task):
-        """One independent solve of a task, graded for correctness and grounding."""
-        trace = await agents.solver.run(task)
-        self.store.trace(trace)
-        return SolverTask.outcome(trace), trace
+        """One independent solve of a task, graded for correctness and grounding. A solve that crashed runs once more;
+        crashed again, it is kept as crashed, and the task's rates leave it out."""
+        for _ in range(2):
+            trace = await agents.solver.run(task)
+            self.store.trace(trace)
+            if not (outcome := SolverTask.outcome(trace))["crashed"]:
+                break
+        return outcome, trace
 
     async def solves(self, agents, task_ids, attempt, n) -> dict:
         """`n` independent solves of each task, on a solver copy of the world kept with the attempt."""
@@ -297,6 +304,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         copy.unlink(missing_ok=True)
         self.world.solver_copy(copy)
         runs = await asyncio.gather(*(asyncio.gather(*(self.solve(agents, self.solver_task(t, copy)) for _ in range(n))) for t in task_ids))  # fmt: skip
+        if dead := [t for t, tries in zip(task_ids, runs) if all(o["crashed"] for o, _ in tries)]:
+            raise RuntimeError(f"every try of {dead} crashed twice: the solver or its grading is failing")
         return dict(zip(task_ids, runs))
 
     async def assess(self, agents, attempt):
