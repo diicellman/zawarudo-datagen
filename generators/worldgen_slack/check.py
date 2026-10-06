@@ -1889,7 +1889,8 @@ async def check_author(root):
                     m for (m,) in self.world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")
                 ]
                 # A mid-run review's note blocks nothing, and still opens the next day.
-                issues = [Issue(artifact="workspace", message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
+                # The final one's defect touches t0, so its fix may rewrite t0 and no other task.
+                issues = [Issue(artifact="workspace", task_ids=[t0] if attempt == "final-01" else [], message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
             # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
             reviews = [TaskReview(task_id=t["id"], valid=not (attempt.startswith("tasks-") and t["id"] == t3), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
@@ -2022,20 +2023,36 @@ async def check_author(root):
                 )  # t3 is a join
                 assert all(f"/task/memory/solves/{t}/{k}.json" in runtime.files for k in range(1, 4)), "the whole tries"  # fmt: skip
             for slot in json.loads(tools.config.context)["slots"]:
+                task = scripted_task(settings, slot, a)
+                asked = task.model_copy(update={"question": f"Asked again ({len(seen)}): " + task.question})
                 if slot["id"] in back:  # every task that came back is rewritten, so tried again
-                    task = scripted_task(settings, slot, a)
-                    asked = f"Asked again ({len(seen)}): " + task.question
-                    await call("add_task", task=task.model_copy(update={"question": asked}))
+                    await call("add_task", task=asked)
+                elif (
+                    slot["id"] in json.loads(tools.config.context)["writable"]
+                ):  # in this batch, but in its band
+                    try:
+                        await call("add_task", task=asked)
+                        raise AssertionError("a task that did not come back was rewritten")
+                    except ValueError as error:
+                        assert "one of the slots you write now" in str(error), error
+                        seen.append(("kept", slot["id"]))
         elif prompt.startswith("The review rejected"):
             issues = json.loads(prompt[prompt.index("[") : prompt.index("]\n") + 1])
             for issue in issues:
                 for message in issue.get("message_ids", []):
                     await call("revise", message_id=message, text="ok, the notes come tomorrow")
             seen.append(("fixed", [m for i in issues for m in i.get("message_ids", [])]))
-            task = scripted_task(
-                settings, json.loads(tools.config.context)["slots"][0], a
-            )  # t0, rewritten in its slot
+            slots = json.loads(tools.config.context)["slots"]
+            task = scripted_task(settings, slots[0], a)  # t0, which the verdict names, rewritten in its slot
             await call("add_task", task=task.model_copy(update={"question": "Asked anew: " + task.question}))
+            other = scripted_task(settings, slots[1], a)
+            try:
+                await call(
+                    "add_task", task=other.model_copy(update={"question": "Asked anew: " + other.question})
+                )
+                raise AssertionError("a fix rewrote a task the verdict does not name")
+            except ValueError as error:
+                assert "one of the slots you write now: ['" + t0 + "']" in str(error), error
 
     agents = SimpleNamespace(judge=ScriptedAgent(), solver=ScriptedSolver(), witness=ScriptedWitness(), author=ScriptedAuthor(script))  # fmt: skip
     manifest = provenance(settings)
@@ -2104,6 +2121,8 @@ async def check_author(root):
     # tasks in their bands never come back.
     assert [s for s in seen if s[0] == "harden"] == [("harden", [t1], ["harder"]), ("harden", [t3], ["fix"]), ("harden", [t3], ["fix"])]  # fmt: skip
     assert state.task_rounds == {t1: 1, t3: 2}, state.task_rounds
+    # A hardening turn rewrites only what came back: t0 (in its band) is refused in t1's turn, t2 in t3's two turns.
+    assert [s for s in seen if s[0] == "kept"] == [("kept", t0), ("kept", t2), ("kept", t2)], [s for s in seen if s[0] == "kept"]  # fmt: skip
     # Two batches, each in its own interaction; the second, cut off after t2, is written again: only t3 is asked for.
     assert [s for s in seen if s[0] == "tasks"] == [("tasks", (t0, t1), (t0, t1)), ("tasks", (t2, t3), (t2, t3)), ("tasks", (t2, t3), (t3,))]  # fmt: skip
     assert state.rounds["tasks"] == 3, state.rounds
@@ -2115,8 +2134,8 @@ async def check_author(root):
     assert ("review", "final-02", "world", False, True, True, ()) in seen, (
         "the final review checks the last issues"
     )
-    assert ("review", "final-02", "task", False, False, False, (t0,)) in seen, (
-        "only the changed task is reviewed again"
+    assert ("review", "final-02", "task", False, False, True, (t0,)) in seen, (
+        "only the changed task is reviewed again, with the issue that named it"
     )
     probed = {a: [s[6] for s in seen if s[:3] == ("review", a, "task")] for a in ("tasks-01", "tasks-03")}
     assert probed == {"tasks-01": [(t0,), (t1,), (t1,)], "tasks-03": [(t2,), (t3,), (t3,), (t3,)]}, (

@@ -594,9 +594,15 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         self.context = json.loads(self.config.context)
         self.settings = Config.model_validate(self.context["settings"])
         self.every_slot = [Slot.model_validate(s) for s in self.context.get("slots", [])]
-        self.slots = [s for s in self.every_slot if s.id in self.context.get("writable", [])]
         self.gaps = Gaps(self.settings.personas.gaps)
         self.posted = None  # the last post: its conversation, the present it left, and its result
+
+    def writable(self) -> list:
+        """The slots the turn at hand may write: the env sets them before each turn (a hardening turn rewrites only
+        the tasks that came back), so they are read on every call, not when the interaction opened."""
+        path = Path(self.context.get("writable_file") or "")
+        ids = json.loads(path.read_text()) if path.is_file() else self.context.get("writable", [])
+        return [s for s in self.every_slot if s.id in ids]
 
     def _with_state(self, fn):
         synced = super()._with_state(fn)
@@ -790,7 +796,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         return self._logged(
             "add_task",
             {"task": task.model_dump(mode="json")},
-            lambda: self._write(lambda copy: add_task(copy, task, self.settings, self.slots)),
+            lambda: self._write(lambda copy: add_task(copy, task, self.settings, self.writable())),
             "tasks",
         )
 
@@ -885,15 +891,19 @@ def harden_prompt(back: dict) -> str:
         f"fix the judge asks for: {json.dumps(back, ensure_ascii=False)}\nRewrite each in its slot so that answering it "
         "needs its level and concept with no easier route, and lands in its band: reword it, or rest it on other "
         "evidence; world_revise can remove a giveaway from a message. A task you change is tried and reviewed again; "
-        "one you keep stands as it is, and its round still counts (rounds_left). End your turn when the tasks stand."
+        "one you keep stands as it is, and its round still counts (rounds_left). Only these tasks may be rewritten in "
+        "this turn. End your turn when the tasks stand."
     )
 
 
-def fix_prompt(issues: list) -> str:
+def fix_prompt(issues: list, writable: list[str]) -> str:
+    rewrite = (
+        f"world_add_task may rewrite only {', '.join(writable)}" if writable else "no task is to be rewritten"
+    )
     return (
         f"The review rejected the world: {json.dumps(issues, ensure_ascii=False)}\nFix each issue with world_revise or "
-        "world_add_task: message_ids are the messages to change, evidence_message_ids show the defect. If you judge an "
-        "issue mistaken, write why in /task/notes/plan.md. End your turn when done."
+        f"world_add_task ({rewrite}): message_ids are the messages to change, evidence_message_ids show the defect. If "
+        "you judge an issue mistaken, write why in /task/notes/plan.md. End your turn when done."
     )
 
 
@@ -916,6 +926,9 @@ def context_of(settings, state, store_root: Path, organization: dict | None, wri
         "settings": json.loads(settings.model_dump_json()),
         "slots": [s.model_dump(mode="json") for s in state.quota],
         "writable": list(writable),
+        "writable_file": str(
+            store_root / "writable.json"
+        ),  # the slots the turn at hand may write, read per call
         "cards": cards(state.cast),
         "selves": selves(state.cast),
         "agenda": agenda,

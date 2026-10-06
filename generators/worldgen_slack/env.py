@@ -16,6 +16,7 @@ import verifiers.v1 as vf
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
+from worldgen_slack.dataset import atomic_json
 from worldgen_slack.db import digest
 from worldgen_slack.taskset import SolverTask, shown
 
@@ -637,8 +638,14 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             for t in back:
                 state.task_rounds[t] = state.task_rounds.get(t, 0) + 1
             self.store.save()
+            self.allow(back)
             tries = {f"memory/solves/{t}/{k}.json": json.dumps(record, ensure_ascii=False) for t in back for k, i in enumerate(state.solves[t]["traces"], 1) if (record := self.saved_trace(i))}  # fmt: skip
             await turn(harden_prompt(back), tries)
+
+    def allow(self, ids) -> None:
+        """The slots the author's next turn may write: its memory marks them and its tools read them per call."""
+        self.writable = list(ids)
+        atomic_json(self.store.root / "writable.json", self.writable)
 
     def batches(self) -> list[list[str]]:
         """The world's slots in batches of `[tasks] batch`, each written and hardened in an interaction of its own."""
@@ -653,7 +660,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         ids, total = self.batches()[state.batch], len(self.batches())
         await self.bring_notes(runtime, state.restore_point)
         attempt = self.store.reserve("tasks", 2 * total)  # a batch cut off is written again once
-        self.writable = ids
+        self.allow(ids)
         task = WorldAuthorTask.create("tasks", 0, self.world.path, self.author_context(), attempt)
         empty = lambda: [t for t in ids if not self.world.db.execute("SELECT 1 FROM tasks WHERE id = ?", (t,)).fetchone()]  # noqa: E731  # fmt: skip
         async with agents.author.interaction(task, runtime=runtime) as interaction:
@@ -664,6 +671,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             for n in range(3):
                 if not (missing := empty()):
                     break
+                self.allow(missing)
                 await turn(tasks_prompt(cfg, missing) if n == 0 else f"These slots have no task yet: {missing}. Write them with world_add_task, then end your turn.")  # fmt: skip
             if missing := empty():
                 raise ReviewLimit(f"the author wrote no task for {missing}")
@@ -678,7 +686,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
 
     async def fix_world(self, agents, runtime) -> None:
         """The final review, until the judge approves or its rounds run out. Its issues go to the author in one more
-        interaction, opened at the first rejection, where every slot may be rewritten."""
+        interaction, opened at the first rejection; a fix may rewrite only the tasks the verdict names."""
         state, cfg = self.store.state, self.settings
         interaction = None
         async with contextlib.AsyncExitStack() as stack:
@@ -686,16 +694,17 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 if (verdict := await self.final_world(agents)).approved:
                     break
                 attempt = f"final-{state.rounds.get('final', 0):02d}"
+                invalid = [{"task_id": r.task_id, "invalid": r.reason} for r in verdict.tasks if not r.valid]
+                issues = [i.model_dump(mode="json") for i in deciding(verdict, cfg.acceptance)] + invalid
+                named = [s.id for s in state.quota if any(s.id in i.get("task_ids", [i.get("task_id")]) for i in issues)]  # fmt: skip
+                self.allow(named)
                 if interaction is None:
                     await self.bring_notes(runtime, state.restore_point)
-                    self.writable = [s.id for s in state.quota]
                     task = WorldAuthorTask.create("tasks", 0, self.world.path, self.author_context(), attempt)
                     interaction = await stack.enter_async_context(
                         agents.author.interaction(task, runtime=runtime)
                     )
-                invalid = [{"task_id": r.task_id, "invalid": r.reason} for r in verdict.tasks if not r.valid]
-                issues = [i.model_dump(mode="json") for i in deciding(verdict, cfg.acceptance)] + invalid
-                await self.author_step(interaction, runtime, fix_prompt(issues), attempt, "tasks")
+                await self.author_step(interaction, runtime, fix_prompt(issues, named), attempt, "tasks")
         if interaction is not None:
             self.store.trace(interaction.trace)
             require_trace(interaction.trace)
