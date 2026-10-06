@@ -85,6 +85,26 @@ async def upload(runtime, files: dict[str, str | bytes], clear: str) -> None:
         raise SandboxError(f"the author's files could not be unpacked: {result.stderr}")
 
 
+@contextlib.asynccontextmanager
+async def keep_awake(runtime, every: float):
+    """The author's VM kept from idling out while only the env works (the solver's tries, the judge's reviews): a
+    no-op command every `every` seconds. The pings end with the block, so a VM left behind still ends on its idle
+    timeout."""
+
+    async def ping():
+        while True:
+            await asyncio.sleep(every)
+            await runtime.run(["true"], {})
+
+    pinger = asyncio.create_task(ping())
+    try:
+        yield
+    finally:
+        pinger.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pinger
+
+
 def require_trace(trace):
     if not trace.ok:
         raise RuntimeError("agent execution failed: " + "; ".join(e.message for e in trace.errors))
@@ -675,7 +695,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 await turn(tasks_prompt(cfg, missing) if n == 0 else f"These slots have no task yet: {missing}. Write them with world_add_task, then end your turn.")  # fmt: skip
             if missing := empty():
                 raise ReviewLimit(f"the author wrote no task for {missing}")
-            await self.harden(agents, turn, attempt, ids)
+            # A probe round can outlast the VM's idle timeout: the solver and the judge work, the author waits.
+            async with keep_awake(runtime, cfg.author.keepalive):
+                await self.harden(agents, turn, attempt, ids)
         self.store.trace(interaction.trace)
         require_trace(interaction.trace)
         await self.keep_notes(runtime, attempt)
@@ -690,6 +712,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         state, cfg = self.store.state, self.settings
         interaction = None
         async with contextlib.AsyncExitStack() as stack:
+            await stack.enter_async_context(keep_awake(runtime, cfg.author.keepalive))
             while state.phase == "final":
                 if (verdict := await self.final_world(agents)).approved:
                     break

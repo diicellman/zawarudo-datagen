@@ -65,11 +65,12 @@ from .chronicle import (
     today,
     today_line,
 )
-from .env import GenerationEnv, band_move
+from .env import GenerationEnv, keep_awake
 from .generate import failure, provenance, run_label
 from .store import Store
 from .config import ROOT, Acceptance, Category, Config, Needs
 from .contracts import (
+    band_move,
     DAY,
     PARTS,
     PHASE_CRITERIA,
@@ -1742,7 +1743,7 @@ class FakeRuntime:
     """The author's VM as files: what the env writes, the author reads and writes, and rm."""
 
     def __init__(self):
-        self.files = {}
+        self.files, self.pings = {}, 0
 
     async def write(self, path, data):
         self.files[path] = data
@@ -1753,6 +1754,7 @@ class FakeRuntime:
         return self.files[path]
 
     async def run(self, argv, env):
+        self.pings += argv == ["true"]
         if argv[:2] == ["rm", "-f"]:
             for path in argv[2:]:
                 self.files.pop(path, None)
@@ -1826,6 +1828,7 @@ async def check_author(root):
                     "task_rounds": 1,
                     "review_chunk": 1,
                     "solvers": 2,
+                    "keepalive": 0.0005,
                 }  # fmt: skip
             ),
         }
@@ -2012,6 +2015,7 @@ async def check_author(root):
                 "hardening reads the judge's level fit, code's measures, both rates and the level's band"
             )  # fmt: skip
             seen.append(("harden", sorted(back), sorted(r["move"] for r in back.values())))
+            seen.append(("pinged", runtime.pings))  # by now the probe ran, with the VM kept awake
             for (
                 t,
                 r,
@@ -2174,6 +2178,15 @@ async def check_author(root):
     assert (
         band_move(probe | {"approved": False}) == "fix" and band_move(probe | {"right_rate": 0.5}) == "harder"
     )
+
+    # The author's VM is pinged while only the env works, and no more once the block ends.
+    assert next(s[1] for s in seen if s[0] == "pinged") > 0, "the VM is kept awake through the probes"
+    awake = FakeRuntime()
+    async with keep_awake(awake, 0.01):
+        await asyncio.sleep(0.05)
+    pinged = awake.pings
+    await asyncio.sleep(0.03)
+    assert pinged >= 2 and awake.pings == pinged, (pinged, awake.pings)
 
     class Slow(ScriptedAgent):  # GLM's gate holds its solves to [author] solvers, whatever the episode allows
         active, peak = 0, 0

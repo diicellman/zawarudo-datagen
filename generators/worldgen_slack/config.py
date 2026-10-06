@@ -182,6 +182,9 @@ class AuthorSettings(Section):
     review_chunk: int = Field(default=5, ge=1, le=50)
     solvers: int = Field(default=8, ge=1, le=64)
     witness_tries: int = Field(default=2, ge=0, le=8)
+    keepalive: float = Field(
+        default=600, gt=0, le=1700
+    )  # seconds between pings of the author's idle VM (30-min timeout)
     day_attempts: int = Field(
         default=2, ge=1, le=5
     )  # a day that cannot close is written again from its start
