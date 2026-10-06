@@ -150,6 +150,12 @@ def load_run(path, full=False):
     order = {e["attempt"]: i for i, e in reversed(list(enumerate(events))) if e.get("attempt")}
     events = [e for e in events if e["event"] not in QUIET]
     traces = [summarize(read_json(p), full) for p in (run / "traces").glob("*.json")]
+    db = connect(run / "world.sqlite")
+    board = {}
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'board'").fetchone():  # worlds since the board
+        for slot, fact in db.execute("SELECT slot, fact_id FROM board ORDER BY slot, fact_id"):
+            board.setdefault(slot, []).append(fact)
+    db.close()
     snapshots, attempts = {}, []
     folders = sorted((p for p in (run / "attempts").iterdir() if p.is_dir()), key=lambda p: (order.get(p.name, -1 if p.name in ("premise", "organization") else 1e9), p.name))  # fmt: skip
     for folder in folders:
@@ -187,6 +193,7 @@ def load_run(path, full=False):
         "world": snapshot(run / "world.sqlite"),
         "bindings": bindings,
         "task_reviews": state.get("task_reviews") or {},
+        "board": board,
         "scenes": scenes,
         "scene_of": owner,
         "attempts": attempts,

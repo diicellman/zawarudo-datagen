@@ -36,10 +36,24 @@ def main():
         "ledger tasks show the messages their facts are stated in"
     )
     assert all(p["profile"] for p in run["catalog"]["personas"]), "the cast shows seeded profiles"
+    # A task shows its band and rounds, each of its probes, the witness's tries and the board's facts.
+    assert run["summary"]["rates"] and all(
+        "band" in r and "rounds" in r for r in run["summary"]["rates"].values()
+    )
+    assert {e["task_id"] for e in run["events"] if e["event"] == "task_reviewed"} == set(tasks), (
+        "every task's probes"
+    )
+    assert any(t["role"] == "witness" and t["evaluation"] and t["task_id"] in tasks for t in run["traces"]), (
+        "the witness"
+    )
+    assert run["board"] and set(run["board"]) <= set(tasks) and all(run["board"].values()), (
+        "the board per ledger slot"
+    )
+    assert run["world"]["zone"], "times are drawn on the world's clock"
     attack = "</script><script>alert('artifact')</script>&"
     html = render({"runs": [], "probe": attack})
     assert attack not in html and "__VIEWER_DATA__" not in html and "\\u003c/script\\u003e" in html
-    print("Viewer checks passed: attempt order, snapshots, conversations, gold queries, cast, escaping.")
+    print("Viewer checks passed: attempt order, snapshots, conversations, gold queries, cast, bands, probes, witness, board, escaping.")  # fmt: skip
 
 
 if __name__ == "__main__":

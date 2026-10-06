@@ -267,6 +267,8 @@ function overview() {
     ['Cost', usd(sum.reported_model_cost), 'priced calls only'],
     ['Wall time', dur(sum.elapsed_seconds ?? (X.t1 - X.t0)), 'first to last event'],
     ['Right answers', rates.length ? pct(rates.reduce((a, b) => a + b, 0) / rates.length) : '–', rates.length + ' tasks reviewed'],
+    ...(sum.in_band ? [['In band', Object.values(sum.in_band).reduce((a, [i]) => a + i, 0) + ' of ' + Object.values(sum.in_band).reduce((a, [, n]) => a + n, 0),
+      Object.entries(sum.in_band).map(([l, [i, n]]) => `L${l} ${i}/${n}`).join(' · ')]] : []),
   ];
   const usage = Object.entries(sum.usage_by_role || {});
   return h('div', {},
@@ -543,11 +545,13 @@ function renderThread() {
 }
 
 /* ---------- tasks ---------- */
+/* A task review's label is the task, "tasks", or "tasks-<n>" when a batch is reviewed in chunks. */
+const batchReviews = a => Object.entries(a.reviews || {}).filter(([k]) => k === 'tasks' || k.startsWith('tasks-')).map(([, v]) => v);
 function solvesFor(t) {
   const review = R.task_reviews?.[t];
   if (review?.results?.length) return review.results;
   for (const a of [...R.attempts].reverse()) {
-    const solves = list((a.reviews?.[t] || a.reviews?.tasks)?.solves).filter(s => s.task_id === t);
+    const solves = [a.reviews?.[t], ...batchReviews(a)].flatMap(v => list(v?.solves)).filter(s => s.task_id === t);
     if (solves.length) return solves;
   }
   return [];
@@ -568,20 +572,30 @@ function taskDetail(t) {
   const solves = solvesFor(t.id);
   let verdict = null;
   for (const a of [...R.attempts].reverse()) {
-    const own = a.reviews?.[t.id]?.verdict, batch = a.reviews?.tasks?.verdict;
+    const own = a.reviews?.[t.id]?.verdict, batch = batchReviews(a).map(v => v.verdict).find(v => list(v?.tasks).some(r => r.task_id === t.id));
     if (own) { verdict = [a.id, own]; break; }
-    if (batch && list(batch.tasks).some(r => r.task_id === t.id)) {
+    if (batch) {
       verdict = [a.id + ' · batch', {...batch, issues: list(batch.issues).filter(i => !list(i.task_ids).length || i.task_ids.includes(t.id))}];
       break;
     }
   }
   const evidence = new Set(list(binding?.claims).flatMap(c => c.message_ids));
+  const rate = R.summary?.rates?.[t.id], board = list(R.board?.[t.id]);
+  const probes = list(R.events).filter(e => e.event === 'task_reviewed' && e.task_id === t.id);
+  const witnessed = R.traces.filter(x => x.role === 'witness' && x.task_id === t.id && x.evaluation).map(x => x.evaluation);
   return h('div', {},
     h('div', {class: 'card'}, label(`${t.id} · ${t.group_id}`), h('div', {class: 'q', text: t.question}),
       h('span', {class: 'chip', text: 'reader · ' + (reader?.name || t.actor_id) + (persona ? ' · ' + persona.role : '')}),
       h('span', {class: 'chip', text: `${t.category} · level ${t.level}`}),
       h('span', {class: 'chip', text: 'right answers · ' + pct(R.task_reviews?.[t.id]?.right_rate ?? R.task_reviews?.[t.id]?.solve_rate)}),
-      R.task_reviews?.[t.id]?.strict_rate !== undefined ? h('span', {class: 'chip', text: 'right and grounded · ' + pct(R.task_reviews[t.id].strict_rate)}) : null),
+      R.task_reviews?.[t.id]?.strict_rate !== undefined ? h('span', {class: 'chip', text: 'right and grounded · ' + pct(R.task_reviews[t.id].strict_rate)}) : null,
+      rate?.band ? h('span', {class: 'chip', text: `band ${pct(rate.band[0])}–${pct(rate.band[1])}`}) : null,
+      rate?.band ? h('span', {class: 'chip ' + (rate.in_band ? 'good' : 'warn'), text: rate.in_band ? '✓ in its band' : '! outside its band'}) : null,
+      rate?.rounds !== undefined ? h('span', {class: 'chip', text: 'hardening rounds · ' + rate.rounds}) : null,
+      rate?.witness_right !== null && rate?.witness_right !== undefined ? h('span', {class: 'chip', text: 'witness right · ' + pct(rate.witness_right)}) : null),
+    probes.length ? h('div', {class: 'card', style: 'margin-top:12px'}, label(`Probes (${probes.length})`),
+      h('p', {class: 'small muted', text: 'Each review of the task, in order: the share of right answers (its difficulty) and of right and grounded ones (the reward).'}),
+      probes.map(e => h('div', {class: 'small mono', text: `${e.attempt} · right ${pct(e.right_rate)} · right and grounded ${pct(e.strict_rate)} · ${e.tries} tries${e.crashed ? ` (${e.crashed} crashed)` : ''}${e.approved ? '' : ' · not approved'}`}))) : null,
     h('div', {class: 'card', style: 'margin-top:12px'}, label('Answer'),
       spoil(h('p', {style: 'font-size:16px', text: t.answer.canonical_answer})),
       list(t.answer.required_claims).map((claim, k) => {
@@ -591,12 +605,16 @@ function taskDetail(t) {
             S.spoilers ? list(ev?.user_ids).map(u => h('span', {class: 'chip ev', text: 'directory · ' + personName(u)})) : null));
       }),
       spoil(h('p', {class: 'small muted'}, h('span', {class: 'label', text: 'Reasoning  '}), t.reasoning)),
+      S.spoilers && board.length ? h('div', {}, label('Board (its facts, planned before day 1)'), h('p', {}, board.map(f => h('span', {class: 'chip', title: X.facts[f] ? `${X.facts[f].subject} · ${X.facts[f].predicate}: ${X.facts[f].value}` : '', text: f})))) : null,
       S.spoilers ? h('div', {}, label('Facts'), list(t.fact_ids).map(f => X.facts[f] ? h('p', {class: 'small'}, h('span', {class: 'chip', text: f}),
         `${X.facts[f].subject} · ${X.facts[f].predicate}: ${X.facts[f].value}`, h('span', {class: 'faint mono', text: `  from ${X.facts[f].valid_from}${X.facts[f].valid_until ? ' until ' + X.facts[f].valid_until : ''}`})) : null)) : null),
     h('div', {class: 'card', style: 'margin-top:12px'}, label('Gold query'), h('p', {class: 'small muted', text: 'Runs as the reader sees the world: channels they cannot read do not exist for it. Its rows are the answer.'}),
       t.gold_sql ? spoil(h('pre', {class: 'small mono', style: 'white-space:pre-wrap', text: t.gold_sql})) : empty('No gold query')),
     h('div', {class: 'card', style: 'margin-top:12px'}, label(`Independent solves (${solves.length})`),
       solves.length ? h('div', {class: 'solves'}, solves.map((s, k) => solveCard(s, k, evidence))) : empty('No solves recorded')),
+    witnessed.length ? h('div', {class: 'card', style: 'margin-top:12px'}, label(`Witness tries (${witnessed.length})`),
+      h('p', {class: 'small muted', text: 'A stronger solver tries a task the solver rarely answers: one it answers is hard, not broken. Its tries count in no rate.'}),
+      h('div', {class: 'solves'}, witnessed.map((s, k) => solveCard(s, k, evidence)))) : null,
     verdict ? h('div', {class: 'card', style: 'margin-top:12px'}, label(`Task judge · ${verdict[0]}`), status(verdict[1].approved),
       h('p', {text: verdict[1].summary}), Object.entries(verdict[1].criteria || {}).map(([k, v]) => h('div', {class: 'small'}, meter(v), ' ', h('span', {class: 'faint', text: k}))),
       issueList(list(verdict[1].issues))) : null);
@@ -606,7 +624,7 @@ function evidenceCard(id) {
   if (!m) return h('span', {class: 'chip bad', text: id + ' (missing)'});
   const c = X.convs[m.conversation_id];
   return h('button', {class: 'evmsg', type: 'button', onclick: () => openMessage(id)},
-    h('div', {class: 'small'}, h('b', {text: personName(m.author_id)}), h('span', {class: 'when', text: `${utc(m.timestamp)} · ${c?.name || c?.kind || ''}`})),
+    h('div', {class: 'small'}, h('b', {text: personName(m.author_id)}), h('span', {class: 'when', text: `${utc(m.timestamp, V().world?.zone)} · ${c?.name || c?.kind || ''}`})),
     h('div', {class: 'text small', text: m.text}));
 }
 function solveCard(s, k, evidence) {
