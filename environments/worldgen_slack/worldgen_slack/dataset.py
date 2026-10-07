@@ -53,9 +53,9 @@ def sha256(path: Path) -> str:
 
 
 class PublicTask(StrictModel):
-    """A task as a solver gets it, with how hard it measured: the solver model's tries at the release, its share of
-    right answers and of right and grounded ones, the gold evidence the tries saw, and the witness's share of right
-    answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns."""
+    """A task as a solver gets it, with how hard it measured: the solver model's tries at the release (those that
+    crashed, and those that never answered), its share of right answers and of right and grounded ones, the gold
+    evidence the tries saw, and the witness's share of right answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns."""
 
     task_id: SafeId
     question: NonEmptyText
@@ -67,6 +67,7 @@ class PublicTask(StrictModel):
     solver: str | None = None
     tries: int | None = None
     crashed: int | None = None
+    unanswered: int | None = None
     right_rate: float | None = None
     strict_rate: float | None = None
     coverage: float | None = None

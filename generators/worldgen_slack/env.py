@@ -129,6 +129,7 @@ def rates(results: list[dict]) -> dict:
         "coverage": sum(seen) / len(seen) if seen else None,
         "tries": len(finished),
         "crashed": len(results) - len(finished),
+        "unanswered": sum(bool(r.get("unanswered")) for r in finished),
     }
 
 
@@ -581,7 +582,16 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         skips the task until it changes."""
         state = self.store.state
         fresh = [t for t in due if state.solves.get(t, {}).get("key") != keys[t]]
-        for task_id, task_runs in (await self.solves(agents, fresh, attempt, n)).items():
+        solved = await self.solves(agents, fresh, attempt, n)
+        # A task above level 1 with mixed tries is near a band's edge, where 4 tries say little: it gets more.
+        levels = dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())
+        rights = {t: [o["correct"] for o, _ in tries if not o["crashed"]] for t, tries in solved.items()}
+        if mixed := [t for t in fresh if levels[t] > 1 and 0 < sum(rights[t]) < len(rights[t])] if self.settings.author.extra_tries else []:  # fmt: skip
+            for task_id, more in (
+                await self.solves(agents, mixed, attempt, self.settings.author.extra_tries)
+            ).items():
+                solved[task_id] = solved[task_id] + more
+        for task_id, task_runs in solved.items():
             self.keep_solves(task_id, keys[task_id], task_runs)
         runs = {t: state.solves[t] for t in due}
         witnessed = await self.witness(agents, due, keys, attempt)

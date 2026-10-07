@@ -81,7 +81,8 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
     @staticmethod
     def outcome(trace: vf.Trace) -> dict:
         """A solve's graded result. One that crashed before its grade (its harness, its model stream or its grading
-        failed) scores zero and is marked crashed: its try tells nothing about the task."""
+        failed) scores zero and is marked crashed: its try tells nothing about the task. One that finished without an
+        answer is marked unanswered."""
         result = trace.info.get("evaluation")
         crashed = result is None or not trace.ok
         if result is None:
@@ -99,7 +100,12 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             }
         if not trace.ok:
             result.update(execution_ok=False, semantic_correctness=0.0)
-        return result | {"crashed": crashed}
+        # A finished try that never answers (an empty last message, or the turn cap mid-search) is wrong, and counted.
+        silent = (
+            not (result.get("response") or "").strip()
+            or getattr(trace, "stop_condition", None) == "max_turns"
+        )
+        return result | {"crashed": crashed, "unanswered": not crashed and silent}
 
     async def finalize(self, trace):
         trace.info["observations"] = [c.model_dump(mode="json") for c in trace.state.calls]

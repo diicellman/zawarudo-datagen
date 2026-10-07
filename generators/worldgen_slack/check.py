@@ -65,7 +65,7 @@ from .chronicle import (
     today,
     today_line,
 )
-from .env import GenerationEnv, keep_awake, try_digest
+from .env import GenerationEnv, keep_awake, rates, try_digest
 from .generate import failure, provenance, run_label
 from .store import Store
 from .config import ROOT, Acceptance, Category, Config, Needs
@@ -1844,6 +1844,7 @@ async def check_author(root):
                     "share_tolerance": 1.0,
                     "review_days": [2],
                     "tries": 3,
+                    "extra_tries": 0,  # tried below, apart from the flow
                     "task_rounds": 1,
                     "review_chunk": 1,
                     "solvers": 2,
@@ -1871,7 +1872,7 @@ async def check_author(root):
                 return SimpleNamespace(ok=False, info={}, errors=[SimpleNamespace(message="model stream ended")], task=task, last_reply="", id=name)  # fmt: skip
             finished[key] += 1
             right, grounded = task.data.task_id in always or finished[key] % 2 == 1, task.data.task_id != t2
-            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "calls": 2, "reason": "r"}  # fmt: skip
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "calls": 2, "reason": "r", "response": "an answer"}  # fmt: skip
             # A search that misses, then a read that shows the task's evidence, if it rests on any.
             found = [{"channel": c, "ts": ts} for c, ts in task.config.reference.messages]
             observations = [{"tool": "search_messages", "arguments": {"query": "release"}, "output": {"items": []}}, {"tool": "read_channel", "arguments": {"channel_id": "C1"}, "output": {"items": found}}]  # fmt: skip
@@ -1885,7 +1886,7 @@ async def check_author(root):
             key = (store.state.active_attempt, task.data.task_id)
             witnessed[key] += 1
             name = "-".join(["witness", *key, str(witnessed[key])])
-            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r"}  # fmt: skip
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r", "response": "an answer"}  # fmt: skip
             record = {"id": name, "agent": {"name": "witness", "config": {}}, "task": {"data": {"task_id": task.data.task_id}}, "ok": True, "nodes": [], "info": {"observations": [], "evaluation": evaluation}}  # fmt: skip
             return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id=name, record=record)  # fmt: skip
 
@@ -2202,7 +2203,7 @@ async def check_author(root):
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
     summary = store.summary("complete")
-    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1, "witness_right": 1.0, "level_fit": 3, "level": 3, "band": [0.0, 0.5], "in_band": True, "rounds": 0, "kept": False}, (
+    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1, "witness_right": 1.0, "level_fit": 3, "level": 3, "band": [0.0, 0.5], "in_band": True, "rounds": 0, "kept": False, "unanswered": 0}, (
         "difficulty is the right-answer rate, the strict rate reported beside it; a try that crashed twice is counted, "
         "and left out of the rates; the band it landed in"
     )  # fmt: skip
@@ -2244,7 +2245,7 @@ async def check_author(root):
             Slow.peak = max(Slow.peak, Slow.active)
             await asyncio.sleep(0.01)
             Slow.active -= 1
-            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r"}  # fmt: skip
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r", "response": "an answer"}  # fmt: skip
             return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id="slow")  # fmt: skip
 
     await env.solves(SimpleNamespace(solver=Slow()), [t0, t1], "final-02", 3)
@@ -2272,6 +2273,11 @@ async def check_author(root):
     fails(store.publish)  # a task resting on a fact no message states
     store.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
     store.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
+    # A try that finished without an answer, an empty last message or the turn cap mid-search, is wrong and counted.
+    graded = {"task_id": t1, "correct": False, "semantic_correctness": 0.0, "response": "an answer"}
+    ends = [("an answer", "agent_completed"), ("", "agent_completed"), ("let me look further", "max_turns")]
+    silent = [SolverTask.outcome(SimpleNamespace(ok=True, info={"evaluation": graded | {"response": r}}, stop_condition=stop))["unanswered"] for r, stop in ends]  # fmt: skip
+    assert silent == [False, True, True] and rates([{"correct": False, "semantic_correctness": 0.0, "unanswered": u} for u in silent])["unanswered"] == 2  # fmt: skip
     # A try as the author reads it: the call that first showed the evidence, how many showed a decoy, the route up to
     # the evidence and then its last three calls, and a short answer.
     read = lambda tool, ts=None: {"tool": tool, "arguments": {}, "output": {"items": [{"channel": "C1", "ts": ts}] if ts else []}}  # noqa: E731  # fmt: skip
@@ -2328,6 +2334,18 @@ async def check_author(root):
     assert run_label(Path("/x/data/v7-01/software")) == "worldgen-v7-01-software", (
         "a run's sandboxes are findable"
     )
+    # A task above level 1 whose tries are mixed gets more of them; one right every time does not.
+    env.settings = settings.model_copy(
+        update={"author": settings.author.model_copy(update={"extra_tries": 2})}
+    )
+    store.state.active_attempt = "final-02"
+    always.discard(t3)  # t3, level 1, now mixed too: level 1 gets no more tries
+    runs, _ = await env.judge_tasks(
+        agents, [t0, t1, t3], {t0: "rewritten", t1: "rewritten", t3: "rewritten"}, "final-02", 3
+    )
+    assert [len(runs[t]["results"]) for t in (t0, t1, t3)] == [5, 3, 3], {
+        t: len(r["results"]) for t, r in runs.items()
+    }
     store.close()
     retried = SimpleNamespace(
         ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]

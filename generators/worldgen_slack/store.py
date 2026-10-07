@@ -206,7 +206,7 @@ class Store:
         bands, levels = self.settings.get("tasks", {}).get("bands"), dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())  # fmt: skip
         rates, in_band = {}, {}
         for task, review in self.state.task_reviews.items():
-            rates[task] = {k: review.get(k) for k in ("right_rate", "strict_rate", "coverage", "tries", "crashed", "witness_right", "level_fit")}  # fmt: skip
+            rates[task] = {k: review.get(k) for k in ("right_rate", "strict_rate", "coverage", "tries", "crashed", "unanswered", "witness_right", "level_fit")}  # fmt: skip
             if bands and task in levels:
                 band = bands[levels[task] - 1]
                 landed = band_move(review | {"approved": True, "band": band}) is None
@@ -238,6 +238,7 @@ class Store:
                 str(level): count for level, count in sorted(in_band.items())
             },  # level: [in its band, of]
             "crashed_solves": sum(r["crashed"] or 0 for r in rates.values()),
+            "unanswered_tries": sum(r["unanswered"] or 0 for r in rates.values()),
             "witness_tries": sum(len(w["results"]) for w in self.state.witness.values()),
             "mean_learnability": sum(4 * p * (1 - p) for p in right) / len(right) if right else None,
             "usage_by_role": usage,
@@ -299,7 +300,7 @@ class Store:
                 )
             ]
             review, env = self.state.task_reviews.get(task["id"]), self.settings.get("env", {})
-            measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "right_rate", "strict_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
+            measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "unanswered", "right_rate", "strict_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
             rows.append(
                 PublicTask(task_id=task["id"], question=task["question"], actor_id=task["actor_id"], category=task["category"], level=task["level"], answer_type=task["answer_type"], world_hash=world_hash, **measured)
             )  # fmt: skip
