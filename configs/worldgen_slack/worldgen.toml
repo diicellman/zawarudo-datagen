@@ -59,13 +59,14 @@ styles = [
 # both. Every task is written on the finished world.
 # `concepts`, one list per level, are concrete things a task of that level requires; the seed draws one per slot
 # (DataDesigner's complexity -> concept subcategories). `needs`, one table per level, is what code checks a task for
-# when it is written: `rank`, its evidence's best search rank for the question's own words (evidence they never find
-# passes); `depth`, how many newer top-level messages (and earlier replies in its thread) it sits under, as a share of
-# the busiest channel the asker can read, so it scales with the world; `channels`,
-# the channels its facts are first stated in; `relations`, supersedes and after links among its facts; `decoys`, decoy
-# facts on their subjects the asker can read; `named`, at most how many of its evidence's channel names and
-# identifiers (words with digits, as PWSQL-03) the question names. S1's questions named their channels and IDs, and
-# search found every ledger task's evidence first.
+# when it is written: `channels`, the channels its facts are first stated in; `relations`, supersedes and after links
+# among its facts; `decoys`, its near-misses: decoys, or values whose change the asker cannot see, on its answer's
+# subject and attribute, that the asker can read and nothing in their sight retracts; `hidden`, its answer stated where
+# it is harder to see than its near-misses (a thread reply, a DM, a later day); `named`, at most how many of its
+# evidence's channel names and identifiers (words with digits, as PWSQL-03) the question names. Taxonomy v3
+# (2026-10-07): S2's medium tries came from unretracted near-misses beside a less visible truth, while GLM followed
+# every correction made in plain sight; search rank and depth left the needs (the author met rank by rewording, and
+# every channel of a 400-message world reads in one page), and are still measured.
 [taxonomy.lookup]
 gold = "sql"
 answer_types = ["text", "set", "number"]
@@ -73,16 +74,15 @@ definition = "Read one thing off the workspace's structure: who posted, where, w
 levels = [
   "one message or directory entry",
   "a reply inside a thread, or a read narrowed by a filter",
-  "something buried in a long channel that takes several pages to read",
+  "one of many look-alike routine posts, told apart by one detail",
   "a message the question describes only by what surrounds it (who answered, what came just before or after), among near-identical messages in a busy channel",
 ]
 concepts = [
   ["who posted a message the question describes", "which channel holds a message the question describes", "a person's title or team in the directory"],
   ["who replied in the thread of a message the question describes", "a message narrowed down by its author and its day", "who reacted to a message the question describes"],
-  ["a message several pages back in a busy channel", "the earliest or the latest of many similar messages", "a reply deep in a long thread"],
+  ["one of several look-alike routine posts, told apart by its author, day or a number", "the earliest or the latest of many similar messages", "a reply deep in a long thread"],
   ["the message just before or after a described one in a busy channel", "one of several near-identical messages, told apart by who reacted or replied", "a reply deep in a long thread, described by the discussion around it"],
 ]
-needs = [{}, {}, {depth = 0.3}, {depth = 0.5, rank = 10}]
 
 [taxonomy.search]
 gold = "ledger"
@@ -100,7 +100,7 @@ concepts = [
   ["a fact the question names only indirectly", "a fact among near-miss messages about the same subject", "a fact whose keyword also appears in unrelated chatter"],
   ["a fact stated with a synonym or nickname the question does not use", "a fact stated only as a reply in a thread about something else", "a fact only a direct message states, with public near-misses"],
 ]
-needs = [{}, {rank = 2}, {rank = 5, decoys = 1, named = 0}, {rank = 15, decoys = 2, named = 0}]
+needs = [{}, {}, {decoys = 1, named = 0}, {decoys = 2, hidden = true, named = 0}]
 
 [taxonomy.semantic]
 gold = "ledger"
@@ -115,10 +115,10 @@ levels = [
 concepts = [
   ["a value superseded once by a later message"],
   ["a value superseded twice", "a value the later messages refer to by another name", "a value corrected in a reply thread"],
-  ["a value split across messages in two channels", "a credible decoy that is never explicitly retracted", "a contradiction settled by the more authoritative person"],
+  ["a value split across messages in two channels", "a credible decoy that is never explicitly retracted", "a contradiction settled by the more authoritative person", "a change only a later thread reply under the original post states"],
   ["a value changed three times across channels, the last change a thread reply", "a value whose latest change comes from someone other than its owner, in another channel", "a decision reversed, then partly restored by someone with more authority"],
 ]
-needs = [{relations = 1}, {relations = 1}, {relations = 1, channels = 2, decoys = 1}, {relations = 2, channels = 3, decoys = 1, named = 0}]
+needs = [{relations = 1}, {relations = 1}, {relations = 1, channels = 2, decoys = 1, hidden = true}, {relations = 2, channels = 3, decoys = 1, hidden = true, named = 0}]
 
 [taxonomy.join]
 gold = "sql"
@@ -153,7 +153,7 @@ concepts = [
   ["which members of a channel stayed silent within a window after the message stating a fact"],
   ["who reacted to the message stating a fact, found among near-identical announcements, and also posted in another channel that day", "who replied to the correction of a fact but not to its first statement"],
 ]
-needs = [{}, {}, {rank = 3}, {rank = 10, decoys = 1}]
+needs = [{}, {}, {decoys = 1}, {decoys = 1, hidden = true}]
 
 [taxonomy.robustness]
 gold = "sql"
@@ -168,9 +168,10 @@ levels = [
 concepts = [
   ["a project, person or decision that never appears in the workspace"],
   ["a decision discussed only in a private channel the asker is not in", "a detail settled only in a direct message between others"],
-  ["a decision asked about as final that was proposed and then reversed", "a date asked about after it was moved", "work asked about as owned by someone who handed it off"],
+  ["a decision asked about as final that was proposed and then reversed", "a date asked about after it was moved", "work asked about as owned by someone who handed it off", "a value asked about that an upstream change made uncertain, with no replacement stated"],
   ["a namesake project whose details are public while the one asked about is private", "an outdated public plan a private decision replaced", "a figure discussed publicly as an estimate and settled only in a private channel"],
 ]
+needs = [{}, {}, {}, {decoys = 1}]
 
 # One model per agent. Unset fields (harness, runtime, sampling) keep the role defaults in config.py.
 [env.timeout]

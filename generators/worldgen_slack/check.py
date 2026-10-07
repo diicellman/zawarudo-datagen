@@ -854,6 +854,8 @@ def check_contracts(root):
     assert "t1" in recorded(directory, slot("lookup", 1)), (
         "a task with no facts meets a level that needs none"
     )
+    nobody = task(category="robustness", answer_type="refusal", sql="SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", facts=())  # fmt: skip
+    assert "t1" in recorded(nobody, slot("robustness", 1)), "nor one whose level's needs are empty"
     with world.trial() as copy:
         record_task(copy, search, settings, found)
     assert json.loads(world.db.execute("SELECT gold_json FROM tasks").fetchone()[0]) == [
@@ -872,13 +874,29 @@ def check_contracts(root):
     # f4 after and over f3; a decoy counts where the task's actor can read it.
     nine = slot("semantic", 3, id="t9")
 
-    def decoy(channel, id="f5"):
-        return lambda copy: copy.insert("facts", [dict(id=id, storyline="s2", subject="Audit", attribute="owner", value="Ines", channel_id=channel, author_id=a, day=3, summary="s", is_decoy=1)])  # fmt: skip
+    def decoy(channel, id="f5", day=3, attribute="owner"):
+        return lambda copy: copy.insert("facts", [dict(id=id, storyline="s2", subject="Audit", attribute=attribute, value="Ines", channel_id=channel, author_id=a, day=day, summary="s", is_decoy=1)])  # fmt: skip
+
+    def retracted(channel, by="f4"):  # a decoy that a fact stated in `by`'s channel supersedes
+        def setup(copy):
+            decoy(channel)(copy)
+            copy.insert("fact_relations", [dict(src_fact=by, dst_fact="f5", kind="supersedes")])
+
+        return setup
+
+    def corrected_unseen(
+        copy,
+    ):  # the decoy's correction, another decoy, is only in #leads, which c cannot read
+        decoy(ops)(copy)
+        decoy(leads, id="f6")(copy)
+        copy.insert("fact_relations", [dict(src_fact="f6", dst_fact="f5", kind="supersedes")])
 
     for facts, actor, needs, setup, refusal in (
         (["f1", "f4"], a, {"channels": 2}, None, "first stated in at least 2 channels (they are in 1)"),
         (["f3", "f4"], a, {"relations": 3}, None, "at least 3 supersedes or after relations among its facts (it has 2)"),
-        (["f2", "f4"], c, {"decoys": 1}, decoy(leads), "at least 1 decoy facts on its facts' subjects, where its actor can read them (it has 0)"),  # c is not in #leads
+        (["f2", "f4"], c, {"decoys": 1}, decoy(leads), "at least 1 near-misses"),  # c is not in #leads
+        (["f2", "f4"], c, {"decoys": 1}, retracted(ops), "at least 1 near-misses"),  # f4 corrects it in plain sight
+        (["f2", "f4"], c, {"decoys": 1}, decoy(ops, attribute="budget"), "at least 1 near-misses"),  # another attribute
     ):  # fmt: skip
         asked = settled(facts).model_copy(update={"actor_id": actor})
         refused(refusal, recorded, asked, nine, needing(settings, "semantic", 3, **needs), setup or (lambda copy: None))  # fmt: skip
@@ -886,6 +904,9 @@ def check_contracts(root):
     assert "t9" in recorded(settled(["f3", "f4"]), nine, needing(settings, "semantic", 3, relations=2))
     asked = settled(["f2", "f4"]).model_copy(update={"actor_id": c})
     assert "t9" in recorded(asked, nine, needing(settings, "semantic", 3, decoys=1), decoy(ops))
+    assert "t9" in recorded(asked, nine, needing(settings, "semantic", 3, decoys=1), corrected_unseen), (
+        "a near-miss whose correction its actor cannot see still misleads"
+    )
     hybrid = dict(category="hybrid", level=1, actor_id=c, answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages m, facts f WHERE f.id = 'f1'")  # fmt: skip
     unread = Task(
         id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
@@ -1055,7 +1076,8 @@ def check_clock(root):
         pass
     late = [f.model_copy(update={"day": 9}) for f in [*facts, *extra]]
     assert front_loaded(world, settings, late, 9) is None, "a third that is over is not held to its share"
-    # The board: each ledger and hybrid slot's planned facts, as many as its level needs; checked on every plan.
+    # The board: the planned facts of each slot that rests on them (ledger and hybrid, and those whose level needs
+    # something of their facts), as many as its level needs; checked on every plan.
     board_slots = [Slot(id=i, category=c, level=n, concept="a concept", style="a style") for i, c, n in (("t1", "semantic", 3), ("t3", "search", 1), ("t2", "lookup", 1))]  # fmt: skip
     spread = needing(settings, "semantic", 3, channels=2)
     entries = lambda *pairs: [BoardEntry(slot=slot, facts=ids) for slot, ids in pairs]  # noqa: E731
@@ -1065,12 +1087,27 @@ def check_clock(root):
             record_plan(copy, document, spread, board_slots)
 
     for expected, board in (
-        ("each ledger and hybrid slot will rest on; ['t1', 't3'] have none", []),
-        ("the ledger and hybrid slots of now.md; ['t2'] are not", entries(("t1", ["f3", "f4"]), ("t3", ["f4"]), ("t2", ["f1"]))),
+        ("each slot that rests on planned facts will rest on; ['t1', 't3'] have none", []),
+        ("the slots of now.md that rest on planned facts; ['t2'] do not", entries(("t1", ["f3", "f4"]), ("t3", ["f4"]), ("t2", ["f1"]))),
         ("the board names facts of the plan; ['f9'] are not", entries(("t1", ["f3", "f9"]), ("t3", ["f4"]))),
         ("the board's t1 (level-3 semantic) needs its facts first stated in at least 2 channels (they are in 1)", entries(("t1", ["f1", "f4"]), ("t3", ["f4"]))),
     ):  # fmt: skip
         refused(expected, boarded, plan(board=board))
+    # A robustness level-4 slot rests on planned facts too: a near-miss its asker will see, the truth out of sight.
+    robust = [
+        *board_slots,
+        Slot(id="t4", category="robustness", level=4, concept="a concept", style="a style"),
+    ]
+    near = PlanFact(id="f5", storyline="s2", subject="Audit", attribute="owner", value="Ines", channel_id=ops, author_id=a, day=3, decoy=True, summary="s")  # fmt: skip
+
+    def boarded_robust(document):
+        with world.trial() as copy:
+            record_plan(copy, document, needing(spread, "robustness", 4, decoys=1), robust)
+
+    usual = entries(("t1", ["f3", "f4"]), ("t3", ["f4"]))
+    refused("['t4'] have none", boarded_robust, plan(board=usual))
+    refused("the board's t4 (level-4 robustness) needs at least 1 near-misses", boarded_robust, plan(board=[*usual, *entries(("t4", ["f4"]))]))  # fmt: skip
+    boarded_robust(plan(facts=[*facts, near], board=[*usual, *entries(("t4", ["f4", "f5"]))]))
     try:  # facts may be shared; a replan's board replaces the last; a fact the board rests on stays planned
         with world.trial() as copy:
             record_plan(copy, plan(board=entries(("t1", ["f3", "f4"]), ("t3", ["f4"]))), spread, board_slots)
@@ -1086,8 +1123,9 @@ def check_clock(root):
     slots = [Slot(id="t1", category="semantic", level=3, concept="a concept", style="a style"), Slot(id="t2", category="lookup", level=1, concept="a concept", style="a style")]  # fmt: skip
     owner = Task(id="t1", category="semantic", level=3, actor_id=a, question="Who owns the audit after the dry run?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f4'", facts=["f3", "f4"])  # fmt: skip
 
-    def tasked(task, cfg=None):
+    def tasked(task, cfg=None, setup=lambda copy: None):
         with world.trial() as copy:
+            setup(copy)
             return add_task(copy, task, cfg or settings, slots)
 
     refused("once the calendar is closed", tasked, owner)
@@ -1283,20 +1321,21 @@ def check_clock(root):
     assert any("3 of today's 4 messages are thread replies" in e for e in measured), measured
     refused("t1 is a semantic level 3 task", tasked, owner.model_copy(update={"level": 2}))
     refused("one of the slots you write now: ['t1', 't2']", tasked, owner.model_copy(update={"id": "t9"}))
-    result = tasked(owner)
-    assert result["gold"] == [{"answer": "Owen"}] and result["bm25_rank"] and result["channels"] == 2, result
-    # The needs its messages give: its evidence's search rank, the messages above it, what the question names.
     level3 = lambda **needs: needing(settings, "semantic", 3, **needs)  # noqa: E731
+    result = tasked(owner, level3(channels=2, relations=1))
+    assert result["gold"] == [{"answer": "Owen"}] and result["bm25_rank"] and result["channels"] == 2, result
+    assert "depth_share" in result and result["hidden"] is False, "rank and depth are measured, and reported"
+    # The needs its messages give: where its answer is stated beside its near-misses, what the question names.
     refused("first stated in at least 2 channels", tasked, owner.model_copy(update={"facts": ["f1", "f4"]}), level3(channels=2))  # fmt: skip  # both in #ops
-    refused(f"for the question's own words (it is hit {result['bm25_rank']})", tasked, owner, level3(rank=result["bm25_rank"] + 1))  # fmt: skip
-    refused(f"(it is under {result['depth_share']:.0%}, {result['depth']} messages)", tasked, owner, level3(depth=result["depth_share"] + 0.01))  # fmt: skip
+    refused(
+        "its answer stated where it is harder to see", tasked, owner, level3(hidden=True)
+    )  # f4 is top-level in #ops
+    earlier = lambda copy: copy.insert("facts", [dict(id="f8", storyline="s2", subject="Audit", attribute="owner", value="Ines", channel_id=ops, author_id=a, day=2, summary="s", is_decoy=1)])  # noqa: E731  # fmt: skip
+    assert tasked(owner, level3(decoys=1, hidden=True), earlier)["hidden"], "stated after every near-miss"
     leads_named = owner.model_copy(update={"question": "Who owns the audit after the dry run in #leads?"})
     refused("naming at most 0 of its evidence's channels and identifiers (it names 1)", tasked, leads_named, level3(named=0))  # fmt: skip
-    assert (
-        tasked(leads_named, level3(named=1, rank=result["bm25_rank"], depth=result["depth_share"]))["named"]
-        == 1
-    )
-    tasked(owner)
+    assert tasked(leads_named, level3(named=1))["named"] == 1
+    tasked(owner, level3())
     replier = Task(id="t2", category="lookup", level=1, actor_id=c, question="Who said thanks in #ops?", answer_type="text", gold_sql="SELECT u.real_name AS answer FROM messages m JOIN users u ON u.id = m.user_id WHERE m.text = 'thanks'")  # fmt: skip
     tasked(replier.model_copy(update={"question": "Who said thanks?"}))
     tasked(replier)  # the slot's task is replaced

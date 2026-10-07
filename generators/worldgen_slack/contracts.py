@@ -624,16 +624,14 @@ def unmet(needs, measured: dict) -> list[str]:
     """Each of a level's needs that a task's measures fall short of, with what was measured; a need whose measure is
     not given (a board entry has only its facts') is not checked."""
     out = []
-    if (rank := measured.get("bm25_rank")) is not None and rank < needs.rank:
-        out.append(f"its evidence below the first {needs.rank - 1} search hits for the question's own words (it is hit {rank})")  # fmt: skip
-    if "depth_share" in measured and measured["depth_share"] < needs.depth:
-        out.append(f"its evidence under at least {needs.depth:.0%} as many messages as the busiest channel its actor reads holds, newer in its channel or earlier in its thread (it is under {measured['depth_share']:.0%}, {measured['depth']} messages)")  # fmt: skip
     if measured["channels"] < needs.channels:
         out.append(f"its facts first stated in at least {needs.channels} channels (they are in {measured['channels']})")  # fmt: skip
     if measured["relations"] < needs.relations:
         out.append(f"at least {needs.relations} supersedes or after relations among its facts (it has {measured['relations']})")  # fmt: skip
     if measured["decoys"] < needs.decoys:
-        out.append(f"at least {needs.decoys} decoy facts on its facts' subjects, where its actor can read them (it has {measured['decoys']})")  # fmt: skip
+        out.append(f"at least {needs.decoys} near-misses: decoys, or values whose change its actor cannot see, on its answer's subject and attribute, that its actor can read and no change it can see retracts (it has {measured['decoys']})")  # fmt: skip
+    if needs.hidden and measured.get("hidden") is False:
+        out.append("its answer stated where it is harder to see than its near-misses: in a thread reply, in a DM, or on a later day than every near-miss")  # fmt: skip
     if needs.named is not None and measured.get("named", 0) > needs.named:
         out.append(f"a question naming at most {needs.named} of its evidence's channels and identifiers (it names {measured['named']})")  # fmt: skip
     return out
@@ -643,16 +641,14 @@ def needs_text(needs) -> str:
     """A level's needs, as the author reads them in now.md."""
     many = lambda n, word: f"{n} {word}" + ("s" if n > 1 else "")  # noqa: E731
     out = []
-    if needs.rank > 1:
-        out.append("evidence not the question's first search hit" if needs.rank == 2 else f"evidence not among the question's first {needs.rank - 1} search hits")  # fmt: skip
-    if needs.depth:
-        out.append(f"evidence under {needs.depth:.0%} of its busiest channel's messages")
     if needs.channels:
         out.append(f"facts first stated in {many(needs.channels, 'channel')}")
     if needs.relations:
         out.append(f"{many(needs.relations, 'relation')} among its facts")
     if needs.decoys:
-        out.append(f"{many(needs.decoys, 'readable decoy')} on their subjects")
+        out.append(f"{many(needs.decoys, 'near-miss')} on its answer's subject and attribute that its actor can read, unretracted in its sight")  # fmt: skip
+    if needs.hidden:
+        out.append("its answer in a thread reply, a DM, or later than its near-misses")
     if needs.named is not None:
         out.append("a question that names none of its evidence's channels and identifiers" if needs.named == 0 else f"a question naming at most {needs.named} of its evidence's channels and identifiers")  # fmt: skip
     return "; ".join(out)
@@ -674,15 +670,71 @@ def named(world, question: str, evidence: list[int]) -> int:
 
 
 def fact_measures(world, ids: list[str], actor: str | None = None) -> dict:
-    """What a task's facts give it: the channels they are first stated in, the relations among them, and the decoys
-    on their subjects (that `actor` can read, given one)."""
+    """What a task's facts give it: the channels they are first stated in, the relations among them, and its
+    near-misses (`decoys`): facts other than its answer facts (those of its facts that are no decoy and that none of
+    the others supersedes) on an answer fact's subject and attribute, that `actor` can read, and that no fact `actor`
+    can see supersedes: an unretracted decoy, or a value whose change is out of the actor's sight. A near-miss the
+    world corrects in plain sight is no near-miss: S2's solver followed every such chain. Planned before any actor is
+    chosen, a near-miss counts wherever it is stated, and a change counts as seen when it is public."""
     marks = ", ".join("?" * len(ids))
     channels = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", ids).fetchone()[0]  # fmt: skip
     relations = world.db.execute(f"SELECT COUNT(*) FROM fact_relations WHERE src_fact IN ({marks}) AND dst_fact IN ({marks})", [*ids, *ids]).fetchone()[0]  # fmt: skip
-    decoys = world.db.execute(f"SELECT channel_id FROM facts WHERE is_decoy = 1 AND lower(trim(subject)) IN (SELECT lower(trim(subject)) FROM facts WHERE id IN ({marks}))", ids).fetchall()  # fmt: skip
-    if actor:
-        decoys = [d for d in decoys if readable(world, actor, d[0])]
-    return {"channels": channels, "relations": relations, "decoys": len(decoys)}
+    return {"channels": channels, "relations": relations, "decoys": len(near_misses(world, ids, actor))}
+
+
+def near_misses(world, ids: list[str], actor: str | None = None) -> list[str]:
+    """The near-misses of a task resting on facts `ids` (`fact_measures`), as fact ids."""
+    marks = ", ".join("?" * len(ids))
+    answers = world.db.execute(
+        f"""SELECT id, lower(trim(subject)) AS subject, lower(trim(attribute)) AS attribute FROM facts
+        WHERE id IN ({marks}) AND is_decoy = 0 AND id NOT IN (
+          SELECT dst_fact FROM fact_relations WHERE kind = 'supersedes' AND src_fact IN ({marks}))""",
+        [*ids, *ids],
+    ).fetchall()
+
+    def places(fact: str) -> set[str]:  # where a fact is stated, or planned to be first stated
+        stated = {r[0] for r in world.db.execute("SELECT DISTINCT m.channel_id FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?", (fact,))}  # fmt: skip
+        return stated or {
+            world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()[0]
+        }
+
+    def public(channel: str) -> bool:
+        return (
+            world.db.execute("SELECT type FROM channels WHERE id = ?", (channel,)).fetchone()[0] == "public"
+        )
+
+    reads = (lambda c: readable(world, actor, c)) if actor else (lambda c: True)
+    sees = (lambda c: readable(world, actor, c)) if actor else public
+    out = []
+    for answer in answers:
+        for (fact,) in world.db.execute(
+            "SELECT id FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ? ORDER BY id",
+            (answer["subject"], answer["attribute"]),
+        ):
+            if fact in {a["id"] for a in answers} or fact in out or not any(map(reads, places(fact))):
+                continue
+            changes = [r[0] for r in world.db.execute("SELECT src_fact FROM fact_relations WHERE kind = 'supersedes' AND dst_fact = ?", (fact,))]  # fmt: skip
+            if not any(sees(c) for change in changes for c in places(change)):
+                out.append(fact)
+    return out
+
+
+def hidden(world, ids: list[str], actor: str) -> bool | None:
+    """Whether a task's answer is stated where it is harder to see than its near-misses: an anchor of an answer fact
+    in a thread reply or a direct conversation, or on a later day than every near-miss is first stated. None for a
+    task with no answer fact stated."""
+    answers = [f for f in ids if f not in (misses := near_misses(world, ids, actor))]
+    marks = ", ".join("?" * len(answers))
+    anchors = world.db.execute(
+        f"""SELECT m.parent_id, c.type, f.day FROM evidence e JOIN messages m ON m.id = e.message_id
+        JOIN channels c ON c.id = m.channel_id JOIN facts f ON f.id = e.fact_id
+        WHERE e.role = 'anchor' AND e.fact_id IN ({marks}) AND f.is_decoy = 0""",
+        answers,
+    ).fetchall()
+    if not anchors:
+        return None
+    last = max((world.db.execute("SELECT day FROM facts WHERE id = ?", (f,)).fetchone()[0] for f in misses), default=None)  # fmt: skip
+    return any(a["parent_id"] is not None or a["type"] in ("im", "mpim") or (last is not None and a["day"] > last) for a in anchors)  # fmt: skip
 
 
 def measures(world, task_id: str, rows: list[dict], tables) -> dict:
@@ -692,11 +744,12 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
     give it (`fact_measures`)."""
     task = world.db.execute("SELECT actor_id, question FROM tasks WHERE id = ?", (task_id,)).fetchone()
     evidence = [r["message_id"] for r in rows if r.get("message_id") is not None]
+    # Its own evidence: a decoy it lists among its facts is a near-miss to search past, not evidence to find.
     evidence += [
         r[0]
         for r in world.db.execute(
             """SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id
-            WHERE tf.task_id = ? AND e.role = 'anchor'""",
+            JOIN facts f ON f.id = tf.fact_id WHERE tf.task_id = ? AND e.role = 'anchor' AND f.is_decoy = 0""",
             (task_id,),
         )
     ]
@@ -722,14 +775,18 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
     ]
     facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
     (busiest,) = reader.db.execute("SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM messages WHERE parent_id IS NULL GROUP BY channel_id)").fetchone()  # fmt: skip
-    return {
-        "evidence_pages": max(pages, default=None),
-        "depth": max(under, default=0),
-        "depth_share": round(max(under, default=0) / busiest, 3) if busiest else 0.0,
-        "tables": sorted(tables),
-        "bm25_rank": reader.rank(task["question"], evidence),
-        "named": named(world, task["question"], list(dict.fromkeys(evidence))),
-    } | fact_measures(world, facts, task["actor_id"])
+    return (
+        {
+            "evidence_pages": max(pages, default=None),
+            "depth": max(under, default=0),
+            "depth_share": round(max(under, default=0) / busiest, 3) if busiest else 0.0,
+            "tables": sorted(tables),
+            "bm25_rank": reader.rank(task["question"], evidence),
+            "named": named(world, task["question"], list(dict.fromkeys(evidence))),
+        }
+        | fact_measures(world, facts, task["actor_id"])
+        | ({"hidden": hidden(world, facts, task["actor_id"])} if facts else {})
+    )
 
 
 def band_move(probe: dict) -> str | None:

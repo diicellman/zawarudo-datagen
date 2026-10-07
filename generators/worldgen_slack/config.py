@@ -115,19 +115,23 @@ class ActivityConfig(Section):
 
 
 class Needs(Section):
-    """What code checks a task of one level for when it is written: its evidence's best search rank for the
-    question's own words (evidence the words never find passes); how deep its evidence sits (newer top-level messages
-    in its channel, and earlier replies in its thread), as a share of the busiest channel its actor can read, so the
-    need scales with the world; the channels its facts are first stated in; the relations
-    among its facts; the decoys its actor can read on their subjects; and at most how many of its evidence's channel
-    names and identifiers (words with digits, as PWSQL-03) the question names."""
+    """What code checks a task of one level for when it is written: the channels its facts are first stated in; the
+    relations among its facts; its near-misses (decoys, or values whose change its actor cannot see, on its answer's
+    subject and attribute, readable and unretracted in its actor's sight: `contracts.fact_measures`); whether its
+    answer is stated where it is harder to see than they are (`hidden`: a thread reply, a DM, or a later day); and at
+    most how many of its evidence's channel names and identifiers (words with digits, as PWSQL-03) the question names.
+    Search rank and depth are measured and reported, not needed: S2's author met a rank need by rewording, and at a
+    world's size every channel reads in one page."""
 
-    rank: int = Field(default=1, ge=1)
-    depth: float = Field(default=0, ge=0, lt=1)
     channels: int = Field(default=0, ge=0)
     relations: int = Field(default=0, ge=0)
     decoys: int = Field(default=0, ge=0)
+    hidden: bool = False
     named: int | None = Field(default=None, ge=0)
+
+    def facts(self) -> bool:
+        """Whether a level needs anything of its facts, so its slots are planned on the board before day 1."""
+        return bool(self.channels or self.relations or self.decoys or self.hidden)
 
 
 class Category(Section):

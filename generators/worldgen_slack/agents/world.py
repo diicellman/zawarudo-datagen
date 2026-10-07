@@ -29,6 +29,7 @@ from ..chronicle import (
     bounds,
     drift,
     part_of,
+    planned_on_board,
     post,
     posted,
     present,
@@ -139,8 +140,9 @@ Voice
 Tasks (after the last day, world_add_task)
 - One task for each slot of now.md, with the slot's id: a question an actor asks, as hard as its level and concept
   say, in its style. Nothing can be posted after the last day, so plan from day 1 what each slot will rest on (the
-  plan's board, checked against each level's needs): facts in several channels, decoys, buried or split evidence,
-  private conversations.
+  plan's board, checked against each level's needs): facts in several channels; near-misses, a teammate's confident
+  wrong claim, a stale reading, a plan changed out of the asker's sight, that nothing in their sight retracts; the
+  answer where it is harder to see than its near-misses (a thread reply, a DM, a later day); private conversations.
 """
     + GOLD_SQL
     + """- world_add_task checks the task, refuses it below its level's needs (now.md lists each slot's), and returns its
@@ -294,7 +296,13 @@ def now_page(world, settings, context: dict) -> str:
             f"- {slot['id']}: {slot['category']} level {level}: {spec.levels[level - 1]}; concept: {slot['concept']}; "
             f"style: {slot['style']}"
             + (f"; needs: {needs}" if needs else "")
-            + (f"; the board rests it on {', '.join(board[slot['id']])}" if slot["id"] in board else "")
+            + (
+                f"; the board rests it on {', '.join(board[slot['id']])}"
+                if slot["id"] in board
+                else "; for the board"
+                if planned_on_board(spec, level)
+                else ""
+            )
             + ("; written in this turn" if slot["id"] in context.get("writable", []) else "")
         )
     if notes := drift(world, context.get("cards", {})):
@@ -723,9 +731,9 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def plan(self, ledger: Plan) -> str:
-        """Plan the ledger, whole: storylines, events, facts, and the board (the facts each ledger and hybrid task slot
-        will rest on, as its level needs). Planned events and stated facts stay as they are; the rest may change.
-        Returns what the ledger now holds."""
+        """Plan the ledger, whole: storylines, events, facts, and the board (the facts each task slot now.md marks for
+        the board will rest on, as its level needs). Planned events and stated facts stay as they are; the rest may
+        change. Returns what the ledger now holds."""
 
         def act():
             self._write(lambda copy: record_plan(copy, ledger, self.settings, self.every_slot))
@@ -845,8 +853,8 @@ def plan_prompt(world, settings, feedback: str = "") -> str:
     count = settings.storylines
     return (
         f"Before day 1 ({clock(world, bounds(world, 1)[0])[:14]}): plan the ledger with world_plan: exactly {count} "
-        "storylines, their events and their facts, over the calendar in now.md, and its board: the facts each ledger "
-        "and hybrid slot in now.md will rest on, as many channels, relations and decoys as its level needs. Then write "
+        "storylines, their events and their facts, over the calendar in now.md, and its board: the facts each slot "
+        "now.md marks for the board will rest on, as many channels, relations and near-misses as its level needs. Then write "
         "/task/notes/plan.md: each storyline's arc day by day, and how each slot will be asked. End your turn when the "
         f"ledger is planned.{rejected(feedback)}"
     )

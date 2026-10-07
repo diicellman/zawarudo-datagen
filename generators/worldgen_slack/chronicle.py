@@ -407,12 +407,20 @@ def front_loaded(world, settings, facts: list, day: int) -> str | None:
     return None
 
 
+def planned_on_board(category, level: int) -> bool:
+    """Whether a slot rests on planned facts, so the board plans them before day 1: a ledger or hybrid slot, and one
+    whose level needs something of its facts (robustness level 4: a near-miss in sight, the truth out of it)."""
+    needs = category.needs[level - 1] if category.needs else None
+    return category.gold in ("ledger", "hybrid") or bool(needs and needs.facts())
+
+
 def record_plan(world, plan: Plan, settings, slots=()) -> None:
     """The ledger in time order. Storylines are fixed once planned (summaries may change); an event, once planned,
     never moves or goes; a stated fact keeps everything but its summary, while an unstated one may change or go and is
     planned for today or later. A fact about an event carries the event's moment. The board gives each ledger and
-    hybrid slot of `slots` the planned facts it will rest on, as many channels, relations and decoys as its level
-    needs: the material of a hard backward task exists before day 1, when it can still be posted."""
+    hybrid slot of `slots` the planned facts it will rest on (and each slot whose level needs something of its facts),
+    as many channels, relations and near-misses as its level needs: the material of a hard backward task exists before
+    day 1, when it can still be posted."""
     count = settings.storylines
     if len(plan.storylines) != count:
         raise ValueError(f"plan exactly {count} storylines")
@@ -457,15 +465,15 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
     planned = {f.id: f for f in plan.facts}
     if gone := sorted(stated - planned.keys()):
         raise ValueError(f"stated facts stay in the ledger: {gone}")
-    backward = {s.id: s for s in slots if settings.taxonomy[s.category].gold in ("ledger", "hybrid")}
+    backward = {s.id: s for s in slots if planned_on_board(settings.taxonomy[s.category], s.level)}
     board = {e.slot: list(dict.fromkeys(e.facts)) for e in plan.board}
     if len(board) < len(plan.board):
         raise ValueError("the board has one entry for each slot")
     if strays := sorted(board.keys() - backward.keys()):
-        raise ValueError(f"the board is for the ledger and hybrid slots of now.md; {strays} are not")
+        raise ValueError(f"the board is for the slots of now.md that rest on planned facts; {strays} do not")
     if missing := sorted(backward.keys() - board.keys()):
         raise ValueError(
-            f"the board names the facts each ledger and hybrid slot will rest on; {missing} have none"
+            f"the board names the facts each slot that rests on planned facts will rest on; {missing} have none"
         )
     if unknown := sorted({f for facts in board.values() for f in facts} - planned.keys()):
         raise ValueError(f"the board names facts of the plan; {unknown} are not")

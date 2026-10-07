@@ -12,9 +12,10 @@ holds the present (`world_meta.now_us`), and nothing is written before it.
    titles, teams, channels with members and their everyday routines. Code adds direct messages and the calendar.
 2. **Plan.** With `world_plan`, the author writes the ledger: storylines, events (a moment each, never moved once
    planned) and facts (what is stated, by whom, in which channel, on which day, about which event), and the board:
-   the facts each ledger and hybrid task slot will rest on, checked against its level's needs (channels, relations,
-   decoys), so a hard backward task's material exists while it can still be posted. It also writes
-   `/task/notes/plan.md`: the arcs per day.
+   the facts each slot that rests on planned facts (ledger and hybrid, and those whose level needs a near-miss) will
+   rest on, checked against its level's needs (channels, relations, near-misses: decoys, or values whose change the
+   asker cannot see, that nothing in their sight retracts), so a hard backward task's material exists while it can
+   still be posted. It also writes `/task/notes/plan.md`: the arcs per day.
 3. **Days.** Each calendar day is one interaction. The author reads `/task/memory` (rendered by code before every
    turn: `now.md`, the ledger, a page per person, channel, storyline and event) and its own notes, then posts the
    day's conversations in time order with `world_post` and moves on with `world_advance`. Code times every line
@@ -27,9 +28,13 @@ holds the present (`world_meta.now_us`), and nothing is written before it.
    open the author's next day, where `world_revise` rewrites a message in place.
 5. **Tasks.** After the last day, the author writes one task per slot with `world_add_task`: the seed draws
    `[tasks] per_100` slots per 100 messages over the taxonomy's cells. Its gold query is checked (T1-T7, readable
-   facts, the level's needs) and code's measures of its difficulty come back. The GLM solver tries each task
-   `[author] tries` times and the judge reviews it. A task whose share of right answers misses its level's
-   `[tasks] bands`, or that the judge does not approve, comes back to the author, for up to `task_rounds` turns.
+   facts, the level's needs, among them `hidden`: its answer stated where it is harder to see than its near-misses)
+   and code's measures of its difficulty come back. The GLM solver tries each task `[author] tries` times, and
+   `extra_tries` more when its tries are mixed above level 1; the judge reviews it. A task whose share of right
+   answers misses its level's `[tasks] bands`, or that the judge does not approve, comes back to the author with its
+   question, gold and the solver's route (where the evidence first showed, which decoys it read), for up to
+   `task_rounds` rewrites: a rewrite keeps the answer and changes the route, and a turn that changes nothing ends the
+   loop.
    The slots are written in batches of `[tasks] batch`, each in an author interaction of its own. A stronger solver,
    the witness (`[env.witness]`), tries each task GLM answers right less often than its band's floor: one it answers
    is hard, not broken. Its tries go to the judge and count in no rate.
