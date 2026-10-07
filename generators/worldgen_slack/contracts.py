@@ -602,7 +602,9 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
     }
     if normalized(task.question) in asked:
         raise ValueError(f"{task.id}: a task asks a question no other task asks")
-    for fact in task.facts:
+    for fact in (
+        task.facts if task.answer_type != "refusal" else ()
+    ):  # a refusal may rest on the truth out of sight
         row = world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()
         if row and not readable(world, task.actor_id, row[0]):
             raise ValueError(f"{task.id}: its actor cannot read {row[0]}, where {fact} is stated")
@@ -669,66 +671,84 @@ def named(world, question: str, evidence: list[int]) -> int:
     return sum(bool(re.search(rf"(?<![\w-]){re.escape(t)}(?![\w-])", question, re.IGNORECASE)) for t in terms)
 
 
-def fact_measures(world, ids: list[str], actor: str | None = None) -> dict:
+def fact_measures(world, ids: list[str], actor: str | None = None, gold=None, refusal: bool = False) -> dict:
     """What a task's facts give it: the channels they are first stated in, the relations among them, and its
-    near-misses (`decoys`): facts other than its answer facts (those of its facts that are no decoy and that none of
-    the others supersedes) on an answer fact's subject and attribute, that `actor` can read, and that no fact `actor`
-    can see supersedes: an unretracted decoy, or a value whose change is out of the actor's sight. A near-miss the
-    world corrects in plain sight is no near-miss: S2's solver followed every such chain. Planned before any actor is
-    chosen, a near-miss counts wherever it is stated, and a change counts as seen when it is public."""
+    near-misses (`decoys`): facts on an answer fact's subject and attribute, other than its answer facts, that `actor`
+    can read and that no fact `actor` can see supersedes: an unretracted decoy, or a value whose change is out of the
+    actor's sight. A near-miss the world corrects in plain sight is no near-miss: S2's solver followed every such
+    chain. Planned before any actor is chosen, a near-miss counts wherever it is stated, and a change counts as seen
+    when it is public."""
     marks = ", ".join("?" * len(ids))
     channels = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", ids).fetchone()[0]  # fmt: skip
     relations = world.db.execute(f"SELECT COUNT(*) FROM fact_relations WHERE src_fact IN ({marks}) AND dst_fact IN ({marks})", [*ids, *ids]).fetchone()[0]  # fmt: skip
-    return {"channels": channels, "relations": relations, "decoys": len(near_misses(world, ids, actor))}
+    answers = answer_facts(world, ids, actor, gold, refusal)
+    return {"channels": channels, "relations": relations, "decoys": len(near_misses(world, answers, actor))}
 
 
-def near_misses(world, ids: list[str], actor: str | None = None) -> list[str]:
-    """The near-misses of a task resting on facts `ids` (`fact_measures`), as fact ids."""
+def places(world, fact: str) -> set[str]:
+    """Where a fact is stated, or, before it is, the channel it is planned to be first stated in."""
+    stated = {r[0] for r in world.db.execute("SELECT DISTINCT m.channel_id FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?", (fact,))}  # fmt: skip
+    return stated or {world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()[0]}
+
+
+def answer_facts(
+    world, ids: list[str], actor: str | None = None, gold=None, refusal: bool = False
+) -> list[str]:
+    """Which of a task's facts it answers with: those its gold answers are the values of; for a refusal, those out of
+    its actor's sight (the truth it cannot see); else, or when none is, those that are no decoy and that no fact
+    supersedes; and for a task about an earlier state, its facts that are no decoy (a later value is its near-miss)."""
     marks = ", ".join("?" * len(ids))
-    answers = world.db.execute(
-        f"""SELECT id, lower(trim(subject)) AS subject, lower(trim(attribute)) AS attribute FROM facts
-        WHERE id IN ({marks}) AND is_decoy = 0 AND id NOT IN (
-          SELECT dst_fact FROM fact_relations WHERE kind = 'supersedes' AND src_fact IN ({marks}))""",
-        [*ids, *ids],
-    ).fetchall()
+    values = {str(v).strip().casefold() for v in gold or ()}
+    if refusal and actor:
+        found = [f for f in ids if not any(readable(world, actor, c) for c in places(world, f))]
+    else:
+        found = [f for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", ids) if v.strip().casefold() in values]  # fmt: skip
+    current = f"SELECT id FROM facts WHERE id IN ({marks}) AND is_decoy = 0 AND id NOT IN (SELECT dst_fact FROM fact_relations WHERE kind = 'supersedes')"  # fmt: skip
+    earlier = f"SELECT id FROM facts WHERE id IN ({marks}) AND is_decoy = 0"
+    return (
+        found
+        or [f for (f,) in world.db.execute(current, ids)]
+        or [f for (f,) in world.db.execute(earlier, ids)]
+    )
 
-    def places(fact: str) -> set[str]:  # where a fact is stated, or planned to be first stated
-        stated = {r[0] for r in world.db.execute("SELECT DISTINCT m.channel_id FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?", (fact,))}  # fmt: skip
-        return stated or {
-            world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()[0]
-        }
 
-    def public(channel: str) -> bool:
+def near_misses(world, answers: list[str], actor: str | None = None) -> list[str]:
+    """The near-misses of a task answering with facts `answers` (`fact_measures`), as fact ids."""
+    reads = (lambda c: readable(world, actor, c)) if actor else (lambda c: True)
+
+    def sees(channel: str) -> bool:
+        if actor:
+            return readable(world, actor, channel)
         return (
             world.db.execute("SELECT type FROM channels WHERE id = ?", (channel,)).fetchone()[0] == "public"
         )
 
-    reads = (lambda c: readable(world, actor, c)) if actor else (lambda c: True)
-    sees = (lambda c: readable(world, actor, c)) if actor else public
     out = []
     for answer in answers:
+        subject, attribute = world.db.execute("SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (answer,)).fetchone()  # fmt: skip
         for (fact,) in world.db.execute(
             "SELECT id FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ? ORDER BY id",
-            (answer["subject"], answer["attribute"]),
+            (subject, attribute),
         ):
-            if fact in {a["id"] for a in answers} or fact in out or not any(map(reads, places(fact))):
+            if fact in answers or fact in out or not any(map(reads, places(world, fact))):
                 continue
             changes = [r[0] for r in world.db.execute("SELECT src_fact FROM fact_relations WHERE kind = 'supersedes' AND dst_fact = ?", (fact,))]  # fmt: skip
-            if not any(sees(c) for change in changes for c in places(change)):
+            if not any(sees(c) for change in changes for c in places(world, change)):
                 out.append(fact)
     return out
 
 
-def hidden(world, ids: list[str], actor: str) -> bool | None:
+def hidden(world, ids: list[str], actor: str, gold=None) -> bool | None:
     """Whether a task's answer is stated where it is harder to see than its near-misses: an anchor of an answer fact
     in a thread reply or a direct conversation, or on a later day than every near-miss is first stated. None for a
     task with no answer fact stated."""
-    answers = [f for f in ids if f not in (misses := near_misses(world, ids, actor))]
+    answers = answer_facts(world, ids, actor, gold)
+    misses = near_misses(world, answers, actor)
     marks = ", ".join("?" * len(answers))
     anchors = world.db.execute(
         f"""SELECT m.parent_id, c.type, f.day FROM evidence e JOIN messages m ON m.id = e.message_id
         JOIN channels c ON c.id = m.channel_id JOIN facts f ON f.id = e.fact_id
-        WHERE e.role = 'anchor' AND e.fact_id IN ({marks}) AND f.is_decoy = 0""",
+        WHERE e.role = 'anchor' AND e.fact_id IN ({marks})""",
         answers,
     ).fetchall()
     if not anchors:
@@ -742,7 +762,10 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
     messages it sits under, the tables its gold query reads, its evidence's best rank when the actor searches the
     question's own words, how many of its evidence's channels and identifiers the question names, and what its facts
     give it (`fact_measures`)."""
-    task = world.db.execute("SELECT actor_id, question FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    task = world.db.execute(
+        "SELECT actor_id, question, answer_type FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    answers, refusal = [r.get("answer") for r in rows], task["answer_type"] == "refusal"
     evidence = [r["message_id"] for r in rows if r.get("message_id") is not None]
     # Its own evidence: a decoy it lists among its facts is a near-miss to search past, not evidence to find.
     evidence += [
@@ -784,8 +807,8 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
             "bm25_rank": reader.rank(task["question"], evidence),
             "named": named(world, task["question"], list(dict.fromkeys(evidence))),
         }
-        | fact_measures(world, facts, task["actor_id"])
-        | ({"hidden": hidden(world, facts, task["actor_id"])} if facts else {})
+        | fact_measures(world, facts, task["actor_id"], answers, refusal)
+        | ({"hidden": hidden(world, facts, task["actor_id"], answers)} if facts and not refusal else {})
     )
 
 

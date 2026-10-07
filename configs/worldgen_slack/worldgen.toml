@@ -153,7 +153,7 @@ concepts = [
   ["which members of a channel stayed silent within a window after the message stating a fact"],
   ["who reacted to the message stating a fact, found among near-identical announcements, and also posted in another channel that day", "who replied to the correction of a fact but not to its first statement"],
 ]
-needs = [{}, {}, {decoys = 1}, {decoys = 1, hidden = true}]
+needs = [{}, {}, {decoys = 1}, {decoys = 1}]  # S2's hybrid L4 in band (0.25) had its near-miss on its truth's day
 
 [taxonomy.robustness]
 gold = "sql"
