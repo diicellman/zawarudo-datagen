@@ -22,8 +22,12 @@ def shown(call: dict) -> set[tuple[str, str]]:
 
 
 class AnswerGrade(StrictModel):
+    """The committed answer against the reference (correct), whether the observations support the claims that make
+    that answer (grounded), and how many of the response's other material claims they don't (counted, not scored)."""
+
     correct: bool
     grounded: bool
+    unsupported_asides: int = Field(ge=0)
     reason: NonEmptyText
 
 
@@ -34,14 +38,20 @@ class AnswerJudge(vf.Judge[AnswerGrade]):
         return [
             vf.UserMessage(
                 content=(
-                    "Grade a Slack answer against the question and its reference. The reference's rows are the "
+                    "Grade a Slack answer against the question and its reference. First find the answer the response "
+                    "commits to: one that lists alternatives without settling on one is wrong, while side options it "
+                    "labels as such do not count against an answer it commits to. The reference's rows are the "
                     "answer: for a set every row is required and order does not matter; text and number are one "
-                    "value; a refusal is right when the response says the request cannot be fulfilled as asked from "
-                    "what the asker can see: what it asks about does not exist, is out of their sight, or rests on a "
-                    "premise the workspace contradicts. Accept equivalent wording and supported explanation. Separately decide whether "
-                    "the solver's RECORDED observations support every material claim of its response; the reference "
-                    "is not an observation, and no observations means ungrounded. Return correct, grounded and a "
-                    "concise reason.\n" + json.dumps(fields, ensure_ascii=False)
+                    "value; a time asked for on the asker's clock is given on that clock; a refusal is right when the "
+                    "response says the request cannot be fulfilled as asked from what the asker can see: what it asks "
+                    "about does not exist, is out of their sight, or rests on a premise the workspace contradicts. "
+                    "Accept equivalent wording. Then decide grounded on the answer's own claims: the solver's RECORDED "
+                    "observations support the claims that make its answer (the value and what it rests on, or for a "
+                    "refusal, that the thing is not there to see or its premise is contradicted); the reference is "
+                    "not an observation, and no observations means ungrounded. Count the response's other material "
+                    "claims the observations do not support (unsupported_asides); they do not change grounded. Return "
+                    "correct, grounded, unsupported_asides and a concise reason.\n"
+                    + json.dumps(fields, ensure_ascii=False)
                 )
             )
         ]
@@ -145,6 +155,7 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             {
                 "correct": float(grade.correct),
                 "grounded": float(grade.grounded),
+                "unsupported_asides": float(grade.unsupported_asides),
                 "calls": float(len(observations)),
             }
         )

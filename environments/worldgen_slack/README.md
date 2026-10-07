@@ -1,8 +1,10 @@
 # Slack QA taskset
 
 `worldgen-slack` loads related questions against one released Slack world: a SQLite file without the answer key.
-Each task starts a fresh solver session with actor-scoped Slack tools. A native `vf.Judge` call grades correctness
-and grounding in the solver's own observations; it does not launch a judge agent.
+Each task starts a fresh solver session with actor-scoped Slack tools. A native `vf.Judge` call grades the answer the
+response commits to (one that lists alternatives without settling on one is wrong) and whether the solver's own
+observations support the claims that make it; other unsupported claims are counted (`unsupported_asides`) but cost
+nothing. It does not launch a judge agent.
 
 ```bash
 uv run eval @ configs/worldgen_slack/eval.toml -n 1 -r 2 --no-push --plain
@@ -11,11 +13,12 @@ uv run eval @ configs/worldgen_slack/eval.toml -n 1 -r 2 --no-push --plain
 Set `--env.taskset.task.release_dir` to select another generated release. Public rows and the world's hash are
 validated before execution; private answers stay host-side.
 
-A release (format `worldgen-slack.v7`) carries, with each public task, how hard it measured when it was generated:
-the solver model and its tries (`tries`, `crashed`), its share of right answers (`right_rate`, the difficulty) and
-of right and grounded ones (`strict_rate`, the reward), the share of the gold evidence its tries saw (`coverage`),
-and, for a task the solver rarely answered, a stronger witness's share of right answers (`witness`,
-`witness_right`). A curriculum can filter on them. A `worldgen-slack.v6` release still loads, without them.
+A release (format `worldgen-slack.v8`) carries, with each public task, how hard it measured when it was generated:
+the solver model and its tries (`tries`; `crashed`, and `unanswered` for those that ended without an answer), its
+share of right answers (`right_rate`, the difficulty) and of right and grounded ones (`strict_rate`, the reward), the
+share of the gold evidence its tries saw (`coverage`), and, for a task the solver rarely answered, a stronger
+witness's share of right answers (`witness`, `witness_right`). A curriculum can filter on them. `worldgen-slack.v7`
+releases (whose strict rate needed every claim grounded) and v6 releases (without rates) still load.
 
 ## The solver's tools
 

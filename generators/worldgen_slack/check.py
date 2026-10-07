@@ -30,7 +30,7 @@ from verifiers.v1.errors import SandboxError
 from verifiers.v1.mcp.launch import serve
 from worldgen_slack.dataset import PrivateAnswer, PublicTask, load_release, sha256, write_release
 from worldgen_slack.db import ANSWER_KEY, World
-from worldgen_slack.taskset import SolverTask
+from worldgen_slack.taskset import AnswerGrade, AnswerJudge, SolverTask
 from worldgen_slack.tools import SlackTools, WorldToolsConfig, file_hash, stage_world, watch_parent
 from .agents.inspection import ReviewState
 from .agents.judge import JudgeTask, review_payload
@@ -1697,8 +1697,31 @@ async def check_reviews(root):
     solve = SolverTask.create(task, root / "solver.sqlite", answer, network_policy=False)
     assert "rollback" not in solve.data.model_dump_json() + solve.config.tools.model_dump_json()
     assert solve.config.tools.db_hash == sha256(root / "solver.sqlite")
+    # The answer judge grades the answer the response commits to and grounds the claims that make it; an unsupported
+    # aside is counted, and costs nothing.
+    asks = AnswerJudge(solve.config.judge).build_messages(
+        question="q", reference={}, response="r", observations=[]
+    )
+    assert "lists alternatives without settling on one is wrong" in asks[0].content and "do not change grounded" in asks[0].content  # fmt: skip
+    assert "unsupported_asides" in AnswerGrade.model_json_schema()["required"]
+    observed = [{"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C1", "ts": answer.messages[0][1]}]}}]  # fmt: skip
+    for asides, grounded, score in ((2, True, 1.0), (0, False, 0.0)):
+        grade = AnswerGrade(correct=True, grounded=grounded, unsupported_asides=asides, reason="r")
+        trace = SimpleNamespace(info={"observations": observed}, last_reply="rollback", id="try", record_metrics=lambda m: None)  # fmt: skip
+        judged = AnswerJudge.evaluate
+        AnswerJudge.evaluate = lambda self, **fields: asyncio.sleep(0, SimpleNamespace(parsed=grade))
+        try:
+            assert await SolverTask.semantic_correctness(solve, trace) == score, (asides, grounded)
+        finally:
+            AnswerJudge.evaluate = judged
+        assert trace.info["evaluation"]["unsupported_asides"] == asides and trace.info["evaluation"]["evidence_coverage"] == 0.5  # fmt: skip
     write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})
     assert load_release(root / "release")[1:] == ([task], {"t1": answer})
+    manifest = json.loads((root / "release" / "manifest.json").read_text())
+    assert manifest["format"] == "worldgen-slack.v8"
+    (root / "release" / "manifest.json").write_text(json.dumps(manifest | {"format": "worldgen-slack.v7"}))
+    assert load_release(root / "release")[1:] == ([task], {"t1": answer}), "a v7 release still loads"
+    (root / "release" / "manifest.json").write_text(json.dumps(manifest))
     write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})  # idempotent
     fails(
         write_release,
@@ -2321,7 +2344,7 @@ async def check_author(root):
     store.publish()
     world, rows, answers = load_release(store.root / "release")
     assert len(rows) == 4 and World(world).db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    assert json.loads((store.root / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v7"
+    assert json.loads((store.root / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v8"
     assert all((r.right_rate, r.strict_rate, r.tries, r.solver) == (state.task_reviews[r.task_id]["right_rate"], state.task_reviews[r.task_id]["strict_rate"], state.task_reviews[r.task_id]["tries"], settings.env.solver.model) for r in rows), "each task's rates are published"  # fmt: skip
     assert {r.task_id: (r.witness, r.witness_right) for r in rows if r.witness} == {
         t2: (settings.env.witness.model, 1.0)

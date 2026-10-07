@@ -86,8 +86,8 @@ class PrivateAnswer(StrictModel):
 
 
 class Manifest(StrictModel):
-    format: Literal["worldgen-slack.v6", "worldgen-slack.v7"] = (
-        "worldgen-slack.v7"  # v7: tasks carry their rates
+    format: Literal["worldgen-slack.v6", "worldgen-slack.v7", "worldgen-slack.v8"] = (
+        "worldgen-slack.v8"  # v7: tasks carry their rates; v8: strict grounds the answer's claims, unanswered counted
     )
     world_hash: str
     files: dict[str, str]
