@@ -608,9 +608,15 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
     def writable(self) -> list:
         """The slots the turn at hand may write: the env sets them before each turn (a hardening turn rewrites only
         the tasks that came back), so they are read on every call, not when the interaction opened."""
-        path = Path(self.context.get("writable_file") or "")
-        ids = json.loads(path.read_text()) if path.is_file() else self.context.get("writable", [])
+        ids = self.allowed().get("ids", [])
         return [s for s in self.every_slot if s.id in ids]
+
+    def allowed(self) -> dict:
+        """What the env allows the turn at hand, read per call: the slots it may write, and the answers the tasks
+        that came back to be harder or easier keep."""
+        path = Path(self.context.get("writable_file") or "")
+        saved = json.loads(path.read_text()) if path.is_file() else {"ids": self.context.get("writable", [])}
+        return saved if isinstance(saved, dict) else {"ids": saved}
 
     def _with_state(self, fn):
         synced = super()._with_state(fn)
@@ -804,7 +810,9 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         return self._logged(
             "add_task",
             {"task": task.model_dump(mode="json")},
-            lambda: self._write(lambda copy: add_task(copy, task, self.settings, self.writable())),
+            lambda: self._write(
+                lambda copy: add_task(copy, task, self.settings, self.writable(), self.allowed().get("keep"))
+            ),
             "tasks",
         )
 

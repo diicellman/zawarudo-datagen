@@ -2124,11 +2124,21 @@ async def check_author(root):
                 asked = task.model_copy(update={"question": f"Asked again ({len(seen)}): " + task.question})
                 if slot["id"] == t3 and slot["id"] in back:
                     # Its first fix revises the message the review names, not the task: it is tried again all the
-                    # same. Its second changes nothing, and the loop ends rather than send the same tries back.
+                    # same. Its second rewrites it with another answer, which a fix may change.
                     if fixes == 1:
                         last = world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
                         await call("revise", message_id=last, text="quiet day, nothing to report")
+                    else:
+                        await call("add_task", task=asked.model_copy(update={"gold_sql": "SELECT COUNT(*) AS answer FROM messages WHERE parent_id IS NULL"}))  # fmt: skip
                 elif slot["id"] in back:  # a task that came back is rewritten, so tried again
+                    if back[slot["id"]]["move"] == "harder":  # keeping its answer: another answer is refused
+                        swapped = asked.model_copy(update={"gold_sql": "SELECT value AS answer FROM facts WHERE id = 'f3'", "facts": ["f3"]})  # fmt: skip
+                        try:
+                            await call("add_task", task=swapped)
+                            raise AssertionError("a harder rewrite changed its answer")
+                        except ValueError as error:
+                            assert "keeps its answer" in str(error), error
+                            seen.append(("answer kept", slot["id"]))
                     await call("add_task", task=asked)
                 elif (
                     slot["id"] in json.loads(tools.config.context)["writable"]
@@ -2222,16 +2232,19 @@ async def check_author(root):
     assert store.world.db.execute("SELECT text FROM messages WHERE id = ?", (second,)).fetchone()[0] == "ok, the notes come tomorrow"  # fmt: skip
     assert "rollback" in store.world.db.execute("SELECT text FROM messages WHERE id = ?", (first,)).fetchone()[0], "the evidence stays"  # fmt: skip
     # Too easy, t1 comes back for its one round; t3, which the judge does not approve, comes back after it too. The
-    # tasks in their bands never come back. A round counts what changed: t3's revised message, not its unchanged turn.
+    # tasks in their bands never come back. A round counts what changed: t3's revised message, then t3 itself.
     assert [s for s in seen if s[0] == "harden"] == [("harden", [t1], ["harder"]), ("harden", [t3], ["fix"]), ("harden", [t3], ["fix"])]  # fmt: skip
-    assert state.task_rounds == {t1: 1, t3: 1}, state.task_rounds
+    assert state.task_rounds == {t1: 1, t3: 2}, state.task_rounds
+    assert [s for s in seen if s[0] == "answer kept"] == [("answer kept", t1)], (
+        "a harder t1 keeps its answer; t3's fix need not"
+    )
     # A hardening turn rewrites only what came back: t0 (in its band) is refused in t1's turn, t2 in t3's two turns.
     assert [s for s in seen if s[0] == "kept"] == [("kept", t0), ("kept", t2), ("kept", t2)], [s for s in seen if s[0] == "kept"]  # fmt: skip
     # Two batches, each in its own interaction; the second, cut off after t2, is written again: only t3 is asked for.
     assert [s for s in seen if s[0] == "tasks"] == [("tasks", (t0, t1), (t0, t1)), ("tasks", (t2, t3), (t2, t3)), ("tasks", (t2, t3), (t3,))]  # fmt: skip
     assert state.rounds["tasks"] == 3, state.rounds
     # Each probe tries what changed; the final reviews solve only what changed since: t0, which a fix rewrote.
-    assert solved == {("tasks-01", t0): 4, ("tasks-01", t1): 6, ("tasks-03", t2): 4, ("tasks-03", t3): 6, ("final-02", t0): 3}, solved  # fmt: skip
+    assert solved == {("tasks-01", t0): 4, ("tasks-01", t1): 6, ("tasks-03", t2): 4, ("tasks-03", t3): 9, ("final-02", t0): 3}, solved  # fmt: skip
     assert set(state.solves) == {t0, t1, t2, t3}, "a rewritten task's runs are its new ones"
     assert ("review", "review-02-02", "world", True, True, False, ()) in seen
     assert ("review", "final-01", "world", False, True, True, ()) in seen, "the world issue a probe raised"
@@ -2243,9 +2256,8 @@ async def check_author(root):
         "only the changed task is reviewed again, with the issue that named it"
     )
     probed = {a: [s[6] for s in seen if s[:3] == ("review", a, "task")] for a in ("tasks-01", "tasks-03")}
-    assert probed == {"tasks-01": [(t0,), (t1,), (t1,)], "tasks-03": [(t2,), (t3,), (t3,)]}, (
-        "the judge reviews each probe's tasks, one chunk at a time; each passes on its own; a turn that changes "
-        "nothing is not probed"
+    assert probed == {"tasks-01": [(t0,), (t1,), (t1,)], "tasks-03": [(t2,), (t3,), (t3,), (t3,)]}, (
+        "the judge reviews each probe's tasks, one chunk at a time; each passes on its own"
     )  # fmt: skip
     assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [(t3,)], (
         "the final review judges only what changed or failed since its probe's review"

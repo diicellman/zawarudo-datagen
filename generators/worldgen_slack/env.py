@@ -34,7 +34,7 @@ from .agents.world import (
     plan_prompt,
     tasks_prompt,
 )
-from .chronicle import agenda_budget, bounds, close_day, posted, present, start_clock, today
+from .chronicle import agenda_budget, answer_of, bounds, close_day, posted, present, start_clock, today
 from .config import Config, PipelineConfig
 from .contracts import (
     PHASE_CRITERIA,
@@ -728,7 +728,10 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     back[t] = self.returned(t, r) | {"move": move, "tries_left": max(0, cfg.author.task_rounds - given - 1)}  # fmt: skip
             if not back or turns > cfg.author.task_rounds:
                 return
-            self.allow(back)
+            self.allow(
+                back,
+                {t: answer_of(self.world, t) for t, r in back.items() if r["move"] in ("harder", "easier")},
+            )
             named = {t: state.probes[t].get("issue_messages", []) for t in back}
             before = {t: (self.task_key(t), self.texts(named[t])) for t in back}
             tries = {f"memory/solves/{t}/{k}.json": json.dumps(record, ensure_ascii=False) for t in back for k, i in enumerate(state.solves[t]["traces"], 1) if (record := self.saved_trace(i))}  # fmt: skip
@@ -746,10 +749,11 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             if not changed:
                 return
 
-    def allow(self, ids) -> None:
-        """The slots the author's next turn may write: its memory marks them and its tools read them per call."""
+    def allow(self, ids, keep: dict | None = None) -> None:
+        """The slots the author's next turn may write, and the answers those that came back to be harder or easier
+        keep: its memory marks them and its tools read them per call."""
         self.writable = list(ids)
-        atomic_json(self.store.root / "writable.json", self.writable)
+        atomic_json(self.store.root / "writable.json", {"ids": self.writable, "keep": keep or {}})
 
     def batches(self) -> list[list[str]]:
         """The world's slots in batches of `[tasks] batch`, each written and hardened in an interaction of its own."""

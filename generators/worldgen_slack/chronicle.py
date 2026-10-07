@@ -852,10 +852,22 @@ def revise(world, message_id: int, text: str) -> dict:
     return {"message": message_id, "text": rendered}
 
 
-def add_task(world, task: Task, settings, slots: list) -> dict:
+def answer_of(world, task_id: str) -> list:
+    """What a task answers: its gold rows' answers, or, for a refusal, the facts it rests on."""
+    row = world.db.execute("SELECT answer_type, gold_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row["answer_type"] == "refusal":
+        return sorted(
+            f for (f,) in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))
+        )
+    return sorted(str(r.get("answer")) for r in json.loads(row["gold_json"]))
+
+
+def add_task(world, task: Task, settings, slots: list, keep: dict | None = None) -> dict:
     """One task for one of the slots being written, on the finished world; it replaces the slot's task, if any. Its
-    gold query is checked as every task is (T1-T7, readable facts, the level's needs). Returns its gold rows and
-    code's measures of how hard it is."""
+    gold query is checked as every task is (T1-T7, readable facts, the level's needs). A task that came back to be
+    harder or easier keeps its answer (`keep`, from the version the solver tried): a rewrite changes the route to the
+    answer, not the answer (WebShaper's expansion keeps it); a refusal keeps one of the facts it rested on. Returns
+    its gold rows and code's measures of how hard it is."""
     if today(world) is not None:
         raise ValueError("tasks are written once the calendar is closed")
     slot = next((s for s in slots if s.id == task.id), None)
@@ -863,4 +875,15 @@ def add_task(world, task: Task, settings, slots: list) -> dict:
         raise ValueError(f"a task's id is one of the slots you write now: {[s.id for s in slots]}")
     world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
     world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
-    return {"task": task.id} | record_task(world, task, settings, slot)  # every planned fact is stated by now
+    result = {"task": task.id} | record_task(
+        world, task, settings, slot
+    )  # every planned fact is stated by now
+    if keep and (was := keep.get(task.id)) is not None:
+        now = answer_of(world, task.id)
+        if (now != was) if task.answer_type != "refusal" else (was and not set(was) & set(now)):
+            raise ValueError(
+                f"{task.id} came back to be harder or easier and keeps its answer: the version the solver tried "
+                f"answers {was}, this one {now}. Change the route to that answer (lean on a near-miss, name what it "
+                "asks about by what surrounds it, add a condition), not the answer"
+            )
+    return result
