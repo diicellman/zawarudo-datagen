@@ -210,7 +210,12 @@ class Store:
             if bands and task in levels:
                 band = bands[levels[task] - 1]
                 landed = band_move(review | {"approved": True, "band": band}) is None
-                rates[task] |= {"level": levels[task], "band": band, "in_band": landed, "rounds": self.state.task_rounds.get(task, 0)}  # fmt: skip
+                spent = self.state.task_rounds.get(task, 0)
+                rates[task] |= {"level": levels[task], "band": band, "in_band": landed, "rounds": spent}
+                # Out of its band with no rewrite left: the author kept it, and it is released as it stands.
+                rates[task]["kept"] = not landed and spent >= self.settings.get("author", {}).get(
+                    "task_rounds", 0
+                )
                 count = in_band.setdefault(levels[task], [0, 0])
                 count[0], count[1] = count[0] + landed, count[1] + 1
         right = [r["right_rate"] for r in rates.values()]

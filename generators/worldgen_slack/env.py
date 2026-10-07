@@ -146,22 +146,37 @@ def merged(verdicts: list[Verdict]) -> Verdict:
     )
 
 
-def try_digest(result: dict, record: dict | None, evidence: set) -> dict:
-    """One solver try as the author reads it: its grade, each call with its arguments and what it returned, the step
-    at which the gold evidence first appeared, and its answer."""
-    steps, first = [], None
+def try_digest(result: dict, record: dict | None, evidence: set, decoys: set = frozenset()) -> dict:
+    """One solver try as the author reads it: its grade, the step at which the gold evidence first showed and the call
+    that showed it, how many calls showed a decoy, its route (the calls up to the evidence, then its last three) and
+    its answer. The whole try is a file of its own."""
+    steps, first, lured = [], None, 0
     for k, call in enumerate(((record or {}).get("info") or {}).get("observations") or [], 1):
-        hits = shown(call) & evidence
-        first = first or (k if hits else None)
+        seen = shown(call)
+        hits, lures = seen & evidence, seen & decoys
+        first, lured = first or (k if hits else None), lured + bool(lures)
         items = call["output"].get("items")
         returned = f"{len(items)} items" if isinstance(items, list) else "one result"
-        steps.append(f"{call['tool']} {json.dumps(call['arguments'], ensure_ascii=False)} → {returned}" + (", evidence" if hits else ""))  # fmt: skip
-    return {k: result.get(k) for k in ("correct", "grounded", "crashed", "reason")} | {
+        steps.append(f"{call['tool']} {json.dumps(call['arguments'], ensure_ascii=False)[:160]} → {returned}" + (", evidence" if hits else "") + (", a decoy" if lures else ""))  # fmt: skip
+    head = steps[: first or 3]
+    rest = steps[len(head) :]
+    route = head + ([f"… {len(rest) - 3} more calls …"] if len(rest) > 3 else []) + rest[-3:]
+    return {k: result.get(k) for k in ("correct", "grounded", "crashed")} | {
+        "reason": (result.get("reason") or "")[:240],
         "calls": len(steps),
         "evidence_at": first,
-        "steps": steps,
-        "answer": (result.get("response") or "")[:400],
+        "found_by": steps[first - 1] if first else None,
+        "decoy_reads": lured,
+        "steps": route,
+        "answer": (result.get("response") or "")[:300],
     }
+
+
+# The anchor messages of the decoys on a task's facts' subjects: the near-misses a task rests beside.
+DECOYS = """SELECT m.id, m.channel_id, m.ts, m.text FROM task_facts tf JOIN facts f ON f.id = tf.fact_id
+JOIN facts d ON d.is_decoy = 1 AND lower(trim(d.subject)) = lower(trim(f.subject))
+JOIN evidence e ON e.fact_id = d.id JOIN messages m ON m.id = e.message_id
+WHERE tf.task_id = ? GROUP BY m.id ORDER BY m.ts_us, m.id"""
 
 
 class GenerationEnv(vf.Env[PipelineConfig]):
@@ -324,17 +339,23 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 (task_id,),
             )
         ]
-        decoys = [
-            r[0]
-            for r in db.execute(
-                """SELECT m.text FROM task_facts tf JOIN facts f ON f.id = tf.fact_id
-                JOIN facts d ON d.is_decoy = 1 AND lower(trim(d.subject)) = lower(trim(f.subject))
-                JOIN evidence e ON e.fact_id = d.id JOIN messages m ON m.id = e.message_id
-                WHERE tf.task_id = ? GROUP BY m.id ORDER BY m.ts_us, m.id""",
-                (task_id,),
-            )
-        ]
+        decoys = [r["text"] for r in db.execute(DECOYS, (task_id,))]
         return digest([task, texts, decoys])
+
+    def returned(self, task_id: str, probe: dict) -> dict:
+        """A task as it comes back to the author: what it asks and answers and who asks it, its earlier versions with
+        their rates, how it fared, code's measures, and the tries (GLM's, condensed; the witness's)."""
+        db = self.world.db
+        row = db.execute("SELECT t.question, t.answer_type, t.gold_sql, t.gold_json, u.real_name, u.title FROM tasks t JOIN users u ON u.id = t.actor_id WHERE t.id = ?", (task_id,)).fetchone()  # fmt: skip
+        witness = self.store.state.witness.get(task_id, {})
+        current = witness.get("key") == self.store.state.probes.get(task_id, {}).get("key")
+        return {
+            "question": row["question"], "answer_type": row["answer_type"], "gold": json.loads(row["gold_json"]),
+            "gold_sql": row["gold_sql"], "asked_by": f"{row['real_name']} ({row['title']})",
+            "facts": [f for (f,) in db.execute("SELECT fact_id FROM task_facts WHERE task_id = ? ORDER BY fact_id", (task_id,))],
+        } | {k: v for k, v in probe.items() if k not in ("question", "issue_messages")} | {
+            "witness_tries": [{"correct": w.get("correct"), "calls": w.get("calls"), "answer": (w.get("response") or "")[:200]} for w in witness.get("results", [])] if current else [],
+        }  # fmt: skip
 
     def texts(self, message_ids) -> list:
         """The current text of these messages, in order."""
@@ -652,10 +673,21 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     (rate["right_rate"], rate["strict_rate"], fewest, task_id),
                 )
                 review = next(r for r in judged.tasks if r.task_id == task_id)
+                decoys = {(r["channel_id"], r["ts"]) for r in self.world.db.execute(DECOYS, (task_id,))}
+                question = self.world.db.execute(
+                    "SELECT question FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()[0]
+                before = state.probes.get(task_id, {})
+                # The versions the task had before, each with how often GLM was right: the moves already tried.
+                history = before.get("history", []) + (
+                    [{"question": before["question"], "right_rate": before["right_rate"]}]
+                    if before.get("question") not in (None, question)
+                    else []
+                )
                 state.probes[task_id] = (
-                    {"key": keys[task_id]}
+                    {"key": keys[task_id], "question": question, "history": history}
                     | {k: v for k, v in measured[task_id].items() if k not in ("level_fit", "right_rate", "strict_rate")}
-                    | rate | {"solves": [try_digest(o, self.saved_trace(i), {tuple(m) for m in answers[task_id].messages}) for o, i in zip(outcomes, runs[task_id]["traces"])]}
+                    | rate | {"solves": [try_digest(o, self.saved_trace(i), {tuple(m) for m in answers[task_id].messages}, decoys) for o, i in zip(outcomes, runs[task_id]["traces"])]}
                     | {"level_fit": review.level_fit, "valid": review.valid, "review": review.reason}
                     | {"issues": [f"{i.defect} {i.requested_change}" for i in judged.issues if task_id in i.task_ids]}
                     | {"issue_messages": sorted({m for i in judged.issues if task_id in i.task_ids for m in (*i.message_ids, *i.evidence_message_ids)})}
@@ -680,7 +712,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 move = band_move(r)
                 given = state.task_rounds.get(t, 0)
                 if move == "fix" or (move and given < cfg.author.task_rounds):
-                    back[t] = r | {"move": move, "rounds_left": max(0, cfg.author.task_rounds - given - 1)}
+                    back[t] = self.returned(t, r) | {"move": move, "tries_left": max(0, cfg.author.task_rounds - given - 1)}  # fmt: skip
             if not back or turns > cfg.author.task_rounds:
                 return
             self.allow(back)
@@ -695,7 +727,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     self.task_key(t) == before[t][0]
                 ):  # only the world around it changed: try it afresh all the same
                     for cache in (state.probes, state.solves, state.witness):
-                        cache.pop(t, None)
+                        if t in cache:
+                            cache[t]["key"] = None
             self.store.save()
             if not changed:
                 return

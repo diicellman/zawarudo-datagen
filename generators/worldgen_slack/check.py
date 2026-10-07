@@ -65,7 +65,7 @@ from .chronicle import (
     today,
     today_line,
 )
-from .env import GenerationEnv, keep_awake
+from .env import GenerationEnv, keep_awake, try_digest
 from .generate import failure, provenance, run_label
 from .store import Store
 from .config import ROOT, Acceptance, Category, Config, Needs
@@ -2037,6 +2037,10 @@ async def check_author(root):
             assert all(r["level_fit"] == 3 and "evidence_pages" in r and r["concept"] and r["band"] and "right_rate" in r and "strict_rate" in r for r in back.values()), (
                 "hardening reads the judge's level fit, code's measures, both rates and the level's band"
             )  # fmt: skip
+            assert all(r["question"] and r["gold_sql"] and "gold" in r and r["asked_by"] and r["tries_left"] == 0 and "found_by" in r["solves"][0] and "decoy_reads" in r["solves"][0] for r in back.values()), (
+                "a returned task carries what it asks and answers, who asks it, and the route to beat"
+            )  # fmt: skip
+            assert all(len(json.dumps(r)) < 6000 for r in back.values()), "a returned task is small"
             seen.append(("harden", sorted(back), sorted(r["move"] for r in back.values())))
             seen.append(("pinged", runtime.pings))  # by now the probe ran, with the VM kept awake
             for (
@@ -2189,12 +2193,15 @@ async def check_author(root):
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
     summary = store.summary("complete")
-    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1, "witness_right": 1.0, "level_fit": 3, "level": 3, "band": [0.0, 0.5], "in_band": True, "rounds": 0}, (
+    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1, "witness_right": 1.0, "level_fit": 3, "level": 3, "band": [0.0, 0.5], "in_band": True, "rounds": 0, "kept": False}, (
         "difficulty is the right-answer rate, the strict rate reported beside it; a try that crashed twice is counted, "
         "and left out of the rates; the band it landed in"
     )  # fmt: skip
     # t1 (level 2) stayed too easy; t0 was rewritten at the fix, to 2 of 3 right; t3 is in its level-1 band
     assert summary["in_band"] == {"1": [1, 1], "2": [1, 2], "3": [1, 1]}, summary["in_band"]
+    assert [t for t, r in summary["rates"].items() if r["kept"]] == [t1], (
+        "t1 stayed too easy with no rewrite left"
+    )
     assert summary["crashed_solves"] == 1 and summary["witness_tries"] == 2, summary
     assert abs(summary["mean_learnability"] - 17 / 36) < 1e-9, summary["mean_learnability"]  # t0 2/3, t2 1/2
 
@@ -2256,6 +2263,17 @@ async def check_author(root):
     fails(store.publish)  # a task resting on a fact no message states
     store.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
     store.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
+    # A try as the author reads it: the call that first showed the evidence, how many showed a decoy, the route up to
+    # the evidence and then its last three calls, and a short answer.
+    read = lambda tool, ts=None: {"tool": tool, "arguments": {}, "output": {"items": [{"channel": "C1", "ts": ts}] if ts else []}}  # noqa: E731  # fmt: skip
+    route = [
+        read("read_channel", "2"),
+        read("read_thread", "1"),
+        *(read("search_messages") for _ in range(6)),
+    ]
+    digest_ = try_digest({"correct": True, "response": "x" * 500}, {"info": {"observations": route}}, {("C1", "1")}, {("C1", "2")})  # fmt: skip
+    assert (digest_["evidence_at"], digest_["decoy_reads"], digest_["calls"], len(digest_["answer"])) == (2, 1, 8, 300), digest_  # fmt: skip
+    assert digest_["found_by"].startswith("read_thread") and digest_["steps"][2] == "… 3 more calls …" and len(digest_["steps"]) == 6, digest_  # fmt: skip
     # A hardening turn that changes nothing ends the loop, rounds to spare or not: the same tries would come back.
     idle_turns = []
 
@@ -2265,6 +2283,10 @@ async def check_author(root):
     state.task_rounds[t1] = 0  # t1, too easy, has its round again
     await env.harden(agents, idle, "final-02", [t1])
     assert len(idle_turns) == 1 and state.task_rounds[t1] == 0, (len(idle_turns), state.task_rounds)
+    again = json.loads(idle_turns[0][idle_turns[0].index("{") : idle_turns[0].index("\nRewrite")])[t1]
+    assert [h["right_rate"] for h in again["history"]] == [1.0] and not again["history"][0]["question"].startswith("Asked again"), (
+        "a task comes back with its earlier versions and how often each was answered"
+    )  # fmt: skip
     state.task_rounds[t1] = 1
     # A task's key covers the decoys on its facts' subjects: a revised decoy is a changed task, tried again.
     resting = next(

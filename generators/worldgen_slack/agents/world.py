@@ -145,8 +145,8 @@ Tasks (after the last day, world_add_task)
     + GOLD_SQL
     + """- world_add_task checks the task, refuses it below its level's needs (now.md lists each slot's), and returns its
   gold rows and code's measures (read_channel pages deep, messages above it, tables read, search rank, the channels
-  and identifiers the question names, its facts' channels, relations and decoys). A solver then tries each task;
-  reword a task, or rest it on other evidence, to fit its level.
+  and identifiers the question names, its facts' channels, relations and decoys). A solver then tries each task, and
+  one outside its level's band comes back to you with the solver's route: keep its answer and change the route.
 
 Reviews
 - An independent judge reviews the world after some days and at the end. Its issues come back to you: message_ids
@@ -882,17 +882,22 @@ def tasks_prompt(settings, ids: list[str]) -> str:
 
 def harden_prompt(back: dict) -> str:
     return (
-        "These tasks come back to you, each with its slot's cell, the solver's tries (right_rate, the share of right "
-        "answers, is how hard the task is; strict_rate also needs every claim grounded; solves, each try's calls and the "
-        "step at which the gold evidence first appeared: the route to beat; the whole tries are in "
-        "/task/memory/solves/<task>/), the judge's review (level_fit "
-        "from 0 to 4: how fully answering it needs its level and concept), code's measures (evidence pages, tables "
-        "read, search rank), its level's band of right-answer rates, and what it needs (move): harder, easier, or the "
-        f"fix the judge asks for: {json.dumps(back, ensure_ascii=False)}\nRewrite each in its slot so that answering it "
-        "needs its level and concept with no easier route, and lands in its band: reword it, or rest it on other "
-        "evidence; world_revise can remove a giveaway from a message. A task you change is tried and reviewed again; "
-        "one you keep stands as it is, and its round still counts (rounds_left). Only these tasks may be rewritten in "
-        "this turn. End your turn when the tasks stand."
+        "These tasks come back to you, each with what it asks, its gold rows and gold SQL and who asks it, its earlier "
+        "versions with how often the solver was right on each (history), the solver's tries (right_rate, the share of "
+        "right answers, is how hard the task is; strict_rate also needs the answer's claims grounded; each try's "
+        "route: the step at which the gold evidence first showed (evidence_at), the call that showed it (found_by), "
+        "how many calls showed a decoy (decoy_reads), the answer; the whole tries are in /task/memory/solves/<task>/), "
+        "the witness's tries, the judge's review, code's measures, its level's band of right-answer rates, and what "
+        "it needs (move): harder, easier, or the fix the judge asks for. Each rewrite is tried and reviewed again, the "
+        "last one too; tries_left counts the rewrites still tried after this one: "
+        f"{json.dumps(back, ensure_ascii=False)}\nRewrite each in its slot so that answering it needs its level and "
+        "concept with no easier route, and lands in its band. Keep its answer and change its route: lean the question "
+        "on a near-miss the world holds (a decoy on its subject); name what it asks about by what surrounds it rather "
+        "than by a name, ID or date the solver can search for (a sub-question the world answers elsewhere); add a "
+        "condition that singles the answer out only together with the others; point it at one of several look-alike "
+        "posts. To make it easier, give back a name or narrow a condition. world_revise can remove a giveaway from a "
+        "message. A task you keep stands as it is. Only these tasks may be rewritten in this turn. End your turn when "
+        "the tasks stand."
     )
 
 
