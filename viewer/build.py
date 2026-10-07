@@ -29,13 +29,18 @@ def iso(us: int) -> str:
 
 
 def snapshot(path: Path) -> dict:
-    """A world file as the page draws it: people, conversations and messages."""
+    """A world file as the page draws it: people, conversations and messages with their reactions."""
     db = connect(path)
-    members = {}
+    members, reactions = {}, {}
     for channel, user in db.execute(
         "SELECT channel_id, user_id FROM members WHERE left_us IS NULL ORDER BY user_id"
     ):
         members.setdefault(channel, []).append(user)
+    # Each message's reactions grouped by emoji, as Slack draws them: emoji in the order first used, people in order.
+    for message, emoji, user in db.execute(
+        "SELECT message_id, emoji, user_id FROM reactions ORDER BY message_id, created_us, user_id"
+    ):
+        reactions.setdefault(message, {}).setdefault(emoji, []).append(user)
     zone = db.execute("SELECT value FROM world_meta WHERE key = 'zone'").fetchone()
     world = {
         "zone": zone[0] if zone else None,
@@ -48,7 +53,8 @@ def snapshot(path: Path) -> dict:
             for r in db.execute("SELECT * FROM channels ORDER BY id")
         ],
         "messages": [
-            {"id": str(r["id"]), "conversation_id": r["channel_id"], "author_id": r["user_id"], "text": r["text"], "timestamp": iso(r["ts_us"]), "thread_root_id": str(r["parent_id"]) if r["parent_id"] else None, "deleted": bool(r["is_deleted"])}
+            {"id": str(r["id"]), "conversation_id": r["channel_id"], "author_id": r["user_id"], "text": r["text"], "timestamp": iso(r["ts_us"]), "thread_root_id": str(r["parent_id"]) if r["parent_id"] else None, "deleted": bool(r["is_deleted"]), "edited": r["edited_us"] is not None,
+             "reactions": [{"emoji": e, "user_ids": us} for e, us in reactions.get(r["id"], {}).items()]}
             for r in db.execute("SELECT * FROM messages ORDER BY ts_us")
         ],
     }  # fmt: skip
@@ -91,9 +97,9 @@ def summarize(record, full):
     return row
 
 
-def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict]:
+def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
     """The world file's answer key as the page draws it: catalog (people, storylines, facts, tasks), evidence per
-    task, scenes, and each message's scene."""
+    task, scenes, each message's scene, and the facts each message states (as anchor or support, decoys marked)."""
     db = connect(path)
     cast = {c["uuid"]: c for c in state.get("cast", [])}
     from_seed = {"U" + digest(["user", uuid])[:10].upper(): c for uuid, c in cast.items()}
@@ -135,8 +141,13 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict]:
         scenes.append(
             {"id": s["id"], "conversation_id": s["channel_id"], "participant_ids": participants, "start": iso(s["slot_start_us"]), "end": iso(s["slot_end_us"]), "situation": s["situation"], "beats": beats, "messages": ids, "promises": promises, "revision_note": plan.get("revision_note", "")}
         )  # fmt: skip
+    marks = {}
+    for message, fact, role, decoy in db.execute(
+        "SELECT e.message_id, e.fact_id, e.role, f.is_decoy FROM evidence e JOIN facts f ON f.id = e.fact_id ORDER BY e.message_id, e.fact_id"
+    ):  # fmt: skip
+        marks.setdefault(str(message), []).append({"fact": fact, "role": role, "decoy": bool(decoy)})
     db.close()
-    return catalog, bindings, scenes, owner
+    return catalog, bindings, scenes, owner, marks
 
 
 def load_run(path, full=False):
@@ -145,7 +156,7 @@ def load_run(path, full=False):
     state = read_json(run / "state.json")
     if state is None or not (run / "world.sqlite").exists():
         raise ValueError(f"No run (state.json and world.sqlite) in {run}")
-    catalog, bindings, scenes, owner = ledger(run / "world.sqlite", state)
+    catalog, bindings, scenes, owner, marks = ledger(run / "world.sqlite", state)
     events = [json.loads(line) for line in (run / "progress.jsonl").read_text().splitlines()]
     order = {e["attempt"]: i for i, e in reversed(list(enumerate(events))) if e.get("attempt")}
     events = [e for e in events if e["event"] not in QUIET]
@@ -192,6 +203,7 @@ def load_run(path, full=False):
         "catalog": catalog,
         "world": snapshot(run / "world.sqlite"),
         "bindings": bindings,
+        "fact_marks": marks,
         "task_reviews": state.get("task_reviews") or {},
         "board": board,
         "scenes": scenes,

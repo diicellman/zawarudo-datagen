@@ -1970,7 +1970,7 @@ async def check_author(root):
                 await talk(
                     leads, dict(author_id=a, text="dry run for the audit window at {at:e1}", conveys=["f3"])
                 )
-                await talk(ops, dict(author_id=a, text="Owen owns the audit at {at:e1}", conveys=["f4"]), dict(author_id=d, text="thanks"))  # fmt: skip
+                await talk(ops, dict(author_id=a, text="Owen owns the audit at {at:e1}", conveys=["f4"], reactions=[Reaction(user_id=d, emoji="eyes")]), dict(author_id=d, text=f"thanks <@{a}>"))  # fmt: skip
             if day == 4:
                 assert "message_ids" not in prompt, "a review's issues are delivered once"
             if day == 4 and "was rejected" not in prompt:

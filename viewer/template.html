@@ -67,6 +67,11 @@ button.chip:hover{border-color:var(--fg3)}.chip.good{color:var(--good);border-co
 .av{width:32px;height:32px;display:grid;place-items:center;background:var(--raise);border:1px solid var(--line);font:500 11px var(--mono);color:var(--fg2)}
 .who{font-weight:600}.when{font:11px var(--mono);color:var(--fg3);margin-left:8px}.text{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}
 .linkish{background:none;border:0;padding:0;color:var(--fg2);font:11px var(--mono);text-decoration:underline;text-underline-offset:3px}
+.mention{color:var(--ev);background:var(--evbg);padding:0 2px;border-radius:2px}
+.reacts{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}.react{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);background:var(--raise);padding:0 7px;border-radius:10px;font-size:12px;line-height:20px}
+.react b{font:500 11px var(--mono);color:var(--fg2)}.chip.decoy{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent);border-style:dashed}
+.daysep{display:flex;align-items:center;gap:10px;padding:10px 16px 2px;font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--fg3)}.daysep::before,.daysep::after{content:"";flex:1;border-top:1px solid var(--line)}
+.chan-head details summary{cursor:pointer}.chan-head details[open]{max-height:120px;overflow:auto}
 /* tasks */
 .tasks{display:grid;grid-template-columns:320px minmax(0,1fr);gap:16px}.tlist{display:flex;flex-direction:column;gap:1px;background:var(--line);border:1px solid var(--line);align-self:start}
 .titem{background:var(--card);border:0;text-align:left;padding:10px 12px}.titem:hover,.titem.on{background:var(--raise)}
@@ -461,6 +466,31 @@ function tip(ev, text) {
 }
 
 /* ---------- world ---------- */
+// Slack's emoji shortcodes as glyphs; one this map lacks shows as :name:, as Slack shows an unknown custom emoji.
+const EMOJI = {'+1': '👍', thumbsup: '👍', '-1': '👎', thumbsdown: '👎', eyes: '👀', white_check_mark: '✅', heavy_check_mark: '✔️', raised_hands: '🙌', tada: '🎉',
+  pray: '🙏', thinking_face: '🤔', ramen: '🍜', ok_hand: '👌', memo: '📝', laughing: '😆', joy: '😂', heart_eyes: '😍', grimacing: '😬', evergreen_tree: '🌲',
+  dart: '🎯', heart: '❤️', fire: '🔥', rocket: '🚀', clap: '👏', smile: '😄', slightly_smiling_face: '🙂', sweat_smile: '😅', wave: '👋', muscle: '💪', '100': '💯',
+  x: '❌', warning: '⚠️', rotating_light: '🚨', sob: '😭', facepalm: '🤦', face_palm: '🤦', raised_hand: '✋', point_up: '☝️', coffee: '☕', sunglasses: '😎', wink: '😉'};
+const glyph = name => EMOJI[name] || `:${name}:`;
+// A message's text with <@U…> and <#C…|name> drawn as names and known :shortcodes: as emoji: text nodes and spans,
+// so the text is never parsed as HTML.
+function richText(text, small) {
+  const node = h('div', {class: 'text' + (small ? ' small' : '')});
+  let last = 0;
+  for (const m of String(text).matchAll(/<([@#])([A-Z0-9]+)(?:\|([^>]*))?>|:([a-z0-9_+'-]+):/g)) {
+    if (m[4] && !EMOJI[m[4]]) continue;
+    node.append(text.slice(last, m.index));
+    if (m[4]) node.append(h('span', {title: m[0], text: EMOJI[m[4]]}));
+    else node.append(h('span', {class: 'mention', title: m[2], text: m[1] === '@' ? '@' + personName(m[2]) : '#' + (m[3] || V().convs[m[2]]?.name || m[2])}));
+    last = m.index + m[0].length;
+  }
+  node.append(text.slice(last));
+  return node;
+}
+const plain = text => String(text).replace(/<@([A-Z0-9]+)>/g, (_, id) => '@' + personName(id));
+const reacts = m => list(m.reactions).length ? h('div', {class: 'reacts'}, m.reactions.map(r => h('span', {class: 'react', title: `:${r.emoji}: ` + r.user_ids.map(personName).join(', ')},
+  glyph(r.emoji), h('b', {text: r.user_ids.length})))) : null;
+const dayOf = ts => new Intl.DateTimeFormat('en-GB', {timeZone: V().world?.zone || 'UTC', weekday: 'long', day: '2-digit', month: 'long'}).format(new Date(ts));
 function visibleTo(c) { return !S.reader || c.kind === 'public_channel' || list(c.member_ids).includes(S.reader); }
 function openMessage(id) {
   let snapshot = null, m = X.msgs[id];
@@ -495,7 +525,8 @@ function world() {
     }));
   const c = W.convs[S.conv];
   const pane = h('div', {class: 'pane'}, h('div', {class: 'chan-head'}, h('div', {style: 'font-weight:600', text: (c.kind === 'public_channel' ? '# ' : '') + convName(c)}),
-    h('div', {class: 'small muted', text: [c.topic, c.purpose].filter(Boolean).join(' — ')}), h('div', {class: 'small faint mono', text: `${c.kind} · ${list(c.member_ids).length} members`})),
+    h('div', {class: 'small muted', text: [c.topic, c.purpose].filter(Boolean).join(' — ')}),
+    h('details', {class: 'small faint mono'}, h('summary', {text: `${c.kind} · ${list(c.member_ids).length} members`}), h('div', {class: 'muted', text: list(c.member_ids).map(personName).join(', ')}))),
     h('div', {id: 'msgs'}));
   const thread = h('div', {class: 'thread', id: 'thread'});
   requestAnimationFrame(() => { renderMessages(); renderThread(); });
@@ -510,10 +541,13 @@ function messageRow(m, compact) {
     h('div', {class: 'av', text: initials(personName(m.author_id))}),
     h('div', {}, h('span', {class: 'who', text: personName(m.author_id)}),
       h('span', {class: 'when', title: zone ? 'author local: ' + utc(m.timestamp, zone) + ' (' + zone + ')' : '', text: utc(m.timestamp, V().world?.zone)}),
+      m.edited ? h('span', {class: 'when', text: '(edited)'}) : null,
       persona ? h('span', {class: 'when', text: persona.role}) : null,
-      h('div', {class: 'text', text: m.text}),
+      richText(m.text), reacts(m),
       h('div', {}, !compact && n ? h('button', {class: 'linkish', type: 'button', text: `${n} repl${n > 1 ? 'ies' : 'y'}`, onclick: () => { S.message = m.id; renderThread(); renderMessages(); }}) : null,
         ev.map(([t, k]) => h('button', {class: 'chip ev', type: 'button', text: `${t} · claim ${k}`, onclick: () => go('tasks', {task: t})})),
+        S.spoilers ? list(R.fact_marks?.[m.id]).map(f => { const fact = X.facts[f.fact];
+          return h('span', {class: 'chip' + (f.decoy ? ' decoy' : ''), title: fact ? `${fact.subject} · ${fact.predicate}: ${fact.value}` : f.fact, text: `${f.decoy ? 'decoy ' : ''}${f.fact} · ${f.role}`}); }) : null,
         R.scene_of[m.id] ? h('span', {class: 'chip', text: R.scene_of[m.id]}) : null,
         m.deleted ? h('span', {class: 'chip bad', text: 'deleted'}) : null)));
 }
@@ -522,9 +556,12 @@ function renderMessages() {
   if (!box) return;
   const q = S.search.trim().toLowerCase();
   const W = V();
-  const rows = list(W.world.messages).filter(m => m.conversation_id === S.conv && !m.thread_root_id && (!q || (m.text + ' ' + personName(m.author_id)).toLowerCase().includes(q)
-    || list(W.replies[m.id]).some(r => r.text.toLowerCase().includes(q)))).sort((a, b) => a.timestamp < b.timestamp ? -1 : 1);
-  box.replaceChildren(...(rows.length ? rows.map(m => messageRow(m)) : [empty('No messages')]));
+  const rows = list(W.world.messages).filter(m => m.conversation_id === S.conv && !m.thread_root_id && (!q || (plain(m.text) + ' ' + personName(m.author_id)).toLowerCase().includes(q)
+    || list(W.replies[m.id]).some(r => plain(r.text).toLowerCase().includes(q)))).sort((a, b) => a.timestamp < b.timestamp ? -1 : 1);
+  // A divider at each new day on the world's clock, as Slack draws one.
+  let day = null;
+  const drawn = rows.flatMap(m => { const d = dayOf(m.timestamp), row = messageRow(m); if (d === day) return [row]; day = d; return [h('div', {class: 'daysep', text: d}), row]; });
+  box.replaceChildren(...(rows.length ? drawn : [empty('No messages')]));
   if (S.message) document.getElementById('m-' + S.message)?.scrollIntoView({block: 'center'});
 }
 function renderThread() {
@@ -625,7 +662,7 @@ function evidenceCard(id) {
   const c = X.convs[m.conversation_id];
   return h('button', {class: 'evmsg', type: 'button', onclick: () => openMessage(id)},
     h('div', {class: 'small'}, h('b', {text: personName(m.author_id)}), h('span', {class: 'when', text: `${utc(m.timestamp, V().world?.zone)} · ${c?.name || c?.kind || ''}`})),
-    h('div', {class: 'text small', text: m.text}));
+    richText(m.text, true), reacts(m));
 }
 function solveCard(s, k, evidence) {
   const trace = X.traces[s.solver_trace_id] || null;

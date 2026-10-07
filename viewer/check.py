@@ -1,6 +1,7 @@
 """Offline check on a scripted run: uv run --frozen python viewer/check.py"""
 
 import asyncio
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -12,6 +13,11 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(check_author(Path(tmp) / "author"))
         run = load_run(Path(tmp) / "author" / "run")
+        db = sqlite3.connect(Path(tmp) / "author" / "run" / "world.sqlite")
+        stated = {
+            (str(m), f, role) for m, f, role in db.execute("SELECT message_id, fact_id, role FROM evidence")
+        }
+        db.close()
     # A world written in time order by one author: its blocks in order, and each conversation by its lines.
     steps = [a["id"] for a in run["attempts"]]
     assert (
@@ -50,10 +56,22 @@ def main():
         "the board per ledger slot"
     )
     assert run["world"]["zone"], "times are drawn on the world's clock"
+    # A message shows its reactions and whom it mentions, as Slack does, and the facts it states.
+    people = {u["id"] for u in run["world"]["users"]}
+    reacted = [m for m in run["world"]["messages"] if m["reactions"]]
+    assert reacted and all(
+        r["user_ids"] and set(r["user_ids"]) <= people for m in reacted for r in m["reactions"]
+    ), "each message's reactions, by emoji, with who reacted"
+    assert any("<@" in m["text"] for m in run["world"]["messages"]), (
+        "a mention, which the page draws as a name"
+    )
+    marks = {(m, f["fact"], f["role"]) for m, fs in run["fact_marks"].items() for f in fs}
+    assert marks and marks == stated, "every message marks the facts it states"
+    assert all("decoy" in f for fs in run["fact_marks"].values() for f in fs)
     attack = "</script><script>alert('artifact')</script>&"
     html = render({"runs": [], "probe": attack})
     assert attack not in html and "__VIEWER_DATA__" not in html and "\\u003c/script\\u003e" in html
-    print("Viewer checks passed: attempt order, snapshots, conversations, gold queries, cast, bands, probes, witness, board, escaping.")  # fmt: skip
+    print("Viewer checks passed: attempt order, snapshots, conversations, gold queries, cast, bands, probes, witness, board, reactions, mentions, facts, escaping.")  # fmt: skip
 
 
 if __name__ == "__main__":
