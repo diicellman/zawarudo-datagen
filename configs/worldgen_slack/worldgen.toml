@@ -182,9 +182,10 @@ model = "anthropic/claude-opus-5.5"  # the voice lab (2026-10-04): 0.77 blind re
 
 # Anthropic caches a prompt only when asked: each request's prefix is cached up to its end, so an agent's next step
 # pays for its new tail alone. Without it every step was billed in full, and the harness's token cap (new tokens only)
-# cut smoke 02's second day.
+# cut smoke 02's second day. The cache lives an hour: a probe keeps the author waiting 8 to 39 minutes (S2), past the
+# default five, and each hardening turn then re-read its whole context uncached until S2's batch 4 hit the cap.
 [env.author.sampling]
-cache_control = { type = "ephemeral" }
+cache_control = { type = "ephemeral", ttl = "1h" }
 
 [env.judge]
 model = "openai/gpt-6-sol"
