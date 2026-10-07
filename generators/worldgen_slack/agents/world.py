@@ -906,9 +906,10 @@ def fix_prompt(issues: list, writable: list[str]) -> str:
         f"world_add_task may rewrite only {', '.join(writable)}" if writable else "no task is to be rewritten"
     )
     return (
-        f"The review rejected the world: {json.dumps(issues, ensure_ascii=False)}\nFix each issue with world_revise or "
-        f"world_add_task ({rewrite}): message_ids are the messages to change, evidence_message_ids show the defect. If "
-        "you judge an issue mistaken, write why in /task/notes/plan.md. End your turn when done."
+        f"The review rejected the world: {json.dumps(issues, ensure_ascii=False)}\nFix each blocking issue with "
+        f"world_revise or world_add_task ({rewrite}): message_ids are the messages to change, evidence_message_ids "
+        "show the defect. Fix the others too, or write in /task/notes/plan.md why you leave one; if you judge an issue "
+        "mistaken, write why there. End your turn when done."
     )
 
 

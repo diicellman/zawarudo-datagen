@@ -46,7 +46,6 @@ from .contracts import (
     band_move,
     cards,
     clock,
-    deciding,
     organize,
     pick_cast,
     quality,
@@ -412,7 +411,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         self.refresh_gold()
         keys = {t: self.task_key(t) for (t,) in self.world.db.execute("SELECT id FROM tasks ORDER BY id")}
         due = [t for t, key in keys.items() if state.task_reviews.get(t, {}).get("key") != key]
-        previous = state.last_verdict.issues if state.last_verdict else []
+        previous = list(state.last_verdict.issues) if state.last_verdict else []
+        # A task whose last probe the judge did not approve is reviewed with the issues that probe raised.
+        previous += [i for t, raised in state.task_issues.items() if not state.probes.get(t, {}).get("approved", True) for i in raised if i not in previous]  # fmt: skip
         people = cards(state.cast)
 
         # The world's open issues: the last final review's, and those task reviews raised that name no task.
@@ -603,6 +604,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         # A review of a few tasks at a time, the reviews side by side: each task passes on its own chunk's verdict.
         verdicts = await asyncio.gather(*(judged(k, chunk) for k, chunk in enumerate(chunks, 1)))
         verdict_of = {t: v for chunk, v in zip(chunks, verdicts) for t in chunk}
+        for task_id in due:  # the issues each task's latest review raised, for the final review
+            state.task_issues[task_id] = [i for i in verdict_of[task_id].issues if task_id in i.task_ids]
         # An issue that names no task blocks none of them: it is the world's, and waits for the final review.
         seen_issues = {(i.artifact, i.defect) for i in state.open_issues}
         for issue in (i for v in verdicts for i in v.issues if not i.task_ids):
@@ -789,7 +792,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     break
                 attempt = f"final-{state.rounds.get('final', 0):02d}"
                 invalid = [{"task_id": r.task_id, "invalid": r.reason} for r in verdict.tasks if not r.valid]
-                issues = [i.model_dump(mode="json") for i in deciding(verdict, cfg.acceptance)] + invalid
+                # Every issue goes back, the non-blocking ones too: the author fixes them or says why not.
+                issues = [i.model_dump(mode="json") for i in verdict.issues] + invalid
                 named = [s.id for s in state.quota if any(s.id in i.get("task_ids", [i.get("task_id")]) for i in issues)]  # fmt: skip
                 self.allow(named)
                 if interaction is None:

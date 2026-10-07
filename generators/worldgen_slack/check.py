@@ -1913,6 +1913,8 @@ async def check_author(root):
                 # A mid-run review's note blocks nothing, and still opens the next day.
                 # The final one's defect touches t0, so its fix may rewrite t0 and no other task.
                 issues = [Issue(artifact="workspace", task_ids=[t0] if attempt == "final-01" else [], message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
+                if attempt == "final-01":  # a note beside the blocking defect, which the author hears too
+                    issues.append(Issue(artifact="workspace", defect="a little formal", requested_change="loosen", blocking=False))  # fmt: skip
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
             # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
             reviews = [TaskReview(task_id=t["id"], valid=not (attempt.startswith("tasks-") and t["id"] == t3), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
@@ -2076,6 +2078,7 @@ async def check_author(root):
                         seen.append(("kept", slot["id"]))
         elif prompt.startswith("The review rejected"):
             issues = json.loads(prompt[prompt.index("[") : prompt.index("]\n") + 1])
+            seen.append(("fix issues", [i.get("blocking") for i in issues]))
             for issue in issues:
                 for message in issue.get("message_ids", []):
                     await call("revise", message_id=message, text="ok, the notes come tomorrow")
@@ -2183,6 +2186,12 @@ async def check_author(root):
     )  # fmt: skip
     assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [(t3,)], (
         "the final review judges only what changed or failed since its probe's review"
+    )
+    assert ("review", "final-01", "task", False, False, True, (t3,)) in seen, (
+        "with the issues its probe raised"
+    )
+    assert ("fix issues", [True, False]) in seen, (
+        "a fix hears the review's notes as well as its blocking issues"
     )
     assert {e["attempt"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines()) if e["event"] == "candidate_finished" and e["approved"]} >= {"tasks-01", "tasks-03"}, "each batch's attempt is closed"  # fmt: skip
     assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"
