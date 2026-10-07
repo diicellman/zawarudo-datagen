@@ -20,8 +20,10 @@ and, for a task the solver rarely answered, a stronger witness's share of right 
 ## The solver's tools
 
 `search_messages`, `search_users`, `search_channels`, `list_user_channels`, `read_channel`, `read_thread`,
-`get_user`, `list_channel_members` and `get_reactions`, as the task's actor. Pages hold `items` and a cursor bound to
-one actor, world and query; a page holds 1-100 items. Search ranks by BM25.
+`get_user`, `list_channel_members`, `get_reactions` and `whoami`, as the task's actor. `whoami` (Slack's auth.test)
+says who the actor is, with their timezone and the present on their clock; every message carries its time in UTC
+(`time_utc`) and on the actor's clock (`time_local`), and a DM lists all its members. Pages hold `items` and a cursor
+bound to one actor, world and query; a page holds 1-100 items. Search ranks by BM25.
 
 Public channels are readable by everyone in the workspace; private channels and DMs need membership, which a
 member who left no longer has. Deleted messages are excluded. There are no writes.

@@ -74,6 +74,7 @@ TOOLS = (
     "get_user",
     "list_channel_members",
     "get_reactions",
+    "whoami",
 )
 
 FIRST = """first AS (
@@ -427,9 +428,17 @@ class World:
         more = base64.b64encode(canonical([key, end])).decode() if end < len(items) else None
         return {"items": items[offset:end], "next_cursor": more}
 
-    @staticmethod
-    def _message(row: sqlite3.Row) -> dict:
+    def _times(self, us: int, prefix: str = "time") -> dict:
+        """A moment as a Slack client shows it to the actor: in UTC, and on the actor's own clock."""
+        moment = datetime.fromtimestamp(us / 1e6, ZoneInfo(self.actor["tz"]))
+        return {
+            f"{prefix}_utc": datetime.fromtimestamp(us / 1e6, ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            f"{prefix}_local": moment.strftime("%a %Y-%m-%d %H:%M %Z"),
+        }
+
+    def _message(self, row: sqlite3.Row) -> dict:
         out = {"channel": row["channel_id"], "ts": row["ts"], "user": row["user_id"], "text": row["text"]}
+        out |= self._times(row["ts_us"])
         if row["parent_ts"]:
             out["thread_ts"] = row["parent_ts"]
         elif row["reply_count"]:
@@ -531,18 +540,18 @@ class World:
         kinds = [t.strip() for t in types.split(",") if t.strip()]
         if not kinds or set(kinds) - {"public", "private", "mpim", "im"}:
             raise ValueError("types is a comma-separated subset of public, private, mpim, im")
+        # A direct conversation lists all its members, the user among them, as Slack's conversations.members does.
         rows = self.db.execute(
             f"""SELECT c.*, (SELECT COUNT(*) FROM main.members m WHERE m.channel_id = c.id AND m.left_us IS NULL) AS n,
-            (SELECT group_concat(m.user_id) FROM main.members m WHERE m.channel_id = c.id AND m.left_us IS NULL
-             AND m.user_id <> ?) AS others
+            (SELECT group_concat(m.user_id) FROM main.members m WHERE m.channel_id = c.id AND m.left_us IS NULL) AS everyone
             FROM main.channels c JOIN main.members mine ON mine.channel_id = c.id AND mine.user_id = ?
               AND mine.left_us IS NULL
             WHERE c.type IN ({", ".join("?" * len(kinds))}) ORDER BY c.type, c.name, c.id""",
-            (self.actor["id"], self.actor["id"], *kinds),
+            (self.actor["id"], *kinds),
         )
         items = [
             self._channel_info(r)
-            | ({"users": sorted((r["others"] or "").split(","))} if r["name"] is None else {})
+            | ({"users": sorted((r["everyone"] or "").split(","))} if r["name"] is None else {})
             for r in rows
         ]
         return self._page(items, ["mine", kinds], cursor, limit)
@@ -616,3 +625,11 @@ class World:
         )
         reactions = [{"name": r["emoji"], "count": r["n"], "users": r["users"].split(",")} for r in rows]
         return {"channel": channel_id, "ts": ts, "reactions": reactions}
+
+    def whoami(self) -> dict:
+        """The user the tools act as, and the present on their clock (Slack's auth.test)."""
+        me, now = self.actor, self.db.execute("SELECT value FROM world_meta WHERE key = 'now_us'").fetchone()
+        team = self.db.execute("SELECT value FROM world_meta WHERE key = 'company'").fetchone()
+        out = {"user_id": me["id"], "name": me["handle"], "real_name": me["real_name"], "title": me["title"]}
+        out |= {"tz": me["tz"], "team": team[0] if team else None}
+        return out | (self._times(int(now[0]), "now") if now else {})

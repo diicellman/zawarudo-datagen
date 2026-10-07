@@ -427,7 +427,23 @@ async def check_world(root):
         solver, "rollback"
     ) and "can you check the rollback" not in texts(u3, "rollback")
     assert [c["id"] for c in solver.list_user_channels()["items"]] == ["D1", "C1"]
-    assert solver.list_user_channels(types="im")["items"][0]["users"] == ["U1"]
+    assert solver.list_user_channels(types="im")["items"][0]["users"] == ["U1", "U2"], (
+        "a DM names both members"
+    )
+    # The tools say whom they act as and when it is, and every message's time in UTC and on the user's own clock.
+    me = solver.whoami()
+    assert (me["user_id"], me["name"], me["tz"]) == ("U2", "u2", "America/Chicago") and me[
+        "now_local"
+    ].startswith("Thu 2026-06-18 00:00 CDT"), me
+    first = solver.read_channel("C1")["items"][-1]
+    assert first["time_local"].endswith("CDT") and first["time_utc"] == datetime.fromtimestamp(
+        float(first["ts"]), ZoneInfo("UTC")
+    ).strftime("%Y-%m-%dT%H:%M:%SZ"), first
+    fall = int(datetime(2026, 11, 1, 6, 30, tzinfo=ZoneInfo("UTC")).timestamp() * 1e6)  # 1:30 CDT, then CST
+    assert [solver._times(fall + h * 3_600_000_000)["time_local"][-9:] for h in (0, 1)] == [
+        "01:30 CDT",
+        "01:30 CST",
+    ]
     assert [m["text"] for m in u3.read_channel("C1")["items"]] == [
         "notes posted for release 4.2",
         texts(u3, "blocked")[0],
@@ -484,7 +500,7 @@ async def check_world(root):
         ClientSession(reader, writer_) as client,
     ):
         await client.initialize()
-        assert len((await client.list_tools()).tools) == 9
+        assert len((await client.list_tools()).tools) == 10
     bad = WorldToolsConfig(actor_id="U2", db_path=config.db_path, db_hash="0" * 64)
     try:
         await SlackTools(bad).setup()
@@ -511,7 +527,7 @@ async def check_world(root):
             os.kill(server, 9)
             raise AssertionError(f"a tool server outlived the process that started it (gone before: {late})")
     print(
-        "PASS world: triggers, rules with rollback, completion, solver copy, visibility, search, paging, tools, "
+        "PASS world: triggers, rules with rollback, completion, solver copy, visibility, search, paging, whoami and times, tools, "
         "servers end with their parent"
     )
 
