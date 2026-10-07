@@ -1,18 +1,18 @@
 # One generation run: uv run --frozen worldgen-slack --config configs/worldgen_slack/worldgen.toml
 # A new world needs a new `seed` and `output`; a run resumes only with the configuration it started with.
-# Now: S2 (2026-10-06), S1's sector at S1's size with 40 tasks: 10 days, 400 messages, 10 tasks per 100 messages in
-# batches of 10, reviewed after days 3 and 6. It measures the right-answer rates by level before the medium levels'
-# needs are tuned (the user's decision). The S2a smoke (data/v7-04-smoke) was seed 20261010, 2 days, 80 messages,
-# 8 tasks in batches of 4, task_rounds = 2, reviewed after day 1; S1 (data/v7-01) was seed 20261008, 10 tasks.
+# Now: S3 (2026-10-08), S2's sector at 2.5 times its size, with the S2 fixes (C40-C48): 10 days, 1,000 messages, 4 tasks
+# per 100 messages (40) in batches of 10, reviewed after days 3 and 6. Scale and the task fixes go together (the
+# user's decision, 2026-10-07): scale shows what fails next. S2 (data/v7-02) was seed 20261009, 400 messages, 10 per
+# 100; the S2a smoke (data/v7-04-smoke) seed 20261010, 2 days, 80 messages, 8 tasks; S1 (data/v7-01) seed 20261008.
 sector = "IT for a business-to-business software company: cloud platform operations, service releases, and customer incident coordination"
-seed = 20261009
-output = "data/v7-02/software"
+seed = 20261011
+output = "data/v7-05/software"
 storylines = 3            # the plot the ledger plans before day 1
 
 # One author writes the world in time order.
 [author]
 review_days = [3, 6]      # the judge reviews the world after these days, and at the end
-tries = 4                 # the solver's tries of a task, each time it is probed
+tries = 4                 # the solver's tries of a task, each time it is probed (4 more when mixed, above level 1)
 task_rounds = 3           # turns a task outside its level's band comes back to the author
 keepalive = 600           # seconds between pings of the author's VM while the solver and the judge work
 
@@ -27,7 +27,7 @@ days = 10
 
 # The workspace's shape: code places conversations by these targets, and measure.py scores the world against them.
 [activity]
-messages = 400            # whole world, storylines included (estimate; 80 for a smoke)
+messages = 1000           # whole world, storylines included (estimate; 80 for a smoke)
 channel_skew = 1.1        # Zipf exponent over channels ranked by members (estimate)
 dms_per_person = 0.4      # direct-message pairs per person (estimate)
 dm_share = 0.25           # share of background messages in DMs (estimate)
@@ -39,7 +39,7 @@ emoji_rate = 0.08         # measured, same corpus; scorecard only
 parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 0.03 }  # workday rhythm (estimate)
 
 [tasks]
-per_100 = 10              # tasks per 100 messages (the user's decision, 2026-10-05): 40 for S1's 400
+per_100 = 4               # tasks per 100 messages: 40 for S3's 1,000 (S2: 10 per 100, 40 of 400)
 # Per level, the band of GLM's right-answer rate a task aims for (the user's decision, 2026-10-05): level 1 anchors
 # that most tries get right; level 4 tasks GLM rarely answers, and the witness must.
 bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5], [0.0, 0.25]]
