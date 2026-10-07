@@ -69,6 +69,9 @@ class RunState(StrictModel):
     )  # task → the turns it came back to the author in
     batch: int = 0  # the batch of slots the tasks phase writes next
     witness: dict[str, dict] = Field(default_factory=dict)  # task → the witness's runs, with its key
+    open_issues: list[Issue] = Field(
+        default_factory=list
+    )  # task reviews' issues naming no task, for the final review
 
 
 class ReviewLimit(RuntimeError):

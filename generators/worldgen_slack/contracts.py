@@ -994,6 +994,11 @@ def validate_verdict(verdict: Verdict, payload: dict) -> None:
         raise ValueError("judge must review every requested task exactly once")
     if payload["phase"] == "task" and any(r.level_fit is None for r in verdict.tasks):
         raise ValueError("a task review scores each task's level_fit from 0 to 4")
+    if payload["phase"] == "task" and any(i.blocking and not i.task_ids for i in verdict.issues):
+        raise ValueError(
+            "a blocking issue in a task review names the tasks it blocks (task_ids); a defect that blocks no task "
+            "is not blocking"
+        )
 
 
 def deciding(verdict: Verdict, acceptance) -> list[Issue]:
@@ -1007,12 +1012,13 @@ def accepted(verdict: Verdict, acceptance) -> bool:
 
 
 def accepted_task(verdict: Verdict, acceptance, task_id: str) -> bool:
-    """One task of a batched review passes on its own review and the issues that name it or no task."""
+    """One task of a batched review passes on its own review and the issues that name it: an issue naming no task is
+    the world's, and the final review decides it."""
     return accepted(
         verdict.model_copy(
             update={
                 "tasks": [r for r in verdict.tasks if r.task_id == task_id],
-                "issues": [i for i in verdict.issues if task_id in i.task_ids or not i.task_ids],
+                "issues": [i for i in verdict.issues if task_id in i.task_ids],
             }
         ),
         acceptance,

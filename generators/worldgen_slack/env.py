@@ -312,7 +312,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         return verdict
 
     def task_key(self, task_id: str) -> str:
-        """What a task review depends on: the task, its gold rows, and the text of the messages they rest on."""
+        """What a task review depends on: the task, its gold rows, the text of the messages they rest on, and the text
+        of the decoys on its facts' subjects; a revised decoy is a changed task."""
         db = self.world.db
         task = dict(db.execute("SELECT id, actor_id, question, answer_type, gold_sql, gold_json FROM tasks WHERE id = ?", (task_id,)).fetchone())  # fmt: skip
         texts = [
@@ -323,7 +324,22 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 (task_id,),
             )
         ]
-        return digest([task, texts])
+        decoys = [
+            r[0]
+            for r in db.execute(
+                """SELECT m.text FROM task_facts tf JOIN facts f ON f.id = tf.fact_id
+                JOIN facts d ON d.is_decoy = 1 AND lower(trim(d.subject)) = lower(trim(f.subject))
+                JOIN evidence e ON e.fact_id = d.id JOIN messages m ON m.id = e.message_id
+                WHERE tf.task_id = ? GROUP BY m.id ORDER BY m.ts_us, m.id""",
+                (task_id,),
+            )
+        ]
+        return digest([task, texts, decoys])
+
+    def texts(self, message_ids) -> list:
+        """The current text of these messages, in order."""
+        marks = ", ".join("?" * len(message_ids))
+        return [r[0] for r in self.world.db.execute(f"SELECT text FROM messages WHERE id IN ({marks}) ORDER BY id", list(message_ids))]  # fmt: skip
 
     def refresh_gold(self):
         """Gold rows follow the world: every task's query runs again as its actor after the world changes."""
@@ -378,13 +394,16 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         previous = state.last_verdict.issues if state.last_verdict else []
         people = cards(state.cast)
 
+        # The world's open issues: the last final review's, and those task reviews raised that name no task.
         workspace = [i.model_dump(mode="json") for i in previous if i.artifact == "workspace"]
+        workspace += [i.model_dump(mode="json") for i in state.open_issues]
         world_payload = review_payload(self.world, "world", [], people=people, ledger=ledger_digest(self.world), **({"previous_issues": workspace} if workspace else {}))  # fmt: skip
         async with asyncio.TaskGroup() as group:
             world = group.create_task(self.review(agents, world_payload, attempt, {}, "world"))
             checked = group.create_task(self.judge_tasks(agents, due, keys, attempt, n, previous)) if due else None  # fmt: skip
         runs, judged = checked.result() if checked else ({}, None)
         verdict = merged([v for v in (judged, world.result()) if v is not None])
+        state.open_issues = []  # the final review has seen them; what remains is in its verdict
         self.store.artifact(attempt, "verdict", verdict.model_dump(mode="json"))
         self.store.artifact(
             attempt, "acceptance", {"approved": verdict.approved, "reviewed_tasks": list(runs)}
@@ -563,6 +582,12 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         # A review of a few tasks at a time, the reviews side by side: each task passes on its own chunk's verdict.
         verdicts = await asyncio.gather(*(judged(k, chunk) for k, chunk in enumerate(chunks, 1)))
         verdict_of = {t: v for chunk, v in zip(chunks, verdicts) for t in chunk}
+        # An issue that names no task blocks none of them: it is the world's, and waits for the final review.
+        seen_issues = {(i.artifact, i.defect) for i in state.open_issues}
+        for issue in (i for v in verdicts for i in v.issues if not i.task_ids):
+            if (issue.artifact, issue.defect) not in seen_issues:
+                state.open_issues.append(issue)
+                seen_issues.add((issue.artifact, issue.defect))
         for task_id in due:
             results = runs[task_id]["results"]
             rate = rates(results)
@@ -633,6 +658,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     | rate | {"solves": [try_digest(o, self.saved_trace(i), {tuple(m) for m in answers[task_id].messages}) for o, i in zip(outcomes, runs[task_id]["traces"])]}
                     | {"level_fit": review.level_fit, "valid": review.valid, "review": review.reason}
                     | {"issues": [f"{i.defect} {i.requested_change}" for i in judged.issues if task_id in i.task_ids]}
+                    | {"issue_messages": sorted({m for i in judged.issues if task_id in i.task_ids for m in (*i.message_ids, *i.evidence_message_ids)})}
                     | {"approved": accepted_task(judged, cfg.acceptance, task_id), "band": cfg.tasks.bands[measured[task_id]["level"] - 1]}
                     | {"witness_right": rates(state.witness[task_id]["results"])["right_rate"] if state.witness.get(task_id, {}).get("key") == keys[task_id] else None}
                 )  # fmt: skip
@@ -644,7 +670,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         """The proposer and the solver: GLM tries each task and the judge reviews it; the author gets back each task
         whose right-answer rate misses its level's band while it has rounds left, and each task the judge did not
         approve, rewrites what it will, and the changed tasks are tried again, until none comes back. A task the judge
-        did not approve comes back after its last round too; the rounds bound the loop."""
+        did not approve comes back after its last round too; the rounds bound the loop. A round is a rewrite: it counts
+        when the task changes (or a message its review names does), and a turn that changes none of them ends the loop,
+        since the same tries would come back."""
         state, cfg = self.store.state, self.settings
         for turns in itertools.count():
             back = {}
@@ -655,12 +683,22 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     back[t] = r | {"move": move, "rounds_left": max(0, cfg.author.task_rounds - given - 1)}
             if not back or turns > cfg.author.task_rounds:
                 return
-            for t in back:
-                state.task_rounds[t] = state.task_rounds.get(t, 0) + 1
-            self.store.save()
             self.allow(back)
+            named = {t: state.probes[t].get("issue_messages", []) for t in back}
+            before = {t: (self.task_key(t), self.texts(named[t])) for t in back}
             tries = {f"memory/solves/{t}/{k}.json": json.dumps(record, ensure_ascii=False) for t in back for k, i in enumerate(state.solves[t]["traces"], 1) if (record := self.saved_trace(i))}  # fmt: skip
             await turn(harden_prompt(back), tries)
+            changed = [t for t in back if (self.task_key(t), self.texts(named[t])) != before[t]]
+            for t in changed:
+                state.task_rounds[t] = state.task_rounds.get(t, 0) + 1
+                if (
+                    self.task_key(t) == before[t][0]
+                ):  # only the world around it changed: try it afresh all the same
+                    for cache in (state.probes, state.solves, state.witness):
+                        cache.pop(t, None)
+            self.store.save()
+            if not changed:
+                return
 
     def allow(self, ids) -> None:
         """The slots the author's next turn may write: its memory marks them and its tools read them per call."""

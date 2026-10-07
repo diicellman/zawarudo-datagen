@@ -1592,7 +1592,10 @@ async def check_reviews(root):
     fails(validate_verdict, unscored, payload)  # a task review scores each task's level_fit
     assert "level_fit" in verdict_schema("task", ["t1"])["$defs"]["TaskReview"]["required"]
     workspace = Issue(artifact="workspace", defect="d", requested_change="c")
-    validate_verdict(verdict(approved=False, issues=[workspace]), payload)
+    fails(
+        validate_verdict, verdict(approved=False, issues=[workspace]), payload
+    )  # a blocking one names its tasks
+    validate_verdict(verdict(issues=[workspace.model_copy(update={"blocking": False})]), payload)
     assert "workspace" in str(schema["$defs"]["Issue"]["properties"]["artifact"])
     issue = Issue(artifact="tasks", task_ids=["t2"], defect="d", requested_change="c")
     fails(verdict, issues=[issue])
@@ -1601,7 +1604,7 @@ async def check_reviews(root):
     strict, lenient = Acceptance(minor_issues_block=True), Acceptance()
     assert accepted_task(batch, lenient, "t1") and not accepted_task(batch, lenient, "t2")
     general = batch.model_copy(update={"issues": [issue.model_copy(update={"task_ids": []})]})
-    assert not accepted_task(general, lenient, "t1"), "an issue naming no task blocks every task"
+    assert accepted_task(general, lenient, "t1"), "an issue naming no task blocks none: it is the world's"
     minor = batch.model_copy(update={"issues": [issue.model_copy(update={"blocking": False})]})
     assert (
         accepted_task(minor, lenient, "t2")
@@ -1913,7 +1916,11 @@ async def check_author(root):
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
             # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
             reviews = [TaskReview(task_id=t["id"], valid=not (attempt.startswith("tasks-") and t["id"] == t3), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
-            issues += [Issue(artifact="tasks", task_ids=[r.task_id], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
+            last = self.world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+            issues += [Issue(artifact="tasks", task_ids=[r.task_id], message_ids=[last], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
+            if attempt.startswith("tasks-") and payload["tasks"] and payload["tasks"][0]["id"] == t3:
+                # A defect of the world, naming no task: it blocks none, and the final review hears it.
+                issues.append(Issue(artifact="ledger", defect="a summary drifts", requested_change="restate it", blocking=False))  # fmt: skip
             verdict = Verdict(approved=not any(i.blocking for i in issues) and all(r.valid for r in reviews), tasks=reviews, issues=issues, criteria=criteria, summary="s")  # fmt: skip
             validate_verdict(verdict, payload)
             return verdict
@@ -2042,10 +2049,17 @@ async def check_author(root):
                     r["solves"],
                 )  # t3 is a join
                 assert all(f"/task/memory/solves/{t}/{k}.json" in runtime.files for k in range(1, 4)), "the whole tries"  # fmt: skip
+            fixes = sum(1 for x in seen if x[0] == "harden" and t3 in x[1])
             for slot in json.loads(tools.config.context)["slots"]:
                 task = scripted_task(settings, slot, a)
                 asked = task.model_copy(update={"question": f"Asked again ({len(seen)}): " + task.question})
-                if slot["id"] in back:  # every task that came back is rewritten, so tried again
+                if slot["id"] == t3 and slot["id"] in back:
+                    # Its first fix revises the message the review names, not the task: it is tried again all the
+                    # same. Its second changes nothing, and the loop ends rather than send the same tries back.
+                    if fixes == 1:
+                        last = world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+                        await call("revise", message_id=last, text="quiet day, nothing to report")
+                elif slot["id"] in back:  # a task that came back is rewritten, so tried again
                     await call("add_task", task=asked)
                 elif (
                     slot["id"] in json.loads(tools.config.context)["writable"]
@@ -2138,19 +2152,20 @@ async def check_author(root):
     assert store.world.db.execute("SELECT text FROM messages WHERE id = ?", (second,)).fetchone()[0] == "ok, the notes come tomorrow"  # fmt: skip
     assert "rollback" in store.world.db.execute("SELECT text FROM messages WHERE id = ?", (first,)).fetchone()[0], "the evidence stays"  # fmt: skip
     # Too easy, t1 comes back for its one round; t3, which the judge does not approve, comes back after it too. The
-    # tasks in their bands never come back.
+    # tasks in their bands never come back. A round counts what changed: t3's revised message, not its unchanged turn.
     assert [s for s in seen if s[0] == "harden"] == [("harden", [t1], ["harder"]), ("harden", [t3], ["fix"]), ("harden", [t3], ["fix"])]  # fmt: skip
-    assert state.task_rounds == {t1: 1, t3: 2}, state.task_rounds
+    assert state.task_rounds == {t1: 1, t3: 1}, state.task_rounds
     # A hardening turn rewrites only what came back: t0 (in its band) is refused in t1's turn, t2 in t3's two turns.
     assert [s for s in seen if s[0] == "kept"] == [("kept", t0), ("kept", t2), ("kept", t2)], [s for s in seen if s[0] == "kept"]  # fmt: skip
     # Two batches, each in its own interaction; the second, cut off after t2, is written again: only t3 is asked for.
     assert [s for s in seen if s[0] == "tasks"] == [("tasks", (t0, t1), (t0, t1)), ("tasks", (t2, t3), (t2, t3)), ("tasks", (t2, t3), (t3,))]  # fmt: skip
     assert state.rounds["tasks"] == 3, state.rounds
     # Each probe tries what changed; the final reviews solve only what changed since: t0, which a fix rewrote.
-    assert solved == {("tasks-01", t0): 4, ("tasks-01", t1): 6, ("tasks-03", t2): 4, ("tasks-03", t3): 9, ("final-02", t0): 3}, solved  # fmt: skip
+    assert solved == {("tasks-01", t0): 4, ("tasks-01", t1): 6, ("tasks-03", t2): 4, ("tasks-03", t3): 6, ("final-02", t0): 3}, solved  # fmt: skip
     assert set(state.solves) == {t0, t1, t2, t3}, "a rewritten task's runs are its new ones"
     assert ("review", "review-02-02", "world", True, True, False, ()) in seen
-    assert ("review", "final-01", "world", False, True, False, ()) in seen
+    assert ("review", "final-01", "world", False, True, True, ()) in seen, "the world issue a probe raised"
+    assert state.open_issues == [], "the final review has heard them"
     assert ("review", "final-02", "world", False, True, True, ()) in seen, (
         "the final review checks the last issues"
     )
@@ -2158,8 +2173,9 @@ async def check_author(root):
         "only the changed task is reviewed again, with the issue that named it"
     )
     probed = {a: [s[6] for s in seen if s[:3] == ("review", a, "task")] for a in ("tasks-01", "tasks-03")}
-    assert probed == {"tasks-01": [(t0,), (t1,), (t1,)], "tasks-03": [(t2,), (t3,), (t3,), (t3,)]}, (
-        "the judge reviews each probe's tasks, one chunk at a time; each passes on its own"
+    assert probed == {"tasks-01": [(t0,), (t1,), (t1,)], "tasks-03": [(t2,), (t3,), (t3,)]}, (
+        "the judge reviews each probe's tasks, one chunk at a time; each passes on its own; a turn that changes "
+        "nothing is not probed"
     )  # fmt: skip
     assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [(t3,)], (
         "the final review judges only what changed or failed since its probe's review"
@@ -2240,6 +2256,31 @@ async def check_author(root):
     fails(store.publish)  # a task resting on a fact no message states
     store.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
     store.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
+    # A hardening turn that changes nothing ends the loop, rounds to spare or not: the same tries would come back.
+    idle_turns = []
+
+    async def idle(prompt, extra=None):
+        idle_turns.append(prompt)
+
+    state.task_rounds[t1] = 0  # t1, too easy, has its round again
+    await env.harden(agents, idle, "final-02", [t1])
+    assert len(idle_turns) == 1 and state.task_rounds[t1] == 0, (len(idle_turns), state.task_rounds)
+    state.task_rounds[t1] = 1
+    # A task's key covers the decoys on its facts' subjects: a revised decoy is a changed task, tried again.
+    resting = next(
+        t for (t,) in store.world.db.execute("SELECT task_id FROM task_facts WHERE fact_id = 'f4'")
+    )
+    keyed, lure = env.task_key(resting), store.world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+    store.world.insert("facts", [dict(id="f8", storyline="s2", subject="Audit", attribute="owner", value="Mia", is_decoy=1, channel_id=channel_id("public", "ops", []), author_id=store.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], day=3, summary="s")])  # fmt: skip
+    store.world.db.execute(
+        "INSERT INTO evidence (fact_id, message_id, role) VALUES ('f8', ?, 'supporting')", (lure,)
+    )
+    decoyed = env.task_key(resting)
+    store.world.db.execute("UPDATE messages SET text = 'Mia owns it now, I think' WHERE id = ?", (lure,))
+    assert len({keyed, decoyed, env.task_key(resting)}) == 3, "the key follows the task's decoys"
+    store.world.db.execute("DELETE FROM evidence WHERE fact_id = 'f8'")
+    store.world.db.execute("DELETE FROM facts WHERE id = 'f8'")
+    store.world.db.execute("UPDATE messages SET text = 'quiet day, nothing to report' WHERE id = ?", (lure,))
     store.publish()
     world, rows, answers = load_release(store.root / "release")
     assert len(rows) == 4 and World(world).db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
