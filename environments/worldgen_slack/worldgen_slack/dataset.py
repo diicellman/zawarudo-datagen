@@ -53,40 +53,50 @@ def sha256(path: Path) -> str:
 
 
 class PublicTask(StrictModel):
-    """A task as a solver gets it, with how hard it measured: the solver model's tries at the release, its share of
-    right answers and of right and grounded ones, the gold evidence the tries saw, and the witness's share of right
-    answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns."""
+    """A task as a solver gets it, with how hard it measured: the solver model's tries at the release (those that
+    crashed, and those that never answered), its share of right answers (with its 90% interval), of right and
+    grounded ones, and of those that declined to answer, the gold evidence the tries saw, and the witness's share of
+    right answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns."""
 
     task_id: SafeId
     question: NonEmptyText
     actor_id: SafeId
     category: NonEmptyText
     level: int
-    answer_type: Literal["text", "set", "number", "refusal"]
+    answer_type: Literal["text", "set", "number", "refusal", "status"]
     world_hash: str
     solver: str | None = None
     tries: int | None = None
     crashed: int | None = None
+    unanswered: int | None = None
     right_rate: float | None = None
+    right_interval: Annotated[list[float], Field(min_length=2, max_length=2)] | None = (
+        None  # its 90% interval
+    )
     strict_rate: float | None = None
+    abstain_rate: float | None = None
     coverage: float | None = None
     witness: str | None = None
     witness_right: float | None = None
 
 
 class PrivateAnswer(StrictModel):
-    """The gold rows of a task, and the messages (channel, ts) and people its answer rests on."""
+    """The gold rows of a task, the messages (channel, ts) and people its answer rests on, and, for a refusal, the
+    truth out of its actor's sight (`unseen`)."""
 
-    answer_type: Literal["text", "set", "number", "refusal"]
+    answer_type: Literal["text", "set", "number", "refusal", "status"]
     rows: list[dict[str, JsonValue]]
     gold_sql: NonEmptyText
     messages: list[Annotated[list[str], Field(min_length=2, max_length=2)]]  # [channel, ts]
+    unseen: list[Annotated[list[str], Field(min_length=2, max_length=2)]] = []
     users: list[str]
 
 
 class Manifest(StrictModel):
-    format: Literal["worldgen-slack.v6", "worldgen-slack.v7"] = (
-        "worldgen-slack.v7"  # v7: tasks carry their rates
+    format: Literal["worldgen-slack.v6", "worldgen-slack.v7", "worldgen-slack.v8", "worldgen-slack.v9"] = (
+        # v7: tasks carry their rates; v8: strict grounds the answer's claims, unanswered counted; v9: status answers,
+        # the abstain rate and the right rate's interval, and a reward of +1, 0 or -1
+        "worldgen-slack.v9"
     )
     world_hash: str
     files: dict[str, str]
@@ -111,12 +121,15 @@ def load_release(root: Path) -> tuple[Path, list[PublicTask], dict[str, PrivateA
     for row in rows:
         if row.world_hash != manifest.world_hash:
             raise ValueError("a task references another world")
-        reader = World(root / "world.sqlite", actor=row.actor_id)
-        for channel, ts in answers[row.task_id].messages:
-            if not reader.db.execute(
+        reader, answer = World(root / "world.sqlite", actor=row.actor_id), answers[row.task_id]
+        for channel, ts in answer.messages + answer.unseen:
+            readable = reader.db.execute(
                 "SELECT 1 FROM messages WHERE channel_id = ? AND ts = ?", (channel, ts)
-            ).fetchone():
+            ).fetchone()
+            if not readable and [channel, ts] in answer.messages:
                 raise ValueError(f"{row.task_id}: evidence its actor cannot read")
+            if readable and [channel, ts] in answer.unseen:
+                raise ValueError(f"{row.task_id}: evidence out of sight that its actor can read")
         for user in answers[row.task_id].users:
             reader.get_user(user)
         reader.close()

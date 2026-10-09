@@ -1,18 +1,18 @@
 # One generation run: uv run --frozen worldgen-slack --config configs/worldgen_slack/worldgen.toml
 # A new world needs a new `seed` and `output`; a run resumes only with the configuration it started with.
-# Now: S2 (2026-10-06), S1's sector at S1's size with 40 tasks: 10 days, 400 messages, 10 tasks per 100 messages in
-# batches of 10, reviewed after days 3 and 6. It measures the right-answer rates by level before the medium levels'
-# needs are tuned (the user's decision). The S2a smoke (data/v7-04-smoke) was seed 20261010, 2 days, 80 messages,
-# 8 tasks in batches of 4, task_rounds = 2, reviewed after day 1; S1 (data/v7-01) was seed 20261008, 10 tasks.
+# Now: S3 (2026-10-08), S2's sector at 2.5 times its size, with the S2 fixes (C40-C48): 10 days, 1,000 messages, 4 tasks
+# per 100 messages (40) in batches of 10, reviewed after days 3 and 6. Scale and the task fixes go together (the
+# user's decision, 2026-10-07): scale shows what fails next. S2 (data/v7-02) was seed 20261009, 400 messages, 10 per
+# 100; the S2a smoke (data/v7-04-smoke) seed 20261010, 2 days, 80 messages, 8 tasks; S1 (data/v7-01) seed 20261008.
 sector = "IT for a business-to-business software company: cloud platform operations, service releases, and customer incident coordination"
-seed = 20261009
-output = "data/v7-02/software"
+seed = 20261011
+output = "data/v7-05/software"
 storylines = 3            # the plot the ledger plans before day 1
 
 # One author writes the world in time order.
 [author]
 review_days = [3, 6]      # the judge reviews the world after these days, and at the end
-tries = 4                 # the solver's tries of a task, each time it is probed
+tries = 8                 # the solver's tries of a task, each time it is probed, sampled at temperature 1 (C54)
 task_rounds = 3           # turns a task outside its level's band comes back to the author
 keepalive = 600           # seconds between pings of the author's VM while the solver and the judge work
 
@@ -27,7 +27,7 @@ days = 10
 
 # The workspace's shape: code places conversations by these targets, and measure.py scores the world against them.
 [activity]
-messages = 400            # whole world, storylines included (estimate; 80 for a smoke)
+messages = 1000           # whole world, storylines included (estimate; 80 for a smoke)
 channel_skew = 1.1        # Zipf exponent over channels ranked by members (estimate)
 dms_per_person = 0.4      # direct-message pairs per person (estimate)
 dm_share = 0.25           # share of background messages in DMs (estimate)
@@ -39,7 +39,7 @@ emoji_rate = 0.08         # measured, same corpus; scorecard only
 parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 0.03 }  # workday rhythm (estimate)
 
 [tasks]
-per_100 = 10              # tasks per 100 messages (the user's decision, 2026-10-05): 40 for S1's 400
+per_100 = 4               # tasks per 100 messages: 40 for S3's 1,000 (S2: 10 per 100, 40 of 400)
 # Per level, the band of GLM's right-answer rate a task aims for (the user's decision, 2026-10-05): level 1 anchors
 # that most tries get right; level 4 tasks GLM rarely answers, and the witness must.
 bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5], [0.0, 0.25]]
@@ -59,13 +59,14 @@ styles = [
 # both. Every task is written on the finished world.
 # `concepts`, one list per level, are concrete things a task of that level requires; the seed draws one per slot
 # (DataDesigner's complexity -> concept subcategories). `needs`, one table per level, is what code checks a task for
-# when it is written: `rank`, its evidence's best search rank for the question's own words (evidence they never find
-# passes); `depth`, how many newer top-level messages (and earlier replies in its thread) it sits under, as a share of
-# the busiest channel the asker can read, so it scales with the world; `channels`,
-# the channels its facts are first stated in; `relations`, supersedes and after links among its facts; `decoys`, decoy
-# facts on their subjects the asker can read; `named`, at most how many of its evidence's channel names and
-# identifiers (words with digits, as PWSQL-03) the question names. S1's questions named their channels and IDs, and
-# search found every ledger task's evidence first.
+# when it is written: `channels`, the channels its facts are first stated in; `relations`, supersedes and after links
+# among its facts; `decoys`, its near-misses: decoys, or values whose change the asker cannot see, on its answer's
+# subject and attribute, that the asker can read and nothing in their sight retracts; `hidden`, its answer stated where
+# it is harder to see than its near-misses (a thread reply, a DM, a later day); `named`, at most how many of its
+# evidence's channel names and identifiers (words with digits, as PWSQL-03) the question names. Taxonomy v3
+# (2026-10-07): S2's medium tries came from unretracted near-misses beside a less visible truth, while GLM followed
+# every correction made in plain sight; search rank and depth left the needs (the author met rank by rewording, and
+# every channel of a 400-message world reads in one page), and are still measured.
 [taxonomy.lookup]
 gold = "sql"
 answer_types = ["text", "set", "number"]
@@ -73,16 +74,15 @@ definition = "Read one thing off the workspace's structure: who posted, where, w
 levels = [
   "one message or directory entry",
   "a reply inside a thread, or a read narrowed by a filter",
-  "something buried in a long channel that takes several pages to read",
+  "one of many look-alike routine posts, told apart by one detail",
   "a message the question describes only by what surrounds it (who answered, what came just before or after), among near-identical messages in a busy channel",
 ]
 concepts = [
   ["who posted a message the question describes", "which channel holds a message the question describes", "a person's title or team in the directory"],
   ["who replied in the thread of a message the question describes", "a message narrowed down by its author and its day", "who reacted to a message the question describes"],
-  ["a message several pages back in a busy channel", "the earliest or the latest of many similar messages", "a reply deep in a long thread"],
+  ["one of several look-alike routine posts, told apart by its author, day or a number", "the earliest or the latest of many similar messages", "a reply deep in a long thread"],
   ["the message just before or after a described one in a busy channel", "one of several near-identical messages, told apart by who reacted or replied", "a reply deep in a long thread, described by the discussion around it"],
 ]
-needs = [{}, {}, {depth = 0.3}, {depth = 0.5, rank = 10}]
 
 [taxonomy.search]
 gold = "ledger"
@@ -100,7 +100,7 @@ concepts = [
   ["a fact the question names only indirectly", "a fact among near-miss messages about the same subject", "a fact whose keyword also appears in unrelated chatter"],
   ["a fact stated with a synonym or nickname the question does not use", "a fact stated only as a reply in a thread about something else", "a fact only a direct message states, with public near-misses"],
 ]
-needs = [{}, {rank = 2}, {rank = 5, decoys = 1, named = 0}, {rank = 15, decoys = 2, named = 0}]
+needs = [{}, {}, {decoys = 1, named = 0}, {decoys = 2, hidden = true, named = 0}]
 
 [taxonomy.semantic]
 gold = "ledger"
@@ -115,10 +115,10 @@ levels = [
 concepts = [
   ["a value superseded once by a later message"],
   ["a value superseded twice", "a value the later messages refer to by another name", "a value corrected in a reply thread"],
-  ["a value split across messages in two channels", "a credible decoy that is never explicitly retracted", "a contradiction settled by the more authoritative person"],
+  ["a value split across messages in two channels", "a credible decoy that is never explicitly retracted", "a contradiction settled by the more authoritative person", "a change only a later thread reply under the original post states"],
   ["a value changed three times across channels, the last change a thread reply", "a value whose latest change comes from someone other than its owner, in another channel", "a decision reversed, then partly restored by someone with more authority"],
 ]
-needs = [{relations = 1}, {relations = 1}, {relations = 1, channels = 2, decoys = 1}, {relations = 2, channels = 3, decoys = 1, named = 0}]
+needs = [{relations = 1}, {relations = 1}, {relations = 1, channels = 2, decoys = 1, hidden = true}, {relations = 2, channels = 3, decoys = 1, hidden = true, named = 0}]
 
 [taxonomy.join]
 gold = "sql"
@@ -153,24 +153,28 @@ concepts = [
   ["which members of a channel stayed silent within a window after the message stating a fact"],
   ["who reacted to the message stating a fact, found among near-identical announcements, and also posted in another channel that day", "who replied to the correction of a fact but not to its first statement"],
 ]
-needs = [{}, {}, {rank = 3}, {rank = 10, decoys = 1}]
+needs = [{}, {}, {decoys = 1}, {decoys = 1}]  # S2's hybrid L4 in band (0.25) had its near-miss on its truth's day
 
+# Robustness L3-L4 (2026-10-09): a value the asker can see that was settled where they cannot is a status answer,
+# the latest visible value given as not settled, not a refusal: S3's solver found the provisional value and its
+# caveat, and a refusal graded that wrong.
 [taxonomy.robustness]
-gold = "sql"
-answer_types = ["refusal"]
-definition = "A request the asker cannot fulfill as asked from what they can see; the right answer says so, and why."
+gold = "sql"              # a status answer's gold reads the ledger: its value as the asker can see it stated
+answer_types = ["refusal", "status"]
+definition = "A request the asker cannot fulfill as asked from what they can see; the right answer says so, and why: nothing to find, or only a value that is not settled."
 levels = [
   "what it asks about does not exist",
   "what it asks about is in a conversation the asker cannot read",
-  "a false premise: the request assumes a decision, date or owner the workspace shows was retracted, moved or never made",
-  "visible near-misses (an older plan, a namesake, a draft) look like answers, while the real answer exists only where the asker cannot read",
+  "a value the asker can see that was changed or settled where they cannot: the right answer gives it as not settled",
+  "visible near-misses (an older plan, a namesake, a draft) look like answers, while the settled value exists only where the asker cannot read: the right answer gives the latest value they can see, as not settled",
 ]
 concepts = [
   ["a project, person or decision that never appears in the workspace"],
   ["a decision discussed only in a private channel the asker is not in", "a detail settled only in a direct message between others"],
-  ["a decision asked about as final that was proposed and then reversed", "a date asked about after it was moved", "work asked about as owned by someone who handed it off"],
-  ["a namesake project whose details are public while the one asked about is private", "an outdated public plan a private decision replaced", "a figure discussed publicly as an estimate and settled only in a private channel"],
+  ["a figure posted as provisional and settled only in a direct message", "a decision asked about as final that was changed in a private channel", "work asked about as owned by someone who handed it off privately"],
+  ["an outdated public plan a private decision replaced", "a figure discussed publicly as an estimate and settled only in a private channel", "a swap arranged in direct messages behind a posted roster"],
 ]
+needs = [{}, {}, {}, {decoys = 1}]
 
 # One model per agent. Unset fields (harness, runtime, sampling) keep the role defaults in config.py.
 [env.timeout]
@@ -182,9 +186,10 @@ model = "anthropic/claude-opus-5.5"  # the voice lab (2026-10-04): 0.77 blind re
 
 # Anthropic caches a prompt only when asked: each request's prefix is cached up to its end, so an agent's next step
 # pays for its new tail alone. Without it every step was billed in full, and the harness's token cap (new tokens only)
-# cut smoke 02's second day.
+# cut smoke 02's second day. The cache lives an hour: a probe keeps the author waiting 8 to 39 minutes (S2), past the
+# default five, and each hardening turn then re-read its whole context uncached until S2's batch 4 hit the cap.
 [env.author.sampling]
-cache_control = { type = "ephemeral" }
+cache_control = { type = "ephemeral", ttl = "1h" }
 
 [env.judge]
 model = "openai/gpt-6-sol"

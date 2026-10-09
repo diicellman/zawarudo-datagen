@@ -31,6 +31,9 @@ from .contracts import (
     fact_measures,
     insert_lines,
     normalized,
+    Slot,
+    features,
+    panel,
     record_task,
     render,
     text_errors,
@@ -407,12 +410,20 @@ def front_loaded(world, settings, facts: list, day: int) -> str | None:
     return None
 
 
+def planned_on_board(category, level: int) -> bool:
+    """Whether a slot rests on planned facts, so the board plans them before day 1: a ledger or hybrid slot, and one
+    whose level needs something of its facts (robustness level 4: a near-miss in sight, the truth out of it)."""
+    needs = category.needs[level - 1] if category.needs else None
+    return category.gold in ("ledger", "hybrid") or bool(needs and needs.facts())
+
+
 def record_plan(world, plan: Plan, settings, slots=()) -> None:
     """The ledger in time order. Storylines are fixed once planned (summaries may change); an event, once planned,
     never moves or goes; a stated fact keeps everything but its summary, while an unstated one may change or go and is
     planned for today or later. A fact about an event carries the event's moment. The board gives each ledger and
-    hybrid slot of `slots` the planned facts it will rest on, as many channels, relations and decoys as its level
-    needs: the material of a hard backward task exists before day 1, when it can still be posted."""
+    hybrid slot of `slots` the planned facts it will rest on (and each slot whose level needs something of its facts),
+    as many channels, relations and near-misses as its level needs: the material of a hard backward task exists before
+    day 1, when it can still be posted."""
     count = settings.storylines
     if len(plan.storylines) != count:
         raise ValueError(f"plan exactly {count} storylines")
@@ -457,15 +468,15 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
     planned = {f.id: f for f in plan.facts}
     if gone := sorted(stated - planned.keys()):
         raise ValueError(f"stated facts stay in the ledger: {gone}")
-    backward = {s.id: s for s in slots if settings.taxonomy[s.category].gold in ("ledger", "hybrid")}
+    backward = {s.id: s for s in slots if planned_on_board(settings.taxonomy[s.category], s.level)}
     board = {e.slot: list(dict.fromkeys(e.facts)) for e in plan.board}
     if len(board) < len(plan.board):
         raise ValueError("the board has one entry for each slot")
     if strays := sorted(board.keys() - backward.keys()):
-        raise ValueError(f"the board is for the ledger and hybrid slots of now.md; {strays} are not")
+        raise ValueError(f"the board is for the slots of now.md that rest on planned facts; {strays} do not")
     if missing := sorted(backward.keys() - board.keys()):
         raise ValueError(
-            f"the board names the facts each ledger and hybrid slot will rest on; {missing} have none"
+            f"the board names the facts each slot that rests on planned facts will rest on; {missing} have none"
         )
     if unknown := sorted({f for facts in board.values() for f in facts} - planned.keys()):
         raise ValueError(f"the board names facts of the plan; {unknown} are not")
@@ -844,10 +855,22 @@ def revise(world, message_id: int, text: str) -> dict:
     return {"message": message_id, "text": rendered}
 
 
-def add_task(world, task: Task, settings, slots: list) -> dict:
+def answer_of(world, task_id: str) -> list:
+    """What a task answers: its gold rows' answers, or, for a refusal, the facts it rests on."""
+    row = world.db.execute("SELECT answer_type, gold_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row["answer_type"] == "refusal":
+        return sorted(
+            f for (f,) in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))
+        )
+    return sorted(str(r.get("answer")) for r in json.loads(row["gold_json"]))
+
+
+def add_task(world, task: Task, settings, slots: list, keep: dict | None = None) -> dict:
     """One task for one of the slots being written, on the finished world; it replaces the slot's task, if any. Its
-    gold query is checked as every task is (T1-T7, readable facts, the level's needs). Returns its gold rows and
-    code's measures of how hard it is."""
+    gold query is checked as every task is (T1-T7, readable facts, the level's needs). A task that came back to be
+    harder or easier keeps its answer (`keep`, from the version the solver tried): a rewrite changes the route to the
+    answer, not the answer (WebShaper's expansion keeps it); a refusal keeps one of the facts it rested on. Returns
+    its gold rows and code's measures of how hard it is."""
     if today(world) is not None:
         raise ValueError("tasks are written once the calendar is closed")
     slot = next((s for s in slots if s.id == task.id), None)
@@ -855,4 +878,95 @@ def add_task(world, task: Task, settings, slots: list) -> dict:
         raise ValueError(f"a task's id is one of the slots you write now: {[s.id for s in slots]}")
     world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
     world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
-    return {"task": task.id} | record_task(world, task, settings, slot)  # every planned fact is stated by now
+    result = {"task": task.id} | record_task(
+        world, task, settings, slot
+    )  # every planned fact is stated by now
+    if keep and (was := keep.get(task.id)) is not None:
+        now = answer_of(world, task.id)
+        if (now != was) if task.answer_type != "refusal" else (was and not set(was) & set(now)):
+            raise ValueError(
+                f"{task.id} came back to be harder or easier and keeps its answer: the version the solver tried "
+                f"answers {was}, this one {now}. Change the route to that answer (lean on a near-miss, name what it "
+                "asks about by what surrounds it, add a condition), not the answer"
+            )
+    return result
+
+
+# ---------------------------------------------------------------------- the forge: tasks on a frozen world
+
+
+def forge_task(world, task: Task, settings, open_ids: list[str]) -> dict:
+    """One candidate task on a finished, frozen world, for one of the round's open ids. Its category and level are the
+    proposer's own, and its tries re-level it; it is checked as every task is (T1-T7, readable facts, the columns the
+    tools show), with no planned level's needs: the forge measures difficulty instead of planning it. Returns its
+    gold rows and code's measures."""
+    if task.id not in open_ids:
+        raise ValueError(f"a candidate's id is one of this round's open ids: {open_ids}")
+    spec = settings.taxonomy.get(task.category)
+    concept = (
+        spec.levels[task.level - 1] if spec and 1 <= task.level <= len(spec.levels) else "the proposer's own"
+    )
+    slot = Slot(
+        id=task.id, category=task.category, level=task.level, concept=concept, style="the proposer's own"
+    )
+    world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
+    world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
+    result = {"task": task.id} | record_task(world, task, settings, slot, needs=False)
+    lazy = panel(world, task.id, result["gold"])
+    if task.level > 1 and not task.facts and task.answer_type != "refusal" and not task.near_sql:
+        raise ValueError(
+            f"{task.id}: a task above level 1 with no facts names in near_sql its gold query with one condition "
+            "relaxed (a day, a channel, a reaction or a thread left out), which answers otherwise: the answer a hasty "
+            "reader gives"
+        )
+    if task.level > 1 and lazy["shortcut"]:
+        raise ValueError(
+            f"{task.id}: a search for the question's own words reaches its answer first ({lazy['guesses']['top']!r}), "
+            "so it is a level-1 task: GLM never missed such a task in S2 or S3. Put a near-miss where that search "
+            "reaches first (ask with the words its stale or wrong value uses, or where the correction is out of that "
+            "search's way), or write it as level 1"
+        )
+    return result | {"panel": lazy, "features": features(world, task.id, result["gold"])}
+
+
+class Annotation(StrictModel):
+    """A fact the finished world already states, registered on the messages that state it: the ledger grows from the
+    chatter while the workspace stays as it is. Its channel, author and day are its first message's."""
+
+    id: SafeId
+    storyline: SafeId
+    subject: NonEmptyText
+    attribute: NonEmptyText
+    value: NonEmptyText
+    anchor: NonEmptyText  # words every one of its messages contains
+    message_ids: list[int] = Field(min_length=1)
+    supersedes: SafeId | None = None
+    decoy: bool = False
+    summary: NonEmptyText
+
+
+def annotate(world, fact: Annotation) -> dict:
+    """Register a fact the world states (the forge's world_annotate): checked by the world's rules on insert (each
+    message contains the anchor, a supersedes link points forward in time, two values of one subject and attribute
+    are a change or a decoy)."""
+    if world.db.execute("SELECT 1 FROM facts WHERE id = ?", (fact.id,)).fetchone():
+        raise ValueError(f"fact {fact.id} exists: an annotation registers a new fact")
+    if (
+        fact.supersedes
+        and not world.db.execute("SELECT 1 FROM facts WHERE id = ?", (fact.supersedes,)).fetchone()
+    ):
+        raise ValueError(f"fact {fact.supersedes}, which it supersedes, does not exist")
+    marks = ", ".join("?" * len(fact.message_ids))
+    stated = world.db.execute(f"SELECT id, channel_id, user_id, ts_us FROM messages WHERE id IN ({marks}) AND is_deleted = 0 ORDER BY ts_us", fact.message_ids).fetchall()  # fmt: skip
+    if len(stated) != len(set(fact.message_ids)):
+        raise ValueError(f"messages {sorted(set(fact.message_ids) - {r['id'] for r in stated})} do not exist")
+    first = stated[0]
+    (day,) = world.db.execute("SELECT day FROM calendar WHERE ? >= start_us AND ? < end_us", (first["ts_us"], first["ts_us"])).fetchone()  # fmt: skip
+    with world.batch():
+        world.insert("facts", [dict(id=fact.id, storyline=fact.storyline, subject=fact.subject, attribute=fact.attribute, value=fact.value, anchor=fact.anchor, channel_id=first["channel_id"], author_id=first["user_id"], day=day, is_decoy=int(fact.decoy), summary=fact.summary)])  # fmt: skip
+        world.insert("evidence", [dict(fact_id=fact.id, message_id=r["id"], role="anchor", anchor_token=fact.anchor) for r in stated])  # fmt: skip
+        if fact.supersedes:
+            world.insert(
+                "fact_relations", [dict(src_fact=fact.id, dst_fact=fact.supersedes, kind="supersedes")]
+            )
+    return {"fact": fact.id, "channel_id": first["channel_id"], "author_id": first["user_id"], "day": day, "messages": len(stated)}  # fmt: skip

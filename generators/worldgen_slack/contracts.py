@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
-from worldgen_slack.db import World, canonical, digest
+from worldgen_slack.db import SHOWN, World, canonical, digest
 from worldgen_slack.db import words
 from worldgen_slack.dataset import NonEmptyText, SafeId, StrictModel
 
@@ -243,9 +243,11 @@ class Task(StrictModel):
     level: int = Field(ge=1)
     actor_id: SafeId
     question: NonEmptyText
-    answer_type: Literal["text", "set", "number", "refusal"]
+    answer_type: Literal["text", "set", "number", "refusal", "status"]
     gold_sql: NonEmptyText
     facts: Ids = Field(default_factory=list)
+    # The gold query with one condition relaxed (a day, a channel, a reaction left out): what a hasty reader answers.
+    near_sql: list[NonEmptyText] = Field(default_factory=list, max_length=3)
 
 
 class Scene(StrictModel):
@@ -540,7 +542,7 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
         raise ValueError(f"{task.id}: actor_id {task.actor_id} is not a person in the world") from None
     except ValueError as error:
         raise ValueError(f"{task.id}: {error}") from None
-    read, rows = set(out["tables"]), out["rows"]
+    read, rows, source = set(out["tables"]), out["rows"], gold_source(task, settings)
     if renumbered is not None:
         copy, back = renumbered
         try:
@@ -552,18 +554,26 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
                 f"{task.id}: the gold query finds messages by what the question names (words, people, channels, "
                 "threads, reactions, times), never by a message id or by id order"
             )
-    if category.gold == "sql" and read & LEDGER_TABLES:
+    if source == "sql" and read & LEDGER_TABLES:
         raise ValueError(
             f"{task.id}: a {task.category} gold query reads only the workspace, not {sorted(read & LEDGER_TABLES)}"
         )
-    if category.gold in ("ledger", "hybrid") and not read & LEDGER_TABLES:
-        raise ValueError(f"{task.id}: a {task.category} gold query reads the facts it answers from")
-    if category.gold == "hybrid" and not read & STRUCTURE:
+    if source in ("ledger", "hybrid") and not read & LEDGER_TABLES:
+        raise ValueError(
+            f"{task.id}: a {task.category} {task.answer_type} gold query reads the facts it answers from"
+        )
+    if source == "hybrid" and not read & STRUCTURE:
         raise ValueError(
             f"{task.id}: a hybrid gold query also reads the workspace (messages, members, reactions)"
         )
-    if category.gold in ("ledger", "hybrid") and not task.facts:
+    if source in ("ledger", "hybrid") and not task.facts:
         raise ValueError(f"{task.id}: name the facts its answer rests on in facts")
+    unshown = [r for r in out["reads"] if (t := r.split(".")[0]) in SHOWN and r.split(".")[1] not in SHOWN[t]]
+    if unshown:
+        raise ValueError(
+            f"{task.id}: the gold query reads {unshown}, which no Slack tool shows its solver; ask only about what "
+            "the tools show"
+        )
     if task.answer_type == "refusal":
         if rows:
             raise ValueError(
@@ -581,6 +591,17 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
         raise ValueError(
             f"{task.id}: a {task.answer_type} answer is one row; use answer_type set for several"
         )
+    if task.answer_type == "status":
+        unsettled(world, task, rows)
+    for near in task.near_sql:  # a hasty reader's answer: another one, as the actor sees it
+        try:
+            relaxed = world.gold(task.actor_id, near, max_rows=50)["rows"]
+        except ValueError as error:
+            raise ValueError(f"{task.id}: its near-miss query fails: {error}") from None
+        if sorted(str(r.get("answer")) for r in relaxed) == sorted(str(r.get("answer")) for r in rows):
+            raise ValueError(
+                f"{task.id}: its near-miss query returns its gold answer; relax a condition that matters"
+            )
     if given := [
         str(r["answer"])
         for r in rows
@@ -591,23 +612,27 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
     return rows
 
 
-def record_task(world, task: Task, settings, slot: Slot) -> dict:
+def record_task(world, task: Task, settings, slot: Slot, needs: bool = True) -> dict:
     """T6: a task fills its slot. Code checks it (its slot's cell, a question no other task asks, facts its actor can
-    read, T1-T5, T7, and its level's needs) and inserts it with its slot's concept and its gold rows. Returns its gold
-    rows and code's measures. Run inside `World.trial()`."""
+    read, T1-T5, T7, and, with `needs`, its level's needs) and inserts it with its slot's concept and its gold rows.
+    Returns its gold rows and code's measures. Run inside `World.trial()`."""
     if (task.id, task.category, task.level) != (slot.id, slot.category, slot.level):
         raise ValueError(f"{slot.id} is a {slot.category} level {slot.level} task, with the slot's id")
-    asked = {
-        normalized(r[0]) for r in world.db.execute("SELECT question FROM tasks WHERE id != ?", (task.id,))
-    }
-    if normalized(task.question) in asked:
-        raise ValueError(f"{task.id}: a task asks a question no other task asks")
-    for fact in task.facts:
+
+    for fact in (
+        task.facts if task.answer_type not in ("refusal", "status") else ()
+    ):  # a refusal or a status may rest on the truth out of sight
         row = world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()
         if row and not readable(world, task.actor_id, row[0]):
             raise ValueError(f"{task.id}: its actor cannot read {row[0]}, where {fact} is stated")
     with world.renumbered() as renumbered:
         gold = check_task(world, task, settings, renumbered)
+    # A question no other task asks, but for a perspective twin: another asker, for whom its answer differs.
+    for question, actor, rows in world.db.execute("SELECT question, actor_id, gold_json FROM tasks WHERE id != ?", (task.id,)):  # fmt: skip
+        if normalized(question) == normalized(task.question) and (
+            actor == task.actor_id or json.loads(rows) == gold
+        ):
+            raise ValueError(f"{task.id}: a task asks a question no other task asks, unless another person asks it and its answer differs for them")  # fmt: skip
     with world.batch():
         world.insert("tasks", [task_row(task, settings) | {"concept": slot.concept}])
         world.insert("task_facts", [dict(task_id=task.id, fact_id=f) for f in dict.fromkeys(task.facts)])
@@ -615,7 +640,7 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
     tables = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)["tables"]
     measured = measures(world, task.id, gold, tables)
     spec = settings.taxonomy.get(task.category)
-    if spec and spec.needs and (short := unmet(spec.needs[task.level - 1], measured)):
+    if needs and spec and spec.needs and (short := unmet(spec.needs[task.level - 1], measured)):
         raise ValueError(f"{task.id}: a level-{task.level} {task.category} task needs " + "; ".join(short))
     return {"gold": gold} | measured
 
@@ -624,16 +649,14 @@ def unmet(needs, measured: dict) -> list[str]:
     """Each of a level's needs that a task's measures fall short of, with what was measured; a need whose measure is
     not given (a board entry has only its facts') is not checked."""
     out = []
-    if (rank := measured.get("bm25_rank")) is not None and rank < needs.rank:
-        out.append(f"its evidence below the first {needs.rank - 1} search hits for the question's own words (it is hit {rank})")  # fmt: skip
-    if "depth_share" in measured and measured["depth_share"] < needs.depth:
-        out.append(f"its evidence under at least {needs.depth:.0%} as many messages as the busiest channel its actor reads holds, newer in its channel or earlier in its thread (it is under {measured['depth_share']:.0%}, {measured['depth']} messages)")  # fmt: skip
     if measured["channels"] < needs.channels:
         out.append(f"its facts first stated in at least {needs.channels} channels (they are in {measured['channels']})")  # fmt: skip
     if measured["relations"] < needs.relations:
         out.append(f"at least {needs.relations} supersedes or after relations among its facts (it has {measured['relations']})")  # fmt: skip
     if measured["decoys"] < needs.decoys:
-        out.append(f"at least {needs.decoys} decoy facts on its facts' subjects, where its actor can read them (it has {measured['decoys']})")  # fmt: skip
+        out.append(f"at least {needs.decoys} near-misses: decoys, or values whose change its actor cannot see, on its answer's subject and attribute, that its actor can read and no change it can see retracts (it has {measured['decoys']})")  # fmt: skip
+    if needs.hidden and measured.get("hidden") is False:
+        out.append("its answer stated where it is harder to see than its near-misses: in a thread reply, in a DM, or on a later day than every near-miss")  # fmt: skip
     if needs.named is not None and measured.get("named", 0) > needs.named:
         out.append(f"a question naming at most {needs.named} of its evidence's channels and identifiers (it names {measured['named']})")  # fmt: skip
     return out
@@ -643,16 +666,14 @@ def needs_text(needs) -> str:
     """A level's needs, as the author reads them in now.md."""
     many = lambda n, word: f"{n} {word}" + ("s" if n > 1 else "")  # noqa: E731
     out = []
-    if needs.rank > 1:
-        out.append("evidence not the question's first search hit" if needs.rank == 2 else f"evidence not among the question's first {needs.rank - 1} search hits")  # fmt: skip
-    if needs.depth:
-        out.append(f"evidence under {needs.depth:.0%} of its busiest channel's messages")
     if needs.channels:
         out.append(f"facts first stated in {many(needs.channels, 'channel')}")
     if needs.relations:
         out.append(f"{many(needs.relations, 'relation')} among its facts")
     if needs.decoys:
-        out.append(f"{many(needs.decoys, 'readable decoy')} on their subjects")
+        out.append(f"{many(needs.decoys, 'near-miss')} on its answer's subject and attribute that its actor can read, unretracted in its sight")  # fmt: skip
+    if needs.hidden:
+        out.append("its answer in a thread reply, a DM, or later than its near-misses")
     if needs.named is not None:
         out.append("a question that names none of its evidence's channels and identifiers" if needs.named == 0 else f"a question naming at most {needs.named} of its evidence's channels and identifiers")  # fmt: skip
     return "; ".join(out)
@@ -673,34 +694,116 @@ def named(world, question: str, evidence: list[int]) -> int:
     return sum(bool(re.search(rf"(?<![\w-]){re.escape(t)}(?![\w-])", question, re.IGNORECASE)) for t in terms)
 
 
-def fact_measures(world, ids: list[str], actor: str | None = None) -> dict:
-    """What a task's facts give it: the channels they are first stated in, the relations among them, and the decoys
-    on their subjects (that `actor` can read, given one)."""
+def fact_measures(world, ids: list[str], actor: str | None = None, gold=None, refusal: bool = False) -> dict:
+    """What a task's facts give it: the channels they are first stated in, the relations among them, and its
+    near-misses (`decoys`): facts on an answer fact's subject and attribute, other than its answer facts, that `actor`
+    can read and that no fact `actor` can see supersedes: an unretracted decoy, or a value whose change is out of the
+    actor's sight. A near-miss the world corrects in plain sight is no near-miss: S2's solver followed every such
+    chain. Planned before any actor is chosen, a near-miss counts wherever it is stated, and a change counts as seen
+    when it is public."""
     marks = ", ".join("?" * len(ids))
     channels = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", ids).fetchone()[0]  # fmt: skip
     relations = world.db.execute(f"SELECT COUNT(*) FROM fact_relations WHERE src_fact IN ({marks}) AND dst_fact IN ({marks})", [*ids, *ids]).fetchone()[0]  # fmt: skip
-    decoys = world.db.execute(f"SELECT channel_id FROM facts WHERE is_decoy = 1 AND lower(trim(subject)) IN (SELECT lower(trim(subject)) FROM facts WHERE id IN ({marks}))", ids).fetchall()  # fmt: skip
-    if actor:
-        decoys = [d for d in decoys if readable(world, actor, d[0])]
-    return {"channels": channels, "relations": relations, "decoys": len(decoys)}
+    answers = answer_facts(world, ids, actor, gold, refusal)
+    return {"channels": channels, "relations": relations, "decoys": len(near_misses(world, answers, actor))}
+
+
+def places(world, fact: str) -> set[str]:
+    """Where a fact is stated, or, before it is, the channel it is planned to be first stated in."""
+    stated = {r[0] for r in world.db.execute("SELECT DISTINCT m.channel_id FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?", (fact,))}  # fmt: skip
+    return stated or {world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()[0]}
+
+
+def answer_facts(
+    world, ids: list[str], actor: str | None = None, gold=None, refusal: bool = False
+) -> list[str]:
+    """Which of a task's facts it answers with: those its gold answers are the values of; for a refusal, those out of
+    its actor's sight (the truth it cannot see); else, or when none is, those that are no decoy and that no fact
+    supersedes; and for a task about an earlier state, its facts that are no decoy (a later value is its near-miss)."""
+    marks = ", ".join("?" * len(ids))
+    values = {str(v).strip().casefold() for v in gold or ()}
+    if refusal and actor:
+        found = [f for f in ids if not any(readable(world, actor, c) for c in places(world, f))]
+    else:
+        found = [f for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", ids) if v.strip().casefold() in values]  # fmt: skip
+    current = f"SELECT id FROM facts WHERE id IN ({marks}) AND is_decoy = 0 AND id NOT IN (SELECT dst_fact FROM fact_relations WHERE kind = 'supersedes')"  # fmt: skip
+    earlier = f"SELECT id FROM facts WHERE id IN ({marks}) AND is_decoy = 0"
+    return (
+        found
+        or [f for (f,) in world.db.execute(current, ids)]
+        or [f for (f,) in world.db.execute(earlier, ids)]
+    )
+
+
+def near_misses(world, answers: list[str], actor: str | None = None) -> list[str]:
+    """The near-misses of a task answering with facts `answers` (`fact_measures`), as fact ids."""
+    reads = (lambda c: readable(world, actor, c)) if actor else (lambda c: True)
+
+    def sees(channel: str) -> bool:
+        if actor:
+            return readable(world, actor, channel)
+        return (
+            world.db.execute("SELECT type FROM channels WHERE id = ?", (channel,)).fetchone()[0] == "public"
+        )
+
+    out = []
+    for answer in answers:
+        subject, attribute = world.db.execute("SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (answer,)).fetchone()  # fmt: skip
+        for (fact,) in world.db.execute(
+            "SELECT id FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ? ORDER BY id",
+            (subject, attribute),
+        ):
+            if fact in answers or fact in out or not any(map(reads, places(world, fact))):
+                continue
+            changes = [r[0] for r in world.db.execute("SELECT src_fact FROM fact_relations WHERE kind = 'supersedes' AND dst_fact = ?", (fact,))]  # fmt: skip
+            if not any(sees(c) for change in changes for c in places(world, change)):
+                out.append(fact)
+    return out
+
+
+def hidden(world, ids: list[str], actor: str, gold=None) -> bool | None:
+    """Whether a task's answer is stated where it is harder to see than its near-misses: an anchor of an answer fact
+    in a thread reply or a direct conversation, or on a later day than every near-miss is first stated. None for a
+    task with no answer fact stated."""
+    answers = answer_facts(world, ids, actor, gold)
+    misses = near_misses(world, answers, actor)
+    marks = ", ".join("?" * len(answers))
+    anchors = world.db.execute(
+        f"""SELECT m.parent_id, c.type, f.day FROM evidence e JOIN messages m ON m.id = e.message_id
+        JOIN channels c ON c.id = m.channel_id JOIN facts f ON f.id = e.fact_id
+        WHERE e.role = 'anchor' AND e.fact_id IN ({marks})""",
+        answers,
+    ).fetchall()
+    if not anchors:
+        return None
+    last = max((world.db.execute("SELECT day FROM facts WHERE id = ?", (f,)).fetchone()[0] for f in misses), default=None)  # fmt: skip
+    return any(a["parent_id"] is not None or a["type"] in ("im", "mpim") or (last is not None and a["day"] > last) for a in anchors)  # fmt: skip
 
 
 def measures(world, task_id: str, rows: list[dict], tables) -> dict:
     """What makes a task hard, measured for its actor: how many read_channel pages deep its evidence sits and how many
     messages it sits under, the tables its gold query reads, its evidence's best rank when the actor searches the
-    question's own words, how many of its evidence's channels and identifiers the question names, and what its facts
-    give it (`fact_measures`)."""
-    task = world.db.execute("SELECT actor_id, question FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    question's own words, how many of its evidence's channels and identifiers the question names, how much of its
+    evidence the actor cannot read (`unseen`: a refusal's truth out of sight), and what its facts give it
+    (`fact_measures`)."""
+    task = world.db.execute(
+        "SELECT actor_id, question, answer_type FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    answers, refusal = [r.get("answer") for r in rows], task["answer_type"] == "refusal"
     evidence = [r["message_id"] for r in rows if r.get("message_id") is not None]
+    # Its own evidence: a decoy it lists among its facts is a near-miss to search past, not evidence to find.
     evidence += [
         r[0]
         for r in world.db.execute(
             """SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id
-            WHERE tf.task_id = ? AND e.role = 'anchor'""",
+            JOIN facts f ON f.id = tf.fact_id WHERE tf.task_id = ? AND e.role = 'anchor' AND f.is_decoy = 0""",
             (task_id,),
         )
     ]
     reader = World(world.path, actor=task["actor_id"])
+    # A refusal may rest on the truth out of its actor's sight: what the actor cannot read is counted, not measured.
+    evidence = list(dict.fromkeys(evidence))
+    seen = [m for m in evidence if reader.db.execute("SELECT 1 FROM messages WHERE id = ?", (m,)).fetchone()]
     pages = [
         reader.db.execute(
             """SELECT COUNT(*) / 50 + 1 FROM messages m, messages e
@@ -708,7 +811,7 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
             AND m.ts_us > (SELECT ts_us FROM messages WHERE id = COALESCE(e.parent_id, e.id))""",
             (message_id,),
         ).fetchone()[0]
-        for message_id in dict.fromkeys(evidence)
+        for message_id in seen
     ]
     under = [
         reader.db.execute(
@@ -718,18 +821,167 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
             FROM messages e WHERE e.id = ?""",
             (message_id,),
         ).fetchone()[0]
-        for message_id in dict.fromkeys(evidence)
+        for message_id in seen
     ]
     facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
     (busiest,) = reader.db.execute("SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM messages WHERE parent_id IS NULL GROUP BY channel_id)").fetchone()  # fmt: skip
+    return (
+        {
+            "evidence_pages": max(pages, default=None),
+            "depth": max(under, default=0),
+            "depth_share": round(max(under, default=0) / busiest, 3) if busiest else 0.0,
+            "tables": sorted(tables),
+            "bm25_rank": reader.rank(task["question"], seen),
+            "named": named(world, task["question"], evidence),
+            "unseen": len(evidence) - len(seen),
+        }
+        | fact_measures(world, facts, task["actor_id"], answers, refusal)
+        | ({"hidden": hidden(world, facts, task["actor_id"], answers)} if facts and not refusal else {})
+    )
+
+
+def stated_values(world, facts: list[str], actor: str) -> dict[str, list[int]]:
+    """The values its actor can read stated on the subjects and attributes of a task's facts, each with the messages
+    that state it, oldest first."""
+    reader, out = World(world.path, actor=actor), {}
+    seen = {r[0] for r in reader.db.execute("SELECT id FROM messages")}
+    reader.close()
+    marks = ", ".join("?" * len(facts))
+    for value, message, _ in world.db.execute(
+        f"""SELECT lower(trim(f.value)), m.id, m.ts_us FROM facts f JOIN evidence e ON e.fact_id = f.id
+        JOIN messages m ON m.id = e.message_id WHERE (lower(trim(f.subject)), lower(trim(f.attribute))) IN
+        (SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id IN ({marks})) ORDER BY m.ts_us""",
+        facts,
+    ):
+        if message in seen:
+            out.setdefault(value, []).append(message)
+    return out
+
+
+def panel(world, task_id: str, rows: list[dict]) -> dict:
+    """Lazy solvers, played by code over the ledger as a task's actor can read it (StateMemBench's heuristics,
+    2608.19652): the first value stated on its answer's subject and attribute, the latest, the most stated, and the
+    first a search for the question's own words reaches. `traps` are the ones that answer wrong. A task the search
+    for its own words answers right is a shortcut: in S2 and S3, GLM never missed one of its 20 such tasks, and
+    missed 8 of the 17 where that search found a wrong value first."""
+    task = world.db.execute(
+        "SELECT actor_id, question, answer_type FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
+    stated = stated_values(world, facts, task["actor_id"]) if facts else {}
+    if not stated:
+        return {"guesses": {}, "traps": [], "shortcut": False}
+    when = {v: world.db.execute(f"SELECT MIN(ts_us), MAX(ts_us) FROM messages WHERE id IN ({', '.join('?' * len(ms))})", ms).fetchone() for v, ms in stated.items()}  # fmt: skip
+    reader = World(world.path, actor=task["actor_id"])
+    ranks = {v: reader.rank(task["question"], ms) for v, ms in stated.items()}
+    reader.close()
+    found = [v for v in stated if ranks[v] is not None]
+    guesses = {
+        "first": min(stated, key=lambda v: when[v][0]),
+        "latest": max(stated, key=lambda v: when[v][1]),
+        "most": max(stated, key=lambda v: len(stated[v])),
+        "top": min(found, key=lambda v: ranks[v]) if found else None,
+    }
+    # The value the task rests on: its answer facts' (a hybrid task answers about the message that states it).
+    marks = ", ".join("?" * len(facts))
+    answered = answer_facts(world, facts, task["actor_id"], [r.get("answer") for r in rows])
+    gold = {v.strip().casefold() for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", facts) if f in answered}  # fmt: skip
+    if task["answer_type"] == "refusal":  # nothing is the answer: any value given is wrong
+        return {
+            "guesses": guesses,
+            "traps": [k for k, v in guesses.items() if v is not None],
+            "shortcut": False,
+        }
+    traps = [k for k, v in guesses.items() if v is not None and v not in gold]
+    return {"guesses": guesses, "traps": traps, "shortcut": task["answer_type"] != "status" and guesses["top"] in gold}  # fmt: skip
+
+
+def features(world, task_id: str, rows: list[dict]) -> dict:
+    """What a task's structure is, measured by code: how many values its asker can see on its answer's subject and
+    attribute (`changes`), where its answer's statement sits (`last_link`: a thread reply, a direct conversation, a
+    private channel, or a channel, and later than the first value), how many rows it answers, whether another person
+    asking gets another answer (`perspective`), and whether its answer is in no message as written (`derived`)."""
+    task = world.db.execute(
+        "SELECT actor_id, gold_sql, answer_type FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
+    answers = [str(r.get("answer")) for r in rows]
+    stated = stated_values(world, facts, task["actor_id"]) if facts else {}
+    link = None
+    # Where its answer is stated: its answer facts' values, as the panel reads them (a hybrid or a person answer is
+    # about the message that states a fact).
+    answered = answer_facts(world, facts, task["actor_id"], answers) if facts else []
+    values = [v.strip().casefold() for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({', '.join('?' * len(answered))})", answered)] if answered else []  # fmt: skip
+    golden = [stated[v] for v in values if v in stated]
+    if golden:
+        message = world.db.execute("SELECT m.parent_id, c.type, m.ts_us FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?", (golden[0][0],)).fetchone()  # fmt: skip
+        link = "thread" if message["parent_id"] else {"im": "dm", "mpim": "dm", "private": "private"}.get(message["type"], "channel")  # fmt: skip
+        first = min(world.db.execute(f"SELECT MIN(ts_us) FROM messages WHERE id IN ({', '.join('?' * len(ms))})", ms).fetchone()[0] for ms in stated.values())  # fmt: skip
+        link += "·later" if message["ts_us"] > first and len(stated) > 1 else ""
+    others = []
+    for (user,) in world.db.execute("SELECT id FROM users WHERE id != ? ORDER BY id", (task["actor_id"],)):
+        try:
+            others.append(sorted(str(r.get("answer")) for r in world.gold(user, task["gold_sql"], max_rows=50)["rows"]))  # fmt: skip
+        except ValueError:
+            continue  # the query returns what that person cannot read
+    readable = World(world.path, actor=task["actor_id"])
+    verbatim = all(readable.db.execute("SELECT 1 FROM messages WHERE instr(lower(text), lower(?)) LIMIT 1", (a,)).fetchone() for a in answers)  # fmt: skip
+    named = all(world.db.execute("SELECT 1 FROM users WHERE real_name = ?", (a,)).fetchone() for a in answers)
+    readable.close()
     return {
-        "evidence_pages": max(pages, default=None),
-        "depth": max(under, default=0),
-        "depth_share": round(max(under, default=0) / busiest, 3) if busiest else 0.0,
-        "tables": sorted(tables),
-        "bm25_rank": reader.rank(task["question"], evidence),
-        "named": named(world, task["question"], list(dict.fromkeys(evidence))),
-    } | fact_measures(world, facts, task["actor_id"])
+        "changes": len(stated),
+        "last_link": link,
+        "rows": len(rows),
+        "perspective": any(o != sorted(answers) for o in others),
+        "derived": bool(answers) and not verbatim and not named,
+        "status": task["answer_type"] == "status",
+    }
+
+
+def failure_cases(world, task_id: str, rows: list[dict]) -> tuple[str, list[tuple[str, str]]]:
+    """A task's gold as a plain answer, and the wrong answers its grade must reject, built by code: each near-miss
+    value its actor can read on its answer's subject and attribute, a hedge between the gold and the first of them, a
+    set with a row left out, declining to answer, a bare opener (judges accept one 60-90% of the time, 2507.08794),
+    and a status given as final. A grade that accepts one, or rejects the gold, is ambiguous as asked
+    (Self-Challenging's failure cases, 2506.01716)."""
+    task = world.db.execute(
+        "SELECT actor_id, answer_type, near_sql FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    kind, answers = task["answer_type"], [str(r.get("answer")) for r in rows]
+    facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
+    misses = []
+    if facts and kind != "refusal":
+        golden = {a.strip().casefold() for a in answers}
+        for fact in answer_facts(world, facts, task["actor_id"], answers):
+            subject, attribute = world.db.execute("SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (fact,)).fetchone()  # fmt: skip
+            for other, value in world.db.execute("SELECT id, value FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ? ORDER BY day, id", (subject, attribute)):  # fmt: skip
+                sight = any(readable(world, task["actor_id"], c) for c in places(world, other))
+                if sight and value.strip().casefold() not in golden and value not in misses:
+                    misses.append(value)
+    elif facts:  # a refusal: any value its actor can see, given as the answer
+        marks = ", ".join("?" * len(facts))
+        misses = [v for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks}) ORDER BY day, id", facts) if any(readable(world, task["actor_id"], c) for c in places(world, f))]  # fmt: skip
+    gold = ", ".join(answers)
+    cases = [(f"the near-miss {value!r}", f"{value}.") for value in misses[:3]]
+    for near in json.loads(
+        task["near_sql"]
+    ):  # a hasty reader's answer, from the gold with a condition relaxed
+        relaxed = ", ".join(
+            str(r.get("answer")) for r in world.gold(task["actor_id"], near, max_rows=50)["rows"]
+        )
+        cases.append((f"the near-miss query's answer {relaxed!r}", f"{relaxed or 'Nobody'}."))
+    cases.append(("a bare opener", "Thought process:"))
+    if kind == "refusal":
+        return "I can't answer that from anything you can see: it isn't there.", cases
+    if misses:
+        cases.append(("a hedge", f"Either {gold} or {misses[0]}; I can't tell which."))
+    if kind == "set" and len(answers) > 1:
+        cases.append(("a set with a row left out", ", ".join(answers[:-1]) + "."))
+    if kind == "status":
+        cases.append(("the status given as final", f"{gold}. That is final and confirmed."))
+        return f"{gold}, though it is not settled: nothing you can see confirms it.", cases
+    cases.append(("declining to answer", "I can't find that in anything you can see."))
+    return f"{gold}.", cases
 
 
 def band_move(probe: dict) -> str | None:
@@ -745,12 +997,45 @@ def band_move(probe: dict) -> str | None:
     return None
 
 
+def gold_source(task: Task, settings) -> str:
+    """Where a task's answer comes from: its category's gold, but a status answer is a value of the ledger as its
+    actor can see it stated."""
+    if task.answer_type == "status":
+        return "ledger"
+    return settings.taxonomy[task.category].gold if task.category in settings.taxonomy else "sql"
+
+
+def unsettled(world, task: Task, rows: list[dict]) -> None:
+    """A status answer's ground: the value its gold gives is a fact its actor can read, that no fact in their sight
+    supersedes, and that a fact it rests on, out of their sight, does. S3's care team could read only the provisional
+    "15%... Grant can correct me", while a DM had settled 10%: the useful answer gives 15% as not settled."""
+    values = {str(r.get("answer")).strip().casefold() for r in rows}
+    seen = lambda f: any(readable(world, task.actor_id, c) for c in places(world, f))  # noqa: E731
+    marks = ", ".join("?" * len(task.facts))
+    given = [f for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", task.facts) if v.strip().casefold() in values and seen(f)]  # fmt: skip
+    if not given:
+        raise ValueError(
+            f"{task.id}: a status answer's gold gives the value of one of its facts its actor can read"
+        )
+    # The values that replace it: later facts on its subject and attribute down its supersedes chain.
+    later = [r[0] for r in world.db.execute(
+        f"""WITH RECURSIVE chain(id) AS (SELECT src_fact FROM fact_relations WHERE kind = 'supersedes'
+        AND dst_fact IN ({", ".join("?" * len(given))}) UNION SELECT r.src_fact FROM chain c JOIN fact_relations r
+        ON r.dst_fact = c.id AND r.kind = 'supersedes')
+        SELECT f.id FROM chain JOIN facts f ON f.id = chain.id JOIN facts g ON g.id = ?
+        WHERE lower(trim(f.subject)) = lower(trim(g.subject)) AND lower(trim(f.attribute)) = lower(trim(g.attribute))""",
+        [*given, given[0]],
+    )]  # fmt: skip
+    if in_sight := [f for f in later if seen(f)]:
+        raise ValueError(f"{task.id}: its actor can read {in_sight}, which supersede the value it gives: that is its answer, not a status")  # fmt: skip
+    if not [f for f in task.facts if f in later]:
+        raise ValueError(f"{task.id}: a status answer rests on a fact, out of its actor's sight, that supersedes the value it gives")  # fmt: skip
+
+
 def task_row(task: Task, settings) -> dict:
     return task.model_dump(
         include={"id", "category", "level", "actor_id", "question", "answer_type", "gold_sql"}
-    ) | {
-        "gold_source": settings.taxonomy[task.category].gold if task.category in settings.taxonomy else "sql"
-    }
+    ) | {"gold_source": gold_source(task, settings), "near_sql": json.dumps(task.near_sql)}
 
 
 def readable(world, actor: str, channel: str) -> bool:
@@ -994,6 +1279,11 @@ def validate_verdict(verdict: Verdict, payload: dict) -> None:
         raise ValueError("judge must review every requested task exactly once")
     if payload["phase"] == "task" and any(r.level_fit is None for r in verdict.tasks):
         raise ValueError("a task review scores each task's level_fit from 0 to 4")
+    if payload["phase"] == "task" and any(i.blocking and not i.task_ids for i in verdict.issues):
+        raise ValueError(
+            "a blocking issue in a task review names the tasks it blocks (task_ids); a defect that blocks no task "
+            "is not blocking"
+        )
 
 
 def deciding(verdict: Verdict, acceptance) -> list[Issue]:
@@ -1007,12 +1297,13 @@ def accepted(verdict: Verdict, acceptance) -> bool:
 
 
 def accepted_task(verdict: Verdict, acceptance, task_id: str) -> bool:
-    """One task of a batched review passes on its own review and the issues that name it or no task."""
+    """One task of a batched review passes on its own review and the issues that name it: an issue naming no task is
+    the world's, and the final review decides it."""
     return accepted(
         verdict.model_copy(
             update={
                 "tasks": [r for r in verdict.tasks if r.task_id == task_id],
-                "issues": [i for i in verdict.issues if task_id in i.task_ids or not i.task_ids],
+                "issues": [i for i in verdict.issues if task_id in i.task_ids],
             }
         ),
         acceptance,

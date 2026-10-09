@@ -22,13 +22,17 @@ from worldgen_slack.db import World, digest
 from worldgen_slack.tools import WorldTaskData, file_hash, watch_parent
 
 from ..chronicle import (
+    Annotation,
     Conversation,
     Plan,
     add_task,
+    annotate,
     advance,
     bounds,
     drift,
+    forge_task,
     part_of,
+    planned_on_board,
     post,
     posted,
     present,
@@ -63,7 +67,14 @@ GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor see
   ledger query reads the facts it answers from, a hybrid query reads both.
 - The gold query finds messages by what the question names (words, people, channels, threads, reactions, times),
   never by a message id or by id order: code checks that it answers the same with the messages renumbered.
-- answer_type: text or number is one row; set is 1 to max_answer_rows rows; refusal is no rows as the actor.
+- It asks only about what the solver's Slack tools show: who reacted, not when; who is a member now, not when they
+  joined; nothing of a channel's creator or a person's account date. Code refuses a column no tool shows.
+- answer_type: text or number is one row; set is 1 to max_answer_rows rows; refusal is no rows as the actor (nothing
+  to find); status is one row, the latest value the actor can see, which a fact out of their sight settles: its gold
+  reads that value from the ledger, and its facts name the settling fact. A status is answered right by giving the
+  value as not settled.
+- near_sql, optional: up to 3 queries, the gold with one condition relaxed, each answering otherwise (the answer a
+  hasty reader gives); the forge asks for one of a task above level 1 that rests on no facts.
 - question is what actor_id asks, in `language`; it does not contain its answer.
 """
 
@@ -139,14 +150,15 @@ Voice
 Tasks (after the last day, world_add_task)
 - One task for each slot of now.md, with the slot's id: a question an actor asks, as hard as its level and concept
   say, in its style. Nothing can be posted after the last day, so plan from day 1 what each slot will rest on (the
-  plan's board, checked against each level's needs): facts in several channels, decoys, buried or split evidence,
-  private conversations.
+  plan's board, checked against each level's needs): facts in several channels; near-misses, a teammate's confident
+  wrong claim, a stale reading, a plan changed out of the asker's sight, that nothing in their sight retracts; the
+  answer where it is harder to see than its near-misses (a thread reply, a DM, a later day); private conversations.
 """
     + GOLD_SQL
     + """- world_add_task checks the task, refuses it below its level's needs (now.md lists each slot's), and returns its
   gold rows and code's measures (read_channel pages deep, messages above it, tables read, search rank, the channels
-  and identifiers the question names, its facts' channels, relations and decoys). A solver then tries each task;
-  reword a task, or rest it on other evidence, to fit its level.
+  and identifiers the question names, its facts' channels, relations and decoys). A solver then tries each task, and
+  one outside its level's band comes back to you with the solver's route: keep its answer and change the route.
 
 Reviews
 - An independent judge reviews the world after some days and at the end. Its issues come back to you: message_ids
@@ -294,7 +306,13 @@ def now_page(world, settings, context: dict) -> str:
             f"- {slot['id']}: {slot['category']} level {level}: {spec.levels[level - 1]}; concept: {slot['concept']}; "
             f"style: {slot['style']}"
             + (f"; needs: {needs}" if needs else "")
-            + (f"; the board rests it on {', '.join(board[slot['id']])}" if slot["id"] in board else "")
+            + (
+                f"; the board rests it on {', '.join(board[slot['id']])}"
+                if slot["id"] in board
+                else "; for the board"
+                if planned_on_board(spec, level)
+                else ""
+            )
             + ("; written in this turn" if slot["id"] in context.get("writable", []) else "")
         )
     if notes := drift(world, context.get("cards", {})):
@@ -530,7 +548,7 @@ def files(world, settings, context: dict, mode: str) -> dict[str, str]:
         out[f"memory/storylines/{storyline}.md"] = storyline_page(world, storyline)
     for (event,) in world.db.execute("SELECT id FROM events"):
         out[f"memory/events/{event}.md"] = event_page(world, event)
-    if mode == "tasks":
+    if mode in ("tasks", "forge"):
         tasks = [task_page(world, dict(t)) for t in world.db.execute("SELECT * FROM tasks ORDER BY id")]
         out["memory/tasks.md"] = "# Tasks\n" + "\n".join(tasks) + "\n"
     return out
@@ -540,7 +558,7 @@ def files(world, settings, context: dict, mode: str) -> dict[str, str]:
 
 
 class AuthoringToolsConfig(vf.ToolsetConfig):
-    mode: Literal["plan", "day", "tasks"] = "plan"
+    mode: Literal["plan", "day", "tasks", "forge"] = "plan"
     day: int = 0
     db_path: str = ""
     db_hash: str = ""
@@ -600,9 +618,15 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
     def writable(self) -> list:
         """The slots the turn at hand may write: the env sets them before each turn (a hardening turn rewrites only
         the tasks that came back), so they are read on every call, not when the interaction opened."""
-        path = Path(self.context.get("writable_file") or "")
-        ids = json.loads(path.read_text()) if path.is_file() else self.context.get("writable", [])
+        ids = self.allowed().get("ids", [])
         return [s for s in self.every_slot if s.id in ids]
+
+    def allowed(self) -> dict:
+        """What the env allows the turn at hand, read per call: the slots it may write, and the answers the tasks
+        that came back to be harder or easier keep."""
+        path = Path(self.context.get("writable_file") or "")
+        saved = json.loads(path.read_text()) if path.is_file() else {"ids": self.context.get("writable", [])}
+        return saved if isinstance(saved, dict) else {"ids": saved}
 
     def _with_state(self, fn):
         synced = super()._with_state(fn)
@@ -723,9 +747,9 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def plan(self, ledger: Plan) -> str:
-        """Plan the ledger, whole: storylines, events, facts, and the board (the facts each ledger and hybrid task slot
-        will rest on, as its level needs). Planned events and stated facts stay as they are; the rest may change.
-        Returns what the ledger now holds."""
+        """Plan the ledger, whole: storylines, events, facts, and the board (the facts each task slot now.md marks for
+        the board will rest on, as its level needs). Planned events and stated facts stay as they are; the rest may
+        change. Returns what the ledger now holds."""
 
         def act():
             self._write(lambda copy: record_plan(copy, ledger, self.settings, self.every_slot))
@@ -792,12 +816,28 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
     @vf.tool
     async def add_task(self, task: Task) -> dict:
         """Write the task of one slot, with the slot's id (it replaces the slot's task, if any): checked, then its gold
-        rows and code's measures returned."""
+        rows and code's measures returned. In the forge, a candidate for one of the round's open ids, of the category
+        and level you choose."""
+
+        def act(copy):
+            if self.config.mode == "forge":
+                return forge_task(copy, task, self.settings, self.allowed().get("ids", []))
+            return add_task(copy, task, self.settings, self.writable(), self.allowed().get("keep"))
+
         return self._logged(
-            "add_task",
-            {"task": task.model_dump(mode="json")},
-            lambda: self._write(lambda copy: add_task(copy, task, self.settings, self.writable())),
-            "tasks",
+            "add_task", {"task": task.model_dump(mode="json")}, lambda: self._write(act), "tasks", "forge"
+        )
+
+    @vf.tool
+    async def annotate(self, fact: Annotation) -> dict:
+        """Register a fact the world already states, on the messages that state it (each contains its anchor; the
+        first is its first statement): the ledger grows, the workspace stays as it is. supersedes names a fact it
+        replaces, stated earlier."""
+        return self._logged(
+            "annotate",
+            {"fact": fact.model_dump(mode="json")},
+            lambda: self._write(lambda copy: annotate(copy, fact)),
+            "forge",
         )
 
 
@@ -827,13 +867,74 @@ class WorldAuthorTask(vf.Task[WorldTaskData, vf.State, WorldAuthorConfig]):
             raise ValueError("the world file requires a host-side tool server")
         data = WorldTaskData(
             prompt=None,
-            system_prompt=AUTHOR_GUIDE,
+            system_prompt=FORGE_GUIDE if mode == "forge" else AUTHOR_GUIDE,
             attempt=attempt,
             world_hash=tools.db_hash,
             network_allow=[],
             network_block=["*"],
         )
         return cls(data, WorldAuthorConfig(tools=tools))
+
+
+FORGE_GUIDE = (
+    """You propose tasks on one company's finished Slack workspace, for training agents that answer colleagues'
+questions from Slack. The workspace is written and frozen: nothing is posted, revised or moved. Each round you write
+candidate tasks; then a small solver model (GLM) tries each one 8 times with the asker's Slack tools, a stronger
+model tries the ones GLM rarely answers, and a judge reviews each. What lands is kept in an archive by category, by
+the level its tries measure, and by its structure; the rest is dropped. Your aim is tasks of every level, and
+above all the middle ones (GLM right in 25-75% of its tries) that are fair: a careful colleague with the same access
+answers them right.
+
+Tools and memory
+- world_now(), world_view(ref), world_sql(sql, actor_id=None) and world_read(actor_id, tool, arguments) read the
+  world: the whole file, or what one person sees, through the solver's own tools. Walk a task's route as its asker
+  before you write it: search with the question's words, read what comes up, and see what a hasty reader would
+  answer.
+- world_add_task(task) writes a candidate for one of the round's open ids, with the category and level you choose;
+  code checks it and returns its gold rows, its measures and its traps. world_annotate(fact) registers a fact the
+  world already states, on its messages, when a task needs one the ledger lacks; the ledger is the world's own
+  record of who stated what, with its decoys (planned wrong claims) and its changes (supersedes).
+- /task/memory/ is code's: taxonomy.md (each category, what its levels ask for, its gold and answer types),
+  archive.md (what each round kept and dropped, how often GLM was right, how it went wrong, and the cells still
+  empty), board.md (the tasks the world was planned for, and the facts each rests on: write these first),
+  ledger.json, and a page per person (its id, U..., is what actor_id and world_read take), channel, storyline and
+  event. /task/notes/ is yours; the world's
+  author left its plan.md there.
+
+What makes a task hard, and what does not (from the world's earlier runs and the literature)
+- GLM searches well and reads threads. It answers wrong when the cheapest route ends at a wrong value: the first
+  value its search for the question's own words finds is stale, a near-miss or a decoy. A near-miss read beside its
+  correction misleads no one; one whose correction sits where that search does not reach (a thread under another
+  post, a DM, a later day, other words) does.
+- What moved GLM: a correction that is itself out of date; a value that changed more than once across channels; a
+  false premise matching a near-miss ("kyong or juancarlos?"); a set or a count that is complete only when every
+  place is read (each missed place costs it); an answer as of a moment, not the latest; who asks (the same question
+  has another answer for someone who cannot read the DM that settles it); answers to work out, not to copy
+  (durations across zones, counts nobody wrote).
+- What did not: rewording; a long question that spells out the route; naming a near-miss and calling it wrong ("the
+  count going around is wrong, so go by QA's post"): that hands over the answer. Ask as a colleague would, briefly.
+- Middle rates come from two or three soft obstacles stacked, each of which GLM gets past most of the time, not from
+  one trap it always or never falls into.
+- A task is fair: its gold is the complete, correct answer from what its asker can read, and nothing else in their
+  sight is as good an answer. Code grades a task's wrong answers before GLM tries it: a near-miss, a hedge, a set
+  missing a row; a task whose grade accepts one is dropped.
+
+Tasks
+- category and level from taxonomy.md; the level is your guess, and GLM's tries decide.
+- A status task (robustness) is for a value its asker can see that a fact out of their sight settles: its gold is
+  that visible value from the ledger, its facts name the settling fact, and the right answer gives it as not settled.
+  A refusal is for what is not there to see at all.
+"""
+    + GOLD_SQL
+)
+
+
+def forge_prompt(round_: int, rounds: int, ids: list[str]) -> str:
+    return (
+        f"Round {round_} of {rounds}. Read /task/memory/archive.md and board.md, and your notes. Then write one "
+        f"candidate with world_add_task for each open id: {', '.join(ids)}. Walk each one's route as its asker first. "
+        "Write in /task/notes/plan.md what you tried and why, then end your turn."
+    )
 
 
 def rejected(feedback: str, restored: str = "") -> str:
@@ -845,18 +946,26 @@ def plan_prompt(world, settings, feedback: str = "") -> str:
     count = settings.storylines
     return (
         f"Before day 1 ({clock(world, bounds(world, 1)[0])[:14]}): plan the ledger with world_plan: exactly {count} "
-        "storylines, their events and their facts, over the calendar in now.md, and its board: the facts each ledger "
-        "and hybrid slot in now.md will rest on, as many channels, relations and decoys as its level needs. Then write "
+        "storylines, their events and their facts, over the calendar in now.md, and its board: the facts each slot "
+        "now.md marks for the board will rest on, as many channels, relations and near-misses as its level needs. Then write "
         "/task/notes/plan.md: each storyline's arc day by day, and how each slot will be asked. End your turn when the "
         f"ledger is planned.{rejected(feedback)}"
     )
+
+
+# S3's judge flagged its planned decoys as defects, and the author corrected them where their readers see them: a
+# near-miss corrected in plain sight misleads no one.
+DECOY_ISSUES = (
+    "An issue about a message that states a decoy is answered in /task/notes/plan.md, not in the world: correcting or "
+    "hedging a decoy where its readers see it voids the near-miss its tasks rest on."
+)
 
 
 def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") -> str:
     total = world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0]
     review = (
         "\nThe judge reviewed the world so far. Fix what you can in what you write next (world_revise rewrites a "
-        f"message where it stands): {json.dumps(issues, ensure_ascii=False)}"
+        f"message where it stands): {json.dumps(issues, ensure_ascii=False)}\n{DECOY_ISSUES}"
         if issues
         else ""
     )
@@ -882,17 +991,22 @@ def tasks_prompt(settings, ids: list[str]) -> str:
 
 def harden_prompt(back: dict) -> str:
     return (
-        "These tasks come back to you, each with its slot's cell, the solver's tries (right_rate, the share of right "
-        "answers, is how hard the task is; strict_rate also needs every claim grounded; solves, each try's calls and the "
-        "step at which the gold evidence first appeared: the route to beat; the whole tries are in "
-        "/task/memory/solves/<task>/), the judge's review (level_fit "
-        "from 0 to 4: how fully answering it needs its level and concept), code's measures (evidence pages, tables "
-        "read, search rank), its level's band of right-answer rates, and what it needs (move): harder, easier, or the "
-        f"fix the judge asks for: {json.dumps(back, ensure_ascii=False)}\nRewrite each in its slot so that answering it "
-        "needs its level and concept with no easier route, and lands in its band: reword it, or rest it on other "
-        "evidence; world_revise can remove a giveaway from a message. A task you change is tried and reviewed again; "
-        "one you keep stands as it is, and its round still counts (rounds_left). Only these tasks may be rewritten in "
-        "this turn. End your turn when the tasks stand."
+        "These tasks come back to you, each with what it asks, its gold rows and gold SQL and who asks it, its earlier "
+        "versions with how often the solver was right on each (history), the solver's tries (right_rate, the share of "
+        "right answers, is how hard the task is; strict_rate also needs the answer's claims grounded; each try's "
+        "route: the step at which the gold evidence first showed (evidence_at), the call that showed it (found_by), "
+        "how many calls showed a decoy (decoy_reads), the answer; the whole tries are in /task/memory/solves/<task>/), "
+        "the witness's tries, the judge's review, code's measures, its level's band of right-answer rates, and what "
+        "it needs (move): harder, easier, or the fix the judge asks for. Each rewrite is tried and reviewed again, the "
+        "last one too; tries_left counts the rewrites still tried after this one: "
+        f"{json.dumps(back, ensure_ascii=False)}\nRewrite each in its slot so that answering it needs its level and "
+        "concept with no easier route, and lands in its band. Keep its answer and change its route: lean the question "
+        "on a near-miss the world holds (a decoy on its subject); name what it asks about by what surrounds it rather "
+        "than by a name, ID or date the solver can search for (a sub-question the world answers elsewhere); add a "
+        "condition that singles the answer out only together with the others; point it at one of several look-alike "
+        "posts. To make it easier, give back a name or narrow a condition. world_revise can remove a giveaway from a "
+        "message. A task you keep stands as it is. Only these tasks may be rewritten in this turn. End your turn when "
+        "the tasks stand."
     )
 
 
@@ -901,9 +1015,10 @@ def fix_prompt(issues: list, writable: list[str]) -> str:
         f"world_add_task may rewrite only {', '.join(writable)}" if writable else "no task is to be rewritten"
     )
     return (
-        f"The review rejected the world: {json.dumps(issues, ensure_ascii=False)}\nFix each issue with world_revise or "
-        f"world_add_task ({rewrite}): message_ids are the messages to change, evidence_message_ids show the defect. If "
-        "you judge an issue mistaken, write why in /task/notes/plan.md. End your turn when done."
+        f"The review rejected the world: {json.dumps(issues, ensure_ascii=False)}\nFix each blocking issue with "
+        f"world_revise or world_add_task ({rewrite}): message_ids are the messages to change, evidence_message_ids "
+        "show the defect. Fix the others too, or write in /task/notes/plan.md why you leave one; if you judge an issue "
+        f"mistaken, write why there. {DECOY_ISSUES} End your turn when done."
     )
 
 

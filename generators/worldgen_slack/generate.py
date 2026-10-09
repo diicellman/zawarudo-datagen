@@ -1,4 +1,5 @@
-"""Generate one Slack world with its tasks, on native Verifiers agents: uv run --frozen worldgen-slack --config <toml>"""
+"""Generate one Slack world with its tasks, on native Verifiers agents: uv run --frozen worldgen-slack --config <toml>
+(or `worldgen-slack forge --config <toml>`: tasks on a finished world)."""
 
 import argparse
 import asyncio
@@ -76,9 +77,30 @@ async def run(config: Config) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "command", nargs="?", choices=["forge"], help="forge: tasks on a finished world (forge.py)"
+    )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true", help="validate the configuration; spend nothing")
     args = parser.parse_args()
+    if args.command == "forge":
+        from . import forge
+
+        plan, settings = forge.load_forge(args.config)
+        if args.dry_run:
+            print(json.dumps(forge.dry_run(plan, settings), indent=1))
+            return 0
+        install_interrupt()
+        try:
+            result = asyncio.run(forge.run(plan, settings))
+        except KeyboardInterrupt:
+            print(
+                "interrupted: the forge is stopped and its sandboxes deleted; rerun to resume",
+                file=sys.stderr,
+            )
+            return 130
+        print(json.dumps(result, indent=2))
+        return 0 if result["status"] == "complete" else 2
     config = load_config(args.config)
     if args.dry_run:
         (occupation, _), *_ = census(config.personas)[1].most_common(1)

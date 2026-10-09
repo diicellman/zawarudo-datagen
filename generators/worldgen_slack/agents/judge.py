@@ -34,7 +34,8 @@ COMMON_GUIDE = """Approve only after investigating. Call inspect_check before wr
 
 PHASE_GUIDES = {
     "task": """Task review. A task is valid when its actor can answer its question as asked from what they can read,
-and its gold rows are the complete, correct answer. Score each criterion of schemas.json from 0 to 1:
+and its gold rows are the complete, correct answer; a status task's answer is its gold value given as not settled, as
+the actor can see it, while the fact that settles it is out of their sight. Score each criterion of schemas.json from 0 to 1:
 - question_fit: each gold query answers its question as asked; test variants with inspect_sql.
 - discoverability: the actor can find the answer with Slack's read tools; try inspect_read, and read the solves.
   Solvers that answer differently or fail can reveal ambiguity or a missing time scope; a mistake the evidence rules
@@ -55,7 +56,11 @@ and its gold rows are the complete, correct answer. Score each criterion of sche
 - professional_realism: it reads as real work. inspect_check's style shows each author's messages beside their typing
   (people in input.json); different people writing in one register is a defect.
 Message times and order are code's; report text that contradicts them, not the times themselves. When input.json has
-ledger, it gives every planned event and fact with its moment on the company clock. When it has written_through, the
+ledger, it gives every planned event and fact with its moment on the company clock. A fact marked (decoy) is a planned
+near-miss: a wrong claim someone makes, which tasks rely on a reader taking for the answer. Judge a decoy's messages
+for realism only (would this person say it, on what they knew), and leave the claim standing: it is a coherence defect
+only when the story later acts on it as true and nothing in the workspace ever settles it; never ask for a decoy to be
+corrected or hedged. When it has written_through, the
 workspace is written up to that moment and goes on later: judge what exists, and leave open what is still open.
 """,
 }

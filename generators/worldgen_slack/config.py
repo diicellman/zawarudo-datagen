@@ -115,19 +115,23 @@ class ActivityConfig(Section):
 
 
 class Needs(Section):
-    """What code checks a task of one level for when it is written: its evidence's best search rank for the
-    question's own words (evidence the words never find passes); how deep its evidence sits (newer top-level messages
-    in its channel, and earlier replies in its thread), as a share of the busiest channel its actor can read, so the
-    need scales with the world; the channels its facts are first stated in; the relations
-    among its facts; the decoys its actor can read on their subjects; and at most how many of its evidence's channel
-    names and identifiers (words with digits, as PWSQL-03) the question names."""
+    """What code checks a task of one level for when it is written: the channels its facts are first stated in; the
+    relations among its facts; its near-misses (decoys, or values whose change its actor cannot see, on its answer's
+    subject and attribute, readable and unretracted in its actor's sight: `contracts.fact_measures`); whether its
+    answer is stated where it is harder to see than they are (`hidden`: a thread reply, a DM, or a later day); and at
+    most how many of its evidence's channel names and identifiers (words with digits, as PWSQL-03) the question names.
+    Search rank and depth are measured and reported, not needed: S2's author met a rank need by rewording, and at a
+    world's size every channel reads in one page."""
 
-    rank: int = Field(default=1, ge=1)
-    depth: float = Field(default=0, ge=0, lt=1)
     channels: int = Field(default=0, ge=0)
     relations: int = Field(default=0, ge=0)
     decoys: int = Field(default=0, ge=0)
+    hidden: bool = False
     named: int | None = Field(default=None, ge=0)
+
+    def facts(self) -> bool:
+        """Whether a level needs anything of its facts, so its slots are planned on the board before day 1."""
+        return bool(self.channels or self.relations or self.decoys or self.hidden)
 
 
 class Category(Section):
@@ -136,7 +140,7 @@ class Category(Section):
     each level for."""
 
     gold: Literal["sql", "ledger", "hybrid"]
-    answer_types: list[Literal["text", "set", "number", "refusal"]] = Field(min_length=1)
+    answer_types: list[Literal["text", "set", "number", "refusal", "status"]] = Field(min_length=1)
     definition: Text
     levels: list[Text] = Field(min_length=1)
     concepts: list[list[Text]]
@@ -174,10 +178,11 @@ class AuthorSettings(Section):
     review_days: list[int] = Field(
         default_factory=lambda: [5]
     )  # the judge reviews the world after these days
-    # The solver's tries of a task, each time it is probed or reviewed; the turns a task outside its band comes back
-    # to the author; the tasks in one judge review (a batch's reviews run side by side); GLM solves at once, as the
-    # account allows 8 concurrent requests; the witness's tries of a task below its band's floor.
-    tries: int = Field(default=4, ge=1, le=16)
+    # The solver's tries of a task, each time it is probed or reviewed (8: at 4, a task right 80% of the time shows
+    # 4 of 4 in 41% of probes); the turns a task outside its band comes back to the author; the tasks in one judge
+    # review (a batch's reviews run side by side); GLM solves at once, as the account allows 8 concurrent requests;
+    # the witness's tries of a task below its band's floor.
+    tries: int = Field(default=8, ge=1, le=16)
     task_rounds: int = Field(default=3, ge=0, le=10)
     review_chunk: int = Field(default=5, ge=1, le=50)
     solvers: int = Field(default=8, ge=1, le=64)

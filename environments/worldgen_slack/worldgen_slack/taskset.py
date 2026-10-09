@@ -22,8 +22,14 @@ def shown(call: dict) -> set[tuple[str, str]]:
 
 
 class AnswerGrade(StrictModel):
+    """The committed answer against the reference (correct), whether the response declined to give one (abstained),
+    whether the observations support the claims that make its answer (grounded), and how many of the response's other
+    material claims they don't (counted, not scored)."""
+
     correct: bool
+    abstained: bool
     grounded: bool
+    unsupported_asides: int = Field(ge=0)
     reason: NonEmptyText
 
 
@@ -34,17 +40,36 @@ class AnswerJudge(vf.Judge[AnswerGrade]):
         return [
             vf.UserMessage(
                 content=(
-                    "Grade a Slack answer against the question and its reference. The reference's rows are the "
-                    "answer: for a set every row is required and order does not matter; text and number are one "
-                    "value; a refusal is right when the response says the request cannot be fulfilled as asked from "
-                    "what the asker can see: what it asks about does not exist, is out of their sight, or rests on a "
-                    "premise the workspace contradicts. Accept equivalent wording and supported explanation. Separately decide whether "
-                    "the solver's RECORDED observations support every material claim of its response; the reference "
-                    "is not an observation, and no observations means ungrounded. Return correct, grounded and a "
-                    "concise reason.\n" + json.dumps(fields, ensure_ascii=False)
+                    "Grade a Slack answer against the question and its reference. First find the answer the response "
+                    "commits to: one that lists alternatives without settling on one is wrong, while side options it "
+                    "labels as such do not count against an answer it commits to. A response that gives no answer and "
+                    "says the request cannot be answered or determined has abstained, whether or not that is right. "
+                    "The reference's rows are the answer: for a set every row is required and order does not matter; "
+                    "text and number are one value; a time asked for on the asker's clock is given on that clock; a "
+                    "refusal is right when the response says the request cannot be fulfilled as asked from what the "
+                    "asker can see: what it asks about does not exist, is out of their sight, or rests on a premise "
+                    "the workspace contradicts. A status reference is the latest value the asker can see, which is "
+                    "not settled: the response is right when it gives that value and says it is not final or "
+                    "confirmed; giving it as final, or another value, is wrong; saying only that it cannot be "
+                    "determined abstains. Accept equivalent wording. Then decide grounded on the answer's own claims: "
+                    "the solver's RECORDED observations support the claims that make its answer (the value and what "
+                    "it rests on; for a status, also that it is unsettled; for a refusal, that the thing is not there "
+                    "to see or its premise is contradicted); the reference is not an observation, and no observations "
+                    "means ungrounded. Count the response's other material claims the observations do not support "
+                    "(unsupported_asides); they do not change grounded. Return correct, abstained, grounded, "
+                    "unsupported_asides and a concise reason.\n" + json.dumps(fields, ensure_ascii=False)
                 )
             )
         ]
+
+
+def reward(grade: AnswerGrade) -> float:
+    """+1 for a right answer the observations ground, 0 for a right one they don't or for declining to answer, -1 for
+    a wrong one: under a 1-or-0 grade a guess always beats saying it cannot be told (TruthRL, Kalai et al.), and S3's
+    solver gave a provisional figure as final in 38 of its 65 misses."""
+    if grade.correct:
+        return 1.0 if grade.grounded else 0.0
+    return 0.0 if grade.abstained else -1.0
 
 
 class SolverConfig(vf.TaskConfig):
@@ -81,7 +106,8 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
     @staticmethod
     def outcome(trace: vf.Trace) -> dict:
         """A solve's graded result. One that crashed before its grade (its harness, its model stream or its grading
-        failed) scores zero and is marked crashed: its try tells nothing about the task."""
+        failed) scores zero and is marked crashed: its try tells nothing about the task. One that finished without an
+        answer is marked unanswered."""
         result = trace.info.get("evaluation")
         crashed = result is None or not trace.ok
         if result is None:
@@ -99,7 +125,12 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             }
         if not trace.ok:
             result.update(execution_ok=False, semantic_correctness=0.0)
-        return result | {"crashed": crashed}
+        # A finished try that never answers (an empty last message, or the turn cap mid-search) is wrong, and counted.
+        silent = (
+            not (result.get("response") or "").strip()
+            or getattr(trace, "stop_condition", None) == "max_turns"
+        )
+        return result | {"crashed": crashed, "unanswered": not crashed and silent}
 
     async def finalize(self, trace):
         trace.info["observations"] = [c.model_dump(mode="json") for c in trace.state.calls]
@@ -124,7 +155,10 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         needed = len(reference.messages) + len(reference.users)
         found = len({tuple(m) for m in reference.messages} & seen) + len(set(reference.users) & users)
         coverage = found / needed if needed else None
-        score = float(grade.correct and grade.grounded)
+        # Grounded by message, not by topic alone: an answer whose gold rests on messages is grounded only if its
+        # tries were shown one of them (a stale message is topically just as close).
+        grade = grade.model_copy(update={"grounded": grade.grounded and (found > 0 or not needed)})
+        score = reward(grade)
         trace.info["evaluation"] = {
             "task_id": self.data.task_id,
             "execution_ok": True,
@@ -138,7 +172,9 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         trace.record_metrics(
             {
                 "correct": float(grade.correct),
+                "abstained": float(grade.abstained),
                 "grounded": float(grade.grounded),
+                "unsupported_asides": float(grade.unsupported_asides),
                 "calls": float(len(observations)),
             }
         )

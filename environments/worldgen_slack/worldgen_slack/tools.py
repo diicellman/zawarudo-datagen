@@ -169,6 +169,11 @@ class SlackTools(vf.Toolset[WorldToolsConfig, CallState]):
         """Get the emoji reactions on a message and who added them."""
         return self._call("get_reactions", channel_id=channel_id, ts=ts)
 
+    @vf.tool
+    async def whoami(self) -> dict:
+        """Who the user is (ID, handle, name, title, timezone) and the current time on their clock."""
+        return self._call("whoami")
+
 
 if __name__ == "__main__":
     watch_parent()

@@ -34,8 +34,12 @@ def role(model: str, *, author: bool = False, solver: bool = False) -> vf.AgentC
             disk=8,
             idle_timeout=1800,
         ),
-        # Reasoning models (e.g. GLM 5.3) can spend >16k tokens thinking before an author writes its file.
-        sampling=vf.Sampling(temperature=0.5 if author else 0.0, max_tokens=64_000 if author else 16_000),
+        # Reasoning models (e.g. GLM 5.3) can spend >16k tokens thinking before an author writes its file. A solver
+        # samples as a policy in training does, so that its tries of a task differ and a rate measures a chance: S3's
+        # sampled at 0, and its 4 tries were nearly one. Judges stay at 0.
+        sampling=vf.Sampling(
+            temperature=0.5 if author else 1.0 if solver else 0.0, max_tokens=64_000 if author else 16_000
+        ),
         max_turns=160 if not solver else 40,
         timeout=TimeoutConfig(setup=600, rollout=3600, finalize=120),
         retries=RetryConfig(max_retries=0),

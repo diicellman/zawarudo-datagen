@@ -23,20 +23,24 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import verifiers.v1 as vf
+import verifiers.v1.utils.interrupt
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from verifiers.v1.dialects.base import append_user_notice
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.mcp.launch import serve
 from worldgen_slack.dataset import PrivateAnswer, PublicTask, load_release, sha256, write_release
-from worldgen_slack.db import ANSWER_KEY, World
-from worldgen_slack.taskset import SolverTask
+from worldgen_slack.db import ANSWER_KEY, SHADOWED, SHOWN, World
+from worldgen_slack.taskset import AnswerGrade, AnswerJudge, SolverTask
 from worldgen_slack.tools import SlackTools, WorldToolsConfig, file_hash, stage_world, watch_parent
 from .agents.inspection import ReviewState
-from .agents.judge import JudgeTask, review_payload
+from .agents.judge import PHASE_GUIDES, JudgeTask, review_payload
 from .agents.synthesizer import parse_premise
 from .agents.world import WorldAuthorTask, context_of, files, ledger_digest
 from .chronicle import (
+    Annotation,
+    forge_task,
     BoardEntry,
     Close,
     Commit,
@@ -65,9 +69,11 @@ from .chronicle import (
     today,
     today_line,
 )
-from .env import GenerationEnv, keep_awake
+from .env import GenerationEnv, ended, keep_awake, rates, try_digest
 from .generate import failure, provenance, run_label
-from .store import Store
+from .store import ReviewLimit, SessionLost, Store
+from .forge import ForgeConfig, ForgeEnv, bucket, measured_level
+from .forge import provenance as forge_provenance
 from .config import ROOT, Acceptance, Category, Config, Needs
 from .contracts import (
     band_move,
@@ -96,6 +102,9 @@ from .contracts import (
     accepted_task,
     at,
     background_plan,
+    failure_cases,
+    features,
+    panel,
     channel_id,
     check_task,
     deciding,
@@ -112,6 +121,13 @@ from .contracts import (
     window,
     world_meta,
 )
+
+
+async def offline(*args, **kwargs):
+    raise AssertionError("the offline checks call no model: script the agent or the judge")
+
+
+vf.Judge.complete = offline  # a judge left unscripted fails here, before it reaches the gateway
 
 
 def fails(function, *args, **kwargs):
@@ -427,7 +443,23 @@ async def check_world(root):
         solver, "rollback"
     ) and "can you check the rollback" not in texts(u3, "rollback")
     assert [c["id"] for c in solver.list_user_channels()["items"]] == ["D1", "C1"]
-    assert solver.list_user_channels(types="im")["items"][0]["users"] == ["U1"]
+    assert solver.list_user_channels(types="im")["items"][0]["users"] == ["U1", "U2"], (
+        "a DM names both members"
+    )
+    # The tools say whom they act as and when it is, and every message's time in UTC and on the user's own clock.
+    me = solver.whoami()
+    assert (me["user_id"], me["name"], me["tz"]) == ("U2", "u2", "America/Chicago") and me[
+        "now_local"
+    ].startswith("Thu 2026-06-18 00:00 CDT"), me
+    first = solver.read_channel("C1")["items"][-1]
+    assert first["time_local"].endswith("CDT") and first["time_utc"] == datetime.fromtimestamp(
+        float(first["ts"]), ZoneInfo("UTC")
+    ).strftime("%Y-%m-%dT%H:%M:%SZ"), first
+    fall = int(datetime(2026, 11, 1, 6, 30, tzinfo=ZoneInfo("UTC")).timestamp() * 1e6)  # 1:30 CDT, then CST
+    assert [solver._times(fall + h * 3_600_000_000)["time_local"][-9:] for h in (0, 1)] == [
+        "01:30 CDT",
+        "01:30 CST",
+    ]
     assert [m["text"] for m in u3.read_channel("C1")["items"]] == [
         "notes posted for release 4.2",
         texts(u3, "blocked")[0],
@@ -484,7 +516,7 @@ async def check_world(root):
         ClientSession(reader, writer_) as client,
     ):
         await client.initialize()
-        assert len((await client.list_tools()).tools) == 9
+        assert len((await client.list_tools()).tools) == 10
     bad = WorldToolsConfig(actor_id="U2", db_path=config.db_path, db_hash="0" * 64)
     try:
         await SlackTools(bad).setup()
@@ -511,7 +543,7 @@ async def check_world(root):
             os.kill(server, 9)
             raise AssertionError(f"a tool server outlived the process that started it (gone before: {late})")
     print(
-        "PASS world: triggers, rules with rollback, completion, solver copy, visibility, search, paging, tools, "
+        "PASS world: triggers, rules with rollback, completion, solver copy, visibility, search, paging, whoami and times, tools, "
         "servers end with their parent"
     )
 
@@ -539,6 +571,8 @@ def check_tasks(root):
     ]
     assert world.gold("U2", "SELECT value AS answer FROM facts WHERE id = 'f1'")["tables"] == ["facts"]
     assert "messages" in world.gold("U2", every)["tables"]
+    assert set(SHOWN) == {*SHADOWED, "users"} and all(shown <= {r[1] for r in world.db.execute(f"PRAGMA table_xinfo({t})")} for t, shown in SHOWN.items()), "SHOWN names the workspace's own columns"  # fmt: skip
+    assert world.gold("U2", "SELECT emoji AS answer FROM reactions WHERE created_us > 0")["reads"] == ["reactions.created_us", "reactions.emoji"], "a gold query's own columns are read off"  # fmt: skip
     assert len(world.gold("U1", every, max_rows=2)["rows"]) == 3, "one row past the cap shows the cap was hit"
     settings = contracts_settings(root)
     who = "SELECT u.real_name AS answer, m.id AS message_id FROM messages m JOIN users u ON u.id = m.user_id"
@@ -838,6 +872,11 @@ def check_contracts(root):
     assert "t1" in recorded(directory, slot("lookup", 1)), (
         "a task with no facts meets a level that needs none"
     )
+    # A gold query asks only about what the tools show: who reacted, never when (S3's reactions "made on Aug 18").
+    for unshown in ("SELECT u.real_name AS answer FROM reactions r JOIN users u ON u.id = r.user_id WHERE r.created_us > 0", "SELECT real_name AS answer FROM users WHERE created_us > 0 LIMIT 1", "SELECT name AS answer FROM channels WHERE creator_id IS NOT NULL LIMIT 1"):  # fmt: skip
+        refused("which no Slack tool shows", recorded, task(category="lookup", sql=unshown, facts=()), slot("lookup", 1))  # fmt: skip
+    nobody = task(category="robustness", answer_type="refusal", sql="SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", facts=())  # fmt: skip
+    assert "t1" in recorded(nobody, slot("robustness", 1)), "nor one whose level's needs are empty"
     with world.trial() as copy:
         record_task(copy, search, settings, found)
     assert json.loads(world.db.execute("SELECT gold_json FROM tasks").fetchone()[0]) == [
@@ -847,6 +886,9 @@ def check_contracts(root):
         "the slot's concept is stored"
     )
     fails(record_task, world, task(id="t2"), settings, slot("search", 1, id="t2"))  # t1 asks it
+    refused("its answer differs for them", record_task, world, task(id="t2", actor_id=d), settings, slot("search", 1, id="t2"))  # fmt: skip  # d asks it too, and gets t1's answer
+    count = lambda id, actor: Task(id=id, category="lookup", level=1, actor_id=actor, question="How many private channels am I in?", answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM channels WHERE type = 'private'")  # noqa: E731  # fmt: skip
+    assert "t3" in recorded(count("t3", c), slot("lookup", 1, id="t3"), setup=lambda copy: record_task(copy, count("t2", a), settings, slot("lookup", 1, id="t2"))), "a perspective twin: another asker, another answer"  # fmt: skip
 
     def settled(facts):  # a level-3 semantic task needs its facts first stated in 2 channels
         sql = f"SELECT value AS answer FROM facts WHERE id = '{facts[-1]}'"
@@ -856,13 +898,30 @@ def check_contracts(root):
     # f4 after and over f3; a decoy counts where the task's actor can read it.
     nine = slot("semantic", 3, id="t9")
 
-    def decoy(channel, id="f5"):
-        return lambda copy: copy.insert("facts", [dict(id=id, storyline="s2", subject="Audit", attribute="owner", value="Ines", channel_id=channel, author_id=a, day=3, summary="s", is_decoy=1)])  # fmt: skip
+    def decoy(channel, id="f5", day=3, attribute="owner"):
+        return lambda copy: copy.insert("facts", [dict(id=id, storyline="s2", subject="Audit", attribute=attribute, value="Ines", channel_id=channel, author_id=a, day=day, summary="s", is_decoy=1)])  # fmt: skip
+
+    def retracted(channel, by="f4"):  # a decoy that a fact stated in `by`'s channel supersedes
+        def setup(copy):
+            decoy(channel)(copy)
+            copy.insert("fact_relations", [dict(src_fact=by, dst_fact="f5", kind="supersedes")])
+
+        return setup
+
+    def corrected_unseen(
+        copy,
+    ):  # the decoy's correction, another decoy, is only in #leads, which c cannot read
+        decoy(ops)(copy)
+        decoy(leads, id="f6")(copy)
+        copy.insert("fact_relations", [dict(src_fact="f6", dst_fact="f5", kind="supersedes")])
 
     for facts, actor, needs, setup, refusal in (
         (["f1", "f4"], a, {"channels": 2}, None, "first stated in at least 2 channels (they are in 1)"),
         (["f3", "f4"], a, {"relations": 3}, None, "at least 3 supersedes or after relations among its facts (it has 2)"),
-        (["f2", "f4"], c, {"decoys": 1}, decoy(leads), "at least 1 decoy facts on its facts' subjects, where its actor can read them (it has 0)"),  # c is not in #leads
+        (["f2", "f4"], c, {"decoys": 1}, decoy(leads), "at least 1 near-misses"),  # c is not in #leads
+        (["f2", "f4"], c, {"decoys": 1}, retracted(ops), "at least 1 near-misses"),  # f4 corrects it in plain sight
+        (["f2", "f4"], c, {"decoys": 1}, decoy(ops, attribute="budget"), "at least 1 near-misses"),  # another attribute
+        (["f4", "f3"], a, {"decoys": 1}, decoy(ops), "at least 1 near-misses"),  # it answers f3's window, not the owner
     ):  # fmt: skip
         asked = settled(facts).model_copy(update={"actor_id": actor})
         refused(refusal, recorded, asked, nine, needing(settings, "semantic", 3, **needs), setup or (lambda copy: None))  # fmt: skip
@@ -870,6 +929,90 @@ def check_contracts(root):
     assert "t9" in recorded(settled(["f3", "f4"]), nine, needing(settings, "semantic", 3, relations=2))
     asked = settled(["f2", "f4"]).model_copy(update={"actor_id": c})
     assert "t9" in recorded(asked, nine, needing(settings, "semantic", 3, decoys=1), decoy(ops))
+    assert "t9" in recorded(asked, nine, needing(settings, "semantic", 3, decoys=1), corrected_unseen), (
+        "a near-miss whose correction its actor cannot see still misleads"
+    )
+    # A refusal rests on the truth its actor cannot see (f3, in #leads) beside the stale value it can (f7, in #ops).
+    stale = lambda copy: (copy.insert("facts", [dict(id="f7", storyline="s2", subject="Audit", attribute="window", value="full test", channel_id=ops, author_id=a, day=3, summary="s")]), copy.insert("fact_relations", [dict(src_fact="f3", dst_fact="f7", kind="supersedes")]))  # noqa: E731  # fmt: skip
+    unseen = Task(id="t9", category="robustness", level=4, actor_id=c, question="When is the audit's full test?", answer_type="refusal", gold_sql="SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", facts=["f3", "f7"])  # fmt: skip
+    four = slot("robustness", 4, id="t9")
+    assert "t9" in recorded(unseen, four, needing(settings, "robustness", 4, decoys=1), stale), (
+        "its near-miss misleads"
+    )
+    refused("at least 1 near-misses", recorded, unseen.model_copy(update={"facts": ["f3"]}), four, needing(settings, "robustness", 4, decoys=1))  # fmt: skip  # no stale value in sight
+
+    # A status answer gives the latest value its actor can see (f7, in #ops), which a fact out of their sight settles
+    # (f3, in #leads): the useful answer gives it as not settled, where a refusal said nothing.
+    status = Task(id="t9", category="robustness", level=3, actor_id=c, question="What is the audit's window?", answer_type="status", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f7'", facts=["f3", "f7"])  # fmt: skip
+    three = slot("robustness", 3, id="t9")
+    assert "t9" in recorded(status, three, settings, stale)
+    refused("out of its actor's sight, that supersedes the value it gives", recorded, status.model_copy(update={"facts": ["f7"]}), three, settings, stale)  # fmt: skip  # nothing settles it
+    refused("which supersede the value it gives", recorded, status.model_copy(update={"actor_id": a}), three, settings, stale)  # fmt: skip  # a reads #leads: f3 is the answer
+    refused("gold gives the value of one of its facts its actor can read", recorded, status.model_copy(update={"gold_sql": "SELECT value AS answer FROM facts WHERE id = 'f3'"}), three, settings, stale)  # fmt: skip
+    refused("gold query reads the facts it answers from", recorded, status.model_copy(update={"gold_sql": "SELECT real_name AS answer FROM users LIMIT 1"}), three, settings, stale)  # fmt: skip
+
+    # The wrong answers a task's grade must reject: the near-miss its actor can read, and a hedge with it.
+    try:
+        with world.trial() as copy:
+            decoy(ops)(copy)
+            copy.insert("facts", [dict(id="f6", storyline="s2", subject="Audit", attribute="owner", value="Mia", channel_id=leads, author_id=a, day=3, summary="s", is_decoy=1)])  # fmt: skip  # out of c's sight
+            record_task(copy, asked, needing(settings, "semantic", 3, decoys=1), nine)
+            raise LookupError(failure_cases(copy, "t9", [{"answer": "Owen"}]))
+    except LookupError as out:
+        gold, cases = out.args[0]
+    assert gold == "Owen." and ("the near-miss 'Ines'", "Ines.") in cases and ("a hedge", "Either Owen or Ines; I can't tell which.") in cases, cases  # fmt: skip
+    assert not [c for c in cases if "Mia" in c[1]], "a value its actor cannot see is no near-miss"
+
+    # Lazy solvers over a chain: "full test" (f7, #ops) is settled as "dry run" (f3, #leads), then a decoy repeats
+    # "rehearsal" in #ops. Taking the first or the latest value is wrong; the truth sits in a private channel, later.
+    def chain(copy):
+        stale(copy)
+        copy.insert("facts", [dict(id="f8", storyline="s2", subject="Audit", attribute="window", value="rehearsal", channel_id=ops, author_id=b, day=3, summary="s", is_decoy=1)])  # fmt: skip
+        (day3,) = copy.db.execute("SELECT start_us FROM calendar WHERE day = 3").fetchone()
+        copy.db.execute("UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(day3 + 14_400_000_000),))
+        said = copy.insert("messages", [dict(channel_id=ch, ts_us=day3 + h * 3_600_000_000, user_id=u, text=t) for h, ch, u, t in ((1, ops, a, "full test it is"), (2, leads, a, "dry run it is"), (3, ops, b, "rehearsal it is"))])  # fmt: skip
+        copy.insert("evidence", [dict(fact_id=f, message_id=m, role="anchor") for f, m in zip(("f7", "f3", "f8"), said)])  # fmt: skip
+
+    window = Task(id="t9", category="semantic", level=3, actor_id=a, question="What is the audit's window?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f3'", facts=["f3", "f7"])  # fmt: skip
+    try:
+        with world.trial() as copy:
+            chain(copy)
+            record_task(copy, window, needing(settings, "semantic", 3), nine)
+            count = Task(id="t8", category="lookup", level=1, actor_id=a, question="How many messages are there?", answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages")  # fmt: skip
+            counted = record_task(copy, count, settings, slot("lookup", 1, id="t8"))["gold"]
+            who = window.model_copy(update={"id": "t7", "question": "Who settled the audit's window?", "gold_sql": "SELECT u.real_name AS answer FROM facts f JOIN users u ON u.id = f.author_id WHERE f.id = 'f3'"})  # fmt: skip
+            settler = record_task(copy, who, needing(settings, "semantic", 3), slot("semantic", 3, id="t7"))[
+                "gold"
+            ]
+            raise LookupError((panel(copy, "t9", [{"answer": "dry run"}]), features(copy, "t9", [{"answer": "dry run"}]), features(copy, "t8", counted), features(copy, "t7", settler)))  # fmt: skip
+    except LookupError as out:
+        lazy, shape, counting, settled_by = out.args[0]
+    assert settled_by["last_link"] == "private·later", "a person's answer is placed by the fact it is about"
+    assert {k: lazy["guesses"][k] for k in ("first", "latest", "top")} == {"first": "full test", "latest": "rehearsal", "top": "rehearsal"} and {"first", "latest", "top"} <= set(lazy["traps"]) and not lazy["shortcut"], lazy  # fmt: skip
+    assert (shape["changes"], shape["last_link"], shape["perspective"]) == (3, "private·later", False), shape
+    assert counting["perspective"] and counting["derived"], (
+        "a count differs by who asks, and no message states it"
+    )
+
+    def stated_unseen(copy):  # the truth, f3, is stated in #leads on day 3, where c cannot read it
+        stale(copy)
+        (day3,) = copy.db.execute("SELECT start_us FROM calendar WHERE day = 3").fetchone()
+        copy.db.execute("UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(day3 + 7_200_000_000),))
+        (truth,) = copy.insert("messages", [dict(channel_id=leads, ts_us=day3 + 3_600_000_000, user_id=a, text="dry run it is")])  # fmt: skip
+        copy.insert("evidence", [dict(fact_id="f3", message_id=truth, role="anchor", anchor_token="dry run")])
+
+    assert "t9" in recorded(status, three, settings, stated_unseen), (
+        "a status rests on its truth stated out of sight"
+    )
+    try:
+        with world.trial() as copy:
+            stated_unseen(copy)
+            raise LookupError(record_task(copy, unseen, needing(settings, "robustness", 4, decoys=1), four))
+    except LookupError as out:
+        measured = out.args[0]
+    assert (measured["unseen"], measured["evidence_pages"], measured["decoys"]) == (1, None, 1), (
+        "evidence its actor cannot read is counted, and measured from no view"
+    )
     hybrid = dict(category="hybrid", level=1, actor_id=c, answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages m, facts f WHERE f.id = 'f1'")  # fmt: skip
     unread = Task(
         id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
@@ -1039,7 +1182,8 @@ def check_clock(root):
         pass
     late = [f.model_copy(update={"day": 9}) for f in [*facts, *extra]]
     assert front_loaded(world, settings, late, 9) is None, "a third that is over is not held to its share"
-    # The board: each ledger and hybrid slot's planned facts, as many as its level needs; checked on every plan.
+    # The board: the planned facts of each slot that rests on them (ledger and hybrid, and those whose level needs
+    # something of their facts), as many as its level needs; checked on every plan.
     board_slots = [Slot(id=i, category=c, level=n, concept="a concept", style="a style") for i, c, n in (("t1", "semantic", 3), ("t3", "search", 1), ("t2", "lookup", 1))]  # fmt: skip
     spread = needing(settings, "semantic", 3, channels=2)
     entries = lambda *pairs: [BoardEntry(slot=slot, facts=ids) for slot, ids in pairs]  # noqa: E731
@@ -1049,12 +1193,27 @@ def check_clock(root):
             record_plan(copy, document, spread, board_slots)
 
     for expected, board in (
-        ("each ledger and hybrid slot will rest on; ['t1', 't3'] have none", []),
-        ("the ledger and hybrid slots of now.md; ['t2'] are not", entries(("t1", ["f3", "f4"]), ("t3", ["f4"]), ("t2", ["f1"]))),
+        ("each slot that rests on planned facts will rest on; ['t1', 't3'] have none", []),
+        ("the slots of now.md that rest on planned facts; ['t2'] do not", entries(("t1", ["f3", "f4"]), ("t3", ["f4"]), ("t2", ["f1"]))),
         ("the board names facts of the plan; ['f9'] are not", entries(("t1", ["f3", "f9"]), ("t3", ["f4"]))),
         ("the board's t1 (level-3 semantic) needs its facts first stated in at least 2 channels (they are in 1)", entries(("t1", ["f1", "f4"]), ("t3", ["f4"]))),
     ):  # fmt: skip
         refused(expected, boarded, plan(board=board))
+    # A robustness level-4 slot rests on planned facts too: a near-miss its asker will see, the truth out of sight.
+    robust = [
+        *board_slots,
+        Slot(id="t4", category="robustness", level=4, concept="a concept", style="a style"),
+    ]
+    near = PlanFact(id="f5", storyline="s2", subject="Audit", attribute="owner", value="Ines", channel_id=ops, author_id=a, day=3, decoy=True, summary="s")  # fmt: skip
+
+    def boarded_robust(document):
+        with world.trial() as copy:
+            record_plan(copy, document, needing(spread, "robustness", 4, decoys=1), robust)
+
+    usual = entries(("t1", ["f3", "f4"]), ("t3", ["f4"]))
+    refused("['t4'] have none", boarded_robust, plan(board=usual))
+    refused("the board's t4 (level-4 robustness) needs at least 1 near-misses", boarded_robust, plan(board=[*usual, *entries(("t4", ["f4"]))]))  # fmt: skip
+    boarded_robust(plan(facts=[*facts, near], board=[*usual, *entries(("t4", ["f4", "f5"]))]))
     try:  # facts may be shared; a replan's board replaces the last; a fact the board rests on stays planned
         with world.trial() as copy:
             record_plan(copy, plan(board=entries(("t1", ["f3", "f4"]), ("t3", ["f4"]))), spread, board_slots)
@@ -1070,8 +1229,9 @@ def check_clock(root):
     slots = [Slot(id="t1", category="semantic", level=3, concept="a concept", style="a style"), Slot(id="t2", category="lookup", level=1, concept="a concept", style="a style")]  # fmt: skip
     owner = Task(id="t1", category="semantic", level=3, actor_id=a, question="Who owns the audit after the dry run?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f4'", facts=["f3", "f4"])  # fmt: skip
 
-    def tasked(task, cfg=None):
+    def tasked(task, cfg=None, setup=lambda copy: None):
         with world.trial() as copy:
+            setup(copy)
             return add_task(copy, task, cfg or settings, slots)
 
     refused("once the calendar is closed", tasked, owner)
@@ -1267,20 +1427,21 @@ def check_clock(root):
     assert any("3 of today's 4 messages are thread replies" in e for e in measured), measured
     refused("t1 is a semantic level 3 task", tasked, owner.model_copy(update={"level": 2}))
     refused("one of the slots you write now: ['t1', 't2']", tasked, owner.model_copy(update={"id": "t9"}))
-    result = tasked(owner)
-    assert result["gold"] == [{"answer": "Owen"}] and result["bm25_rank"] and result["channels"] == 2, result
-    # The needs its messages give: its evidence's search rank, the messages above it, what the question names.
     level3 = lambda **needs: needing(settings, "semantic", 3, **needs)  # noqa: E731
+    result = tasked(owner, level3(channels=2, relations=1))
+    assert result["gold"] == [{"answer": "Owen"}] and result["bm25_rank"] and result["channels"] == 2, result
+    assert "depth_share" in result and result["hidden"] is False, "rank and depth are measured, and reported"
+    # The needs its messages give: where its answer is stated beside its near-misses, what the question names.
     refused("first stated in at least 2 channels", tasked, owner.model_copy(update={"facts": ["f1", "f4"]}), level3(channels=2))  # fmt: skip  # both in #ops
-    refused(f"for the question's own words (it is hit {result['bm25_rank']})", tasked, owner, level3(rank=result["bm25_rank"] + 1))  # fmt: skip
-    refused(f"(it is under {result['depth_share']:.0%}, {result['depth']} messages)", tasked, owner, level3(depth=result["depth_share"] + 0.01))  # fmt: skip
+    refused(
+        "its answer stated where it is harder to see", tasked, owner, level3(hidden=True)
+    )  # f4 is top-level in #ops
+    earlier = lambda copy: copy.insert("facts", [dict(id="f8", storyline="s2", subject="Audit", attribute="owner", value="Ines", channel_id=ops, author_id=a, day=2, summary="s", is_decoy=1)])  # noqa: E731  # fmt: skip
+    assert tasked(owner, level3(decoys=1, hidden=True), earlier)["hidden"], "stated after every near-miss"
     leads_named = owner.model_copy(update={"question": "Who owns the audit after the dry run in #leads?"})
     refused("naming at most 0 of its evidence's channels and identifiers (it names 1)", tasked, leads_named, level3(named=0))  # fmt: skip
-    assert (
-        tasked(leads_named, level3(named=1, rank=result["bm25_rank"], depth=result["depth_share"]))["named"]
-        == 1
-    )
-    tasked(owner)
+    assert tasked(leads_named, level3(named=1))["named"] == 1
+    tasked(owner, level3())
     replier = Task(id="t2", category="lookup", level=1, actor_id=c, question="Who said thanks in #ops?", answer_type="text", gold_sql="SELECT u.real_name AS answer FROM messages m JOIN users u ON u.id = m.user_id WHERE m.text = 'thanks'")  # fmt: skip
     tasked(replier.model_copy(update={"question": "Who said thanks?"}))
     tasked(replier)  # the slot's task is replaced
@@ -1323,7 +1484,7 @@ def author_context(settings, cast, org, root, agenda=None):
 
 
 async def check_tools(root):
-    """The author's tools (v7): nine, served host-side over the world file; each turn's tools act only in their turn
+    """The author's tools (v7): ten, served host-side over the world file (annotate is the forge's); each turn's tools act only in their turn
     and on their day; writes are checked and logged, reads are live; the memory renders every time on the company
     clock, never as raw microseconds, and the one-pager stays small on a full world."""
     root.mkdir(parents=True)
@@ -1448,7 +1609,7 @@ async def check_tools(root):
     served = tools_for("day", 2)  # a tool server checks the world file's hash when it starts
     with_state(served)
     described = await served_tools(served)
-    assert set(described) == {"now", "view", "sql", "read", "plan", "post", "advance", "revise", "add_task"} and served.server_name == "world"  # fmt: skip
+    assert set(described) == {"now", "view", "sql", "read", "plan", "post", "advance", "revise", "add_task", "annotate"} and served.server_name == "world"  # fmt: skip
     # help() in the author's IPython shows a tool's description alone: it names every field of every document a
     # call takes, nested ones too, with ? when optional.
     for tool, models in {"post": (Conversation, PostLine, Reaction, Commit, Close), "plan": (Plan, PlanFact, Event, Storyline), "add_task": (Task,)}.items():  # fmt: skip
@@ -1510,7 +1671,7 @@ async def check_tools(root):
     )
     assert not raw.search(json.dumps(ledger_digest(world))), "the judge's ledger is rendered too"
     print(
-        "PASS tools: nine served, scoped by turn and day, checked and logged; memory rendered, small, round-trips"
+        "PASS tools: ten served, scoped by turn and day, checked and logged; memory rendered, small, round-trips"
     )
 
 
@@ -1576,7 +1737,10 @@ async def check_reviews(root):
     fails(validate_verdict, unscored, payload)  # a task review scores each task's level_fit
     assert "level_fit" in verdict_schema("task", ["t1"])["$defs"]["TaskReview"]["required"]
     workspace = Issue(artifact="workspace", defect="d", requested_change="c")
-    validate_verdict(verdict(approved=False, issues=[workspace]), payload)
+    fails(
+        validate_verdict, verdict(approved=False, issues=[workspace]), payload
+    )  # a blocking one names its tasks
+    validate_verdict(verdict(issues=[workspace.model_copy(update={"blocking": False})]), payload)
     assert "workspace" in str(schema["$defs"]["Issue"]["properties"]["artifact"])
     issue = Issue(artifact="tasks", task_ids=["t2"], defect="d", requested_change="c")
     fails(verdict, issues=[issue])
@@ -1585,7 +1749,7 @@ async def check_reviews(root):
     strict, lenient = Acceptance(minor_issues_block=True), Acceptance()
     assert accepted_task(batch, lenient, "t1") and not accepted_task(batch, lenient, "t2")
     general = batch.model_copy(update={"issues": [issue.model_copy(update={"task_ids": []})]})
-    assert not accepted_task(general, lenient, "t1"), "an issue naming no task blocks every task"
+    assert accepted_task(general, lenient, "t1"), "an issue naming no task blocks none: it is the world's"
     minor = batch.model_copy(update={"issues": [issue.model_copy(update={"blocking": False})]})
     assert (
         accepted_task(minor, lenient, "t2")
@@ -1678,8 +1842,55 @@ async def check_reviews(root):
     solve = SolverTask.create(task, root / "solver.sqlite", answer, network_policy=False)
     assert "rollback" not in solve.data.model_dump_json() + solve.config.tools.model_dump_json()
     assert solve.config.tools.db_hash == sha256(root / "solver.sqlite")
+    # The answer judge grades the answer the response commits to and grounds the claims that make it; an unsupported
+    # aside is counted, and costs nothing.
+    asks = AnswerJudge(solve.config.judge).build_messages(
+        question="q", reference={}, response="r", observations=[]
+    )
+    assert "lists alternatives without settling on one is wrong" in asks[0].content and "do not change grounded" in asks[0].content  # fmt: skip
+    assert "never ask for a decoy to be\ncorrected or hedged" in PHASE_GUIDES["world"], (
+        "the world judge knows a decoy is planned"
+    )
+    assert "unsupported_asides" in AnswerGrade.model_json_schema()["required"]
+    observed = [{"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C1", "ts": answer.messages[0][1]}]}}]  # fmt: skip
+    assert "A status reference is the latest value the asker can see" in asks[0].content and "has abstained" in asks[0].content  # fmt: skip
+    # The reward: +1 right and grounded, 0 right but ungrounded or declined, -1 wrong (an aside costs nothing).
+    for correct, abstained, grounded, asides, score in ((True, False, True, 2, 1.0), (True, False, False, 0, 0.0), (False, True, False, 0, 0.0), (False, False, False, 0, -1.0), (True, True, True, 0, 1.0), (False, False, True, 0, -1.0)):  # fmt: skip
+        grade = AnswerGrade(correct=correct, abstained=abstained, grounded=grounded, unsupported_asides=asides, reason="r")  # fmt: skip
+        trace = SimpleNamespace(info={"observations": observed}, last_reply="rollback", id="try", record_metrics=lambda m: None)  # fmt: skip
+        judged = AnswerJudge.evaluate
+        AnswerJudge.evaluate = lambda self, **fields: asyncio.sleep(0, SimpleNamespace(parsed=grade))
+        try:
+            assert await SolverTask.semantic_correctness(solve, trace) == score, (
+                correct,
+                abstained,
+                grounded,
+            )
+        finally:
+            AnswerJudge.evaluate = judged
+        assert trace.info["evaluation"]["unsupported_asides"] == asides and trace.info["evaluation"]["evidence_coverage"] == 0.5  # fmt: skip
+    # Grounded by message: tries never shown the gold's messages are ungrounded, whatever the judge says.
+    elsewhere = [
+        {"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C9", "ts": "1.000001"}]}}
+    ]
+    grade = AnswerGrade(correct=True, abstained=False, grounded=True, unsupported_asides=0, reason="r")
+    trace = SimpleNamespace(info={"observations": elsewhere}, last_reply="rollback", id="try", record_metrics=lambda m: None)  # fmt: skip
+    judged, AnswerJudge.evaluate = AnswerJudge.evaluate, lambda self, **fields: asyncio.sleep(0, SimpleNamespace(parsed=grade))  # fmt: skip
+    try:
+        assert (
+            await SolverTask.semantic_correctness(solve, trace) == 0.0
+            and not trace.info["evaluation"]["grounded"]
+        )
+    finally:
+        AnswerJudge.evaluate = judged
     write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})
     assert load_release(root / "release")[1:] == ([task], {"t1": answer})
+    manifest = json.loads((root / "release" / "manifest.json").read_text())
+    assert manifest["format"] == "worldgen-slack.v9"
+    for old in ("worldgen-slack.v7", "worldgen-slack.v8"):
+        (root / "release" / "manifest.json").write_text(json.dumps(manifest | {"format": old}))
+        assert load_release(root / "release")[1:] == ([task], {"t1": answer}), f"a {old} release still loads"
+    (root / "release" / "manifest.json").write_text(json.dumps(manifest))
     write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})  # idempotent
     fails(
         write_release,
@@ -1696,6 +1907,11 @@ async def check_reviews(root):
         update={"messages": [["G1", world.db.execute("SELECT ts FROM messages WHERE id = 4").fetchone()[0]]]}
     )
     fails(write_release, root / "release2", root / "solver.sqlite", [task], {"t1": hidden})
+    # A refusal's truth out of its actor's sight ships apart, as unseen; evidence its actor can read may not.
+    out_of_sight = answer.model_copy(update={"messages": [], "unseen": hidden.messages})
+    write_release(root / "release3", root / "solver.sqlite", [task], {"t1": out_of_sight})
+    assert load_release(root / "release3")[2]["t1"].unseen == hidden.messages
+    fails(write_release, root / "release4", root / "solver.sqlite", [task], {"t1": answer.model_copy(update={"unseen": answer.messages})})  # fmt: skip
     print("PASS reviews: verdict contracts, per-task acceptance, judge tools as actors, solver copy, release")
 
 
@@ -1852,7 +2068,11 @@ async def check_author(root):
                 return SimpleNamespace(ok=False, info={}, errors=[SimpleNamespace(message="model stream ended")], task=task, last_reply="", id=name)  # fmt: skip
             finished[key] += 1
             right, grounded = task.data.task_id in always or finished[key] % 2 == 1, task.data.task_id != t2
-            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "calls": 2, "reason": "r"}  # fmt: skip
+            if (
+                "hard to find" in task.data.prompt
+            ):  # a forge candidate it answers only when shown the evidence
+                right = "These messages bear on it" in task.data.prompt
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": float(right and grounded), "correct": right, "grounded": grounded, "calls": 2, "reason": "r", "response": "an answer"}  # fmt: skip
             # A search that misses, then a read that shows the task's evidence, if it rests on any.
             found = [{"channel": c, "ts": ts} for c, ts in task.config.reference.messages]
             observations = [{"tool": "search_messages", "arguments": {"query": "release"}, "output": {"items": []}}, {"tool": "read_channel", "arguments": {"channel_id": "C1"}, "output": {"items": found}}]  # fmt: skip
@@ -1866,11 +2086,20 @@ async def check_author(root):
             key = (store.state.active_attempt, task.data.task_id)
             witnessed[key] += 1
             name = "-".join(["witness", *key, str(witnessed[key])])
-            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r"}  # fmt: skip
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r", "response": "an answer"}  # fmt: skip
             record = {"id": name, "agent": {"name": "witness", "config": {}}, "task": {"data": {"task_id": task.data.task_id}}, "ok": True, "nodes": [], "info": {"observations": [], "evaluation": evaluation}}  # fmt: skip
             return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id=name, record=record)  # fmt: skip
 
     class AuthorEnv(GenerationEnv):
+        # The answer judge, played by code: it accepts a task's gold alone; a loose one a bare opener too, a blind one
+        # not even the gold.
+        loose = blind = False
+
+        async def grade(self, question, reference, response):
+            answers = ", ".join(str(r.get("answer")) for r in reference["rows"])
+            right = response in (f"{answers}.", "I can't answer that from anything you can see: it isn't there.") or response.startswith(f"{answers}, though")  # fmt: skip
+            return SimpleNamespace(parsed=SimpleNamespace(correct=(right and not self.blind) or (self.loose and response == "Thought process:")), usage=None)  # fmt: skip
+
         async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
             if context["phase"] == "premise":
                 return Premises(premises=[Premise(company=f"{w} Software", niche="n", region="r", size="s", culture="c", cast="x", staffing={"software_developer": 4}) for w in ("Lattice", "Birch")]).model_dump_json()  # fmt: skip
@@ -1894,13 +2123,21 @@ async def check_author(root):
                 # A mid-run review's note blocks nothing, and still opens the next day.
                 # The final one's defect touches t0, so its fix may rewrite t0 and no other task.
                 issues = [Issue(artifact="workspace", task_ids=[t0] if attempt == "final-01" else [], message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
+                if attempt == "final-01":  # a note beside the blocking defect, which the author hears too
+                    issues.append(Issue(artifact="workspace", defect="a little formal", requested_change="loosen", blocking=False))  # fmt: skip
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
             # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
-            reviews = [TaskReview(task_id=t["id"], valid=not (attempt.startswith("tasks-") and t["id"] == t3), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
-            issues += [Issue(artifact="tasks", task_ids=[r.task_id], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
+            reviews = [TaskReview(task_id=t["id"], valid=not ((attempt.startswith("tasks-") and t["id"] == t3) or "vague" in t["question"]), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
+            last = self.world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+            issues += [Issue(artifact="tasks", task_ids=[r.task_id], message_ids=[last], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
+            if attempt.startswith("tasks-") and payload["tasks"] and payload["tasks"][0]["id"] == t3:
+                # A defect of the world, naming no task: it blocks none, and the final review hears it.
+                issues.append(Issue(artifact="ledger", defect="a summary drifts", requested_change="restate it", blocking=False))  # fmt: skip
             verdict = Verdict(approved=not any(i.blocking for i in issues) and all(r.valid for r in reviews), tasks=reviews, issues=issues, criteria=criteria, summary="s")  # fmt: skip
             validate_verdict(verdict, payload)
             return verdict
+
+    forging = {"vague": False}  # a forge whose every candidate the judge rejects
 
     async def script(prompt, tools, runtime):
         """The author: plans, writes each day, writes tasks, hardens two of them, fixes what the review names."""
@@ -1956,6 +2193,9 @@ async def check_author(root):
                 assert "message_ids" in prompt and "evidence_message_ids" in prompt, (
                     "the review's issues open day 3"
                 )
+                assert "hedging a decoy where its readers see it voids the near-miss" in prompt, (
+                    "a decoy's issue is answered in notes"
+                )
                 if crash["armed"]:
                     await talk(ops, dict(author_id=c, text="morning"))
                     crash["armed"] = False
@@ -1988,6 +2228,65 @@ async def check_author(root):
                 await talk(ops, dict(author_id=d, text="quiet day"))
             await close()
             await runtime.write("/task/notes/recap.md", f"day {day}: done".encode())
+        elif tools.config.mode == "forge":
+            # The proposer: the board and its notes come with the frozen world, which it reads and may not write.
+            ids = re.findall(r"r\d\d-\d\d", prompt)
+            assert (
+                b"Board" in runtime.files["/task/memory/board.md"] and "/task/notes/plan.md" in runtime.files
+            ), "the board and the world author's notes come to the proposer"
+            assert b"## lookup" in runtime.files["/task/memory/taxonomy.md"] and b"- level 1: one message" in runtime.files["/task/memory/taxonomy.md"], "and the taxonomy"  # fmt: skip
+            seen.append(("forge", tuple(ids), "Round" in prompt))
+            if ids[0] == "r02-01" and not forging["vague"]:  # fmt: skip  # the archive: what the last round kept, and why it dropped the rest
+                archive = runtime.files["/task/memory/archive.md"].decode()
+                assert "r01-01" in archive and "kept in lookup·L2·plain" in archive and "dropped: the judge did not approve it" in archive and "lookup: L1 0/2 · L2 1/2" in archive, archive  # fmt: skip
+            try:
+                await call("revise", message_id=1, text="rewritten")
+                raise AssertionError("the forge wrote the workspace")
+            except ValueError as error:
+                assert "forge turn" in str(error), error
+            try:
+                await call(
+                    "add_task",
+                    task=scripted_task(settings, {"id": "elsewhere", "category": "lookup", "level": 1}, a),
+                )
+                raise AssertionError("a candidate outside the round's open ids was written")
+            except ValueError as error:
+                assert "open ids" in str(error), error
+            if ids[0] == "r01-01":
+                first = world.db.execute("SELECT id FROM messages WHERE text LIKE '%rollback%' ORDER BY ts_us LIMIT 1").fetchone()[0]  # fmt: skip
+                await call("annotate", fact=Annotation(id="n1", storyline="s1", subject="Release 4.2", attribute="call", value="roll it back", anchor="rollback", message_ids=[first], summary="s"))  # fmt: skip
+                for bad, why in (({"anchor": "nowhere in it"}, "must contain"), ({"subject": "Elsewhere", "supersedes": "nothing"}, "which it supersedes, does not exist")):  # fmt: skip
+                    try:
+                        await call("annotate", fact=Annotation(id="n2", storyline="s1", subject="Release 4.2", attribute="call", value="other", anchor="rollback", message_ids=[first], summary="s").model_copy(update=bad))  # fmt: skip
+                        raise AssertionError(f"an annotation was accepted: {bad}")
+                    except ValueError as error:
+                        assert why in str(error), error
+                # A search for the question's own words reaches the answer first: level 1, whatever it is called.
+                notes = Task(id=ids[0], category="search", level=2, actor_id=a, question="When were the notes up for release 4.2?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f2'", facts=["f2"])  # fmt: skip
+                try:
+                    await call("add_task", task=notes)
+                    raise AssertionError("a shortcut was written above level 1")
+                except ValueError as error:
+                    assert "so it is a level-1 task" in str(error), error
+                assert (await call("add_task", task=notes.model_copy(update={"level": 1})))["panel"][
+                    "shortcut"
+                ]
+                # A task on no facts above level 1 names the answer a hasty reader gives: another one.
+                newest = Task(id=ids[0], category="lookup", level=2, actor_id=a, question="Who is the newest person here?", answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1")  # fmt: skip
+                for near, why in (([], "near_sql"), ([newest.gold_sql], "returns its gold answer")):
+                    try:
+                        await call("add_task", task=newest.model_copy(update={"near_sql": near}))
+                        raise AssertionError(f"a near-miss query was accepted: {near}")
+                    except ValueError as error:
+                        assert why in str(error), error
+            for n, open_id in enumerate(ids):  # a candidate the judge approves, and a vague one it does not
+                question = f"Who is the newest person here, round {open_id}?" + (" vague" if n or forging["vague"] else "")  # fmt: skip
+                written = await call("add_task", task=Task(id=open_id, category="lookup", level=2, actor_id=a, question=question, answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1", near_sql=["SELECT real_name AS answer FROM users ORDER BY id LIMIT 1"]))  # fmt: skip
+                assert set(written["features"]) == {"changes", "last_link", "rows", "perspective", "derived", "status"} and written["features"]["rows"] == 1, written  # fmt: skip
+            if (
+                ids[0] == "r02-01" and not forging["vague"]
+            ):  # one GLM misses unless shown the evidence; the witness answers
+                await call("add_task", task=Task(id=ids[0], category="search", level=1, actor_id=a, question="When were the notes up for release 4.2? it is hard to find", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f2'", facts=["f2"]))  # fmt: skip
         elif prompt.startswith("The last day is closed"):
             context = json.loads(tools.config.context)
             writable, slots = context["writable"], {s["id"]: s for s in context["slots"]}
@@ -2014,6 +2313,10 @@ async def check_author(root):
             assert all(r["level_fit"] == 3 and "evidence_pages" in r and r["concept"] and r["band"] and "right_rate" in r and "strict_rate" in r for r in back.values()), (
                 "hardening reads the judge's level fit, code's measures, both rates and the level's band"
             )  # fmt: skip
+            assert all(r["question"] and r["gold_sql"] and "gold" in r and r["asked_by"] and r["tries_left"] == 0 and "found_by" in r["solves"][0] and "decoy_reads" in r["solves"][0] for r in back.values()), (
+                "a returned task carries what it asks and answers, who asks it, and the route to beat"
+            )  # fmt: skip
+            assert all(len(json.dumps(r)) < 6000 for r in back.values()), "a returned task is small"
             seen.append(("harden", sorted(back), sorted(r["move"] for r in back.values())))
             seen.append(("pinged", runtime.pings))  # by now the probe ran, with the VM kept awake
             for (
@@ -2026,10 +2329,27 @@ async def check_author(root):
                     r["solves"],
                 )  # t3 is a join
                 assert all(f"/task/memory/solves/{t}/{k}.json" in runtime.files for k in range(1, 4)), "the whole tries"  # fmt: skip
+            fixes = sum(1 for x in seen if x[0] == "harden" and t3 in x[1])
             for slot in json.loads(tools.config.context)["slots"]:
                 task = scripted_task(settings, slot, a)
                 asked = task.model_copy(update={"question": f"Asked again ({len(seen)}): " + task.question})
-                if slot["id"] in back:  # every task that came back is rewritten, so tried again
+                if slot["id"] == t3 and slot["id"] in back:
+                    # Its first fix revises the message the review names, not the task: it is tried again all the
+                    # same. Its second rewrites it with another answer, which a fix may change.
+                    if fixes == 1:
+                        last = world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+                        await call("revise", message_id=last, text="quiet day, nothing to report")
+                    else:
+                        await call("add_task", task=asked.model_copy(update={"gold_sql": "SELECT COUNT(*) AS answer FROM messages WHERE parent_id IS NULL"}))  # fmt: skip
+                elif slot["id"] in back:  # a task that came back is rewritten, so tried again
+                    if back[slot["id"]]["move"] == "harder":  # keeping its answer: another answer is refused
+                        swapped = asked.model_copy(update={"gold_sql": "SELECT value AS answer FROM facts WHERE id = 'f3'", "facts": ["f3"]})  # fmt: skip
+                        try:
+                            await call("add_task", task=swapped)
+                            raise AssertionError("a harder rewrite changed its answer")
+                        except ValueError as error:
+                            assert "keeps its answer" in str(error), error
+                            seen.append(("answer kept", slot["id"]))
                     await call("add_task", task=asked)
                 elif (
                     slot["id"] in json.loads(tools.config.context)["writable"]
@@ -2041,7 +2361,9 @@ async def check_author(root):
                         assert "one of the slots you write now" in str(error), error
                         seen.append(("kept", slot["id"]))
         elif prompt.startswith("The review rejected"):
+            assert "hedging a decoy where its readers see it voids the near-miss" in prompt
             issues = json.loads(prompt[prompt.index("[") : prompt.index("]\n") + 1])
+            seen.append(("fix issues", [i.get("blocking") for i in issues]))
             for issue in issues:
                 for message in issue.get("message_ids", []):
                     await call("revise", message_id=message, text="ok, the notes come tomorrow")
@@ -2122,9 +2444,12 @@ async def check_author(root):
     assert store.world.db.execute("SELECT text FROM messages WHERE id = ?", (second,)).fetchone()[0] == "ok, the notes come tomorrow"  # fmt: skip
     assert "rollback" in store.world.db.execute("SELECT text FROM messages WHERE id = ?", (first,)).fetchone()[0], "the evidence stays"  # fmt: skip
     # Too easy, t1 comes back for its one round; t3, which the judge does not approve, comes back after it too. The
-    # tasks in their bands never come back.
+    # tasks in their bands never come back. A round counts what changed: t3's revised message, then t3 itself.
     assert [s for s in seen if s[0] == "harden"] == [("harden", [t1], ["harder"]), ("harden", [t3], ["fix"]), ("harden", [t3], ["fix"])]  # fmt: skip
     assert state.task_rounds == {t1: 1, t3: 2}, state.task_rounds
+    assert [s for s in seen if s[0] == "answer kept"] == [("answer kept", t1)], (
+        "a harder t1 keeps its answer; t3's fix need not"
+    )
     # A hardening turn rewrites only what came back: t0 (in its band) is refused in t1's turn, t2 in t3's two turns.
     assert [s for s in seen if s[0] == "kept"] == [("kept", t0), ("kept", t2), ("kept", t2)], [s for s in seen if s[0] == "kept"]  # fmt: skip
     # Two batches, each in its own interaction; the second, cut off after t2, is written again: only t3 is asked for.
@@ -2134,7 +2459,8 @@ async def check_author(root):
     assert solved == {("tasks-01", t0): 4, ("tasks-01", t1): 6, ("tasks-03", t2): 4, ("tasks-03", t3): 9, ("final-02", t0): 3}, solved  # fmt: skip
     assert set(state.solves) == {t0, t1, t2, t3}, "a rewritten task's runs are its new ones"
     assert ("review", "review-02-02", "world", True, True, False, ()) in seen
-    assert ("review", "final-01", "world", False, True, False, ()) in seen
+    assert ("review", "final-01", "world", False, True, True, ()) in seen, "the world issue a probe raised"
+    assert state.open_issues == [], "the final review has heard them"
     assert ("review", "final-02", "world", False, True, True, ()) in seen, (
         "the final review checks the last issues"
     )
@@ -2148,6 +2474,12 @@ async def check_author(root):
     assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [(t3,)], (
         "the final review judges only what changed or failed since its probe's review"
     )
+    assert ("review", "final-01", "task", False, False, True, (t3,)) in seen, (
+        "with the issues its probe raised"
+    )
+    assert ("fix issues", [True, False]) in seen, (
+        "a fix hears the review's notes as well as its blocking issues"
+    )
     assert {e["attempt"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines()) if e["event"] == "candidate_finished" and e["approved"]} >= {"tasks-01", "tasks-03"}, "each batch's attempt is closed"  # fmt: skip
     assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"
     days = [json.loads(line) for line in (store.root / "progress.jsonl").read_text().splitlines()]
@@ -2157,12 +2489,15 @@ async def check_author(root):
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
     summary = store.summary("complete")
-    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1, "witness_right": 1.0, "level_fit": 3, "level": 3, "band": [0.0, 0.5], "in_band": True, "rounds": 0}, (
+    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1, "witness_right": 1.0, "level_fit": 3, "level": 3, "band": [0.0, 0.5], "in_band": True, "rounds": 0, "kept": False, "unanswered": 0}, (
         "difficulty is the right-answer rate, the strict rate reported beside it; a try that crashed twice is counted, "
         "and left out of the rates; the band it landed in"
     )  # fmt: skip
     # t1 (level 2) stayed too easy; t0 was rewritten at the fix, to 2 of 3 right; t3 is in its level-1 band
     assert summary["in_band"] == {"1": [1, 1], "2": [1, 2], "3": [1, 1]}, summary["in_band"]
+    assert [t for t, r in summary["rates"].items() if r["kept"]] == [t1], (
+        "t1 stayed too easy with no rewrite left"
+    )
     assert summary["crashed_solves"] == 1 and summary["witness_tries"] == 2, summary
     assert abs(summary["mean_learnability"] - 17 / 36) < 1e-9, summary["mean_learnability"]  # t0 2/3, t2 1/2
 
@@ -2196,7 +2531,7 @@ async def check_author(root):
             Slow.peak = max(Slow.peak, Slow.active)
             await asyncio.sleep(0.01)
             Slow.active -= 1
-            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r"}  # fmt: skip
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r", "response": "an answer"}  # fmt: skip
             return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id="slow")  # fmt: skip
 
     await env.solves(SimpleNamespace(solver=Slow()), [t0, t1], "final-02", 3)
@@ -2224,10 +2559,67 @@ async def check_author(root):
     fails(store.publish)  # a task resting on a fact no message states
     store.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
     store.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
+    # A try that finished without an answer, an empty last message or the turn cap mid-search, is wrong and counted.
+    graded = {"task_id": t1, "correct": False, "semantic_correctness": 0.0, "response": "an answer"}
+    ends = [("an answer", "agent_completed"), ("", "agent_completed"), ("let me look further", "max_turns")]
+    silent = [SolverTask.outcome(SimpleNamespace(ok=True, info={"evaluation": graded | {"response": r}}, stop_condition=stop))["unanswered"] for r, stop in ends]  # fmt: skip
+    assert silent == [False, True, True] and rates([{"correct": False, "semantic_correctness": 0.0, "unanswered": u} for u in silent])["unanswered"] == 2  # fmt: skip
+    # A try as the author reads it: the call that first showed the evidence, how many showed a decoy, the route up to
+    # the evidence and then its last three calls, and a short answer.
+    read = lambda tool, ts=None: {"tool": tool, "arguments": {}, "output": {"items": [{"channel": "C1", "ts": ts}] if ts else []}}  # noqa: E731  # fmt: skip
+    route = [
+        read("read_channel", "2"),
+        read("read_thread", "1"),
+        *(read("search_messages") for _ in range(6)),
+    ]
+    digest_ = try_digest({"correct": True, "response": "x" * 500}, {"info": {"observations": route}}, {("C1", "1")}, {("C1", "2")})  # fmt: skip
+    assert (digest_["evidence_at"], digest_["decoy_reads"], digest_["calls"], len(digest_["answer"])) == (2, 1, 8, 300), digest_  # fmt: skip
+    assert digest_["found_by"].startswith("read_thread") and digest_["steps"][2] == "… 3 more calls …" and len(digest_["steps"]) == 6, digest_  # fmt: skip
+    # A hardening turn that changes nothing ends the loop, rounds to spare or not: the same tries would come back.
+    idle_turns = []
+
+    async def idle(prompt, extra=None):
+        idle_turns.append(prompt)
+
+    state.task_rounds[t1] = 0  # t1, too easy, has its round again
+    await env.harden(agents, idle, "final-02", [t1])
+    assert len(idle_turns) == 1 and state.task_rounds[t1] == 0, (len(idle_turns), state.task_rounds)
+    again = json.loads(idle_turns[0][idle_turns[0].index("{") : idle_turns[0].index("\nRewrite")])[t1]
+    assert [h["right_rate"] for h in again["history"]] == [1.0] and not again["history"][0]["question"].startswith("Asked again"), (
+        "a task comes back with its earlier versions and how often each was answered"
+    )  # fmt: skip
+    state.task_rounds[t1] = 1
+    # A task's key covers the decoys on its facts' subjects: a revised decoy is a changed task, tried again.
+    resting = next(
+        t for (t,) in store.world.db.execute("SELECT task_id FROM task_facts WHERE fact_id = 'f4'")
+    )
+    keyed, lure = env.task_key(resting), store.world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+    store.world.insert("facts", [dict(id="f8", storyline="s2", subject="Audit", attribute="owner", value="Mia", is_decoy=1, channel_id=channel_id("public", "ops", []), author_id=store.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], day=3, summary="s")])  # fmt: skip
+    store.world.db.execute(
+        "INSERT INTO evidence (fact_id, message_id, role) VALUES ('f8', ?, 'supporting')", (lure,)
+    )
+    decoyed = env.task_key(resting)
+    store.world.db.execute("UPDATE messages SET text = 'Mia owns it now, I think' WHERE id = ?", (lure,))
+    assert len({keyed, decoyed, env.task_key(resting)}) == 3, "the key follows the task's decoys"
+    store.world.db.execute("DELETE FROM evidence WHERE fact_id = 'f8'")
+    store.world.db.execute("DELETE FROM facts WHERE id = 'f8'")
+    store.world.db.execute("UPDATE messages SET text = 'quiet day, nothing to report' WHERE id = ?", (lure,))
+    # A refusal resting on the truth out of its actor's sight ships that truth apart, as unseen.
+    leads = channel_id("private", "leads", [])
+    (outsider,) = store.world.db.execute("SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM members WHERE channel_id = ?) ORDER BY id LIMIT 1", (leads,)).fetchone()  # fmt: skip
+    (asker,) = store.world.db.execute("SELECT actor_id FROM tasks WHERE id = ?", (some,)).fetchone()
+    added = store.world.db.execute("INSERT OR IGNORE INTO task_facts (task_id, fact_id) VALUES (?, 'f3')", (some,)).rowcount  # fmt: skip
+    store.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = ?", (outsider, some))
+    truth = [list(r) for r in store.world.db.execute("SELECT m.channel_id, m.ts FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = 'f3' AND e.role = 'anchor'")]  # fmt: skip
+    private = store.release_rows("h")[1][some]
+    assert truth and private.unseen == truth and not [m for m in private.messages if m in truth], private
+    store.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = ?", (asker, some))
+    if added:
+        store.world.db.execute("DELETE FROM task_facts WHERE task_id = ? AND fact_id = 'f3'", (some,))
     store.publish()
     world, rows, answers = load_release(store.root / "release")
     assert len(rows) == 4 and World(world).db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    assert json.loads((store.root / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v7"
+    assert json.loads((store.root / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v9"
     assert all((r.right_rate, r.strict_rate, r.tries, r.solver) == (state.task_reviews[r.task_id]["right_rate"], state.task_reviews[r.task_id]["strict_rate"], state.task_reviews[r.task_id]["tries"], settings.env.solver.model) for r in rows), "each task's rates are published"  # fmt: skip
     assert {r.task_id: (r.witness, r.witness_right) for r in rows if r.witness} == {
         t2: (settings.env.witness.model, 1.0)
@@ -2240,6 +2632,142 @@ async def check_author(root):
     assert run_label(Path("/x/data/v7-01/software")) == "worldgen-v7-01-software", (
         "a run's sandboxes are findable"
     )
+    # A solver samples as a policy in training does, so its tries differ; a rate comes with its 90% interval, wide
+    # at a few tries.
+    assert settings.env.solver.sampling.temperature == 1.0 == settings.env.witness.sampling.temperature and settings.env.judge.sampling.temperature == 0.0  # fmt: skip
+    assert rates([{"correct": i < 6, "semantic_correctness": 0.0} for i in range(8)])["right_interval"] == [0.46, 0.913]  # fmt: skip
+    assert rates([{"correct": True, "semantic_correctness": 1.0}] * 4)["right_interval"] == [0.596, 1.0], "4 of 4 still allows 0.6"  # fmt: skip
+    graded = [{"correct": True, "grounded": True, "semantic_correctness": 1.0}, {"correct": False, "grounded": False, "semantic_correctness": -1.0}, {"correct": False, "abstained": True, "grounded": False, "semantic_correctness": 0.0}, {"correct": True, "grounded": False, "semantic_correctness": 0.0}]  # fmt: skip
+    assert (rates(graded)["strict_rate"], rates(graded)["abstain_rate"]) == (0.25, 0.25), "strict is the share right and grounded, not the mean reward"  # fmt: skip
+    assert all(r.right_interval == state.task_reviews[r.task_id]["right_interval"] for r in rows), "intervals are published"  # fmt: skip
+    # A task ships with the wrong answers its grade must reject: one the answer judge accepts makes it ambiguous as
+    # asked, and it is not approved, whatever its tries.
+    assert store.state.screens and all(not s["failed"] for s in store.state.screens.values()), "every task was screened"  # fmt: skip
+    gold, cases = failure_cases(store.world, t1, json.loads(store.world.db.execute("SELECT gold_json FROM tasks WHERE id = ?", (t1,)).fetchone()[0]))  # fmt: skip
+    assert gold.endswith(".") and ("a bare opener", "Thought process:") in cases and any(n == "declining to answer" for n, _ in cases), cases  # fmt: skip
+    lax = AuthorEnv(settings, store)
+    lax.loose, store.state.active_attempt = True, "final-02"
+    _, verdict = await lax.judge_tasks(agents, [t1], {t1: "screened loose"}, "final-02", 3)
+    assert not verdict.approved and any("accepts a wrong answer to it: a bare opener" in i.defect for i in store.state.task_issues[t1]), verdict  # fmt: skip
+    assert store.state.screens[t1]["failed"] == ["a bare opener ('Thought process:')"]
+    lax.loose, lax.blind = False, True
+    assert (await lax.screen([t1], {t1: "screened blind"}, "final-02"))[t1] == [
+        "its gold answer, judged wrong"
+    ]
+    # A session lost to its sandbox is none of the author's limits (S3 stopped three times on Prime's dropped process
+    # stream, each reported as the author's limits): its block is written again once and spends no attempt, and a
+    # second loss in a row stops the run.
+    rpc = SimpleNamespace(type="HarnessError", message="harness 'rlm': APIError: process stream RPC failed (unavailable)")  # fmt: skip
+    budget = SimpleNamespace(type="HarnessError", message="harness 'rlm': RuntimeError: ACP agent completed without committing a model turn: [token budget reached]")  # fmt: skip
+    assert isinstance(ended(SimpleNamespace(errors=[rpc])), SessionLost)
+    assert all(isinstance(ended(t), ReviewLimit) for t in (SimpleNamespace(errors=[budget]), SimpleNamespace(errors=[rpc], is_truncated=True), SimpleNamespace(errors=[]))), "the author's own limits"  # fmt: skip
+
+    async def cut_off(prompt):
+        return SimpleNamespace(terminated=True)
+
+    try:
+        await env.author_step(SimpleNamespace(trace=SimpleNamespace(ok=False, errors=[rpc]), turn=cut_off), FakeRuntime(), "write", "final-02", "tasks")  # fmt: skip
+        raise AssertionError("a dropped session was reported as the author's limits")
+    except SessionLost:
+        pass
+    blocks = []
+
+    class Dropping(AuthorEnv):  # the run's blocks, of which the first `losses` lose their session
+        def __init__(self, key, losses):
+            super().__init__(settings, store)
+            self.key, self.losses = key, losses
+
+        async def blocks(self, agents_, runtime, setup):
+            blocks.append(store.reserve(self.key, 1))
+            if len([b for b in blocks if b.startswith(self.key)]) <= self.losses:
+                raise ended(SimpleNamespace(errors=[rpc]))
+            store.finish_attempt(True)
+
+    stopping = verifiers.v1.utils.interrupt
+    stopping._cleaning_up = True  # a stop cancels the session's streams: it is not retried
+    try:
+        await Dropping("stop", 1).author_world(agents)
+        raise AssertionError("a stopped run was taken up again")
+    except SessionLost:
+        assert blocks == ["stop-01"] and "stop" not in store.state.lost, blocks
+    finally:
+        stopping._cleaning_up = False
+    blocks.clear()
+    await Dropping("block", 1).author_world(agents)
+    assert blocks == ["block-01", "block-02"] and store.state.lost == {"block": 1}, (blocks, store.state.lost)
+    try:
+        await Dropping("gone", 2).author_world(agents)
+        raise AssertionError("a block that lost its session twice went on")
+    except SessionLost:
+        assert blocks[2:] == ["gone-01", "gone-02"] and store.state.lost["gone"] == 2, blocks
+    # The forge: tasks proposed on the finished world, which stays frozen; what the judge approves is kept.
+    plan = ForgeConfig(
+        base=Path("worldgen.toml"), world=store.root, output=root / "forge", rounds=2, candidates=2
+    )
+    workspace = store.world.db.execute(
+        "SELECT group_concat(id || ':' || text, '|') FROM messages"
+    ).fetchone()[0]
+    forged = TestStore(plan.output, forge_provenance(plan, settings))
+
+    class Forging(ForgeEnv):
+        review, grade, author_turn, loose, blind = (
+            AuthorEnv.review,
+            AuthorEnv.grade,
+            AuthorEnv.author_turn,
+            False,
+            False,
+        )
+
+    store.state.active_attempt = "forge"  # the scripted solver names its tries by the run it reads
+    await Forging(plan, settings, forged).run(None, agents)
+    assert [x[1] for x in seen if x[0] == "forge"] == [("r01-01", "r01-02"), ("r02-01", "r02-02")]
+    assert forged.state.phase == "done" and sorted(t for (t,) in forged.world.db.execute("SELECT id FROM tasks")) == ["r01-01", "r02-01"], "the vague candidates are dropped"  # fmt: skip
+    hard = forged.state.forged["r02-01"]
+    assert (hard["right"], hard["witness"], hard["hint"], hard["level"], hard["verdict"]) == (0.0, 1.0, 1.0, 3, "kept in search·L3·k1"), hard  # fmt: skip
+    assert dict(forged.world.db.execute("SELECT id, level FROM tasks").fetchall()) == {"r01-01": 2, "r02-01": 3}, "its tries give its level"  # fmt: skip
+    assert forged.world.db.execute("SELECT group_concat(id || ':' || text, '|') FROM messages").fetchone()[0] == workspace, "the workspace is frozen"  # fmt: skip
+    assert tuple(forged.world.db.execute("SELECT channel_id, author_id FROM facts WHERE id = 'n1'").fetchone()) == tuple(store.world.db.execute("SELECT channel_id, user_id FROM messages WHERE text LIKE '%rollback%' ORDER BY ts_us LIMIT 1").fetchone()), "an annotation is placed by its first message"  # fmt: skip
+    forged.publish()
+    assert {r.task_id for r in load_release(plan.output / "release")[1]} == {"r01-01", "r02-01"}
+    _, cases = failure_cases(forged.world, "r01-01", json.loads(forged.world.db.execute("SELECT gold_json FROM tasks WHERE id = 'r01-01'").fetchone()[0]))  # fmt: skip
+    assert any(name.startswith("the near-miss query's answer") for name, _ in cases), cases
+    # A cell keeps the candidate GLM's tries are most mixed on; the lowest band also needs the witness to answer it.
+    assert [measured_level(r, settings.tasks.bands) for r in (1.0, 0.75, 0.6, 0.5, 0.25, 0.0)] == [
+        1,
+        1,
+        2,
+        2,
+        3,
+        3,
+    ]
+    assert bucket({"changes": 3, "last_link": "dm·later", "rows": 2, "perspective": True, "derived": False, "status": False}) == "k3+dm+set+perspective"  # fmt: skip
+    weigher, keep = Forging(plan, settings, forged), forged.state.archive["lookup·L2·plain"]
+    newest = Task(id="r09-01", category="lookup", level=2, actor_id=forged.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], question="Who is the newest person here, again?", answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1", near_sql=["SELECT real_name AS answer FROM users ORDER BY id LIMIT 1"])  # fmt: skip
+    for open_id, review, verdict in (("r09-01", {"right_rate": 0.0, "witness_right": 0.0}, "dropped: the witness does not answer it either: hard, or broken"), ("r09-01", {"right_rate": 0.5, "witness_right": None}, "kept in lookup·L2·plain"), ("r09-02", {"right_rate": 0.625, "witness_right": None}, "dropped: its cell lookup·L2·plain holds r09-01, as mixed or more")):  # fmt: skip
+        with forged.world.trial() as copy:
+            forge_task(copy, newest.model_copy(update={"id": open_id, "question": f"Who is the newest person here, {open_id}?"}), settings, [open_id])  # fmt: skip
+        forged.state.solves[open_id] = {"key": "k", "results": [], "traces": []}
+        assert weigher.place(open_id, review, None, "x")["verdict"] == verdict, review
+    assert forged.state.archive["lookup·L2·plain"]["task"] == "r09-01" and forged.state.forged["r01-01"]["verdict"] == "replaced by r09-01" and keep["task"] == "r01-01", "a more mixed candidate takes its cell"  # fmt: skip
+    forged.close()
+    fails(Store, plan.output, forge_provenance(plan.model_copy(update={"rounds": 3}), settings))  # fmt: skip  # its own config only
+    # A forge stops early: once the archive is full (here, a target of none and no board), or after two rounds that
+    # keep nothing.
+    for name, changes, vague, rounds in (
+        ("forge-full", {"target": 0}, False, 1),
+        ("forge-idle", {}, True, 2),
+    ):
+        early = plan.model_copy(update={"output": root / name, "rounds": 4} | changes)
+        forging["vague"], early_store = vague, TestStore(early.output, forge_provenance(early, settings))
+        env_ = Forging(early, settings, early_store)
+        env_.adopt()
+        early_store.world.db.execute("DELETE FROM board")
+        await env_.run(None, agents)
+        assert (early_store.state.phase, early_store.state.batch) == ("done", rounds), (
+            name,
+            early_store.state.batch,
+        )
+        early_store.close()
     store.close()
     retried = SimpleNamespace(
         ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]

@@ -1,0 +1,16 @@
+# One forge: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge.toml [--dry-run]
+# F1 (2026-10-09): tasks on S3's finished world (data/v7-05/software, 953 messages, 59 facts, realism 0.91), which
+# stays frozen. S3's in-run task phase landed 1 of 20 level-2 and level-3 tasks in band; the forge proposes freely,
+# keeps what its tries measure, and stops when the archive holds `target` tasks per category and level, after
+# `rounds`, or after two rounds that keep nothing. A new forge needs a new `output`; one resumes only with the
+# configuration it started with.
+base = "configs/worldgen_slack/worldgen.toml"   # S3's configuration: its people, taxonomy and roles
+world = "data/v7-05/software"
+output = "data/v7-05/forge-01"
+rounds = 6
+candidates = 12           # one round's candidates: 72 at most, tried 8 times each
+target = 2                # kept tasks per category and level (24 cells: 48)
+
+# What the forge changes of the base's settings.
+[settings.tasks]
+max_answer_rows = 12      # exhaustive sets: a set of n is right about p^n of the time (WideSearch)

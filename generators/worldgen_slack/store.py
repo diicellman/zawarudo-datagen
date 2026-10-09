@@ -69,10 +69,23 @@ class RunState(StrictModel):
     )  # task → the turns it came back to the author in
     batch: int = 0  # the batch of slots the tasks phase writes next
     witness: dict[str, dict] = Field(default_factory=dict)  # task → the witness's runs, with its key
+    # Task reviews' issues: those naming no task, which wait for the final review, and each task's latest ones.
+    open_issues: list[Issue] = Field(default_factory=list)
+    task_issues: dict[str, list[Issue]] = Field(default_factory=dict)
+    lost: dict[str, int] = Field(default_factory=dict)  # attempts a lost session cut off: they spend no round
+    # Each task's screen: the wrong answers its grade accepted, with its key. The forge: each candidate's outcome,
+    # and the archive's cells (category, measured level, structure), each holding its task.
+    screens: dict[str, dict] = Field(default_factory=dict)
+    forged: dict[str, dict] = Field(default_factory=dict)
+    archive: dict[str, dict] = Field(default_factory=dict)
 
 
 class ReviewLimit(RuntimeError):
     pass
+
+
+class SessionLost(RuntimeError):
+    """An author's session ended on an error that is none of its own limits: its sandbox, tunnel or provider."""
 
 
 class Store:
@@ -117,7 +130,7 @@ class Store:
 
     def reserve(self, key, maximum):
         used = self.state.rounds.get(key, 0)
-        if used >= maximum:
+        if used - self.state.lost.get(key, 0) >= maximum:
             raise ReviewLimit(f"review limit exhausted for {key}: {used}/{maximum}")
         self.state.rounds[key] = used + 1
         attempt = f"{key.replace(':', '-')}-{used + 1:02d}"
@@ -169,13 +182,25 @@ class Store:
         self.state.active_attempt = None
         self.save()
 
+    def lose(self) -> str | None:
+        """The active attempt was cut off by a lost session, which is no attempt of the author's: it is closed, its
+        files kept for reading, and it spends none of its key's rounds."""
+        attempt = self.state.active_attempt
+        if attempt:
+            key = attempt.rsplit("-", 1)[0]
+            self.state.lost[key] = self.state.lost.get(key, 0) + 1
+            self.event("candidate_finished", attempt=attempt, approved=False, lost=True)
+            self.state.active_attempt = None
+            self.save()
+        return attempt
+
     def summary(self, status, reason=""):
         usage = {}
-        for path in (self.root / "traces").glob("*.json"):
-            trace = read_json(path)
-            accounts = [(trace["agent"]["name"], trace.get("usage") or {}, False)]
-            accounts += [("answer_judge", value, True) for value in trace.get("extra_usage", [])]
-            for name, account, is_judge in accounts:
+        # Each trace's own calls and its answer judge's; then the answer judge's grades of the failure cases.
+        books = [[(t["agent"]["name"], t.get("usage") or {}, False, t.get("ok"))] + [("answer_judge", u, True, None) for u in t.get("extra_usage", [])] for t in map(read_json, (self.root / "traces").glob("*.json"))]  # fmt: skip
+        books.append([("answer_judge", u, True, None) for s in self.state.screens.values() for u in s.get("usage", [])])  # fmt: skip
+        for accounts in books:
+            for name, account, is_judge, ok in accounts:
                 row = usage.setdefault(
                     name,
                     {
@@ -188,7 +213,7 @@ class Store:
                     | {"unpriced_calls": 0, "failed_traces": 0},
                 )
                 row["judge_calls" if is_judge else "traces"] += 1
-                row["failed_traces"] += not is_judge and trace.get("ok") is False
+                row["failed_traces"] += not is_judge and ok is False
                 row["input_tokens"] += (account.get("prompt_tokens") or 0) + (
                     account.get("cached_input_tokens") or 0
                 )
@@ -203,11 +228,16 @@ class Store:
         bands, levels = self.settings.get("tasks", {}).get("bands"), dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())  # fmt: skip
         rates, in_band = {}, {}
         for task, review in self.state.task_reviews.items():
-            rates[task] = {k: review.get(k) for k in ("right_rate", "strict_rate", "coverage", "tries", "crashed", "witness_right", "level_fit")}  # fmt: skip
+            rates[task] = {k: review.get(k) for k in ("right_rate", "strict_rate", "coverage", "tries", "crashed", "unanswered", "witness_right", "level_fit")}  # fmt: skip
             if bands and task in levels:
                 band = bands[levels[task] - 1]
                 landed = band_move(review | {"approved": True, "band": band}) is None
-                rates[task] |= {"level": levels[task], "band": band, "in_band": landed, "rounds": self.state.task_rounds.get(task, 0)}  # fmt: skip
+                spent = self.state.task_rounds.get(task, 0)
+                rates[task] |= {"level": levels[task], "band": band, "in_band": landed, "rounds": spent}
+                # Out of its band with no rewrite left: the author kept it, and it is released as it stands.
+                rates[task]["kept"] = not landed and spent >= self.settings.get("author", {}).get(
+                    "task_rounds", 0
+                )
                 count = in_band.setdefault(levels[task], [0, 0])
                 count[0], count[1] = count[0] + landed, count[1] + 1
         right = [r["right_rate"] for r in rates.values()]
@@ -230,6 +260,7 @@ class Store:
                 str(level): count for level, count in sorted(in_band.items())
             },  # level: [in its band, of]
             "crashed_solves": sum(r["crashed"] or 0 for r in rates.values()),
+            "unanswered_tries": sum(r["unanswered"] or 0 for r in rates.values()),
             "witness_tries": sum(len(w["results"]) for w in self.state.witness.values()),
             "mean_learnability": sum(4 * p * (1 - p) for p in right) / len(right) if right else None,
             "usage_by_role": usage,
@@ -269,7 +300,8 @@ class Store:
         return out
 
     def release_rows(self, world_hash: str) -> tuple[list[PublicTask], dict[str, PrivateAnswer]]:
-        """Each task's public row and private answer: its gold rows, and the messages and people they rest on."""
+        """Each task's public row and private answer: its gold rows, and the messages and people they rest on; a
+        refusal's truth out of its actor's sight goes apart, as `unseen`."""
         rows, answers = [], {}
         db = self.world.db
         for task in db.execute("SELECT * FROM tasks ORDER BY id").fetchall():
@@ -284,14 +316,14 @@ class Store:
                 )
             }
             marks = ", ".join("?" * len(ids))
-            messages = [
-                list(r)
-                for r in db.execute(
-                    f"SELECT channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us", sorted(ids)
-                )
-            ]
+            reader = World(self.world.path, actor=task["actor_id"])
+            readable = {r[0] for r in reader.db.execute(f"SELECT id FROM messages WHERE id IN ({marks})", sorted(ids))}  # fmt: skip
+            reader.close()
+            stated = db.execute(f"SELECT id, channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us", sorted(ids)).fetchall()  # fmt: skip
+            messages = [[r["channel_id"], r["ts"]] for r in stated if r["id"] in readable]
+            unseen = [[r["channel_id"], r["ts"]] for r in stated if r["id"] not in readable]
             review, env = self.state.task_reviews.get(task["id"]), self.settings.get("env", {})
-            measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "right_rate", "strict_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
+            measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "unanswered", "right_rate", "right_interval", "strict_rate", "abstain_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
             rows.append(
                 PublicTask(task_id=task["id"], question=task["question"], actor_id=task["actor_id"], category=task["category"], level=task["level"], answer_type=task["answer_type"], world_hash=world_hash, **measured)
             )  # fmt: skip
@@ -300,6 +332,7 @@ class Store:
                 rows=gold,
                 gold_sql=task["gold_sql"],
                 messages=messages,
+                unseen=unseen,
                 users=sorted({r["user_id"] for r in gold if r.get("user_id") is not None}),
             )
         return rows, answers
