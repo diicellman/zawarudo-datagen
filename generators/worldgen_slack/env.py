@@ -403,8 +403,13 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 rows = copy.gold(actor, sql, max_rows=self.settings.tasks.max_answer_rows)["rows"]
                 copy.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(rows), task_id))
 
-    def solver_task(self, task_id, world):
+    def solver_task(self, task_id, world, hint: bool = False):
+        """The task as the solver gets it; with `hint`, its question is followed by the messages its answer rests on
+        (SPADE's privileged hint: a task the solver misses even so is hard to reason, or broken, not hard to find)."""
         row, answer = next((r, a) for r, a in zip(*self.answers(world)) if r.task_id == task_id)
+        if hint:
+            texts = [self.world.db.execute("SELECT text FROM messages WHERE channel_id = ? AND ts = ?", (c, ts)).fetchone()[0] for c, ts in answer.messages]  # fmt: skip
+            row = row.model_copy(update={"question": row.question + "\n\nThese messages bear on it:\n" + "\n".join(f"- {t}" for t in texts)})  # fmt: skip
         return SolverTask.create(
             row,
             world,
@@ -430,12 +435,12 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 break
         return outcome, trace
 
-    async def solves(self, agents, task_ids, attempt, n, seat: str = "solver") -> dict:
+    async def solves(self, agents, task_ids, attempt, n, seat: str = "solver", hint: bool = False) -> dict:
         """`n` independent solves of each task by `seat`, on a solver copy of the world kept with the attempt."""
         copy = self.store.path(attempt, f"{seat}.sqlite")
         copy.unlink(missing_ok=True)
         self.world.solver_copy(copy)
-        runs = await asyncio.gather(*(asyncio.gather(*(self.solve(agents, self.solver_task(t, copy), seat) for _ in range(n))) for t in task_ids))  # fmt: skip
+        runs = await asyncio.gather(*(asyncio.gather(*(self.solve(agents, self.solver_task(t, copy, hint), seat) for _ in range(n))) for t in task_ids))  # fmt: skip
         if dead := [t for t, tries in zip(task_ids, runs) if all(o["crashed"] for o, _ in tries)]:
             raise RuntimeError(f"every try of {dead} crashed twice: the solver or its grading is failing")
         return dict(zip(task_ids, runs))

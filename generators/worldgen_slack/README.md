@@ -52,8 +52,15 @@ gives it per role.
 finished, and leaves the world as it is (`forge.py`). It starts from the run's final `world.sqlite` with its tasks
 emptied, its board and ledger kept, and the world author's last notes; then, round by round, a proposer in the
 author's seat writes candidates for the round's open ids, of the category and level it chooses, and the solver,
-the witness and the judge try and review each as a probe does. What the judge approves is kept; the rest is
-dropped. The proposer reads the board (the tasks the world was planned for: backward generation stays), and may
+the witness and the judge try and review each as a probe does. A candidate's tries give its level (the first
+band whose floor its right rate reaches; the lowest band also needs the witness to answer it), and those GLM
+misses half the time or more are tried twice more with the messages their answer rests on, which tells a task hard
+to find from one hard to reason or broken. What the judge approves goes into an archive cell (its category, its
+measured level and its structure: values in sight, where its answer sits, a set, another asker's other answer, an
+answer to work out, a status), which keeps the candidate GLM's tries are most mixed on. `memory/archive.md` tells
+the proposer, each round, what each category and level holds against `target`, which board entries no kept task
+rests on, and how each recent candidate fared and how GLM went wrong. The forge stops when its rounds run out, the
+archive is full, or two rounds keep nothing; the release is the archive. The proposer reads the board (the tasks the world was planned for: backward generation stays), and may
 register with `world_annotate` a fact the world already states, on its messages. Nothing it does posts, revises or
 moves the workspace, so no task goes stale under it. The forge resumes like a run, with its own configuration and
 the world's hash.

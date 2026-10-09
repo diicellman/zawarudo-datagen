@@ -73,9 +73,11 @@ class RunState(StrictModel):
     open_issues: list[Issue] = Field(default_factory=list)
     task_issues: dict[str, list[Issue]] = Field(default_factory=dict)
     lost: dict[str, int] = Field(default_factory=dict)  # attempts a lost session cut off: they spend no round
-    screens: dict[str, dict] = Field(
-        default_factory=dict
-    )  # task → the wrong answers its grade accepted, with its key
+    # Each task's screen: the wrong answers its grade accepted, with its key. The forge: each candidate's outcome,
+    # and the archive's cells (category, measured level, structure), each holding its task.
+    screens: dict[str, dict] = Field(default_factory=dict)
+    forged: dict[str, dict] = Field(default_factory=dict)
+    archive: dict[str, dict] = Field(default_factory=dict)
 
 
 class ReviewLimit(RuntimeError):

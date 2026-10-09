@@ -23,7 +23,8 @@ import verifiers.v1 as vf
 
 from .agents.world import WorldAuthorTask, forge_prompt
 from .config import ROOT, Config, Section, load_config
-from .env import SETUP_FILES, GenerationEnv, keep_awake, require_session
+from .contracts import features
+from .env import SETUP_FILES, GenerationEnv, keep_awake, rates, require_session
 from .generate import failure, run_label
 from .store import Store
 
@@ -36,6 +37,9 @@ class ForgeConfig(Section):
     output: Path
     rounds: int = Field(default=6, ge=1, le=50)
     candidates: int = Field(default=12, ge=1, le=50)  # the candidate tasks one round writes
+    target: int = Field(
+        default=2, ge=1, le=10
+    )  # the tasks kept per category and level before the forge stops
     settings: dict = Field(
         default_factory=dict
     )  # sections of the base configuration it replaces, merged by key
@@ -69,6 +73,21 @@ def provenance(forge: ForgeConfig, settings: Config) -> dict:
 
 
 TASK_TABLES = ("task_facts", "tasks")
+
+
+def bucket(shape: dict) -> str:
+    """A task's structure, as one of the archive's coordinates: how many values its asker can see, where its answer
+    sits, a set, another asker's other answer, an answer to work out, a status."""
+    parts = [f"k{min(shape['changes'], 3)}"] if shape["changes"] else []
+    if shape["last_link"] and not shape["last_link"].startswith("channel"):
+        parts.append(shape["last_link"].split("·")[0])
+    parts += ["set"] * (shape["rows"] > 1) + [k for k in ("perspective", "derived", "status") if shape[k]]
+    return "+".join(parts) or "plain"
+
+
+def measured_level(right: float, bands) -> int:
+    """The level a task's tries put it at: the first band, from level 1 down, whose floor its right rate reaches."""
+    return next(i for i, (low, _) in enumerate(bands, 1) if right >= low)
 
 
 class ForgeEnv(GenerationEnv):
@@ -126,24 +145,89 @@ class ForgeEnv(GenerationEnv):
         require_session(interaction.trace)
         await self.keep_notes(runtime, attempt)
         async with keep_awake(runtime, self.settings.author.keepalive):
-            await self.weigh(agents, attempt, self.written(ids))
+            added = await self.weigh(agents, attempt, self.written(ids))
         state.batch, state.restore_point = number, attempt
-        if number == cfg.rounds:
+        counts = state.plans.setdefault("forge", {})
+        counts["idle"] = idle = 0 if added else counts.get("idle", 0) + 1
+        # It stops when its rounds run out, when the archive is full, or after two rounds that keep nothing.
+        if number == cfg.rounds or self.done() or idle >= 2:
             state.phase = "done"
         self.store.finish_attempt(True)
         self.store.save()
 
-    async def weigh(self, agents, attempt: str, ids: list[str]) -> None:
-        """The round's candidates tried and reviewed (the screen, the solver's tries, the witness, the judge); a
-        candidate the judge does not approve is dropped."""
+    async def weigh(self, agents, attempt: str, ids: list[str]) -> int:
+        """The round's candidates tried and reviewed (the screen, the solver's tries, the witness, the judge); those
+        GLM misses half the time or more are tried twice more with the messages their answer rests on. Each approved
+        one is placed in the archive. Returns how many it kept."""
+        state = self.store.state
         if not ids:
-            return
+            return 0
         self.refresh_gold()
         keys = {t: self.task_key(t) for t in ids}
         await self.judge_tasks(agents, ids, keys, attempt, self.settings.author.tries)
-        reviews = self.store.state.task_reviews
-        for t in [t for t in ids if reviews.get(t, {}).get("key") != keys[t]]:
-            self.drop(t, attempt, "not approved")
+        approved = [t for t in ids if state.task_reviews.get(t, {}).get("key") == keys[t]]
+        low = [t for t in approved if state.task_reviews[t]["right_rate"] <= 0.5 and self.answers_on(t)]
+        hinted = await self.solves(agents, low, attempt, 2, hint=True) if low else {}
+        for t in ids:
+            state.forged[t] = self.place(
+                t, state.task_reviews[t] if t in approved else None, hinted.get(t), attempt
+            )
+        self.store.save()
+        return sum(state.forged[t]["verdict"].startswith("kept") for t in ids)
+
+    def answers_on(self, task_id: str) -> bool:
+        """Whether a task's answer rests on messages a hint can show."""
+        return bool(self.store.release_rows("hint")[1][task_id].messages)
+
+    def place(self, task_id: str, review: dict | None, hinted, attempt: str) -> dict:
+        """One candidate's outcome. Its tries give its level; the lowest band also needs the witness to answer it
+        (hard, not broken). Its cell is its category, that level and its structure (MAP-Elites over task features,
+        OMNI-EPIC's archive); a cell keeps the candidate GLM's tries are most mixed on, 4p(1-p), and the shorter
+        question when they tie."""
+        state, bands = self.store.state, self.settings.tasks.bands
+        row = self.world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        gold = json.loads(row["gold_json"])
+        shape = features(self.world, task_id, gold)
+        out = {"round": state.batch + 1, "category": row["category"], "declared": row["level"], "question": row["question"], "features": shape}  # fmt: skip
+        if review is None:
+            issues = [i.defect for i in state.task_issues.get(task_id, [])] + state.screens.get(task_id, {}).get("failed", [])  # fmt: skip
+            self.drop(task_id, attempt, "not approved")
+            return out | {"verdict": "dropped: the judge did not approve it", "issues": issues[:3]}
+        right, witness = review["right_rate"], review.get("witness_right")
+        hint = rates([o for o, _ in hinted])["right_rate"] if hinted else None
+        level = measured_level(right, bands)
+        misses = [{"answer": r.get("response", "")[:240], "why": r.get("reason", "")[:240]} for r in state.solves[task_id]["results"] if not r.get("correct") and not r.get("crashed")][:2]  # fmt: skip
+        out |= {"right": right, "interval": review.get("right_interval"), "tries": review.get("tries"), "witness": witness, "hint": hint, "level": level, "misses": misses}  # fmt: skip
+        if bands[level - 1][0] == 0 and not witness:
+            self.drop(task_id, attempt, "neither solver answers it")
+            return out | {"verdict": "dropped: the witness does not answer it either: hard, or broken"}
+        cell, score, words = f"{row['category']}·L{level}·{bucket(shape)}", 4 * right * (1 - right), len(row["question"].split())  # fmt: skip
+        held = state.archive.get(cell)
+        if held and (held["score"], -held["words"]) >= (score, -words):
+            self.drop(task_id, attempt, f"{cell} holds {held['task']}")
+            return out | {"verdict": f"dropped: its cell {cell} holds {held['task']}, as mixed or more"}
+        if held:
+            self.drop(held["task"], attempt, f"replaced by {task_id}")
+            state.forged[held["task"]]["verdict"] = f"replaced by {task_id}"
+        self.world.db.execute("UPDATE tasks SET level = ? WHERE id = ?", (level, task_id))
+        state.archive[cell] = {"task": task_id, "score": score, "words": words, "right": right}
+        return out | {"verdict": f"kept in {cell}"}
+
+    def covered(self) -> tuple[dict, list[str]]:
+        """What the archive covers: its tasks per category and level, and the board's entries no kept task rests on (a
+        kept task of the entry's category on one of its facts)."""
+        kept = {(c, lvl): n for c, lvl, n in self.world.db.execute("SELECT category, level, COUNT(*) FROM tasks GROUP BY category, level")}  # fmt: skip
+        rests = {(c, f) for c, f in self.world.db.execute("SELECT t.category, tf.fact_id FROM tasks t JOIN task_facts tf ON tf.task_id = t.id")}  # fmt: skip
+        open_ = [slot for slot, facts in self.world.db.execute("SELECT slot, group_concat(fact_id) FROM board GROUP BY slot") if not any((slot.split("-l")[0], f) in rests for f in facts.split(","))]  # fmt: skip
+        return kept, sorted(open_)
+
+    def done(self) -> bool:
+        """The archive is full: every category and level holds `target` tasks, and every board entry is covered."""
+        kept, open_ = self.covered()
+        cells = [
+            (c, lvl) for c, spec in self.settings.taxonomy.items() for lvl in range(1, len(spec.levels) + 1)
+        ]
+        return not open_ and all(kept.get(cell, 0) >= self.forge.target for cell in cells)
 
     def drop(self, task_id: str, attempt: str, why: str) -> None:
         self.world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task_id,))
@@ -151,12 +235,32 @@ class ForgeEnv(GenerationEnv):
         self.store.event("candidate_dropped", attempt=attempt, task_id=task_id, why=why)
 
     def pages(self) -> dict[str, str]:
-        """The forge's own memory pages, beside the world's: the board the world was planned for."""
-        lines = ["# Board: the tasks the world was planned for, and the facts each rests on", ""]
+        """The forge's own memory pages, beside the world's: the board the world was planned for, and the archive:
+        what each category and level holds against its target, the board's open entries, each kept task, and every
+        candidate of the last two rounds with its tries, its traps and how GLM went wrong (SENTINEL's failure-driven
+        proposer, 2606.12908)."""
+        kept, open_ = self.covered()
+        board = ["# Board: the tasks the world was planned for, and the facts each rests on", ""]
         for slot, facts in self.world.db.execute("SELECT slot, group_concat(fact_id, ', ') FROM board GROUP BY slot ORDER BY slot"):  # fmt: skip
-            lines.append(f"- {slot}: {facts}")
-        kept = [f"- {r['id']} ({r['category']} L{r['level']}, right {r['right_rate']}): {r['question']}" for r in self.world.db.execute("SELECT * FROM tasks ORDER BY id")]  # fmt: skip
-        return {"memory/board.md": "\n".join(lines) + "\n", "memory/archive.md": "# Archive\n\n" + ("\n".join(kept) or "(nothing kept yet)") + "\n"}  # fmt: skip
+            board.append(f"- {slot}: {facts}" + ("  (open)" if slot in open_ else "  (covered)"))
+        lines = ["# Archive", "", f"Target: {self.forge.target} kept tasks per category and level, and every board entry. GLM tries each candidate {self.settings.author.tries} times.", ""]  # fmt: skip
+        for category, spec in self.settings.taxonomy.items():
+            lines.append(f"- {category}: " + " · ".join(f"L{lvl} {kept.get((category, lvl), 0)}/{self.forge.target}" for lvl in range(1, len(spec.levels) + 1)))  # fmt: skip
+        lines += ["", f"Board entries no kept task rests on: {', '.join(open_) or 'none'}", "", "## Kept"]
+        for cell, held in sorted(self.store.state.archive.items()):
+            question = self.world.db.execute(
+                "SELECT question FROM tasks WHERE id = ?", (held["task"],)
+            ).fetchone()
+            lines.append(
+                f"- {cell}: {held['task']}, right {held['right']:.2f}: {question[0] if question else ''}"
+            )
+        last = [t for t, o in self.store.state.forged.items() if o["round"] >= self.store.state.batch - 1]
+        lines += ["", "## The last rounds' candidates"]
+        for t in last:
+            o = self.store.state.forged[t]
+            tried = f"right {o['right']:.2f} of {o['tries']} {o.get('interval')}, witness {o.get('witness')}, hint {o.get('hint')}" if "right" in o else ""  # fmt: skip
+            lines.append(f"- {t} ({o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features'])}" + "".join(f"\n  GLM answered: {m['answer']!r}; the grade: {m['why']!r}" for m in o.get("misses", [])) + "".join(f"\n  issue: {i}" for i in o.get("issues", [])))  # fmt: skip
+        return {"memory/board.md": "\n".join(board) + "\n", "memory/archive.md": "\n".join(lines) + "\n"}
 
 
 async def run(forge: ForgeConfig, settings: Config) -> dict:
