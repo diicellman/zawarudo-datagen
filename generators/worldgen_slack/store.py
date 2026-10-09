@@ -72,10 +72,15 @@ class RunState(StrictModel):
     # Task reviews' issues: those naming no task, which wait for the final review, and each task's latest ones.
     open_issues: list[Issue] = Field(default_factory=list)
     task_issues: dict[str, list[Issue]] = Field(default_factory=dict)
+    lost: dict[str, int] = Field(default_factory=dict)  # attempts a lost session cut off: they spend no round
 
 
 class ReviewLimit(RuntimeError):
     pass
+
+
+class SessionLost(RuntimeError):
+    """An author's session ended on an error that is none of its own limits: its sandbox, tunnel or provider."""
 
 
 class Store:
@@ -120,7 +125,7 @@ class Store:
 
     def reserve(self, key, maximum):
         used = self.state.rounds.get(key, 0)
-        if used >= maximum:
+        if used - self.state.lost.get(key, 0) >= maximum:
             raise ReviewLimit(f"review limit exhausted for {key}: {used}/{maximum}")
         self.state.rounds[key] = used + 1
         attempt = f"{key.replace(':', '-')}-{used + 1:02d}"
@@ -171,6 +176,18 @@ class Store:
         self.event("candidate_finished", attempt=attempt, approved=approved)
         self.state.active_attempt = None
         self.save()
+
+    def lose(self) -> str | None:
+        """The active attempt was cut off by a lost session, which is no attempt of the author's: it is closed, its
+        files kept for reading, and it spends none of its key's rounds."""
+        attempt = self.state.active_attempt
+        if attempt:
+            key = attempt.rsplit("-", 1)[0]
+            self.state.lost[key] = self.state.lost.get(key, 0) + 1
+            self.event("candidate_finished", attempt=attempt, approved=False, lost=True)
+            self.state.active_attempt = None
+            self.save()
+        return attempt
 
     def summary(self, status, reason=""):
         usage = {}

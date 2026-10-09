@@ -65,9 +65,9 @@ from .chronicle import (
     today,
     today_line,
 )
-from .env import GenerationEnv, keep_awake, rates, try_digest
+from .env import GenerationEnv, ended, keep_awake, rates, try_digest
 from .generate import failure, provenance, run_label
-from .store import Store
+from .store import ReviewLimit, SessionLost, Store
 from .config import ROOT, Acceptance, Category, Config, Needs
 from .contracts import (
     band_move,
@@ -2463,6 +2463,42 @@ async def check_author(root):
     assert [len(runs[t]["results"]) for t in (t0, t1, t3)] == [5, 3, 3], {
         t: len(r["results"]) for t, r in runs.items()
     }
+    # A session lost to its sandbox is none of the author's limits (S3 stopped three times on Prime's dropped process
+    # stream, each reported as the author's limits): its block is written again once and spends no attempt, and a
+    # second loss in a row stops the run.
+    rpc = SimpleNamespace(type="HarnessError", message="harness 'rlm': APIError: process stream RPC failed (unavailable)")  # fmt: skip
+    budget = SimpleNamespace(type="HarnessError", message="harness 'rlm': RuntimeError: ACP agent completed without committing a model turn: [token budget reached]")  # fmt: skip
+    assert isinstance(ended(SimpleNamespace(errors=[rpc])), SessionLost)
+    assert all(isinstance(ended(t), ReviewLimit) for t in (SimpleNamespace(errors=[budget]), SimpleNamespace(errors=[rpc], is_truncated=True), SimpleNamespace(errors=[]))), "the author's own limits"  # fmt: skip
+
+    async def cut_off(prompt):
+        return SimpleNamespace(terminated=True)
+
+    try:
+        await env.author_step(SimpleNamespace(trace=SimpleNamespace(ok=False, errors=[rpc]), turn=cut_off), FakeRuntime(), "write", "final-02", "tasks")  # fmt: skip
+        raise AssertionError("a dropped session was reported as the author's limits")
+    except SessionLost:
+        pass
+    blocks = []
+
+    class Dropping(AuthorEnv):  # the run's blocks, of which the first `losses` lose their session
+        def __init__(self, key, losses):
+            super().__init__(settings, store)
+            self.key, self.losses = key, losses
+
+        async def blocks(self, agents_, runtime, setup):
+            blocks.append(store.reserve(self.key, 1))
+            if len([b for b in blocks if b.startswith(self.key)]) <= self.losses:
+                raise ended(SimpleNamespace(errors=[rpc]))
+            store.finish_attempt(True)
+
+    await Dropping("block", 1).author_world(agents)
+    assert blocks == ["block-01", "block-02"] and store.state.lost == {"block": 1}, (blocks, store.state.lost)
+    try:
+        await Dropping("gone", 2).author_world(agents)
+        raise AssertionError("a block that lost its session twice went on")
+    except SessionLost:
+        assert blocks[2:] == ["gone-01", "gone-02"] and store.state.lost["gone"] == 2, blocks
     store.close()
     retried = SimpleNamespace(
         ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]

@@ -51,7 +51,7 @@ from .contracts import (
     quality,
     quota,
 )
-from .store import ReviewLimit, Store, used_names
+from .store import ReviewLimit, SessionLost, Store, used_names
 
 NOTES = ("plan.md", "recap.md")  # the world author's own files in /task/notes
 SETUP_FILES = ("input.json", "guide.md", "schemas.json", "schema.sql", "world.sqlite", "premise.json", "organization.json")  # fmt: skip
@@ -107,6 +107,24 @@ async def keep_awake(runtime, every: float):
 def require_trace(trace):
     if not trace.ok:
         raise RuntimeError("agent execution failed: " + "; ".join(e.message for e in trace.errors))
+
+
+def ended(trace) -> RuntimeError:
+    """Why an author's session ended before its work did: its own limits (the turn cap, the token budget), or an
+    error of its sandbox, tunnel or provider, which is none of the author's (S3's three stops: Prime's process stream
+    dropped, and each was reported as the author's limits)."""
+    errors = "; ".join(f"{e.type}: {e.message}" for e in getattr(trace, "errors", None) or [])
+    if not errors or getattr(trace, "is_truncated", False) or "budget reached" in errors:
+        return ReviewLimit(
+            "the author exhausted its interaction's limits" + (f": {errors}" if errors else "")
+        )
+    return SessionLost("the author's session was lost: " + errors)
+
+
+def require_session(trace):
+    """An author's interaction that failed, for the reason `ended` gives."""
+    if not trace.ok:
+        raise ended(trace)
 
 
 def observable(record: dict) -> dict:
@@ -211,7 +229,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             + f"Write that phase's document to /task/{context['phase']}.json."
         )
         if segment.terminated:
-            raise ReviewLimit("author exhausted its native interaction limits")
+            raise ended(interaction.trace)
         try:
             raw = (await runtime.read(f"/task/{context['phase']}.json", max_bytes=24_000_000)).decode()
         except SandboxError:
@@ -452,7 +470,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         segment = await interaction.turn(prompt)
         self.store.trace(interaction.trace)
         if segment.terminated:
-            raise ReviewLimit("the author exhausted its interaction's limits")
+            raise ended(interaction.trace)
 
     async def note(self, runtime, name: str) -> str | None:
         try:
@@ -478,7 +496,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         async with agents.author.interaction(task, runtime=runtime) as interaction:
             await self.premise_and_organization(interaction, runtime, "plan")
         self.store.trace(interaction.trace)
-        require_trace(interaction.trace)
+        require_session(interaction.trace)
 
     async def plan_world(self, agents, runtime) -> None:
         """The ledger, before day 1: storylines, events and facts, and the author's plan of them."""
@@ -502,7 +520,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     break
                 prompt = "The plan is not done: " + "; ".join(errors) + ". Finish it, then end your turn."
         self.store.trace(interaction.trace)
-        require_trace(interaction.trace)
+        require_session(interaction.trace)
         if errors:
             return self.reject_structure(attempt, "; ".join(errors))
         await self.keep_notes(runtime, attempt)
@@ -544,7 +562,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                     break
                 prompt = f"Day {day} is not done: " + "; ".join(errors) + ". Finish it, then end your turn."
         self.store.trace(interaction.trace)
-        require_trace(interaction.trace)
+        require_session(interaction.trace)
         if errors:
             return self.reject_structure(attempt, "; ".join(errors))
         await self.keep_notes(runtime, attempt)
@@ -787,7 +805,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             async with keep_awake(runtime, cfg.author.keepalive):
                 await self.harden(agents, turn, attempt, ids)
         self.store.trace(interaction.trace)
-        require_trace(interaction.trace)
+        require_session(interaction.trace)
         await self.keep_notes(runtime, attempt)
         state.batch, state.restore_point = state.batch + 1, attempt
         if state.batch == total:
@@ -819,7 +837,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 await self.author_step(interaction, runtime, fix_prompt(issues, named), attempt, "tasks")
         if interaction is not None:
             self.store.trace(interaction.trace)
-            require_trace(interaction.trace)
+            require_session(interaction.trace)
 
     async def final_world(self, agents) -> Verdict:
         """The final review: every stale task solved and judged, and the whole world judged."""
@@ -837,26 +855,42 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         return verdict
 
     async def author_world(self, agents) -> None:
-        """One author agent and one VM for the whole world; one interaction per block of work."""
-        state = self.store.state
+        """One author agent and one VM for the whole world; one interaction per block of work. A session lost to its
+        sandbox, tunnel or provider (or a VM gone mid-run) is none of the author's limits: a fresh VM takes the run up
+        where its state says, as a resume does, and the attempt it cut off spends no round. A second loss in the same
+        block stops the run."""
+        state, last = self.store.state, None
         setup = SynthesizerTask.create(
             synthesizer.premise_context(self.settings, self.used), "setup", self.world.path
         )
-        async with agents.author.provision(setup) as runtime:
-            if state.phase in ("premise", "organization"):
-                await self.setup_world(agents, runtime, setup)
-            # Provisioning lays out the setup files again on every resume; the author's later turns never see them.
-            await runtime.run(["rm", "-f", *(f"/task/{name}" for name in SETUP_FILES)], {})
-            while state.phase == "plan":
-                await self.plan_world(agents, runtime)
-            while state.phase in ("day", "review"):
-                await (
-                    self.review_so_far(agents) if state.phase == "review" else self.write_day(agents, runtime)
+        while True:
+            try:
+                async with agents.author.provision(setup) as runtime:
+                    return await self.blocks(agents, runtime, setup)
+            except (SessionLost, SandboxError) as error:
+                where = (state.phase, state.day, state.batch)
+                attempt = self.store.lose()
+                self.store.event(
+                    "session_lost", attempt=attempt, error=str(error)[:2000], again=where != last
                 )
-            while state.phase == "tasks":
-                await self.write_tasks(agents, runtime)
-            if state.phase == "final":
-                await self.fix_world(agents, runtime)
+                if where == last:
+                    raise
+                last = where
+
+    async def blocks(self, agents, runtime, setup) -> None:
+        state = self.store.state
+        if state.phase in ("premise", "organization"):
+            await self.setup_world(agents, runtime, setup)
+        # Provisioning lays out the setup files again on every resume; the author's later turns never see them.
+        await runtime.run(["rm", "-f", *(f"/task/{name}" for name in SETUP_FILES)], {})
+        while state.phase == "plan":
+            await self.plan_world(agents, runtime)
+        while state.phase in ("day", "review"):
+            await (self.review_so_far(agents) if state.phase == "review" else self.write_day(agents, runtime))
+        while state.phase == "tasks":
+            await self.write_tasks(agents, runtime)
+        if state.phase == "final":
+            await self.fix_world(agents, runtime)
 
     async def run(self, task, agents):
         return await self.author_world(agents)
