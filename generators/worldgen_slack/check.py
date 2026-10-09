@@ -101,6 +101,8 @@ from .contracts import (
     at,
     background_plan,
     failure_cases,
+    features,
+    panel,
     channel_id,
     check_task,
     deciding,
@@ -955,6 +957,32 @@ def check_contracts(root):
         gold, cases = out.args[0]
     assert gold == "Owen." and ("the near-miss 'Ines'", "Ines.") in cases and ("a hedge", "Either Owen or Ines; I can't tell which.") in cases, cases  # fmt: skip
     assert not [c for c in cases if "Mia" in c[1]], "a value its actor cannot see is no near-miss"
+
+    # Lazy solvers over a chain: "full test" (f7, #ops) is settled as "dry run" (f3, #leads), then a decoy repeats
+    # "rehearsal" in #ops. Taking the first or the latest value is wrong; the truth sits in a private channel, later.
+    def chain(copy):
+        stale(copy)
+        copy.insert("facts", [dict(id="f8", storyline="s2", subject="Audit", attribute="window", value="rehearsal", channel_id=ops, author_id=b, day=3, summary="s", is_decoy=1)])  # fmt: skip
+        (day3,) = copy.db.execute("SELECT start_us FROM calendar WHERE day = 3").fetchone()
+        copy.db.execute("UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(day3 + 14_400_000_000),))
+        said = copy.insert("messages", [dict(channel_id=ch, ts_us=day3 + h * 3_600_000_000, user_id=u, text=t) for h, ch, u, t in ((1, ops, a, "full test it is"), (2, leads, a, "dry run it is"), (3, ops, b, "rehearsal it is"))])  # fmt: skip
+        copy.insert("evidence", [dict(fact_id=f, message_id=m, role="anchor") for f, m in zip(("f7", "f3", "f8"), said)])  # fmt: skip
+
+    window = Task(id="t9", category="semantic", level=3, actor_id=a, question="What is the audit's window?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f3'", facts=["f3", "f7"])  # fmt: skip
+    try:
+        with world.trial() as copy:
+            chain(copy)
+            record_task(copy, window, needing(settings, "semantic", 3), nine)
+            count = Task(id="t8", category="lookup", level=1, actor_id=a, question="How many messages are there?", answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages")  # fmt: skip
+            counted = record_task(copy, count, settings, slot("lookup", 1, id="t8"))["gold"]
+            raise LookupError((panel(copy, "t9", [{"answer": "dry run"}]), features(copy, "t9", [{"answer": "dry run"}]), features(copy, "t8", counted)))  # fmt: skip
+    except LookupError as out:
+        lazy, shape, counting = out.args[0]
+    assert {k: lazy["guesses"][k] for k in ("first", "latest", "top")} == {"first": "full test", "latest": "rehearsal", "top": "rehearsal"} and {"first", "latest", "top"} <= set(lazy["traps"]) and not lazy["shortcut"], lazy  # fmt: skip
+    assert (shape["changes"], shape["last_link"], shape["perspective"]) == (3, "private·later", False), shape
+    assert counting["perspective"] and counting["derived"], (
+        "a count differs by who asks, and no message states it"
+    )
 
     def stated_unseen(copy):  # the truth, f3, is stated in #leads on day 3, where c cannot read it
         stale(copy)
@@ -2213,9 +2241,28 @@ async def check_author(root):
                         raise AssertionError(f"an annotation was accepted: {bad}")
                     except ValueError as error:
                         assert why in str(error), error
+                # A search for the question's own words reaches the answer first: level 1, whatever it is called.
+                notes = Task(id=ids[0], category="search", level=2, actor_id=a, question="When were the notes up for release 4.2?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f2'", facts=["f2"])  # fmt: skip
+                try:
+                    await call("add_task", task=notes)
+                    raise AssertionError("a shortcut was written above level 1")
+                except ValueError as error:
+                    assert "so it is a level-1 task" in str(error), error
+                assert (await call("add_task", task=notes.model_copy(update={"level": 1})))["panel"][
+                    "shortcut"
+                ]
+                # A task on no facts above level 1 names the answer a hasty reader gives: another one.
+                newest = Task(id=ids[0], category="lookup", level=2, actor_id=a, question="Who is the newest person here?", answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1")  # fmt: skip
+                for near, why in (([], "near_sql"), ([newest.gold_sql], "returns its gold answer")):
+                    try:
+                        await call("add_task", task=newest.model_copy(update={"near_sql": near}))
+                        raise AssertionError(f"a near-miss query was accepted: {near}")
+                    except ValueError as error:
+                        assert why in str(error), error
             for n, open_id in enumerate(ids):  # a candidate the judge approves, and a vague one it does not
                 question = f"Who is the newest person here, round {open_id}?" + (" vague" if n else "")
-                await call("add_task", task=Task(id=open_id, category="lookup", level=1, actor_id=a, question=question, answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1"))  # fmt: skip
+                written = await call("add_task", task=Task(id=open_id, category="lookup", level=2, actor_id=a, question=question, answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1", near_sql=["SELECT real_name AS answer FROM users ORDER BY id LIMIT 1"]))  # fmt: skip
+                assert set(written["features"]) == {"changes", "last_link", "rows", "perspective", "derived", "status"} and written["features"]["rows"] == 1, written  # fmt: skip
         elif prompt.startswith("The last day is closed"):
             context = json.loads(tools.config.context)
             writable, slots = context["writable"], {s["id"]: s for s in context["slots"]}
@@ -2645,6 +2692,8 @@ async def check_author(root):
     assert tuple(forged.world.db.execute("SELECT channel_id, author_id FROM facts WHERE id = 'n1'").fetchone()) == tuple(store.world.db.execute("SELECT channel_id, user_id FROM messages WHERE text LIKE '%rollback%' ORDER BY ts_us LIMIT 1").fetchone()), "an annotation is placed by its first message"  # fmt: skip
     forged.publish()
     assert {r.task_id for r in load_release(plan.output / "release")[1]} == {"r01-01", "r02-01"}
+    _, cases = failure_cases(forged.world, "r01-01", json.loads(forged.world.db.execute("SELECT gold_json FROM tasks WHERE id = 'r01-01'").fetchone()[0]))  # fmt: skip
+    assert any(name.startswith("the near-miss query's answer") for name, _ in cases), cases
     forged.close()
     fails(Store, plan.output, forge_provenance(plan.model_copy(update={"rounds": 3}), settings))  # fmt: skip  # its own config only
     store.close()

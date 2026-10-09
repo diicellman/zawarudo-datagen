@@ -32,6 +32,8 @@ from .contracts import (
     insert_lines,
     normalized,
     Slot,
+    features,
+    panel,
     record_task,
     render,
     text_errors,
@@ -909,7 +911,22 @@ def forge_task(world, task: Task, settings, open_ids: list[str]) -> dict:
     )
     world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
     world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
-    return {"task": task.id} | record_task(world, task, settings, slot, needs=False)
+    result = {"task": task.id} | record_task(world, task, settings, slot, needs=False)
+    lazy = panel(world, task.id, result["gold"])
+    if task.level > 1 and not task.facts and task.answer_type != "refusal" and not task.near_sql:
+        raise ValueError(
+            f"{task.id}: a task above level 1 with no facts names in near_sql its gold query with one condition "
+            "relaxed (a day, a channel, a reaction or a thread left out), which answers otherwise: the answer a hasty "
+            "reader gives"
+        )
+    if task.level > 1 and lazy["shortcut"]:
+        raise ValueError(
+            f"{task.id}: a search for the question's own words reaches its answer first ({lazy['guesses']['top']!r}), "
+            "so it is a level-1 task: GLM never missed such a task in S2 or S3. Put a near-miss where that search "
+            "reaches first (ask with the words its stale or wrong value uses, or where the correction is out of that "
+            "search's way), or write it as level 1"
+        )
+    return result | {"panel": lazy, "features": features(world, task.id, result["gold"])}
 
 
 class Annotation(StrictModel):

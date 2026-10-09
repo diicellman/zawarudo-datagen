@@ -210,6 +210,7 @@ CREATE TABLE tasks (
   gold_source  TEXT NOT NULL CHECK (gold_source IN ('sql', 'ledger', 'hybrid')),
   gold_sql     TEXT NOT NULL,                        -- run as the actor; returns answer (+ message_id, user_id)
   gold_json    TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(gold_json)),  -- its rows
+  near_sql     TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(near_sql)),   -- the gold, one condition relaxed
   min_calls    INTEGER,                              -- the fewest tool calls of a right probe
   right_rate   REAL,                                 -- the probes' share of right answers: the task's difficulty
   strict_rate  REAL                                  -- the probes' share right and grounded: the released reward

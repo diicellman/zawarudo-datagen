@@ -73,6 +73,8 @@ GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor see
   to find); status is one row, the latest value the actor can see, which a fact out of their sight settles: its gold
   reads that value from the ledger, and its facts name the settling fact. A status is answered right by giving the
   value as not settled.
+- near_sql, optional: up to 3 queries, the gold with one condition relaxed, each answering otherwise (the answer a
+  hasty reader gives); the forge asks for one of a task above level 1 that rests on no facts.
 - question is what actor_id asks, in `language`; it does not contain its answer.
 """
 
