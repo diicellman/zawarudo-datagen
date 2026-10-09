@@ -76,12 +76,14 @@ class PublicTask(StrictModel):
 
 
 class PrivateAnswer(StrictModel):
-    """The gold rows of a task, and the messages (channel, ts) and people its answer rests on."""
+    """The gold rows of a task, the messages (channel, ts) and people its answer rests on, and, for a refusal, the
+    truth out of its actor's sight (`unseen`)."""
 
     answer_type: Literal["text", "set", "number", "refusal"]
     rows: list[dict[str, JsonValue]]
     gold_sql: NonEmptyText
     messages: list[Annotated[list[str], Field(min_length=2, max_length=2)]]  # [channel, ts]
+    unseen: list[Annotated[list[str], Field(min_length=2, max_length=2)]] = []
     users: list[str]
 
 
@@ -112,12 +114,15 @@ def load_release(root: Path) -> tuple[Path, list[PublicTask], dict[str, PrivateA
     for row in rows:
         if row.world_hash != manifest.world_hash:
             raise ValueError("a task references another world")
-        reader = World(root / "world.sqlite", actor=row.actor_id)
-        for channel, ts in answers[row.task_id].messages:
-            if not reader.db.execute(
+        reader, answer = World(root / "world.sqlite", actor=row.actor_id), answers[row.task_id]
+        for channel, ts in answer.messages + answer.unseen:
+            readable = reader.db.execute(
                 "SELECT 1 FROM messages WHERE channel_id = ? AND ts = ?", (channel, ts)
-            ).fetchone():
+            ).fetchone()
+            if not readable and [channel, ts] in answer.messages:
                 raise ValueError(f"{row.task_id}: evidence its actor cannot read")
+            if readable and [channel, ts] in answer.unseen:
+                raise ValueError(f"{row.task_id}: evidence out of sight that its actor can read")
         for user in answers[row.task_id].users:
             reader.get_user(user)
         reader.close()

@@ -760,8 +760,9 @@ def hidden(world, ids: list[str], actor: str, gold=None) -> bool | None:
 def measures(world, task_id: str, rows: list[dict], tables) -> dict:
     """What makes a task hard, measured for its actor: how many read_channel pages deep its evidence sits and how many
     messages it sits under, the tables its gold query reads, its evidence's best rank when the actor searches the
-    question's own words, how many of its evidence's channels and identifiers the question names, and what its facts
-    give it (`fact_measures`)."""
+    question's own words, how many of its evidence's channels and identifiers the question names, how much of its
+    evidence the actor cannot read (`unseen`: a refusal's truth out of sight), and what its facts give it
+    (`fact_measures`)."""
     task = world.db.execute(
         "SELECT actor_id, question, answer_type FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -777,6 +778,9 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
         )
     ]
     reader = World(world.path, actor=task["actor_id"])
+    # A refusal may rest on the truth out of its actor's sight: what the actor cannot read is counted, not measured.
+    evidence = list(dict.fromkeys(evidence))
+    seen = [m for m in evidence if reader.db.execute("SELECT 1 FROM messages WHERE id = ?", (m,)).fetchone()]
     pages = [
         reader.db.execute(
             """SELECT COUNT(*) / 50 + 1 FROM messages m, messages e
@@ -784,7 +788,7 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
             AND m.ts_us > (SELECT ts_us FROM messages WHERE id = COALESCE(e.parent_id, e.id))""",
             (message_id,),
         ).fetchone()[0]
-        for message_id in dict.fromkeys(evidence)
+        for message_id in seen
     ]
     under = [
         reader.db.execute(
@@ -794,7 +798,7 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
             FROM messages e WHERE e.id = ?""",
             (message_id,),
         ).fetchone()[0]
-        for message_id in dict.fromkeys(evidence)
+        for message_id in seen
     ]
     facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
     (busiest,) = reader.db.execute("SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM messages WHERE parent_id IS NULL GROUP BY channel_id)").fetchone()  # fmt: skip
@@ -804,8 +808,9 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
             "depth": max(under, default=0),
             "depth_share": round(max(under, default=0) / busiest, 3) if busiest else 0.0,
             "tables": sorted(tables),
-            "bm25_rank": reader.rank(task["question"], evidence),
-            "named": named(world, task["question"], list(dict.fromkeys(evidence))),
+            "bm25_rank": reader.rank(task["question"], seen),
+            "named": named(world, task["question"], evidence),
+            "unseen": len(evidence) - len(seen),
         }
         | fact_measures(world, facts, task["actor_id"], answers, refusal)
         | ({"hidden": hidden(world, facts, task["actor_id"], answers)} if facts and not refusal else {})

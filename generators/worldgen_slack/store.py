@@ -278,7 +278,8 @@ class Store:
         return out
 
     def release_rows(self, world_hash: str) -> tuple[list[PublicTask], dict[str, PrivateAnswer]]:
-        """Each task's public row and private answer: its gold rows, and the messages and people they rest on."""
+        """Each task's public row and private answer: its gold rows, and the messages and people they rest on; a
+        refusal's truth out of its actor's sight goes apart, as `unseen`."""
         rows, answers = [], {}
         db = self.world.db
         for task in db.execute("SELECT * FROM tasks ORDER BY id").fetchall():
@@ -293,12 +294,12 @@ class Store:
                 )
             }
             marks = ", ".join("?" * len(ids))
-            messages = [
-                list(r)
-                for r in db.execute(
-                    f"SELECT channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us", sorted(ids)
-                )
-            ]
+            reader = World(self.world.path, actor=task["actor_id"])
+            readable = {r[0] for r in reader.db.execute(f"SELECT id FROM messages WHERE id IN ({marks})", sorted(ids))}  # fmt: skip
+            reader.close()
+            stated = db.execute(f"SELECT id, channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us", sorted(ids)).fetchall()  # fmt: skip
+            messages = [[r["channel_id"], r["ts"]] for r in stated if r["id"] in readable]
+            unseen = [[r["channel_id"], r["ts"]] for r in stated if r["id"] not in readable]
             review, env = self.state.task_reviews.get(task["id"]), self.settings.get("env", {})
             measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "unanswered", "right_rate", "strict_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
             rows.append(
@@ -309,6 +310,7 @@ class Store:
                 rows=gold,
                 gold_sql=task["gold_sql"],
                 messages=messages,
+                unseen=unseen,
                 users=sorted({r["user_id"] for r in gold if r.get("user_id") is not None}),
             )
         return rows, answers

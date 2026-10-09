@@ -916,6 +916,23 @@ def check_contracts(root):
         "its near-miss misleads"
     )
     refused("at least 1 near-misses", recorded, unseen.model_copy(update={"facts": ["f3"]}), four, needing(settings, "robustness", 4, decoys=1))  # fmt: skip  # no stale value in sight
+
+    def stated_unseen(copy):  # the truth, f3, is stated in #leads on day 3, where c cannot read it
+        stale(copy)
+        (day3,) = copy.db.execute("SELECT start_us FROM calendar WHERE day = 3").fetchone()
+        copy.db.execute("UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(day3 + 7_200_000_000),))
+        (truth,) = copy.insert("messages", [dict(channel_id=leads, ts_us=day3 + 3_600_000_000, user_id=a, text="dry run it is")])  # fmt: skip
+        copy.insert("evidence", [dict(fact_id="f3", message_id=truth, role="anchor", anchor_token="dry run")])
+
+    try:
+        with world.trial() as copy:
+            stated_unseen(copy)
+            raise LookupError(record_task(copy, unseen, needing(settings, "robustness", 4, decoys=1), four))
+    except LookupError as out:
+        measured = out.args[0]
+    assert (measured["unseen"], measured["evidence_pages"], measured["decoys"]) == (1, None, 1), (
+        "evidence its actor cannot read is counted, and measured from no view"
+    )
     hybrid = dict(category="hybrid", level=1, actor_id=c, answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages m, facts f WHERE f.id = 'f1'")  # fmt: skip
     unread = Task(
         id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
@@ -1786,6 +1803,11 @@ async def check_reviews(root):
         update={"messages": [["G1", world.db.execute("SELECT ts FROM messages WHERE id = 4").fetchone()[0]]]}
     )
     fails(write_release, root / "release2", root / "solver.sqlite", [task], {"t1": hidden})
+    # A refusal's truth out of its actor's sight ships apart, as unseen; evidence its actor can read may not.
+    out_of_sight = answer.model_copy(update={"messages": [], "unseen": hidden.messages})
+    write_release(root / "release3", root / "solver.sqlite", [task], {"t1": out_of_sight})
+    assert load_release(root / "release3")[2]["t1"].unseen == hidden.messages
+    fails(write_release, root / "release4", root / "solver.sqlite", [task], {"t1": answer.model_copy(update={"unseen": answer.messages})})  # fmt: skip
     print("PASS reviews: verdict contracts, per-task acceptance, judge tools as actors, solver copy, release")
 
 
@@ -2401,6 +2423,18 @@ async def check_author(root):
     store.world.db.execute("DELETE FROM evidence WHERE fact_id = 'f8'")
     store.world.db.execute("DELETE FROM facts WHERE id = 'f8'")
     store.world.db.execute("UPDATE messages SET text = 'quiet day, nothing to report' WHERE id = ?", (lure,))
+    # A refusal resting on the truth out of its actor's sight ships that truth apart, as unseen.
+    leads = channel_id("private", "leads", [])
+    (outsider,) = store.world.db.execute("SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM members WHERE channel_id = ?) ORDER BY id LIMIT 1", (leads,)).fetchone()  # fmt: skip
+    (asker,) = store.world.db.execute("SELECT actor_id FROM tasks WHERE id = ?", (some,)).fetchone()
+    added = store.world.db.execute("INSERT OR IGNORE INTO task_facts (task_id, fact_id) VALUES (?, 'f3')", (some,)).rowcount  # fmt: skip
+    store.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = ?", (outsider, some))
+    truth = [list(r) for r in store.world.db.execute("SELECT m.channel_id, m.ts FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = 'f3' AND e.role = 'anchor'")]  # fmt: skip
+    private = store.release_rows("h")[1][some]
+    assert truth and private.unseen == truth and not [m for m in private.messages if m in truth], private
+    store.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = ?", (asker, some))
+    if added:
+        store.world.db.execute("DELETE FROM task_facts WHERE task_id = ? AND fact_id = 'f3'", (some,))
     store.publish()
     world, rows, answers = load_release(store.root / "release")
     assert len(rows) == 4 and World(world).db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
