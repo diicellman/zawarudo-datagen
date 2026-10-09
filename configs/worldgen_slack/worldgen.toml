@@ -12,7 +12,7 @@ storylines = 3            # the plot the ledger plans before day 1
 # One author writes the world in time order.
 [author]
 review_days = [3, 6]      # the judge reviews the world after these days, and at the end
-tries = 4                 # the solver's tries of a task, each time it is probed (4 more when mixed, above level 1)
+tries = 8                 # the solver's tries of a task, each time it is probed, sampled at temperature 1 (C54)
 task_rounds = 3           # turns a task outside its level's band comes back to the author
 keepalive = 600           # seconds between pings of the author's VM while the solver and the judge work
 

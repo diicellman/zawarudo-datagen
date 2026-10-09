@@ -178,12 +178,11 @@ class AuthorSettings(Section):
     review_days: list[int] = Field(
         default_factory=lambda: [5]
     )  # the judge reviews the world after these days
-    # The solver's tries of a task, each time it is probed or reviewed, and more for a task above level 1 whose tries
-    # are mixed (near a band's edge, where 4 say little); the turns a task outside its band comes back to the author;
-    # the tasks in one judge review (a batch's reviews run side by side); GLM solves at once, as the account allows 8
-    # concurrent requests; the witness's tries of a task below its band's floor.
-    tries: int = Field(default=4, ge=1, le=16)
-    extra_tries: int = Field(default=4, ge=0, le=16)
+    # The solver's tries of a task, each time it is probed or reviewed (8: at 4, a task right 80% of the time shows
+    # 4 of 4 in 41% of probes); the turns a task outside its band comes back to the author; the tasks in one judge
+    # review (a batch's reviews run side by side); GLM solves at once, as the account allows 8 concurrent requests;
+    # the witness's tries of a task below its band's floor.
+    tries: int = Field(default=8, ge=1, le=16)
     task_rounds: int = Field(default=3, ge=0, le=10)
     review_chunk: int = Field(default=5, ge=1, le=50)
     solvers: int = Field(default=8, ge=1, le=64)

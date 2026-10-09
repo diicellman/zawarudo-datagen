@@ -1945,7 +1945,6 @@ async def check_author(root):
                     "share_tolerance": 1.0,
                     "review_days": [2],
                     "tries": 3,
-                    "extra_tries": 0,  # tried below, apart from the flow
                     "task_rounds": 1,
                     "review_chunk": 1,
                     "solvers": 2,
@@ -2463,18 +2462,12 @@ async def check_author(root):
     assert run_label(Path("/x/data/v7-01/software")) == "worldgen-v7-01-software", (
         "a run's sandboxes are findable"
     )
-    # A task above level 1 whose tries are mixed gets more of them; one right every time does not.
-    env.settings = settings.model_copy(
-        update={"author": settings.author.model_copy(update={"extra_tries": 2})}
-    )
-    store.state.active_attempt = "final-02"
-    always.discard(t3)  # t3, level 1, now mixed too: level 1 gets no more tries
-    runs, _ = await env.judge_tasks(
-        agents, [t0, t1, t3], {t0: "rewritten", t1: "rewritten", t3: "rewritten"}, "final-02", 3
-    )
-    assert [len(runs[t]["results"]) for t in (t0, t1, t3)] == [5, 3, 3], {
-        t: len(r["results"]) for t, r in runs.items()
-    }
+    # A solver samples as a policy in training does, so its tries differ; a rate comes with its 90% interval, wide
+    # at a few tries.
+    assert settings.env.solver.sampling.temperature == 1.0 == settings.env.witness.sampling.temperature and settings.env.judge.sampling.temperature == 0.0  # fmt: skip
+    assert rates([{"correct": i < 6, "semantic_correctness": 0.0} for i in range(8)])["right_interval"] == [0.46, 0.913]  # fmt: skip
+    assert rates([{"correct": True, "semantic_correctness": 1.0}] * 4)["right_interval"] == [0.596, 1.0], "4 of 4 still allows 0.6"  # fmt: skip
+    assert all(r.right_interval == state.task_reviews[r.task_id]["right_interval"] for r in rows), "intervals are published"  # fmt: skip
     # A session lost to its sandbox is none of the author's limits (S3 stopped three times on Prime's dropped process
     # stream, each reported as the author's limits): its block is written again once and spends no attempt, and a
     # second loss in a row stops the run.

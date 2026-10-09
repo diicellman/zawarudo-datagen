@@ -9,6 +9,7 @@ import contextlib
 import io
 import itertools
 import json
+import math
 import tarfile
 import time
 
@@ -135,14 +136,26 @@ def observable(record: dict) -> dict:
     return record
 
 
+def wilson(right: int, n: int, z: float = 1.645) -> list[float]:
+    """The 90% interval of a share of right answers out of n tries: how little a few tries pin a rate down."""
+    p, spread = right / n, z * z / n
+    centre, half = (
+        (p + spread / 2) / (1 + spread),
+        z * math.sqrt(p * (1 - p) / n + spread / (4 * n)) / (1 + spread),
+    )
+    return [round(max(0.0, centre - half), 3), round(min(1.0, centre + half), 3)]
+
+
 def rates(results: list[dict]) -> dict:
-    """A task's tries in numbers: how often the answer was right (the task's difficulty), how often it was right and
-    grounded (the released reward), and how much of the gold evidence the tries saw. A crashed try tells nothing
-    about the task: it is counted, and left out."""
+    """A task's tries in numbers: how often the answer was right (the task's difficulty) and its 90% interval, how
+    often it was right and grounded (the released reward), and how much of the gold evidence the tries saw. A crashed
+    try tells nothing about the task: it is counted, and left out."""
     finished = [r for r in results if not r.get("crashed")]
     seen = [r["evidence_coverage"] for r in finished if r.get("evidence_coverage") is not None]
+    right = sum(bool(r["correct"]) for r in finished)
     return {
-        "right_rate": sum(bool(r["correct"]) for r in finished) / len(finished),
+        "right_rate": right / len(finished),
+        "right_interval": wilson(right, len(finished)),
         "strict_rate": sum(r["semantic_correctness"] for r in finished) / len(finished),
         "coverage": sum(seen) / len(seen) if seen else None,
         "tries": len(finished),
@@ -601,14 +614,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         state = self.store.state
         fresh = [t for t in due if state.solves.get(t, {}).get("key") != keys[t]]
         solved = await self.solves(agents, fresh, attempt, n)
-        # A task above level 1 with mixed tries is near a band's edge, where 4 tries say little: it gets more.
-        levels = dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())
-        rights = {t: [o["correct"] for o, _ in tries if not o["crashed"]] for t, tries in solved.items()}
-        if mixed := [t for t in fresh if levels[t] > 1 and 0 < sum(rights[t]) < len(rights[t])] if self.settings.author.extra_tries else []:  # fmt: skip
-            for task_id, more in (
-                await self.solves(agents, mixed, attempt, self.settings.author.extra_tries)
-            ).items():
-                solved[task_id] = solved[task_id] + more
         for task_id, task_runs in solved.items():
             self.keep_solves(task_id, keys[task_id], task_runs)
         runs = {t: state.solves[t] for t in due}

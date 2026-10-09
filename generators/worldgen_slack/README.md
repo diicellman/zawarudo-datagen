@@ -29,8 +29,8 @@ holds the present (`world_meta.now_us`), and nothing is written before it.
 5. **Tasks.** After the last day, the author writes one task per slot with `world_add_task`: the seed draws
    `[tasks] per_100` slots per 100 messages over the taxonomy's cells. Its gold query is checked (T1-T7, readable
    facts, the level's needs, among them `hidden`: its answer stated where it is harder to see than its near-misses)
-   and code's measures of its difficulty come back. The GLM solver tries each task `[author] tries` times, and
-   `extra_tries` more when its tries are mixed above level 1; the judge reviews it. A task whose share of right
+   and code's measures of its difficulty come back. The GLM solver tries each task `[author] tries` times (8, sampling
+   at temperature 1, so that its tries differ); the judge reviews it. A task whose share of right
    answers misses its level's `[tasks] bands`, or that the judge does not approve, comes back to the author with its
    question, gold and the solver's route (where the evidence first showed, which decoys it read), for up to
    `task_rounds` rewrites: a rewrite keeps the answer and changes the route, and a turn that changes nothing ends the

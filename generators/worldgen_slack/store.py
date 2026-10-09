@@ -318,7 +318,7 @@ class Store:
             messages = [[r["channel_id"], r["ts"]] for r in stated if r["id"] in readable]
             unseen = [[r["channel_id"], r["ts"]] for r in stated if r["id"] not in readable]
             review, env = self.state.task_reviews.get(task["id"]), self.settings.get("env", {})
-            measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "unanswered", "right_rate", "strict_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
+            measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "unanswered", "right_rate", "right_interval", "strict_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
             rows.append(
                 PublicTask(task_id=task["id"], question=task["question"], actor_id=task["actor_id"], category=task["category"], level=task["level"], answer_type=task["answer_type"], world_hash=world_hash, **measured)
             )  # fmt: skip

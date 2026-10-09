@@ -69,6 +69,9 @@ class PublicTask(StrictModel):
     crashed: int | None = None
     unanswered: int | None = None
     right_rate: float | None = None
+    right_interval: Annotated[list[float], Field(min_length=2, max_length=2)] | None = (
+        None  # its 90% interval
+    )
     strict_rate: float | None = None
     coverage: float | None = None
     witness: str | None = None
