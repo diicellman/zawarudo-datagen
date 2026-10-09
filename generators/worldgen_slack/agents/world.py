@@ -868,11 +868,19 @@ def plan_prompt(world, settings, feedback: str = "") -> str:
     )
 
 
+# S3's judge flagged its planned decoys as defects, and the author corrected them where their readers see them: a
+# near-miss corrected in plain sight misleads no one.
+DECOY_ISSUES = (
+    "An issue about a message that states a decoy is answered in /task/notes/plan.md, not in the world: correcting or "
+    "hedging a decoy where its readers see it voids the near-miss its tasks rest on."
+)
+
+
 def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") -> str:
     total = world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0]
     review = (
         "\nThe judge reviewed the world so far. Fix what you can in what you write next (world_revise rewrites a "
-        f"message where it stands): {json.dumps(issues, ensure_ascii=False)}"
+        f"message where it stands): {json.dumps(issues, ensure_ascii=False)}\n{DECOY_ISSUES}"
         if issues
         else ""
     )
@@ -925,7 +933,7 @@ def fix_prompt(issues: list, writable: list[str]) -> str:
         f"The review rejected the world: {json.dumps(issues, ensure_ascii=False)}\nFix each blocking issue with "
         f"world_revise or world_add_task ({rewrite}): message_ids are the messages to change, evidence_message_ids "
         "show the defect. Fix the others too, or write in /task/notes/plan.md why you leave one; if you judge an issue "
-        "mistaken, write why there. End your turn when done."
+        f"mistaken, write why there. {DECOY_ISSUES} End your turn when done."
     )
 
 

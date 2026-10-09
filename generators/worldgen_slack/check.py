@@ -33,7 +33,7 @@ from worldgen_slack.db import ANSWER_KEY, World
 from worldgen_slack.taskset import AnswerGrade, AnswerJudge, SolverTask
 from worldgen_slack.tools import SlackTools, WorldToolsConfig, file_hash, stage_world, watch_parent
 from .agents.inspection import ReviewState
-from .agents.judge import JudgeTask, review_payload
+from .agents.judge import PHASE_GUIDES, JudgeTask, review_payload
 from .agents.synthesizer import parse_premise
 from .agents.world import WorldAuthorTask, context_of, files, ledger_digest
 from .chronicle import (
@@ -1768,6 +1768,9 @@ async def check_reviews(root):
         question="q", reference={}, response="r", observations=[]
     )
     assert "lists alternatives without settling on one is wrong" in asks[0].content and "do not change grounded" in asks[0].content  # fmt: skip
+    assert "never ask for a decoy to be\ncorrected or hedged" in PHASE_GUIDES["world"], (
+        "the world judge knows a decoy is planned"
+    )
     assert "unsupported_asides" in AnswerGrade.model_json_schema()["required"]
     observed = [{"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C1", "ts": answer.messages[0][1]}]}}]  # fmt: skip
     for asides, grounded, score in ((2, True, 1.0), (0, False, 0.0)):
@@ -2075,6 +2078,9 @@ async def check_author(root):
                 assert "message_ids" in prompt and "evidence_message_ids" in prompt, (
                     "the review's issues open day 3"
                 )
+                assert "hedging a decoy where its readers see it voids the near-miss" in prompt, (
+                    "a decoy's issue is answered in notes"
+                )
                 if crash["armed"]:
                     await talk(ops, dict(author_id=c, text="morning"))
                     crash["armed"] = False
@@ -2181,6 +2187,7 @@ async def check_author(root):
                         assert "one of the slots you write now" in str(error), error
                         seen.append(("kept", slot["id"]))
         elif prompt.startswith("The review rejected"):
+            assert "hedging a decoy where its readers see it voids the near-miss" in prompt
             issues = json.loads(prompt[prompt.index("[") : prompt.index("]\n") + 1])
             seen.append(("fix issues", [i.get("blocking") for i in issues]))
             for issue in issues:
