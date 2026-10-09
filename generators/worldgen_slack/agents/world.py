@@ -64,6 +64,8 @@ GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor see
   ledger query reads the facts it answers from, a hybrid query reads both.
 - The gold query finds messages by what the question names (words, people, channels, threads, reactions, times),
   never by a message id or by id order: code checks that it answers the same with the messages renumbered.
+- It asks only about what the solver's Slack tools show: who reacted, not when; who is a member now, not when they
+  joined; nothing of a channel's creator or a person's account date. Code refuses a column no tool shows.
 - answer_type: text or number is one row; set is 1 to max_answer_rows rows; refusal is no rows as the actor.
 - question is what actor_id asks, in `language`; it does not contain its answer.
 """

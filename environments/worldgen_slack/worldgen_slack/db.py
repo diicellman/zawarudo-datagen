@@ -64,6 +64,33 @@ CREATE TEMP VIEW thread_stats AS SELECT p.id AS root_id, COUNT(r.id) AS reply_co
 """
 # What a gold query may read: the world as its actor sees it, the directory, the calendar and the fact ledger.
 GOLD_READS = {*SHADOWED, "users", "calendar", "storylines", "facts", "fact_relations", "evidence"}
+# Of the workspace, the columns the tools below show, or let the solver work out (a mention is <@U..> in a message's
+# text; a thread's latest reply is the last one it reads; a channel's members are those who have not left): a gold
+# query filters on and returns these alone. S3's gold read reactions.created_us, when the tools say who reacted but
+# never when.
+SHOWN = {
+    "users": {
+        "id",
+        "handle",
+        "real_name",
+        "display_name",
+        "email",
+        "title",
+        "tz",
+        "status_text",
+        "status_emoji",
+        "is_bot",
+        "is_admin",
+        "is_deleted",
+        "profile_json",
+    },  # fmt: skip
+    "channels": {"id", "name", "type", "topic", "purpose", "is_archived"},
+    "members": {"channel_id", "user_id", "left_us"},
+    "messages": {"id", "channel_id", "ts_us", "ts", "user_id", "parent_id", "text", "is_deleted"},
+    "message_mentions": {"message_id", "user_id"},
+    "reactions": {"message_id", "user_id", "emoji"},
+    "thread_stats": {"root_id", "reply_count", "latest_reply_us"},
+}
 TOOLS = (
     "search_messages",
     "search_users",
@@ -346,13 +373,16 @@ class World:
         self, sql: str, max_rows: int = 100, seconds: float = 2.0, readable=lambda table, source: True
     ) -> dict:
         """One read-only SELECT within a time limit: its columns, at most `max_rows` + 1 rows (one past the cap shows
-        the cap was hit) and the tables it read. `readable(table, source)` decides which tables of the file it may
-        read; `local(us)` writes a time on the reader's clock (the actor's, else the company's)."""
+        the cap was hit), the tables it read, and the columns it names itself (`reads`, as table.column: a view's
+        own reads are the view's). `readable(table, source)` decides which tables of the file it may read;
+        `local(us)` writes a time on the reader's clock (the actor's, else the company's)."""
         reader = self.actor["id"] if self.actor else "the world"
         tz = self.actor["tz"] if self.actor else self.zone()
-        zone, tables = ZoneInfo(tz), set()
+        zone, tables, reads = ZoneInfo(tz), set(), set()
 
         def authorize(action, table, column, schema, source):
+            if action == sqlite3.SQLITE_READ and source is None and column:
+                reads.add(f"{table}.{column}")
             if action == sqlite3.SQLITE_READ and schema == "main":
                 if not readable(table, source):
                     return sqlite3.SQLITE_DENY
@@ -382,7 +412,7 @@ class World:
         finally:
             self.db.set_authorizer(None)
             self.db.set_progress_handler(None, 0)
-        return {"columns": columns, "rows": rows, "tables": sorted(tables)}
+        return {"columns": columns, "rows": rows, "tables": sorted(tables), "reads": sorted(reads)}
 
     def zone(self) -> str:
         """The company clock, or UTC for a world without one."""

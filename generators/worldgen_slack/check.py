@@ -29,7 +29,7 @@ from verifiers.v1.dialects.base import append_user_notice
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.mcp.launch import serve
 from worldgen_slack.dataset import PrivateAnswer, PublicTask, load_release, sha256, write_release
-from worldgen_slack.db import ANSWER_KEY, World
+from worldgen_slack.db import ANSWER_KEY, SHADOWED, SHOWN, World
 from worldgen_slack.taskset import AnswerGrade, AnswerJudge, SolverTask
 from worldgen_slack.tools import SlackTools, WorldToolsConfig, file_hash, stage_world, watch_parent
 from .agents.inspection import ReviewState
@@ -555,6 +555,8 @@ def check_tasks(root):
     ]
     assert world.gold("U2", "SELECT value AS answer FROM facts WHERE id = 'f1'")["tables"] == ["facts"]
     assert "messages" in world.gold("U2", every)["tables"]
+    assert set(SHOWN) == {*SHADOWED, "users"} and all(shown <= {r[1] for r in world.db.execute(f"PRAGMA table_xinfo({t})")} for t, shown in SHOWN.items()), "SHOWN names the workspace's own columns"  # fmt: skip
+    assert world.gold("U2", "SELECT emoji AS answer FROM reactions WHERE created_us > 0")["reads"] == ["reactions.created_us", "reactions.emoji"], "a gold query's own columns are read off"  # fmt: skip
     assert len(world.gold("U1", every, max_rows=2)["rows"]) == 3, "one row past the cap shows the cap was hit"
     settings = contracts_settings(root)
     who = "SELECT u.real_name AS answer, m.id AS message_id FROM messages m JOIN users u ON u.id = m.user_id"
@@ -854,6 +856,9 @@ def check_contracts(root):
     assert "t1" in recorded(directory, slot("lookup", 1)), (
         "a task with no facts meets a level that needs none"
     )
+    # A gold query asks only about what the tools show: who reacted, never when (S3's reactions "made on Aug 18").
+    for unshown in ("SELECT u.real_name AS answer FROM reactions r JOIN users u ON u.id = r.user_id WHERE r.created_us > 0", "SELECT real_name AS answer FROM users WHERE created_us > 0 LIMIT 1", "SELECT name AS answer FROM channels WHERE creator_id IS NOT NULL LIMIT 1"):  # fmt: skip
+        refused("which no Slack tool shows", recorded, task(category="lookup", sql=unshown, facts=()), slot("lookup", 1))  # fmt: skip
     nobody = task(category="robustness", answer_type="refusal", sql="SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", facts=())  # fmt: skip
     assert "t1" in recorded(nobody, slot("robustness", 1)), "nor one whose level's needs are empty"
     with world.trial() as copy:

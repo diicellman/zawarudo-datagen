@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
-from worldgen_slack.db import World, canonical, digest
+from worldgen_slack.db import SHOWN, World, canonical, digest
 from worldgen_slack.db import words
 from worldgen_slack.dataset import NonEmptyText, SafeId, StrictModel
 
@@ -564,6 +564,12 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
         )
     if category.gold in ("ledger", "hybrid") and not task.facts:
         raise ValueError(f"{task.id}: name the facts its answer rests on in facts")
+    unshown = [r for r in out["reads"] if (t := r.split(".")[0]) in SHOWN and r.split(".")[1] not in SHOWN[t]]
+    if unshown:
+        raise ValueError(
+            f"{task.id}: the gold query reads {unshown}, which no Slack tool shows its solver; ask only about what "
+            "the tools show"
+        )
     if task.answer_type == "refusal":
         if rows:
             raise ValueError(
