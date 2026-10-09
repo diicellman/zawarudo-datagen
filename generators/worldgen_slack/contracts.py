@@ -601,10 +601,10 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
     return rows
 
 
-def record_task(world, task: Task, settings, slot: Slot) -> dict:
+def record_task(world, task: Task, settings, slot: Slot, needs: bool = True) -> dict:
     """T6: a task fills its slot. Code checks it (its slot's cell, a question no other task asks, facts its actor can
-    read, T1-T5, T7, and its level's needs) and inserts it with its slot's concept and its gold rows. Returns its gold
-    rows and code's measures. Run inside `World.trial()`."""
+    read, T1-T5, T7, and, with `needs`, its level's needs) and inserts it with its slot's concept and its gold rows.
+    Returns its gold rows and code's measures. Run inside `World.trial()`."""
     if (task.id, task.category, task.level) != (slot.id, slot.category, slot.level):
         raise ValueError(f"{slot.id} is a {slot.category} level {slot.level} task, with the slot's id")
     asked = {
@@ -627,7 +627,7 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
     tables = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)["tables"]
     measured = measures(world, task.id, gold, tables)
     spec = settings.taxonomy.get(task.category)
-    if spec and spec.needs and (short := unmet(spec.needs[task.level - 1], measured)):
+    if needs and spec and spec.needs and (short := unmet(spec.needs[task.level - 1], measured)):
         raise ValueError(f"{task.id}: a level-{task.level} {task.category} task needs " + "; ".join(short))
     return {"gold": gold} | measured
 

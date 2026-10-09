@@ -22,12 +22,15 @@ from worldgen_slack.db import World, digest
 from worldgen_slack.tools import WorldTaskData, file_hash, watch_parent
 
 from ..chronicle import (
+    Annotation,
     Conversation,
     Plan,
     add_task,
+    annotate,
     advance,
     bounds,
     drift,
+    forge_task,
     part_of,
     planned_on_board,
     post,
@@ -543,7 +546,7 @@ def files(world, settings, context: dict, mode: str) -> dict[str, str]:
         out[f"memory/storylines/{storyline}.md"] = storyline_page(world, storyline)
     for (event,) in world.db.execute("SELECT id FROM events"):
         out[f"memory/events/{event}.md"] = event_page(world, event)
-    if mode == "tasks":
+    if mode in ("tasks", "forge"):
         tasks = [task_page(world, dict(t)) for t in world.db.execute("SELECT * FROM tasks ORDER BY id")]
         out["memory/tasks.md"] = "# Tasks\n" + "\n".join(tasks) + "\n"
     return out
@@ -553,7 +556,7 @@ def files(world, settings, context: dict, mode: str) -> dict[str, str]:
 
 
 class AuthoringToolsConfig(vf.ToolsetConfig):
-    mode: Literal["plan", "day", "tasks"] = "plan"
+    mode: Literal["plan", "day", "tasks", "forge"] = "plan"
     day: int = 0
     db_path: str = ""
     db_hash: str = ""
@@ -811,14 +814,28 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
     @vf.tool
     async def add_task(self, task: Task) -> dict:
         """Write the task of one slot, with the slot's id (it replaces the slot's task, if any): checked, then its gold
-        rows and code's measures returned."""
+        rows and code's measures returned. In the forge, a candidate for one of the round's open ids, of the category
+        and level you choose."""
+
+        def act(copy):
+            if self.config.mode == "forge":
+                return forge_task(copy, task, self.settings, self.allowed().get("ids", []))
+            return add_task(copy, task, self.settings, self.writable(), self.allowed().get("keep"))
+
         return self._logged(
-            "add_task",
-            {"task": task.model_dump(mode="json")},
-            lambda: self._write(
-                lambda copy: add_task(copy, task, self.settings, self.writable(), self.allowed().get("keep"))
-            ),
-            "tasks",
+            "add_task", {"task": task.model_dump(mode="json")}, lambda: self._write(act), "tasks", "forge"
+        )
+
+    @vf.tool
+    async def annotate(self, fact: Annotation) -> dict:
+        """Register a fact the world already states, on the messages that state it (each contains its anchor; the
+        first is its first statement): the ledger grows, the workspace stays as it is. supersedes names a fact it
+        replaces, stated earlier."""
+        return self._logged(
+            "annotate",
+            {"fact": fact.model_dump(mode="json")},
+            lambda: self._write(lambda copy: annotate(copy, fact)),
+            "forge",
         )
 
 
@@ -848,13 +865,72 @@ class WorldAuthorTask(vf.Task[WorldTaskData, vf.State, WorldAuthorConfig]):
             raise ValueError("the world file requires a host-side tool server")
         data = WorldTaskData(
             prompt=None,
-            system_prompt=AUTHOR_GUIDE,
+            system_prompt=FORGE_GUIDE if mode == "forge" else AUTHOR_GUIDE,
             attempt=attempt,
             world_hash=tools.db_hash,
             network_allow=[],
             network_block=["*"],
         )
         return cls(data, WorldAuthorConfig(tools=tools))
+
+
+FORGE_GUIDE = (
+    """You propose tasks on one company's finished Slack workspace, for training agents that answer colleagues'
+questions from Slack. The workspace is written and frozen: nothing is posted, revised or moved. Each round you write
+candidate tasks; then a small solver model (GLM) tries each one 8 times with the asker's Slack tools, a stronger
+model tries the ones GLM rarely answers, and a judge reviews each. What lands is kept in an archive by category, by
+the level its tries measure, and by its structure; the rest is dropped. Your aim is tasks of every level, and
+above all the middle ones (GLM right in 25-75% of its tries) that are fair: a careful colleague with the same access
+answers them right.
+
+Tools and memory
+- world_now(), world_view(ref), world_sql(sql, actor_id=None) and world_read(actor_id, tool, arguments) read the
+  world: the whole file, or what one person sees, through the solver's own tools. Walk a task's route as its asker
+  before you write it: search with the question's words, read what comes up, and see what a hasty reader would
+  answer.
+- world_add_task(task) writes a candidate for one of the round's open ids, with the category and level you choose;
+  code checks it and returns its gold rows, its measures and its traps. world_annotate(fact) registers a fact the
+  world already states, on its messages, when a task needs one the ledger lacks; the ledger is the world's own
+  record of who stated what, with its decoys (planned wrong claims) and its changes (supersedes).
+- /task/memory/ is code's: archive.md (what each round kept and dropped, how often GLM was right, how it went wrong,
+  and the cells still empty), board.md (the tasks the world was planned for, and the facts each rests on: write
+  these first), ledger.json, and a page per person, channel, storyline and event. /task/notes/ is yours; the world's
+  author left its plan.md there.
+
+What makes a task hard, and what does not (from the world's earlier runs and the literature)
+- GLM searches well and reads threads. It answers wrong when the cheapest route ends at a wrong value: the first
+  value its search for the question's own words finds is stale, a near-miss or a decoy. A near-miss read beside its
+  correction misleads no one; one whose correction sits where that search does not reach (a thread under another
+  post, a DM, a later day, other words) does.
+- What moved GLM: a correction that is itself out of date; a value that changed more than once across channels; a
+  false premise matching a near-miss ("kyong or juancarlos?"); a set or a count that is complete only when every
+  place is read (each missed place costs it); an answer as of a moment, not the latest; who asks (the same question
+  has another answer for someone who cannot read the DM that settles it); answers to work out, not to copy
+  (durations across zones, counts nobody wrote).
+- What did not: rewording; a long question that spells out the route; naming a near-miss and calling it wrong ("the
+  count going around is wrong, so go by QA's post"): that hands over the answer. Ask as a colleague would, briefly.
+- Middle rates come from two or three soft obstacles stacked, each of which GLM gets past most of the time, not from
+  one trap it always or never falls into.
+- A task is fair: its gold is the complete, correct answer from what its asker can read, and nothing else in their
+  sight is as good an answer. Code grades a task's wrong answers before GLM tries it: a near-miss, a hedge, a set
+  missing a row; a task whose grade accepts one is dropped.
+
+Tasks
+- category and level from the taxonomy in now.md's settings; the level is your guess, and GLM's tries decide.
+- A status task (robustness) is for a value its asker can see that a fact out of their sight settles: its gold is
+  that visible value from the ledger, its facts name the settling fact, and the right answer gives it as not settled.
+  A refusal is for what is not there to see at all.
+"""
+    + GOLD_SQL
+)
+
+
+def forge_prompt(round_: int, rounds: int, ids: list[str]) -> str:
+    return (
+        f"Round {round_} of {rounds}. Read /task/memory/archive.md and board.md, and your notes. Then write one "
+        f"candidate with world_add_task for each open id: {', '.join(ids)}. Walk each one's route as its asker first. "
+        "Write in /task/notes/plan.md what you tried and why, then end your turn."
+    )
 
 
 def rejected(feedback: str, restored: str = "") -> str:

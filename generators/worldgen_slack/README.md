@@ -45,3 +45,15 @@ holds the present (`world_meta.now_us`), and nothing is written before it.
 The judge cannot edit the world. Its scores are reported; blocking issues decide acceptance (`[acceptance]`). An
 interrupted run resumes from its checkpoint and the last closed block. Spend is reported, never capped: the summary
 gives it per role.
+
+## The forge: tasks on a finished world
+
+`uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge.toml` writes tasks on a world a run has
+finished, and leaves the world as it is (`forge.py`). It starts from the run's final `world.sqlite` with its tasks
+emptied, its board and ledger kept, and the world author's last notes; then, round by round, a proposer in the
+author's seat writes candidates for the round's open ids, of the category and level it chooses, and the solver,
+the witness and the judge try and review each as a probe does. What the judge approves is kept; the rest is
+dropped. The proposer reads the board (the tasks the world was planned for: backward generation stays), and may
+register with `world_annotate` a fact the world already states, on its messages. Nothing it does posts, revises or
+moves the workspace, so no task goes stale under it. The forge resumes like a run, with its own configuration and
+the world's hash.

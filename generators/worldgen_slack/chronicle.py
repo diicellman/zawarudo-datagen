@@ -31,6 +31,7 @@ from .contracts import (
     fact_measures,
     insert_lines,
     normalized,
+    Slot,
     record_task,
     render,
     text_errors,
@@ -887,3 +888,68 @@ def add_task(world, task: Task, settings, slots: list, keep: dict | None = None)
                 "asks about by what surrounds it, add a condition), not the answer"
             )
     return result
+
+
+# ---------------------------------------------------------------------- the forge: tasks on a frozen world
+
+
+def forge_task(world, task: Task, settings, open_ids: list[str]) -> dict:
+    """One candidate task on a finished, frozen world, for one of the round's open ids. Its category and level are the
+    proposer's own, and its tries re-level it; it is checked as every task is (T1-T7, readable facts, the columns the
+    tools show), with no planned level's needs: the forge measures difficulty instead of planning it. Returns its
+    gold rows and code's measures."""
+    if task.id not in open_ids:
+        raise ValueError(f"a candidate's id is one of this round's open ids: {open_ids}")
+    spec = settings.taxonomy.get(task.category)
+    concept = (
+        spec.levels[task.level - 1] if spec and 1 <= task.level <= len(spec.levels) else "the proposer's own"
+    )
+    slot = Slot(
+        id=task.id, category=task.category, level=task.level, concept=concept, style="the proposer's own"
+    )
+    world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
+    world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
+    return {"task": task.id} | record_task(world, task, settings, slot, needs=False)
+
+
+class Annotation(StrictModel):
+    """A fact the finished world already states, registered on the messages that state it: the ledger grows from the
+    chatter while the workspace stays as it is. Its channel, author and day are its first message's."""
+
+    id: SafeId
+    storyline: SafeId
+    subject: NonEmptyText
+    attribute: NonEmptyText
+    value: NonEmptyText
+    anchor: NonEmptyText  # words every one of its messages contains
+    message_ids: list[int] = Field(min_length=1)
+    supersedes: SafeId | None = None
+    decoy: bool = False
+    summary: NonEmptyText
+
+
+def annotate(world, fact: Annotation) -> dict:
+    """Register a fact the world states (the forge's world_annotate): checked by the world's rules on insert (each
+    message contains the anchor, a supersedes link points forward in time, two values of one subject and attribute
+    are a change or a decoy)."""
+    if world.db.execute("SELECT 1 FROM facts WHERE id = ?", (fact.id,)).fetchone():
+        raise ValueError(f"fact {fact.id} exists: an annotation registers a new fact")
+    if (
+        fact.supersedes
+        and not world.db.execute("SELECT 1 FROM facts WHERE id = ?", (fact.supersedes,)).fetchone()
+    ):
+        raise ValueError(f"fact {fact.supersedes}, which it supersedes, does not exist")
+    marks = ", ".join("?" * len(fact.message_ids))
+    stated = world.db.execute(f"SELECT id, channel_id, user_id, ts_us FROM messages WHERE id IN ({marks}) AND is_deleted = 0 ORDER BY ts_us", fact.message_ids).fetchall()  # fmt: skip
+    if len(stated) != len(set(fact.message_ids)):
+        raise ValueError(f"messages {sorted(set(fact.message_ids) - {r['id'] for r in stated})} do not exist")
+    first = stated[0]
+    (day,) = world.db.execute("SELECT day FROM calendar WHERE ? >= start_us AND ? < end_us", (first["ts_us"], first["ts_us"])).fetchone()  # fmt: skip
+    with world.batch():
+        world.insert("facts", [dict(id=fact.id, storyline=fact.storyline, subject=fact.subject, attribute=fact.attribute, value=fact.value, anchor=fact.anchor, channel_id=first["channel_id"], author_id=first["user_id"], day=day, is_decoy=int(fact.decoy), summary=fact.summary)])  # fmt: skip
+        world.insert("evidence", [dict(fact_id=fact.id, message_id=r["id"], role="anchor", anchor_token=fact.anchor) for r in stated])  # fmt: skip
+        if fact.supersedes:
+            world.insert(
+                "fact_relations", [dict(src_fact=fact.id, dst_fact=fact.supersedes, kind="supersedes")]
+            )
+    return {"fact": fact.id, "channel_id": first["channel_id"], "author_id": first["user_id"], "day": day, "messages": len(stated)}  # fmt: skip

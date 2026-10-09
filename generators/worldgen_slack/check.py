@@ -38,6 +38,7 @@ from .agents.judge import PHASE_GUIDES, JudgeTask, review_payload
 from .agents.synthesizer import parse_premise
 from .agents.world import WorldAuthorTask, context_of, files, ledger_digest
 from .chronicle import (
+    Annotation,
     BoardEntry,
     Close,
     Commit,
@@ -69,6 +70,8 @@ from .chronicle import (
 from .env import GenerationEnv, ended, keep_awake, rates, try_digest
 from .generate import failure, provenance, run_label
 from .store import ReviewLimit, SessionLost, Store
+from .forge import ForgeConfig, ForgeEnv
+from .forge import provenance as forge_provenance
 from .config import ROOT, Acceptance, Category, Config, Needs
 from .contracts import (
     band_move,
@@ -1443,7 +1446,7 @@ def author_context(settings, cast, org, root, agenda=None):
 
 
 async def check_tools(root):
-    """The author's tools (v7): nine, served host-side over the world file; each turn's tools act only in their turn
+    """The author's tools (v7): ten, served host-side over the world file (annotate is the forge's); each turn's tools act only in their turn
     and on their day; writes are checked and logged, reads are live; the memory renders every time on the company
     clock, never as raw microseconds, and the one-pager stays small on a full world."""
     root.mkdir(parents=True)
@@ -1568,7 +1571,7 @@ async def check_tools(root):
     served = tools_for("day", 2)  # a tool server checks the world file's hash when it starts
     with_state(served)
     described = await served_tools(served)
-    assert set(described) == {"now", "view", "sql", "read", "plan", "post", "advance", "revise", "add_task"} and served.server_name == "world"  # fmt: skip
+    assert set(described) == {"now", "view", "sql", "read", "plan", "post", "advance", "revise", "add_task", "annotate"} and served.server_name == "world"  # fmt: skip
     # help() in the author's IPython shows a tool's description alone: it names every field of every document a
     # call takes, nested ones too, with ? when optional.
     for tool, models in {"post": (Conversation, PostLine, Reaction, Commit, Close), "plan": (Plan, PlanFact, Event, Storyline), "add_task": (Task,)}.items():  # fmt: skip
@@ -1630,7 +1633,7 @@ async def check_tools(root):
     )
     assert not raw.search(json.dumps(ledger_digest(world))), "the judge's ledger is rendered too"
     print(
-        "PASS tools: nine served, scoped by turn and day, checked and logged; memory rendered, small, round-trips"
+        "PASS tools: ten served, scoped by turn and day, checked and logged; memory rendered, small, round-trips"
     )
 
 
@@ -2082,7 +2085,7 @@ async def check_author(root):
                     issues.append(Issue(artifact="workspace", defect="a little formal", requested_change="loosen", blocking=False))  # fmt: skip
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
             # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
-            reviews = [TaskReview(task_id=t["id"], valid=not (attempt.startswith("tasks-") and t["id"] == t3), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
+            reviews = [TaskReview(task_id=t["id"], valid=not ((attempt.startswith("tasks-") and t["id"] == t3) or "vague" in t["question"]), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
             last = self.world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
             issues += [Issue(artifact="tasks", task_ids=[r.task_id], message_ids=[last], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
             if attempt.startswith("tasks-") and payload["tasks"] and payload["tasks"][0]["id"] == t3:
@@ -2181,6 +2184,38 @@ async def check_author(root):
                 await talk(ops, dict(author_id=d, text="quiet day"))
             await close()
             await runtime.write("/task/notes/recap.md", f"day {day}: done".encode())
+        elif tools.config.mode == "forge":
+            # The proposer: the board and its notes come with the frozen world, which it reads and may not write.
+            ids = re.findall(r"r\d\d-\d\d", prompt)
+            assert (
+                b"Board" in runtime.files["/task/memory/board.md"] and "/task/notes/plan.md" in runtime.files
+            ), "the board and the world author's notes come to the proposer"
+            seen.append(("forge", tuple(ids), "Round" in prompt))
+            try:
+                await call("revise", message_id=1, text="rewritten")
+                raise AssertionError("the forge wrote the workspace")
+            except ValueError as error:
+                assert "forge turn" in str(error), error
+            try:
+                await call(
+                    "add_task",
+                    task=scripted_task(settings, {"id": "elsewhere", "category": "lookup", "level": 1}, a),
+                )
+                raise AssertionError("a candidate outside the round's open ids was written")
+            except ValueError as error:
+                assert "open ids" in str(error), error
+            if ids[0] == "r01-01":
+                first = world.db.execute("SELECT id FROM messages WHERE text LIKE '%rollback%' ORDER BY ts_us LIMIT 1").fetchone()[0]  # fmt: skip
+                await call("annotate", fact=Annotation(id="n1", storyline="s1", subject="Release 4.2", attribute="call", value="roll it back", anchor="rollback", message_ids=[first], summary="s"))  # fmt: skip
+                for bad, why in (({"anchor": "nowhere in it"}, "must contain"), ({"subject": "Elsewhere", "supersedes": "nothing"}, "which it supersedes, does not exist")):  # fmt: skip
+                    try:
+                        await call("annotate", fact=Annotation(id="n2", storyline="s1", subject="Release 4.2", attribute="call", value="other", anchor="rollback", message_ids=[first], summary="s").model_copy(update=bad))  # fmt: skip
+                        raise AssertionError(f"an annotation was accepted: {bad}")
+                    except ValueError as error:
+                        assert why in str(error), error
+            for n, open_id in enumerate(ids):  # a candidate the judge approves, and a vague one it does not
+                question = f"Who is the newest person here, round {open_id}?" + (" vague" if n else "")
+                await call("add_task", task=Task(id=open_id, category="lookup", level=1, actor_id=a, question=question, answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1"))  # fmt: skip
         elif prompt.startswith("The last day is closed"):
             context = json.loads(tools.config.context)
             writable, slots = context["writable"], {s["id"]: s for s in context["slots"]}
@@ -2584,6 +2619,34 @@ async def check_author(root):
         raise AssertionError("a block that lost its session twice went on")
     except SessionLost:
         assert blocks[2:] == ["gone-01", "gone-02"] and store.state.lost["gone"] == 2, blocks
+    # The forge: tasks proposed on the finished world, which stays frozen; what the judge approves is kept.
+    plan = ForgeConfig(
+        base=Path("worldgen.toml"), world=store.root, output=root / "forge", rounds=2, candidates=2
+    )
+    workspace = store.world.db.execute(
+        "SELECT group_concat(id || ':' || text, '|') FROM messages"
+    ).fetchone()[0]
+    forged = TestStore(plan.output, forge_provenance(plan, settings))
+
+    class Forging(ForgeEnv):
+        review, grade, author_turn, loose, blind = (
+            AuthorEnv.review,
+            AuthorEnv.grade,
+            AuthorEnv.author_turn,
+            False,
+            False,
+        )
+
+    store.state.active_attempt = "forge"  # the scripted solver names its tries by the run it reads
+    await Forging(plan, settings, forged).run(None, agents)
+    assert [x[1] for x in seen if x[0] == "forge"] == [("r01-01", "r01-02"), ("r02-01", "r02-02")]
+    assert forged.state.phase == "done" and sorted(t for (t,) in forged.world.db.execute("SELECT id FROM tasks")) == ["r01-01", "r02-01"], "the vague candidates are dropped"  # fmt: skip
+    assert forged.world.db.execute("SELECT group_concat(id || ':' || text, '|') FROM messages").fetchone()[0] == workspace, "the workspace is frozen"  # fmt: skip
+    assert tuple(forged.world.db.execute("SELECT channel_id, author_id FROM facts WHERE id = 'n1'").fetchone()) == tuple(store.world.db.execute("SELECT channel_id, user_id FROM messages WHERE text LIKE '%rollback%' ORDER BY ts_us LIMIT 1").fetchone()), "an annotation is placed by its first message"  # fmt: skip
+    forged.publish()
+    assert {r.task_id for r in load_release(plan.output / "release")[1]} == {"r01-01", "r02-01"}
+    forged.close()
+    fails(Store, plan.output, forge_provenance(plan.model_copy(update={"rounds": 3}), settings))  # fmt: skip  # its own config only
     store.close()
     retried = SimpleNamespace(
         ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]
