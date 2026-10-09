@@ -17,6 +17,7 @@ import verifiers.v1 as vf
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
+from verifiers.v1.utils.interrupt import cleaning_up
 from worldgen_slack.dataset import atomic_json
 from worldgen_slack.db import digest
 from worldgen_slack.taskset import AnswerJudge, SolverTask, shown
@@ -910,6 +911,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 async with agents.author.provision(setup) as runtime:
                     return await self.blocks(agents, runtime, setup)
             except (SessionLost, SandboxError) as error:
+                if cleaning_up():  # a stop cancels the session's streams: it is a stop, not a loss
+                    raise
                 where = (state.phase, state.day, state.batch)
                 attempt = self.store.lose()
                 self.store.event(

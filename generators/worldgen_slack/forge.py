@@ -235,7 +235,7 @@ class ForgeEnv(GenerationEnv):
         self.store.event("candidate_dropped", attempt=attempt, task_id=task_id, why=why)
 
     def pages(self) -> dict[str, str]:
-        """The forge's own memory pages, beside the world's: the board the world was planned for, and the archive:
+        """The forge's own memory pages, beside the world's: the taxonomy, the board the world was planned for, and the archive:
         what each category and level holds against its target, the board's open entries, each kept task, and every
         candidate of the last two rounds with its tries, its traps and how GLM went wrong (SENTINEL's failure-driven
         proposer, 2606.12908)."""
@@ -260,7 +260,12 @@ class ForgeEnv(GenerationEnv):
             o = self.store.state.forged[t]
             tried = f"right {o['right']:.2f} of {o['tries']} {o.get('interval')}, witness {o.get('witness')}, hint {o.get('hint')}" if "right" in o else ""  # fmt: skip
             lines.append(f"- {t} ({o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features'])}" + "".join(f"\n  GLM answered: {m['answer']!r}; the grade: {m['why']!r}" for m in o.get("misses", [])) + "".join(f"\n  issue: {i}" for i in o.get("issues", [])))  # fmt: skip
-        return {"memory/board.md": "\n".join(board) + "\n", "memory/archive.md": "\n".join(lines) + "\n"}
+        taxonomy = ["# Taxonomy: the categories and levels a candidate takes", ""]
+        for category, spec in self.settings.taxonomy.items():
+            taxonomy += [f"## {category}", spec.definition, f"gold: {spec.gold}; answer types: {', '.join(spec.answer_types)}"]  # fmt: skip
+            taxonomy += [f"- level {lvl}: {text} (for example: {'; '.join(spec.concepts[lvl - 1])})" for lvl, text in enumerate(spec.levels, 1)]  # fmt: skip
+            taxonomy.append("")
+        return {"memory/board.md": "\n".join(board) + "\n", "memory/archive.md": "\n".join(lines) + "\n", "memory/taxonomy.md": "\n".join(taxonomy)}  # fmt: skip
 
 
 async def run(forge: ForgeConfig, settings: Config) -> dict:

@@ -894,9 +894,11 @@ Tools and memory
   code checks it and returns its gold rows, its measures and its traps. world_annotate(fact) registers a fact the
   world already states, on its messages, when a task needs one the ledger lacks; the ledger is the world's own
   record of who stated what, with its decoys (planned wrong claims) and its changes (supersedes).
-- /task/memory/ is code's: archive.md (what each round kept and dropped, how often GLM was right, how it went wrong,
-  and the cells still empty), board.md (the tasks the world was planned for, and the facts each rests on: write
-  these first), ledger.json, and a page per person, channel, storyline and event. /task/notes/ is yours; the world's
+- /task/memory/ is code's: taxonomy.md (each category, what its levels ask for, its gold and answer types),
+  archive.md (what each round kept and dropped, how often GLM was right, how it went wrong, and the cells still
+  empty), board.md (the tasks the world was planned for, and the facts each rests on: write these first),
+  ledger.json, and a page per person (its id, U..., is what actor_id and world_read take), channel, storyline and
+  event. /task/notes/ is yours; the world's
   author left its plan.md there.
 
 What makes a task hard, and what does not (from the world's earlier runs and the literature)
@@ -918,7 +920,7 @@ What makes a task hard, and what does not (from the world's earlier runs and the
   missing a row; a task whose grade accepts one is dropped.
 
 Tasks
-- category and level from the taxonomy in now.md's settings; the level is your guess, and GLM's tries decide.
+- category and level from taxonomy.md; the level is your guess, and GLM's tries decide.
 - A status task (robustness) is for a value its asker can see that a fact out of their sight settles: its gold is
   that visible value from the ledger, its facts name the settling fact, and the right answer gives it as not settled.
   A refusal is for what is not there to see at all.

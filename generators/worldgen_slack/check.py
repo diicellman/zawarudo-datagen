@@ -24,6 +24,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import verifiers.v1 as vf
+import verifiers.v1.utils.interrupt
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from verifiers.v1.dialects.base import append_user_notice
@@ -2233,6 +2234,7 @@ async def check_author(root):
             assert (
                 b"Board" in runtime.files["/task/memory/board.md"] and "/task/notes/plan.md" in runtime.files
             ), "the board and the world author's notes come to the proposer"
+            assert b"## lookup" in runtime.files["/task/memory/taxonomy.md"] and b"- level 1: one message" in runtime.files["/task/memory/taxonomy.md"], "and the taxonomy"  # fmt: skip
             seen.append(("forge", tuple(ids), "Round" in prompt))
             if ids[0] == "r02-01" and not forging["vague"]:  # fmt: skip  # the archive: what the last round kept, and why it dropped the rest
                 archive = runtime.files["/task/memory/archive.md"].decode()
@@ -2681,6 +2683,16 @@ async def check_author(root):
                 raise ended(SimpleNamespace(errors=[rpc]))
             store.finish_attempt(True)
 
+    stopping = verifiers.v1.utils.interrupt
+    stopping._cleaning_up = True  # a stop cancels the session's streams: it is not retried
+    try:
+        await Dropping("stop", 1).author_world(agents)
+        raise AssertionError("a stopped run was taken up again")
+    except SessionLost:
+        assert blocks == ["stop-01"] and "stop" not in store.state.lost, blocks
+    finally:
+        stopping._cleaning_up = False
+    blocks.clear()
     await Dropping("block", 1).author_world(agents)
     assert blocks == ["block-01", "block-02"] and store.state.lost == {"block": 1}, (blocks, store.state.lost)
     try:
