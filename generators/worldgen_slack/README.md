@@ -3,7 +3,7 @@
 The repository [README](../../README.md) contains the command, code map, output layout, and evaluation
 instructions.
 
-`GenerationEnv.author_world()` is the entry to the algorithm. One author agent, an rlm coding agent, works in one
+`GenerationEnv.author_world()` is the entry to the algorithm. One author agent, an rlm agent, works in one
 Prime VM for the whole world, with one interaction per block of work. The world is written forward in time: code
 holds the present (`world_meta.now_us`), and nothing is written before it.
 
