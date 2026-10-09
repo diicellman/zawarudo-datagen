@@ -19,7 +19,7 @@ from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
 from worldgen_slack.dataset import atomic_json
 from worldgen_slack.db import digest
-from worldgen_slack.taskset import SolverTask, shown
+from worldgen_slack.taskset import AnswerJudge, SolverTask, shown
 
 from .agents import synthesizer
 from .agents.judge import JudgeTask, review_payload
@@ -41,12 +41,14 @@ from .contracts import (
     PHASE_CRITERIA,
     Organization,
     Verdict,
+    Issue,
     accepted,
     accepted_task,
     background_plan,
     band_move,
     cards,
     clock,
+    failure_cases,
     organize,
     pick_cast,
     quality,
@@ -613,6 +615,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         are reused, and only changed tasks are solved. A valid review is kept with its task's key, so a later review
         skips the task until it changes."""
         state = self.store.state
+        loose = await self.screen(due, keys, attempt)
         fresh = [t for t in due if state.solves.get(t, {}).get("key") != keys[t]]
         solved = await self.solves(agents, fresh, attempt, n)
         for task_id, task_runs in solved.items():
@@ -635,8 +638,11 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 agents, payload, attempt, files, "tasks" if len(chunks) == 1 else f"tasks-{k}"
             )
 
-        # A review of a few tasks at a time, the reviews side by side: each task passes on its own chunk's verdict.
+        # A review of a few tasks at a time, the reviews side by side: each task passes on its own chunk's verdict,
+        # and on its failure cases: a task whose grade accepts a wrong answer is ambiguous as asked.
         verdicts = await asyncio.gather(*(judged(k, chunk) for k, chunk in enumerate(chunks, 1)))
+        issues = {t: Issue(artifact="tasks", task_ids=[t], defect="the answer judge accepts a wrong answer to it: " + "; ".join(failed), requested_change="ask it so that its gold, and only its gold, is the right answer: tell it apart from what the judge accepted", blocking=True) for t, failed in loose.items() if failed}  # fmt: skip
+        verdicts = [v.model_copy(update={"issues": v.issues + [issues[t] for t in chunk if t in issues], "approved": v.approved and not any(t in issues for t in chunk)}) for chunk, v in zip(chunks, verdicts)]  # fmt: skip
         verdict_of = {t: v for chunk, v in zip(chunks, verdicts) for t in chunk}
         for task_id in due:  # the issues each task's latest review raised, for the final review
             state.task_issues[task_id] = [i for i in verdict_of[task_id].issues if task_id in i.task_ids]
@@ -657,6 +663,31 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             right = rate["right_rate"]
             self.store.event("task_reviewed", attempt=attempt, task_id=task_id, approved=approved, **rate, learnability=4 * right * (1 - right))  # fmt: skip
         return runs, merged(verdicts)
+
+    async def grade(self, question: str, reference: dict, response: str):
+        """The answer judge's grade of one response, with no observations: its `correct` is what a screen reads."""
+        for again in (True, False):
+            try:
+                return await AnswerJudge(self.settings.answer_judge).evaluate(question=question, reference=reference, response=response, observations=[])  # fmt: skip
+            except Exception:
+                if not again:
+                    raise
+
+    async def screen(self, due, keys, attempt) -> dict[str, list[str]]:
+        """Each task's failure cases (`failure_cases`), graded by the answer judge before any try: returns, per task,
+        those it accepted, and its gold if it rejected that. Kept with the task's key, so a task is screened once."""
+        state = self.store.state
+        for t in [t for t in due if state.screens.get(t, {}).get("key") != keys[t]]:
+            row = self.world.db.execute("SELECT question, answer_type, gold_json FROM tasks WHERE id = ?", (t,)).fetchone()  # fmt: skip
+            rows = json.loads(row["gold_json"])
+            gold, cases = failure_cases(self.world, t, rows)
+            reference = {"answer_type": row["answer_type"], "rows": rows}
+            graded = await asyncio.gather(*(self.grade(row["question"], reference, r) for r in [gold, *(r for _, r in cases)]))  # fmt: skip
+            failed = (["its gold answer, judged wrong"] if not graded[0].parsed.correct else []) + [f"{name} ({response!r})" for (name, response), g in zip(cases, graded[1:]) if g.parsed.correct]  # fmt: skip
+            usage = [g.usage.model_dump(mode="json") for g in graded if getattr(g, "usage", None) is not None]
+            state.screens[t] = {"key": keys[t], "failed": failed, "cases": len(cases), "usage": usage}
+            self.store.event("task_screened", attempt=attempt, task_id=t, cases=len(cases), failed=failed)
+        return {t: state.screens[t]["failed"] for t in due}
 
     async def witness(self, agents, due, keys, attempt) -> dict:
         """A stronger solver's tries of each task GLM answers right less often than its band's floor, and of each task

@@ -23,6 +23,7 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import verifiers.v1 as vf
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from verifiers.v1.dialects.base import append_user_notice
@@ -96,6 +97,7 @@ from .contracts import (
     accepted_task,
     at,
     background_plan,
+    failure_cases,
     channel_id,
     check_task,
     deciding,
@@ -112,6 +114,13 @@ from .contracts import (
     window,
     world_meta,
 )
+
+
+async def offline(*args, **kwargs):
+    raise AssertionError("the offline checks call no model: script the agent or the judge")
+
+
+vf.Judge.complete = offline  # a judge left unscripted fails here, before it reaches the gateway
 
 
 def fails(function, *args, **kwargs):
@@ -931,6 +940,18 @@ def check_contracts(root):
     refused("which supersede the value it gives", recorded, status.model_copy(update={"actor_id": a}), three, settings, stale)  # fmt: skip  # a reads #leads: f3 is the answer
     refused("gold gives the value of one of its facts its actor can read", recorded, status.model_copy(update={"gold_sql": "SELECT value AS answer FROM facts WHERE id = 'f3'"}), three, settings, stale)  # fmt: skip
     refused("gold query reads the facts it answers from", recorded, status.model_copy(update={"gold_sql": "SELECT real_name AS answer FROM users LIMIT 1"}), three, settings, stale)  # fmt: skip
+
+    # The wrong answers a task's grade must reject: the near-miss its actor can read, and a hedge with it.
+    try:
+        with world.trial() as copy:
+            decoy(ops)(copy)
+            copy.insert("facts", [dict(id="f6", storyline="s2", subject="Audit", attribute="owner", value="Mia", channel_id=leads, author_id=a, day=3, summary="s", is_decoy=1)])  # fmt: skip  # out of c's sight
+            record_task(copy, asked, needing(settings, "semantic", 3, decoys=1), nine)
+            raise LookupError(failure_cases(copy, "t9", [{"answer": "Owen"}]))
+    except LookupError as out:
+        gold, cases = out.args[0]
+    assert gold == "Owen." and ("the near-miss 'Ines'", "Ines.") in cases and ("a hedge", "Either Owen or Ines; I can't tell which.") in cases, cases  # fmt: skip
+    assert not [c for c in cases if "Mia" in c[1]], "a value its actor cannot see is no near-miss"
 
     def stated_unseen(copy):  # the truth, f3, is stated in #leads on day 3, where c cannot read it
         stale(copy)
@@ -1807,6 +1828,20 @@ async def check_reviews(root):
         finally:
             AnswerJudge.evaluate = judged
         assert trace.info["evaluation"]["unsupported_asides"] == asides and trace.info["evaluation"]["evidence_coverage"] == 0.5  # fmt: skip
+    # Grounded by message: tries never shown the gold's messages are ungrounded, whatever the judge says.
+    elsewhere = [
+        {"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C9", "ts": "1.000001"}]}}
+    ]
+    grade = AnswerGrade(correct=True, abstained=False, grounded=True, unsupported_asides=0, reason="r")
+    trace = SimpleNamespace(info={"observations": elsewhere}, last_reply="rollback", id="try", record_metrics=lambda m: None)  # fmt: skip
+    judged, AnswerJudge.evaluate = AnswerJudge.evaluate, lambda self, **fields: asyncio.sleep(0, SimpleNamespace(parsed=grade))  # fmt: skip
+    try:
+        assert (
+            await SolverTask.semantic_correctness(solve, trace) == 0.0
+            and not trace.info["evaluation"]["grounded"]
+        )
+    finally:
+        AnswerJudge.evaluate = judged
     write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})
     assert load_release(root / "release")[1:] == ([task], {"t1": answer})
     manifest = json.loads((root / "release" / "manifest.json").read_text())
@@ -2011,6 +2046,15 @@ async def check_author(root):
             return SimpleNamespace(ok=True, info={"evaluation": evaluation}, errors=[], task=task, last_reply="", id=name, record=record)  # fmt: skip
 
     class AuthorEnv(GenerationEnv):
+        # The answer judge, played by code: it accepts a task's gold alone; a loose one a bare opener too, a blind one
+        # not even the gold.
+        loose = blind = False
+
+        async def grade(self, question, reference, response):
+            answers = ", ".join(str(r.get("answer")) for r in reference["rows"])
+            right = response in (f"{answers}.", "I can't answer that from anything you can see: it isn't there.") or response.startswith(f"{answers}, though")  # fmt: skip
+            return SimpleNamespace(parsed=SimpleNamespace(correct=(right and not self.blind) or (self.loose and response == "Thought process:")), usage=None)  # fmt: skip
+
         async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
             if context["phase"] == "premise":
                 return Premises(premises=[Premise(company=f"{w} Software", niche="n", region="r", size="s", culture="c", cast="x", staffing={"software_developer": 4}) for w in ("Lattice", "Birch")]).model_dump_json()  # fmt: skip
@@ -2490,6 +2534,20 @@ async def check_author(root):
     graded = [{"correct": True, "grounded": True, "semantic_correctness": 1.0}, {"correct": False, "grounded": False, "semantic_correctness": -1.0}, {"correct": False, "abstained": True, "grounded": False, "semantic_correctness": 0.0}, {"correct": True, "grounded": False, "semantic_correctness": 0.0}]  # fmt: skip
     assert (rates(graded)["strict_rate"], rates(graded)["abstain_rate"]) == (0.25, 0.25), "strict is the share right and grounded, not the mean reward"  # fmt: skip
     assert all(r.right_interval == state.task_reviews[r.task_id]["right_interval"] for r in rows), "intervals are published"  # fmt: skip
+    # A task ships with the wrong answers its grade must reject: one the answer judge accepts makes it ambiguous as
+    # asked, and it is not approved, whatever its tries.
+    assert store.state.screens and all(not s["failed"] for s in store.state.screens.values()), "every task was screened"  # fmt: skip
+    gold, cases = failure_cases(store.world, t1, json.loads(store.world.db.execute("SELECT gold_json FROM tasks WHERE id = ?", (t1,)).fetchone()[0]))  # fmt: skip
+    assert gold.endswith(".") and ("a bare opener", "Thought process:") in cases and any(n == "declining to answer" for n, _ in cases), cases  # fmt: skip
+    lax = AuthorEnv(settings, store)
+    lax.loose, store.state.active_attempt = True, "final-02"
+    _, verdict = await lax.judge_tasks(agents, [t1], {t1: "screened loose"}, "final-02", 3)
+    assert not verdict.approved and any("accepts a wrong answer to it: a bare opener" in i.defect for i in store.state.task_issues[t1]), verdict  # fmt: skip
+    assert store.state.screens[t1]["failed"] == ["a bare opener ('Thought process:')"]
+    lax.loose, lax.blind = False, True
+    assert (await lax.screen([t1], {t1: "screened blind"}, "final-02"))[t1] == [
+        "its gold answer, judged wrong"
+    ]
     # A session lost to its sandbox is none of the author's limits (S3 stopped three times on Prime's dropped process
     # stream, each reported as the author's limits): its block is written again once and spends no attempt, and a
     # second loss in a row stops the run.

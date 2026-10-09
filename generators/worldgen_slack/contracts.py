@@ -827,6 +827,43 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
     )
 
 
+def failure_cases(world, task_id: str, rows: list[dict]) -> tuple[str, list[tuple[str, str]]]:
+    """A task's gold as a plain answer, and the wrong answers its grade must reject, built by code: each near-miss
+    value its actor can read on its answer's subject and attribute, a hedge between the gold and the first of them, a
+    set with a row left out, declining to answer, a bare opener (judges accept one 60-90% of the time, 2507.08794),
+    and a status given as final. A grade that accepts one, or rejects the gold, is ambiguous as asked
+    (Self-Challenging's failure cases, 2506.01716)."""
+    task = world.db.execute("SELECT actor_id, answer_type FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    kind, answers = task["answer_type"], [str(r.get("answer")) for r in rows]
+    facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
+    misses = []
+    if facts and kind != "refusal":
+        golden = {a.strip().casefold() for a in answers}
+        for fact in answer_facts(world, facts, task["actor_id"], answers):
+            subject, attribute = world.db.execute("SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (fact,)).fetchone()  # fmt: skip
+            for other, value in world.db.execute("SELECT id, value FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ? ORDER BY day, id", (subject, attribute)):  # fmt: skip
+                sight = any(readable(world, task["actor_id"], c) for c in places(world, other))
+                if sight and value.strip().casefold() not in golden and value not in misses:
+                    misses.append(value)
+    elif facts:  # a refusal: any value its actor can see, given as the answer
+        marks = ", ".join("?" * len(facts))
+        misses = [v for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks}) ORDER BY day, id", facts) if any(readable(world, task["actor_id"], c) for c in places(world, f))]  # fmt: skip
+    gold = ", ".join(answers)
+    cases = [(f"the near-miss {value!r}", f"{value}.") for value in misses[:3]]
+    cases.append(("a bare opener", "Thought process:"))
+    if kind == "refusal":
+        return "I can't answer that from anything you can see: it isn't there.", cases
+    if misses:
+        cases.append(("a hedge", f"Either {gold} or {misses[0]}; I can't tell which."))
+    if kind == "set" and len(answers) > 1:
+        cases.append(("a set with a row left out", ", ".join(answers[:-1]) + "."))
+    if kind == "status":
+        cases.append(("the status given as final", f"{gold}. That is final and confirmed."))
+        return f"{gold}, though it is not settled: nothing you can see confirms it.", cases
+    cases.append(("declining to answer", "I can't find that in anything you can see."))
+    return f"{gold}.", cases
+
+
 def band_move(probe: dict) -> str | None:
     """What a probed task needs: a fix the judge asks for, or to be harder or easier to land in its level's band of
     right-answer rates. A band that starts at 0 also needs the witness to answer it: one even it fails is too hard."""

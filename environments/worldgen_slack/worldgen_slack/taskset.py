@@ -155,6 +155,9 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         needed = len(reference.messages) + len(reference.users)
         found = len({tuple(m) for m in reference.messages} & seen) + len(set(reference.users) & users)
         coverage = found / needed if needed else None
+        # Grounded by message, not by topic alone: an answer whose gold rests on messages is grounded only if its
+        # tries were shown one of them (a stale message is topically just as close).
+        grade = grade.model_copy(update={"grounded": grade.grounded and (found > 0 or not needed)})
         score = reward(grade)
         trace.info["evaluation"] = {
             "task_id": self.data.task_id,

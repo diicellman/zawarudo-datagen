@@ -73,6 +73,9 @@ class RunState(StrictModel):
     open_issues: list[Issue] = Field(default_factory=list)
     task_issues: dict[str, list[Issue]] = Field(default_factory=dict)
     lost: dict[str, int] = Field(default_factory=dict)  # attempts a lost session cut off: they spend no round
+    screens: dict[str, dict] = Field(
+        default_factory=dict
+    )  # task → the wrong answers its grade accepted, with its key
 
 
 class ReviewLimit(RuntimeError):
@@ -191,11 +194,11 @@ class Store:
 
     def summary(self, status, reason=""):
         usage = {}
-        for path in (self.root / "traces").glob("*.json"):
-            trace = read_json(path)
-            accounts = [(trace["agent"]["name"], trace.get("usage") or {}, False)]
-            accounts += [("answer_judge", value, True) for value in trace.get("extra_usage", [])]
-            for name, account, is_judge in accounts:
+        # Each trace's own calls and its answer judge's; then the answer judge's grades of the failure cases.
+        books = [[(t["agent"]["name"], t.get("usage") or {}, False, t.get("ok"))] + [("answer_judge", u, True, None) for u in t.get("extra_usage", [])] for t in map(read_json, (self.root / "traces").glob("*.json"))]  # fmt: skip
+        books.append([("answer_judge", u, True, None) for s in self.state.screens.values() for u in s.get("usage", [])])  # fmt: skip
+        for accounts in books:
+            for name, account, is_judge, ok in accounts:
                 row = usage.setdefault(
                     name,
                     {
@@ -208,7 +211,7 @@ class Store:
                     | {"unpriced_calls": 0, "failed_traces": 0},
                 )
                 row["judge_calls" if is_judge else "traces"] += 1
-                row["failed_traces"] += not is_judge and trace.get("ok") is False
+                row["failed_traces"] += not is_judge and ok is False
                 row["input_tokens"] += (account.get("prompt_tokens") or 0) + (
                     account.get("cached_input_tokens") or 0
                 )
