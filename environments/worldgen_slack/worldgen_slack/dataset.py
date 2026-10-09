@@ -54,15 +54,16 @@ def sha256(path: Path) -> str:
 
 class PublicTask(StrictModel):
     """A task as a solver gets it, with how hard it measured: the solver model's tries at the release (those that
-    crashed, and those that never answered), its share of right answers and of right and grounded ones, the gold
-    evidence the tries saw, and the witness's share of right answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns."""
+    crashed, and those that never answered), its share of right answers (with its 90% interval), of right and
+    grounded ones, and of those that declined to answer, the gold evidence the tries saw, and the witness's share of
+    right answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns."""
 
     task_id: SafeId
     question: NonEmptyText
     actor_id: SafeId
     category: NonEmptyText
     level: int
-    answer_type: Literal["text", "set", "number", "refusal"]
+    answer_type: Literal["text", "set", "number", "refusal", "status"]
     world_hash: str
     solver: str | None = None
     tries: int | None = None
@@ -73,6 +74,7 @@ class PublicTask(StrictModel):
         None  # its 90% interval
     )
     strict_rate: float | None = None
+    abstain_rate: float | None = None
     coverage: float | None = None
     witness: str | None = None
     witness_right: float | None = None
@@ -82,7 +84,7 @@ class PrivateAnswer(StrictModel):
     """The gold rows of a task, the messages (channel, ts) and people its answer rests on, and, for a refusal, the
     truth out of its actor's sight (`unseen`)."""
 
-    answer_type: Literal["text", "set", "number", "refusal"]
+    answer_type: Literal["text", "set", "number", "refusal", "status"]
     rows: list[dict[str, JsonValue]]
     gold_sql: NonEmptyText
     messages: list[Annotated[list[str], Field(min_length=2, max_length=2)]]  # [channel, ts]
@@ -91,8 +93,10 @@ class PrivateAnswer(StrictModel):
 
 
 class Manifest(StrictModel):
-    format: Literal["worldgen-slack.v6", "worldgen-slack.v7", "worldgen-slack.v8"] = (
-        "worldgen-slack.v8"  # v7: tasks carry their rates; v8: strict grounds the answer's claims, unanswered counted
+    format: Literal["worldgen-slack.v6", "worldgen-slack.v7", "worldgen-slack.v8", "worldgen-slack.v9"] = (
+        # v7: tasks carry their rates; v8: strict grounds the answer's claims, unanswered counted; v9: status answers,
+        # the abstain rate and the right rate's interval, and a reward of +1, 0 or -1
+        "worldgen-slack.v9"
     )
     world_hash: str
     files: dict[str, str]

@@ -922,6 +922,16 @@ def check_contracts(root):
     )
     refused("at least 1 near-misses", recorded, unseen.model_copy(update={"facts": ["f3"]}), four, needing(settings, "robustness", 4, decoys=1))  # fmt: skip  # no stale value in sight
 
+    # A status answer gives the latest value its actor can see (f7, in #ops), which a fact out of their sight settles
+    # (f3, in #leads): the useful answer gives it as not settled, where a refusal said nothing.
+    status = Task(id="t9", category="robustness", level=3, actor_id=c, question="What is the audit's window?", answer_type="status", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f7'", facts=["f3", "f7"])  # fmt: skip
+    three = slot("robustness", 3, id="t9")
+    assert "t9" in recorded(status, three, settings, stale)
+    refused("out of its actor's sight, that supersedes the value it gives", recorded, status.model_copy(update={"facts": ["f7"]}), three, settings, stale)  # fmt: skip  # nothing settles it
+    refused("which supersede the value it gives", recorded, status.model_copy(update={"actor_id": a}), three, settings, stale)  # fmt: skip  # a reads #leads: f3 is the answer
+    refused("gold gives the value of one of its facts its actor can read", recorded, status.model_copy(update={"gold_sql": "SELECT value AS answer FROM facts WHERE id = 'f3'"}), three, settings, stale)  # fmt: skip
+    refused("gold query reads the facts it answers from", recorded, status.model_copy(update={"gold_sql": "SELECT real_name AS answer FROM users LIMIT 1"}), three, settings, stale)  # fmt: skip
+
     def stated_unseen(copy):  # the truth, f3, is stated in #leads on day 3, where c cannot read it
         stale(copy)
         (day3,) = copy.db.execute("SELECT start_us FROM calendar WHERE day = 3").fetchone()
@@ -929,6 +939,9 @@ def check_contracts(root):
         (truth,) = copy.insert("messages", [dict(channel_id=leads, ts_us=day3 + 3_600_000_000, user_id=a, text="dry run it is")])  # fmt: skip
         copy.insert("evidence", [dict(fact_id="f3", message_id=truth, role="anchor", anchor_token="dry run")])
 
+    assert "t9" in recorded(status, three, settings, stated_unseen), (
+        "a status rests on its truth stated out of sight"
+    )
     try:
         with world.trial() as copy:
             stated_unseen(copy)
@@ -1778,22 +1791,29 @@ async def check_reviews(root):
     )
     assert "unsupported_asides" in AnswerGrade.model_json_schema()["required"]
     observed = [{"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C1", "ts": answer.messages[0][1]}]}}]  # fmt: skip
-    for asides, grounded, score in ((2, True, 1.0), (0, False, 0.0)):
-        grade = AnswerGrade(correct=True, grounded=grounded, unsupported_asides=asides, reason="r")
+    assert "A status reference is the latest value the asker can see" in asks[0].content and "has abstained" in asks[0].content  # fmt: skip
+    # The reward: +1 right and grounded, 0 right but ungrounded or declined, -1 wrong (an aside costs nothing).
+    for correct, abstained, grounded, asides, score in ((True, False, True, 2, 1.0), (True, False, False, 0, 0.0), (False, True, False, 0, 0.0), (False, False, False, 0, -1.0), (True, True, True, 0, 1.0), (False, False, True, 0, -1.0)):  # fmt: skip
+        grade = AnswerGrade(correct=correct, abstained=abstained, grounded=grounded, unsupported_asides=asides, reason="r")  # fmt: skip
         trace = SimpleNamespace(info={"observations": observed}, last_reply="rollback", id="try", record_metrics=lambda m: None)  # fmt: skip
         judged = AnswerJudge.evaluate
         AnswerJudge.evaluate = lambda self, **fields: asyncio.sleep(0, SimpleNamespace(parsed=grade))
         try:
-            assert await SolverTask.semantic_correctness(solve, trace) == score, (asides, grounded)
+            assert await SolverTask.semantic_correctness(solve, trace) == score, (
+                correct,
+                abstained,
+                grounded,
+            )
         finally:
             AnswerJudge.evaluate = judged
         assert trace.info["evaluation"]["unsupported_asides"] == asides and trace.info["evaluation"]["evidence_coverage"] == 0.5  # fmt: skip
     write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})
     assert load_release(root / "release")[1:] == ([task], {"t1": answer})
     manifest = json.loads((root / "release" / "manifest.json").read_text())
-    assert manifest["format"] == "worldgen-slack.v8"
-    (root / "release" / "manifest.json").write_text(json.dumps(manifest | {"format": "worldgen-slack.v7"}))
-    assert load_release(root / "release")[1:] == ([task], {"t1": answer}), "a v7 release still loads"
+    assert manifest["format"] == "worldgen-slack.v9"
+    for old in ("worldgen-slack.v7", "worldgen-slack.v8"):
+        (root / "release" / "manifest.json").write_text(json.dumps(manifest | {"format": old}))
+        assert load_release(root / "release")[1:] == ([task], {"t1": answer}), f"a {old} release still loads"
     (root / "release" / "manifest.json").write_text(json.dumps(manifest))
     write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})  # idempotent
     fails(
@@ -2449,7 +2469,7 @@ async def check_author(root):
     store.publish()
     world, rows, answers = load_release(store.root / "release")
     assert len(rows) == 4 and World(world).db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    assert json.loads((store.root / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v8"
+    assert json.loads((store.root / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v9"
     assert all((r.right_rate, r.strict_rate, r.tries, r.solver) == (state.task_reviews[r.task_id]["right_rate"], state.task_reviews[r.task_id]["strict_rate"], state.task_reviews[r.task_id]["tries"], settings.env.solver.model) for r in rows), "each task's rates are published"  # fmt: skip
     assert {r.task_id: (r.witness, r.witness_right) for r in rows if r.witness} == {
         t2: (settings.env.witness.model, 1.0)
@@ -2467,6 +2487,8 @@ async def check_author(root):
     assert settings.env.solver.sampling.temperature == 1.0 == settings.env.witness.sampling.temperature and settings.env.judge.sampling.temperature == 0.0  # fmt: skip
     assert rates([{"correct": i < 6, "semantic_correctness": 0.0} for i in range(8)])["right_interval"] == [0.46, 0.913]  # fmt: skip
     assert rates([{"correct": True, "semantic_correctness": 1.0}] * 4)["right_interval"] == [0.596, 1.0], "4 of 4 still allows 0.6"  # fmt: skip
+    graded = [{"correct": True, "grounded": True, "semantic_correctness": 1.0}, {"correct": False, "grounded": False, "semantic_correctness": -1.0}, {"correct": False, "abstained": True, "grounded": False, "semantic_correctness": 0.0}, {"correct": True, "grounded": False, "semantic_correctness": 0.0}]  # fmt: skip
+    assert (rates(graded)["strict_rate"], rates(graded)["abstain_rate"]) == (0.25, 0.25), "strict is the share right and grounded, not the mean reward"  # fmt: skip
     assert all(r.right_interval == state.task_reviews[r.task_id]["right_interval"] for r in rows), "intervals are published"  # fmt: skip
     # A session lost to its sandbox is none of the author's limits (S3 stopped three times on Prime's dropped process
     # stream, each reported as the author's limits): its block is written again once and spends no attempt, and a

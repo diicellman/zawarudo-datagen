@@ -112,7 +112,7 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
         fact_ids = [r[0] for r in db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (t["id"],))]
         evidence = {str(r["message_id"]) for r in gold if r.get("message_id") is not None}
         evidence |= {str(r[0]) for r in db.execute("SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id WHERE tf.task_id = ? AND e.role = 'anchor'", (t["id"],))}  # fmt: skip
-        claims = [str(r.get("answer")) for r in gold] or ["(refusal: nothing to find)"]
+        claims = [str(r.get("answer")) + (" (not settled)" if t["answer_type"] == "status" else "") for r in gold] or ["(refusal: nothing to find)"]  # fmt: skip
         tasks.append(
             {"id": t["id"], "group_id": next((storyline_of[f] for f in fact_ids), "tasks"), "question": t["question"], "actor_id": t["actor_id"], "fact_ids": fact_ids, "reasoning": f"{t['category']} · level {t['level']} · {t['answer_type']}", "gold_sql": t["gold_sql"], "category": t["category"], "level": t["level"], "answer": {"canonical_answer": "; ".join(claims), "required_claims": claims}}
         )  # fmt: skip

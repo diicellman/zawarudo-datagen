@@ -34,7 +34,8 @@ COMMON_GUIDE = """Approve only after investigating. Call inspect_check before wr
 
 PHASE_GUIDES = {
     "task": """Task review. A task is valid when its actor can answer its question as asked from what they can read,
-and its gold rows are the complete, correct answer. Score each criterion of schemas.json from 0 to 1:
+and its gold rows are the complete, correct answer; a status task's answer is its gold value given as not settled, as
+the actor can see it, while the fact that settles it is out of their sight. Score each criterion of schemas.json from 0 to 1:
 - question_fit: each gold query answers its question as asked; test variants with inspect_sql.
 - discoverability: the actor can find the answer with Slack's read tools; try inspect_read, and read the solves.
   Solvers that answer differently or fail can reveal ambiguity or a missing time scope; a mistake the evidence rules

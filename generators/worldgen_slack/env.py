@@ -148,15 +148,16 @@ def wilson(right: int, n: int, z: float = 1.645) -> list[float]:
 
 def rates(results: list[dict]) -> dict:
     """A task's tries in numbers: how often the answer was right (the task's difficulty) and its 90% interval, how
-    often it was right and grounded (the released reward), and how much of the gold evidence the tries saw. A crashed
-    try tells nothing about the task: it is counted, and left out."""
+    often it was right and grounded (the reward's +1), how often the solver declined to answer, and how much of the
+    gold evidence the tries saw. A crashed try tells nothing about the task: it is counted, and left out."""
     finished = [r for r in results if not r.get("crashed")]
     seen = [r["evidence_coverage"] for r in finished if r.get("evidence_coverage") is not None]
     right = sum(bool(r["correct"]) for r in finished)
     return {
         "right_rate": right / len(finished),
         "right_interval": wilson(right, len(finished)),
-        "strict_rate": sum(r["semantic_correctness"] for r in finished) / len(finished),
+        "strict_rate": sum(bool(r["correct"]) and bool(r.get("grounded")) for r in finished) / len(finished),
+        "abstain_rate": sum(bool(r.get("abstained")) for r in finished) / len(finished),
         "coverage": sum(seen) / len(seen) if seen else None,
         "tries": len(finished),
         "crashed": len(results) - len(finished),

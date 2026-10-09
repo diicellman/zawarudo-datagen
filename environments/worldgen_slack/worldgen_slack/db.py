@@ -151,7 +151,7 @@ RULES = {
     ),
     "unreadable_evidence": (
         """SELECT t.id AS task, tf.fact_id AS fact FROM tasks t JOIN task_facts tf ON tf.task_id = t.id
-        WHERE t.answer_type <> 'refusal'
+        WHERE t.answer_type NOT IN ('refusal', 'status')
           AND EXISTS (SELECT 1 FROM evidence e WHERE e.fact_id = tf.fact_id AND e.role = 'anchor')
           AND NOT EXISTS (
             SELECT 1 FROM evidence e JOIN messages m ON m.id = e.message_id JOIN channels c ON c.id = m.channel_id

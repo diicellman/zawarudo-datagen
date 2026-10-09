@@ -243,7 +243,7 @@ class Task(StrictModel):
     level: int = Field(ge=1)
     actor_id: SafeId
     question: NonEmptyText
-    answer_type: Literal["text", "set", "number", "refusal"]
+    answer_type: Literal["text", "set", "number", "refusal", "status"]
     gold_sql: NonEmptyText
     facts: Ids = Field(default_factory=list)
 
@@ -540,7 +540,7 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
         raise ValueError(f"{task.id}: actor_id {task.actor_id} is not a person in the world") from None
     except ValueError as error:
         raise ValueError(f"{task.id}: {error}") from None
-    read, rows = set(out["tables"]), out["rows"]
+    read, rows, source = set(out["tables"]), out["rows"], gold_source(task, settings)
     if renumbered is not None:
         copy, back = renumbered
         try:
@@ -552,17 +552,19 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
                 f"{task.id}: the gold query finds messages by what the question names (words, people, channels, "
                 "threads, reactions, times), never by a message id or by id order"
             )
-    if category.gold == "sql" and read & LEDGER_TABLES:
+    if source == "sql" and read & LEDGER_TABLES:
         raise ValueError(
             f"{task.id}: a {task.category} gold query reads only the workspace, not {sorted(read & LEDGER_TABLES)}"
         )
-    if category.gold in ("ledger", "hybrid") and not read & LEDGER_TABLES:
-        raise ValueError(f"{task.id}: a {task.category} gold query reads the facts it answers from")
-    if category.gold == "hybrid" and not read & STRUCTURE:
+    if source in ("ledger", "hybrid") and not read & LEDGER_TABLES:
+        raise ValueError(
+            f"{task.id}: a {task.category} {task.answer_type} gold query reads the facts it answers from"
+        )
+    if source == "hybrid" and not read & STRUCTURE:
         raise ValueError(
             f"{task.id}: a hybrid gold query also reads the workspace (messages, members, reactions)"
         )
-    if category.gold in ("ledger", "hybrid") and not task.facts:
+    if source in ("ledger", "hybrid") and not task.facts:
         raise ValueError(f"{task.id}: name the facts its answer rests on in facts")
     unshown = [r for r in out["reads"] if (t := r.split(".")[0]) in SHOWN and r.split(".")[1] not in SHOWN[t]]
     if unshown:
@@ -587,6 +589,8 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
         raise ValueError(
             f"{task.id}: a {task.answer_type} answer is one row; use answer_type set for several"
         )
+    if task.answer_type == "status":
+        unsettled(world, task, rows)
     if given := [
         str(r["answer"])
         for r in rows
@@ -609,8 +613,8 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
     if normalized(task.question) in asked:
         raise ValueError(f"{task.id}: a task asks a question no other task asks")
     for fact in (
-        task.facts if task.answer_type != "refusal" else ()
-    ):  # a refusal may rest on the truth out of sight
+        task.facts if task.answer_type not in ("refusal", "status") else ()
+    ):  # a refusal or a status may rest on the truth out of sight
         row = world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()
         if row and not readable(world, task.actor_id, row[0]):
             raise ValueError(f"{task.id}: its actor cannot read {row[0]}, where {fact} is stated")
@@ -836,12 +840,45 @@ def band_move(probe: dict) -> str | None:
     return None
 
 
+def gold_source(task: Task, settings) -> str:
+    """Where a task's answer comes from: its category's gold, but a status answer is a value of the ledger as its
+    actor can see it stated."""
+    if task.answer_type == "status":
+        return "ledger"
+    return settings.taxonomy[task.category].gold if task.category in settings.taxonomy else "sql"
+
+
+def unsettled(world, task: Task, rows: list[dict]) -> None:
+    """A status answer's ground: the value its gold gives is a fact its actor can read, that no fact in their sight
+    supersedes, and that a fact it rests on, out of their sight, does. S3's care team could read only the provisional
+    "15%... Grant can correct me", while a DM had settled 10%: the useful answer gives 15% as not settled."""
+    values = {str(r.get("answer")).strip().casefold() for r in rows}
+    seen = lambda f: any(readable(world, task.actor_id, c) for c in places(world, f))  # noqa: E731
+    marks = ", ".join("?" * len(task.facts))
+    given = [f for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", task.facts) if v.strip().casefold() in values and seen(f)]  # fmt: skip
+    if not given:
+        raise ValueError(
+            f"{task.id}: a status answer's gold gives the value of one of its facts its actor can read"
+        )
+    # The values that replace it: later facts on its subject and attribute down its supersedes chain.
+    later = [r[0] for r in world.db.execute(
+        f"""WITH RECURSIVE chain(id) AS (SELECT src_fact FROM fact_relations WHERE kind = 'supersedes'
+        AND dst_fact IN ({", ".join("?" * len(given))}) UNION SELECT r.src_fact FROM chain c JOIN fact_relations r
+        ON r.dst_fact = c.id AND r.kind = 'supersedes')
+        SELECT f.id FROM chain JOIN facts f ON f.id = chain.id JOIN facts g ON g.id = ?
+        WHERE lower(trim(f.subject)) = lower(trim(g.subject)) AND lower(trim(f.attribute)) = lower(trim(g.attribute))""",
+        [*given, given[0]],
+    )]  # fmt: skip
+    if in_sight := [f for f in later if seen(f)]:
+        raise ValueError(f"{task.id}: its actor can read {in_sight}, which supersede the value it gives: that is its answer, not a status")  # fmt: skip
+    if not [f for f in task.facts if f in later]:
+        raise ValueError(f"{task.id}: a status answer rests on a fact, out of its actor's sight, that supersedes the value it gives")  # fmt: skip
+
+
 def task_row(task: Task, settings) -> dict:
     return task.model_dump(
         include={"id", "category", "level", "actor_id", "question", "answer_type", "gold_sql"}
-    ) | {
-        "gold_source": settings.taxonomy[task.category].gold if task.category in settings.taxonomy else "sql"
-    }
+    ) | {"gold_source": gold_source(task, settings)}
 
 
 def readable(world, actor: str, channel: str) -> bool:

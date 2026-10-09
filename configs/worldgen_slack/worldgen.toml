@@ -155,21 +155,24 @@ concepts = [
 ]
 needs = [{}, {}, {decoys = 1}, {decoys = 1}]  # S2's hybrid L4 in band (0.25) had its near-miss on its truth's day
 
+# Robustness L3-L4 (2026-10-09): a value the asker can see that was settled where they cannot is a status answer,
+# the latest visible value given as not settled, not a refusal: S3's solver found the provisional value and its
+# caveat, and a refusal graded that wrong.
 [taxonomy.robustness]
-gold = "sql"
-answer_types = ["refusal"]
-definition = "A request the asker cannot fulfill as asked from what they can see; the right answer says so, and why."
+gold = "sql"              # a status answer's gold reads the ledger: its value as the asker can see it stated
+answer_types = ["refusal", "status"]
+definition = "A request the asker cannot fulfill as asked from what they can see; the right answer says so, and why: nothing to find, or only a value that is not settled."
 levels = [
   "what it asks about does not exist",
   "what it asks about is in a conversation the asker cannot read",
-  "a false premise: the request assumes a decision, date or owner the workspace shows was retracted, moved or never made",
-  "visible near-misses (an older plan, a namesake, a draft) look like answers, while the real answer exists only where the asker cannot read",
+  "a value the asker can see that was changed or settled where they cannot: the right answer gives it as not settled",
+  "visible near-misses (an older plan, a namesake, a draft) look like answers, while the settled value exists only where the asker cannot read: the right answer gives the latest value they can see, as not settled",
 ]
 concepts = [
   ["a project, person or decision that never appears in the workspace"],
   ["a decision discussed only in a private channel the asker is not in", "a detail settled only in a direct message between others"],
-  ["a decision asked about as final that was proposed and then reversed", "a date asked about after it was moved", "work asked about as owned by someone who handed it off", "a value asked about that an upstream change made uncertain, with no replacement stated"],
-  ["a namesake project whose details are public while the one asked about is private", "an outdated public plan a private decision replaced", "a figure discussed publicly as an estimate and settled only in a private channel"],
+  ["a figure posted as provisional and settled only in a direct message", "a decision asked about as final that was changed in a private channel", "work asked about as owned by someone who handed it off privately"],
+  ["an outdated public plan a private decision replaced", "a figure discussed publicly as an estimate and settled only in a private channel", "a swap arranged in direct messages behind a posted roster"],
 ]
 needs = [{}, {}, {}, {decoys = 1}]
 

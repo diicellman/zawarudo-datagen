@@ -140,7 +140,7 @@ class Category(Section):
     each level for."""
 
     gold: Literal["sql", "ledger", "hybrid"]
-    answer_types: list[Literal["text", "set", "number", "refusal"]] = Field(min_length=1)
+    answer_types: list[Literal["text", "set", "number", "refusal", "status"]] = Field(min_length=1)
     definition: Text
     levels: list[Text] = Field(min_length=1)
     concepts: list[list[Text]]
