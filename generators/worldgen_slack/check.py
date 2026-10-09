@@ -885,6 +885,9 @@ def check_contracts(root):
         "the slot's concept is stored"
     )
     fails(record_task, world, task(id="t2"), settings, slot("search", 1, id="t2"))  # t1 asks it
+    refused("its answer differs for them", record_task, world, task(id="t2", actor_id=d), settings, slot("search", 1, id="t2"))  # fmt: skip  # d asks it too, and gets t1's answer
+    count = lambda id, actor: Task(id=id, category="lookup", level=1, actor_id=actor, question="How many private channels am I in?", answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM channels WHERE type = 'private'")  # noqa: E731  # fmt: skip
+    assert "t3" in recorded(count("t3", c), slot("lookup", 1, id="t3"), setup=lambda copy: record_task(copy, count("t2", a), settings, slot("lookup", 1, id="t2"))), "a perspective twin: another asker, another answer"  # fmt: skip
 
     def settled(facts):  # a level-3 semantic task needs its facts first stated in 2 channels
         sql = f"SELECT value AS answer FROM facts WHERE id = '{facts[-1]}'"
@@ -976,9 +979,14 @@ def check_contracts(root):
             record_task(copy, window, needing(settings, "semantic", 3), nine)
             count = Task(id="t8", category="lookup", level=1, actor_id=a, question="How many messages are there?", answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages")  # fmt: skip
             counted = record_task(copy, count, settings, slot("lookup", 1, id="t8"))["gold"]
-            raise LookupError((panel(copy, "t9", [{"answer": "dry run"}]), features(copy, "t9", [{"answer": "dry run"}]), features(copy, "t8", counted)))  # fmt: skip
+            who = window.model_copy(update={"id": "t7", "question": "Who settled the audit's window?", "gold_sql": "SELECT u.real_name AS answer FROM facts f JOIN users u ON u.id = f.author_id WHERE f.id = 'f3'"})  # fmt: skip
+            settler = record_task(copy, who, needing(settings, "semantic", 3), slot("semantic", 3, id="t7"))[
+                "gold"
+            ]
+            raise LookupError((panel(copy, "t9", [{"answer": "dry run"}]), features(copy, "t9", [{"answer": "dry run"}]), features(copy, "t8", counted), features(copy, "t7", settler)))  # fmt: skip
     except LookupError as out:
-        lazy, shape, counting = out.args[0]
+        lazy, shape, counting, settled_by = out.args[0]
+    assert settled_by["last_link"] == "private·later", "a person's answer is placed by the fact it is about"
     assert {k: lazy["guesses"][k] for k in ("first", "latest", "top")} == {"first": "full test", "latest": "rehearsal", "top": "rehearsal"} and {"first", "latest", "top"} <= set(lazy["traps"]) and not lazy["shortcut"], lazy  # fmt: skip
     assert (shape["changes"], shape["last_link"], shape["perspective"]) == (3, "private·later", False), shape
     assert counting["perspective"] and counting["derived"], (

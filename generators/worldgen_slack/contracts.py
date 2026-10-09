@@ -618,11 +618,7 @@ def record_task(world, task: Task, settings, slot: Slot, needs: bool = True) -> 
     Returns its gold rows and code's measures. Run inside `World.trial()`."""
     if (task.id, task.category, task.level) != (slot.id, slot.category, slot.level):
         raise ValueError(f"{slot.id} is a {slot.category} level {slot.level} task, with the slot's id")
-    asked = {
-        normalized(r[0]) for r in world.db.execute("SELECT question FROM tasks WHERE id != ?", (task.id,))
-    }
-    if normalized(task.question) in asked:
-        raise ValueError(f"{task.id}: a task asks a question no other task asks")
+
     for fact in (
         task.facts if task.answer_type not in ("refusal", "status") else ()
     ):  # a refusal or a status may rest on the truth out of sight
@@ -631,6 +627,12 @@ def record_task(world, task: Task, settings, slot: Slot, needs: bool = True) -> 
             raise ValueError(f"{task.id}: its actor cannot read {row[0]}, where {fact} is stated")
     with world.renumbered() as renumbered:
         gold = check_task(world, task, settings, renumbered)
+    # A question no other task asks, but for a perspective twin: another asker, for whom its answer differs.
+    for question, actor, rows in world.db.execute("SELECT question, actor_id, gold_json FROM tasks WHERE id != ?", (task.id,)):  # fmt: skip
+        if normalized(question) == normalized(task.question) and (
+            actor == task.actor_id or json.loads(rows) == gold
+        ):
+            raise ValueError(f"{task.id}: a task asks a question no other task asks, unless another person asks it and its answer differs for them")  # fmt: skip
     with world.batch():
         world.insert("tasks", [task_row(task, settings) | {"concept": slot.concept}])
         world.insert("task_facts", [dict(task_id=task.id, fact_id=f) for f in dict.fromkeys(task.facts)])
@@ -906,7 +908,11 @@ def features(world, task_id: str, rows: list[dict]) -> dict:
     answers = [str(r.get("answer")) for r in rows]
     stated = stated_values(world, facts, task["actor_id"]) if facts else {}
     link = None
-    golden = [stated[a.strip().casefold()] for a in answers if a.strip().casefold() in stated]
+    # Where its answer is stated: its answer facts' values, as the panel reads them (a hybrid or a person answer is
+    # about the message that states a fact).
+    answered = answer_facts(world, facts, task["actor_id"], answers) if facts else []
+    values = [v.strip().casefold() for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({', '.join('?' * len(answered))})", answered)] if answered else []  # fmt: skip
+    golden = [stated[v] for v in values if v in stated]
     if golden:
         message = world.db.execute("SELECT m.parent_id, c.type, m.ts_us FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?", (golden[0][0],)).fetchone()  # fmt: skip
         link = "thread" if message["parent_id"] else {"im": "dm", "mpim": "dm", "private": "private"}.get(message["type"], "channel")  # fmt: skip
