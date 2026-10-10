@@ -35,11 +35,12 @@ class ForgeConfig(Section):
     base: Path  # the configuration the world was generated with (its sector, people, taxonomy and roles)
     world: Path  # the finished run: its final world.sqlite, with the ledger and the board
     output: Path
-    rounds: int = Field(default=6, ge=1, le=50)
+    tasks: int = Field(
+        default=40, ge=1, le=10_000
+    )  # the goal: the tasks the archive holds when the forge is done
+    rounds: int = Field(default=12, ge=1, le=100)  # the most rounds it runs toward the goal
     candidates: int = Field(default=12, ge=1, le=50)  # the candidate tasks one round writes
-    target: int = Field(
-        default=2, ge=1, le=10
-    )  # the tasks kept per category and level before the forge stops
+    target: int = Field(default=2, ge=1, le=100)  # the tasks a place (a category and a level) holds
     settings: dict = Field(
         default_factory=dict
     )  # sections of the base configuration it replaces, merged by key
@@ -93,6 +94,9 @@ def measured_level(right: float, bands) -> int:
 class ForgeEnv(GenerationEnv):
     def __init__(self, forge: ForgeConfig, settings: Config, store: Store):
         self.forge = forge
+        places = sum(len(spec.levels) for spec in settings.taxonomy.values())
+        if forge.tasks > forge.target * places:
+            raise ValueError(f"a goal of {forge.tasks} tasks is more than the archive's {places} places hold at {forge.target} each")  # fmt: skip
         super().__init__(settings, store)
 
     async def run(self, task, agents):
@@ -139,7 +143,8 @@ class ForgeEnv(GenerationEnv):
             for n in range(2):
                 if not (missing := [t for t in ids if t not in self.written(ids)]):
                     break
-                prompt = forge_prompt(number, cfg.rounds, ids) if n == 0 else f"These open ids have no candidate yet: {missing}. Write them with world_add_task, then end your turn."  # fmt: skip
+                held = self.world.db.execute("SELECT COUNT(*) FROM tasks WHERE id NOT IN (" + ", ".join("?" * len(ids)) + ")", ids).fetchone()[0]  # fmt: skip
+                prompt = forge_prompt(number, cfg.rounds, ids, held, cfg.tasks) if n == 0 else f"These open ids have no candidate yet: {missing}. Write them with world_add_task, then end your turn."  # fmt: skip
                 await self.author_step(interaction, runtime, prompt, attempt, "forge", self.pages())
         self.store.trace(interaction.trace)
         require_session(interaction.trace)
@@ -149,7 +154,7 @@ class ForgeEnv(GenerationEnv):
         state.batch, state.restore_point = number, attempt
         counts = state.plans.setdefault("forge", {})
         counts["idle"] = idle = 0 if added else counts.get("idle", 0) + 1
-        # It stops when its rounds run out, when the archive is full, or after two rounds that keep nothing.
+        # It stops at its goal, when its rounds run out, or after two rounds that place nothing.
         if number == cfg.rounds or self.done() or idle >= 2:
             state.phase = "done"
         self.store.finish_attempt(True)
@@ -181,9 +186,11 @@ class ForgeEnv(GenerationEnv):
 
     def place(self, task_id: str, review: dict | None, hinted, attempt: str) -> dict:
         """One candidate's outcome. Its tries give its level; the lowest band also needs the witness to answer it
-        (hard, not broken). Its cell is its category, that level and its structure (MAP-Elites over task features,
-        OMNI-EPIC's archive); a cell keeps the candidate GLM's tries are most mixed on, 4p(1-p), and the shorter
-        question when they tie."""
+        (hard, not broken). Its place is its category and that level, which holds up to `target` tasks (MAP-Elites
+        over task features, as OMNI-EPIC keeps its archive). A newcomer to a full place replaces a holder when it
+        brings a structure the place lacks while two holders share one, or when GLM's tries are more mixed on it than
+        on the weakest holder, by 4p(1-p), the shorter question winning a tie. forge-t1's 10 tasks filled 10 cells of
+        their own, so nothing competed and every easy task was kept."""
         state, bands = self.store.state, self.settings.tasks.bands
         row = self.world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         gold = json.loads(row["gold_json"])
@@ -201,17 +208,26 @@ class ForgeEnv(GenerationEnv):
         if bands[level - 1][0] == 0 and not witness:
             self.drop(task_id, attempt, "neither solver answers it")
             return out | {"verdict": "dropped: the witness does not answer it either: hard, or broken"}
-        cell, score, words = f"{row['category']}·L{level}·{bucket(shape)}", 4 * right * (1 - right), len(row["question"].split())  # fmt: skip
-        held = state.archive.get(cell)
-        if held and (held["score"], -held["words"]) >= (score, -words):
-            self.drop(task_id, attempt, f"{cell} holds {held['task']}")
-            return out | {"verdict": f"dropped: its cell {cell} holds {held['task']}, as mixed or more"}
-        if held:
-            self.drop(held["task"], attempt, f"replaced by {task_id}")
-            state.forged[held["task"]]["verdict"] = f"replaced by {task_id}"
+        where, shaped = f"{row['category']}·L{level}", bucket(shape)
+        mine = {"task": task_id, "score": 4 * right * (1 - right), "words": len(row["question"].split()), "right": right, "bucket": shaped}  # fmt: skip
+        holders = state.archive.setdefault(where, [])
+        if len(holders) >= self.forge.target:
+            weakest = lambda hs: min(hs, key=lambda h: (h["score"], -h["words"]))  # noqa: E731
+            shared = [h for h in holders if [g["bucket"] for g in holders].count(h["bucket"]) > 1]
+            if shaped not in {h["bucket"] for h in holders} and shared:
+                out_ = weakest(shared)
+            elif (mine["score"], -mine["words"]) > (weakest(holders)["score"], -weakest(holders)["words"]):
+                out_ = weakest(holders)
+            else:
+                held = ", ".join(h["task"] for h in holders)
+                self.drop(task_id, attempt, f"{where} is full")
+                return out | {"verdict": f"dropped: {where} is full ({held}), with tasks as mixed or more and its structure"}  # fmt: skip
+            holders.remove(out_)
+            self.drop(out_["task"], attempt, f"replaced by {task_id}")
+            state.forged[out_["task"]]["verdict"] = f"replaced by {task_id}"
         self.world.db.execute("UPDATE tasks SET level = ? WHERE id = ?", (level, task_id))
-        state.archive[cell] = {"task": task_id, "score": score, "words": words, "right": right}
-        return out | {"verdict": f"kept in {cell}"}
+        holders.append(mine)
+        return out | {"verdict": f"kept in {where} as {shaped}"}
 
     def covered(self) -> tuple[dict, list[str]]:
         """What the archive covers: its tasks per category and level, and the board's entries no kept task rests on (a
@@ -222,12 +238,9 @@ class ForgeEnv(GenerationEnv):
         return kept, sorted(open_)
 
     def done(self) -> bool:
-        """The archive is full: every category and level holds `target` tasks, and every board entry is covered."""
+        """The forge is at its goal: the archive holds `tasks` tasks, and every board entry is covered."""
         kept, open_ = self.covered()
-        cells = [
-            (c, lvl) for c, spec in self.settings.taxonomy.items() for lvl in range(1, len(spec.levels) + 1)
-        ]
-        return not open_ and all(kept.get(cell, 0) >= self.forge.target for cell in cells)
+        return not open_ and sum(kept.values()) >= self.forge.tasks
 
     def drop(self, task_id: str, attempt: str, why: str) -> None:
         self.world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task_id,))
@@ -243,17 +256,15 @@ class ForgeEnv(GenerationEnv):
         board = ["# Board: the tasks the world was planned for, and the facts each rests on", ""]
         for slot, facts in self.world.db.execute("SELECT slot, group_concat(fact_id, ', ') FROM board GROUP BY slot ORDER BY slot"):  # fmt: skip
             board.append(f"- {slot}: {facts}" + ("  (open)" if slot in open_ else "  (covered)"))
-        lines = ["# Archive", "", f"Target: {self.forge.target} kept tasks per category and level, and every board entry. GLM tries each candidate {self.settings.author.tries} times.", ""]  # fmt: skip
+        lines = ["# Archive", "", f"Goal: {self.forge.tasks} kept tasks, at most {self.forge.target} per category and level, and every board entry covered. It holds {sum(kept.values())}. GLM tries each candidate {self.settings.author.tries} times.", ""]  # fmt: skip
         for category, spec in self.settings.taxonomy.items():
             lines.append(f"- {category}: " + " · ".join(f"L{lvl} {kept.get((category, lvl), 0)}/{self.forge.target}" for lvl in range(1, len(spec.levels) + 1)))  # fmt: skip
-        lines += ["", f"Board entries no kept task rests on: {', '.join(open_) or 'none'}", "", "## Kept"]
-        for cell, held in sorted(self.store.state.archive.items()):
-            question = self.world.db.execute(
-                "SELECT question FROM tasks WHERE id = ?", (held["task"],)
-            ).fetchone()
-            lines.append(
-                f"- {cell}: {held['task']}, right {held['right']:.2f}: {question[0] if question else ''}"
-            )
+        lines += ["", f"Board entries no kept task rests on: {', '.join(open_) or 'none'}", "", "## Kept (a full place takes a newcomer only if GLM's tries are more mixed on it, or it brings a new structure)"]  # fmt: skip
+        for where, holders in sorted(self.store.state.archive.items()):
+            full = " (full)" if len(holders) >= self.forge.target else ""
+            for held in holders:
+                question = self.world.db.execute("SELECT question FROM tasks WHERE id = ?", (held["task"],)).fetchone()  # fmt: skip
+                lines.append(f"- {where}{full}: {held['task']}, right {held['right']:.2f}, structure {held['bucket']}: {question[0] if question else ''}")  # fmt: skip
         last = [t for t, o in self.store.state.forged.items() if o["round"] >= self.store.state.batch - 1]
         lines += ["", "## The last rounds' candidates"]
         for t in last:

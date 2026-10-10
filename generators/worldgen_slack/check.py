@@ -2238,7 +2238,7 @@ async def check_author(root):
             seen.append(("forge", tuple(ids), "Round" in prompt))
             if ids[0] == "r02-01" and not forging["vague"]:  # fmt: skip  # the archive: what the last round kept, and why it dropped the rest
                 archive = runtime.files["/task/memory/archive.md"].decode()
-                assert "r01-01" in archive and "kept in lookup·L2·plain" in archive and "dropped: the judge did not approve it" in archive and "lookup: L1 0/2 · L2 1/2" in archive, archive  # fmt: skip
+                assert "holds 1 of the 30 tasks it aims for" in prompt and "r01-01" in archive and "kept in lookup·L2 as plain" in archive and "dropped: the judge did not approve it" in archive and "lookup: L1 0/2 · L2 1/2" in archive, archive  # fmt: skip
             try:
                 await call("revise", message_id=1, text="rewritten")
                 raise AssertionError("the forge wrote the workspace")
@@ -2701,9 +2701,7 @@ async def check_author(root):
     except SessionLost:
         assert blocks[2:] == ["gone-01", "gone-02"] and store.state.lost["gone"] == 2, blocks
     # The forge: tasks proposed on the finished world, which stays frozen; what the judge approves is kept.
-    plan = ForgeConfig(
-        base=Path("worldgen.toml"), world=store.root, output=root / "forge", rounds=2, candidates=2
-    )
+    plan = ForgeConfig(base=Path("worldgen.toml"), world=store.root, output=root / "forge", rounds=2, candidates=2, tasks=30)  # fmt: skip
     workspace = store.world.db.execute(
         "SELECT group_concat(id || ':' || text, '|') FROM messages"
     ).fetchone()[0]
@@ -2723,7 +2721,7 @@ async def check_author(root):
     assert [x[1] for x in seen if x[0] == "forge"] == [("r01-01", "r01-02"), ("r02-01", "r02-02")]
     assert forged.state.phase == "done" and sorted(t for (t,) in forged.world.db.execute("SELECT id FROM tasks")) == ["r01-01", "r02-01"], "the vague candidates are dropped"  # fmt: skip
     hard = forged.state.forged["r02-01"]
-    assert (hard["right"], hard["witness"], hard["hint"], hard["level"], hard["verdict"]) == (0.0, 1.0, 1.0, 3, "kept in search·L3·k1"), hard  # fmt: skip
+    assert (hard["right"], hard["witness"], hard["hint"], hard["level"], hard["verdict"]) == (0.0, 1.0, 1.0, 3, "kept in search·L3 as k1"), hard  # fmt: skip
     assert dict(forged.world.db.execute("SELECT id, level FROM tasks").fetchall()) == {"r01-01": 2, "r02-01": 3}, "its tries give its level"  # fmt: skip
     assert forged.world.db.execute("SELECT group_concat(id || ':' || text, '|') FROM messages").fetchone()[0] == workspace, "the workspace is frozen"  # fmt: skip
     assert tuple(forged.world.db.execute("SELECT channel_id, author_id FROM facts WHERE id = 'n1'").fetchone()) == tuple(store.world.db.execute("SELECT channel_id, user_id FROM messages WHERE text LIKE '%rollback%' ORDER BY ts_us LIMIT 1").fetchone()), "an annotation is placed by its first message"  # fmt: skip
@@ -2741,20 +2739,39 @@ async def check_author(root):
         3,
     ]
     assert bucket({"changes": 3, "last_link": "dm·later", "rows": 2, "perspective": True, "derived": False, "status": False}) == "k3+dm+set+perspective"  # fmt: skip
-    weigher, keep = Forging(plan, settings, forged), forged.state.archive["lookup·L2·plain"]
-    newest = Task(id="r09-01", category="lookup", level=2, actor_id=forged.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], question="Who is the newest person here, again?", answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1", near_sql=["SELECT real_name AS answer FROM users ORDER BY id LIMIT 1"])  # fmt: skip
-    for open_id, review, verdict in (("r09-01", {"right_rate": 0.0, "witness_right": 0.0}, "dropped: the witness does not answer it either: hard, or broken"), ("r09-01", {"right_rate": 0.5, "witness_right": None}, "kept in lookup·L2·plain"), ("r09-02", {"right_rate": 0.625, "witness_right": None}, "dropped: its cell lookup·L2·plain holds r09-01, as mixed or more")):  # fmt: skip
+    # A place holds two tasks. A newcomer to a full one replaces a holder if GLM's tries are more mixed on it, or if
+    # it brings a structure the place lacks while two holders share one; else it is dropped.
+    weigher, actor = (
+        Forging(plan, settings, forged),
+        forged.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0],
+    )
+    newest = Task(id="r09-01", category="lookup", level=2, actor_id=actor, question="Who is the newest person here?", answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1", near_sql=["SELECT real_name AS answer FROM users ORDER BY id LIMIT 1"])  # fmt: skip
+    newest_two = newest.model_copy(update={"answer_type": "set", "gold_sql": "SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 2", "near_sql": ["SELECT real_name AS answer FROM users ORDER BY id LIMIT 2"]})  # fmt: skip
+    for task_, open_id, question, right, witness, verdict in (
+        (newest, "r09-01", "Who is the newest person here, r09-01?", 0.0, 0.0, "dropped: the witness does not answer it either: hard, or broken"),
+        (newest, "r09-01", "Who is the newest person here, r09-01?", 0.5, None, "kept in lookup·L2 as plain"),  # the place had room
+        (newest, "r09-02", "Who is the newest person here, r09-02?", 0.625, None, "kept in lookup·L2 as plain"),  # more mixed than r01-01
+        (newest, "r09-03", "Who is the newest person here, r09-03, by when they joined?", 0.625, None, "dropped: lookup·L2 is full (r09-01, r09-02), with tasks as mixed or more and its structure"),  # fmt: skip
+        (newest_two, "r09-04", "Who are the two newest people here?", 0.625, None, "kept in lookup·L2 as set"),  # a new structure
+    ):  # fmt: skip
         with forged.world.trial() as copy:
-            forge_task(copy, newest.model_copy(update={"id": open_id, "question": f"Who is the newest person here, {open_id}?"}), settings, [open_id])  # fmt: skip
+            forge_task(
+                copy, task_.model_copy(update={"id": open_id, "question": question}), settings, [open_id]
+            )
         forged.state.solves[open_id] = {"key": "k", "results": [], "traces": []}
-        assert weigher.place(open_id, review, None, "x")["verdict"] == verdict, review
-    assert forged.state.archive["lookup·L2·plain"]["task"] == "r09-01" and forged.state.forged["r01-01"]["verdict"] == "replaced by r09-01" and keep["task"] == "r01-01", "a more mixed candidate takes its cell"  # fmt: skip
+        forged.state.forged[open_id] = weigher.place(open_id, {"right_rate": right, "witness_right": witness}, None, "x")  # fmt: skip  # as weigh records it
+        assert forged.state.forged[open_id]["verdict"] == verdict, (open_id, right)
+    assert [h["task"] for h in forged.state.archive["lookup·L2"]] == ["r09-01", "r09-04"], (
+        forged.state.archive
+    )
+    assert (forged.state.forged["r01-01"]["verdict"], forged.state.forged["r09-02"]["verdict"]) == ("replaced by r09-02", "replaced by r09-04")  # fmt: skip
     forged.close()
     fails(Store, plan.output, forge_provenance(plan.model_copy(update={"rounds": 3}), settings))  # fmt: skip  # its own config only
-    # A forge stops early: once the archive is full (here, a target of none and no board), or after two rounds that
-    # keep nothing.
+    # A forge stops early: at its goal (here, one task and no board), or after two rounds that place nothing. A goal
+    # the archive's places cannot hold is refused.
+    fails(Forging, plan.model_copy(update={"tasks": 1000}), settings, forged)
     for name, changes, vague, rounds in (
-        ("forge-full", {"target": 0}, False, 1),
+        ("forge-full", {"tasks": 1}, False, 1),
         ("forge-idle", {}, True, 2),
     ):
         early = plan.model_copy(update={"output": root / name, "rounds": 4} | changes)
