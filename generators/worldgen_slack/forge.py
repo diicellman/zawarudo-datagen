@@ -350,7 +350,7 @@ async def run(forge: ForgeConfig, settings: Config) -> dict:
 
 
 def dry_run(forge: ForgeConfig, settings: Config) -> dict:
-    """What a forge would start from, spending nothing: the world, its board, and the rounds."""
+    """What a forge would start from, spending nothing: the world, its board, its goal, and the rounds."""
     world = World(forge.world / "world.sqlite")
     count = lambda table: world.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: E731
     return {
@@ -359,6 +359,9 @@ def dry_run(forge: ForgeConfig, settings: Config) -> dict:
         "messages": count("messages"),
         "facts": count("facts"),
         "board": dict(world.db.execute("SELECT slot, group_concat(fact_id, ', ') FROM board GROUP BY slot")),
+        "tasks": forge.tasks,
+        "target": forge.target,
+        "measure": forge.measure,
         "rounds": forge.rounds,
         "candidates": forge.candidates,
         "tries": settings.author.tries,

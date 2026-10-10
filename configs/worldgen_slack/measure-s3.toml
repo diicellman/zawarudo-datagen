@@ -1,0 +1,10 @@
+# S3-M (2026-10-10): S3's own 40 released tasks, re-measured by the forge's probe on S3's world, the baseline F1 is
+# compared with. S3 measured its tasks with 4 tries at temperature 0; the forge measures every task with the screen,
+# 8 tries at temperature 1, the witness, the hint and the judge. Nothing is proposed: the forge only measures.
+# uv run --frozen worldgen-slack forge --config configs/worldgen_slack/measure-s3.toml [--dry-run]
+base = "configs/worldgen_slack/worldgen.toml"
+world = "data/v7-05/software"
+output = "data/v7-05/s3-measured"
+measure = true            # round 0 imports S3's own tasks, as written, and measures them
+rounds = 0                # and no proposer round follows
+target = 40               # a place keeps every task it is given: a measurement drops nothing for room
