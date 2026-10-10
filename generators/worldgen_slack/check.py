@@ -2785,6 +2785,30 @@ async def check_author(root):
             early_store.state.batch,
         )
         early_store.close()
+    # A forge that only measures: the finished run's own tasks, imported as written (past the forge's own gates; a
+    # level-2 count with no near-miss query here), then measured like any candidate, with no proposer turn.
+    source = root / "measure-source"  # a copy of the finished run, with one more task of its own
+    source.mkdir()
+    store.world.snapshot(source / "world.sqlite")
+    (source / "state.json").write_bytes((store.root / "state.json").read_bytes())
+    extra = World(source / "world.sqlite", writable=True)
+    with extra.trial() as copy:
+        record_task(copy, Task(id="extra-l2", category="join", level=2, actor_id=store.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], question="How many messages are there in all?", answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages"), settings, Slot(id="extra-l2", category="join", level=2, concept="c", style="s"))  # fmt: skip
+    source_ids = sorted(t for (t,) in extra.db.execute("SELECT id FROM tasks"))
+    extra.close()
+    measuring = plan.model_copy(update={"world": source, "output": root / "measured", "rounds": 0, "measure": True, "target": 30})  # fmt: skip
+    measured, turns = TestStore(measuring.output, forge_provenance(measuring, settings)), len([x for x in seen if x[0] == "forge"])  # fmt: skip
+    await Forging(measuring, settings, measured).run(None, agents)
+    assert "extra-l2" in source_ids and sorted(measured.state.forged) == source_ids and not [o for o in measured.state.forged.values() if o["verdict"].startswith("not imported")], measured.state.forged  # fmt: skip
+    assert measured.state.phase == "done" and len([x for x in seen if x[0] == "forge"]) == turns, (
+        "no proposer turn"
+    )
+    assert any(o["verdict"].startswith("kept") for o in measured.state.forged.values())
+    measured.publish()
+    measured.close()
+    fails(
+        ForgeConfig, base=Path("w.toml"), world=root, output=root, rounds=0
+    )  # no rounds and nothing to measure
     store.close()
     retried = SimpleNamespace(
         ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]

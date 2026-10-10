@@ -13,7 +13,7 @@ import shutil
 import tomllib
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from verifiers.v1.runtimes.prime import set_base_sandbox_labels
 from worldgen_slack.dataset import atomic_json, sha256
@@ -22,28 +22,36 @@ from worldgen_slack.db import SCHEMA, World
 import verifiers.v1 as vf
 
 from .agents.world import WorldAuthorTask, forge_prompt
+from .chronicle import forge_task
 from .config import ROOT, Config, Section, load_config
-from .contracts import features
+from .contracts import Task, features
 from .env import SETUP_FILES, GenerationEnv, keep_awake, rates, require_session
 from .generate import failure, run_label
 from .store import Store
 
 
 class ForgeConfig(Section):
-    """One forge, configured in one file: the world run it writes on, and what it changes of that run's settings."""
+    """One forge, configured in one file: the world run it writes on, and what it changes of that run's settings.
+    `tasks` is its goal, the tasks the archive holds when it is done; `rounds` the most rounds it runs toward it;
+    `candidates` the candidates one round writes; `target` the tasks a place (a category and a level) holds;
+    `measure` has round 0 measure the finished run's own tasks, as written, before any proposer round; `settings`
+    the sections of the base configuration it replaces, merged by key."""
 
     base: Path  # the configuration the world was generated with (its sector, people, taxonomy and roles)
     world: Path  # the finished run: its final world.sqlite, with the ledger and the board
     output: Path
-    tasks: int = Field(
-        default=40, ge=1, le=10_000
-    )  # the goal: the tasks the archive holds when the forge is done
-    rounds: int = Field(default=12, ge=1, le=100)  # the most rounds it runs toward the goal
-    candidates: int = Field(default=12, ge=1, le=50)  # the candidate tasks one round writes
-    target: int = Field(default=2, ge=1, le=100)  # the tasks a place (a category and a level) holds
-    settings: dict = Field(
-        default_factory=dict
-    )  # sections of the base configuration it replaces, merged by key
+    tasks: int = Field(default=40, ge=1, le=10_000)
+    rounds: int = Field(default=12, ge=0, le=100)
+    candidates: int = Field(default=12, ge=1, le=50)
+    target: int = Field(default=2, ge=1, le=100)
+    measure: bool = False
+    settings: dict = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def works(self):
+        if self.rounds == 0 and not self.measure:
+            raise ValueError("a forge with no rounds only measures: set measure = true")
+        return self
 
 
 def merged(base: dict, changes: dict) -> dict:
@@ -100,9 +108,40 @@ class ForgeEnv(GenerationEnv):
         super().__init__(settings, store)
 
     async def run(self, task, agents):
-        if self.store.state.phase == "premise":
+        state = self.store.state
+        if state.phase == "premise":
             self.adopt()
-        return await self.author_world(agents)
+        if self.forge.measure and not state.plans.get("forge", {}).get("measured"):
+            await self.measure(agents)
+        if state.phase == "tasks":  # a forge that only measures needs no proposer, and no VM
+            await self.author_world(agents)
+
+    async def measure(self, agents) -> None:
+        """Round 0: the finished run's own tasks, under their own ids, checked for validity only (T1-T7, the columns
+        the tools show) and not by the forge's own gates, then measured as any candidate is: the screen, 8 tries, the
+        witness, the hint, the judge. S3's tasks and the forge's are then read with one measuring stick: S3's rates
+        came from 4 tries at temperature 0."""
+        state = self.store.state
+        attempt = self.store.reserve("measure", 2)
+        source = World(self.forge.world / "world.sqlite")
+        rows = source.db.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+        ids = [r["id"] for r in rows]
+        for row in rows:
+            facts = [f for (f,) in source.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (row["id"],))]  # fmt: skip
+            task = Task(id=row["id"], category=row["category"], level=row["level"], actor_id=row["actor_id"], question=row["question"], answer_type=row["answer_type"], gold_sql=row["gold_sql"], facts=facts)  # fmt: skip
+            try:
+                with self.world.trial() as copy:
+                    forge_task(copy, task, self.settings, ids, gates=False)
+            except ValueError as error:  # a task the world's rules now refuse is itself a finding
+                state.forged[row["id"]] = {"round": 0, "category": row["category"], "declared": row["level"], "question": row["question"], "features": {}, "verdict": f"not imported: {error}"}  # fmt: skip
+        source.close()
+        self.store.event("tasks_imported", attempt=attempt, tasks=len(self.written(ids)), of=len(ids))
+        await self.weigh(agents, attempt, self.written(ids))
+        state.plans.setdefault("forge", {})["measured"] = True
+        if self.forge.rounds == 0:
+            state.phase = "done"
+        self.store.finish_attempt(True)
+        self.store.save()
 
     def adopt(self) -> None:
         """The finished world, frozen: its final file with no tasks (their tables as the schema now has them), its board
@@ -270,7 +309,7 @@ class ForgeEnv(GenerationEnv):
         for t in last:
             o = self.store.state.forged[t]
             tried = f"right {o['right']:.2f} of {o['tries']} {o.get('interval')}, witness {o.get('witness')}, hint {o.get('hint')}" if "right" in o else ""  # fmt: skip
-            lines.append(f"- {t} ({o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features'])}" + "".join(f"\n  GLM answered: {m['answer']!r}; the grade: {m['why']!r}" for m in o.get("misses", [])) + "".join(f"\n  issue: {i}" for i in o.get("issues", [])))  # fmt: skip
+            lines.append(f"- {t} ({o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features']) if o['features'] else '-'}" + "".join(f"\n  GLM answered: {m['answer']!r}; the grade: {m['why']!r}" for m in o.get("misses", [])) + "".join(f"\n  issue: {i}" for i in o.get("issues", [])))  # fmt: skip
         taxonomy = ["# Taxonomy: the categories and levels a candidate takes", ""]
         for category, spec in self.settings.taxonomy.items():
             taxonomy += [f"## {category}", spec.definition, f"gold: {spec.gold}; answer types: {', '.join(spec.answer_types)}"]  # fmt: skip

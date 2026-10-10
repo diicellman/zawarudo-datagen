@@ -895,11 +895,12 @@ def add_task(world, task: Task, settings, slots: list, keep: dict | None = None)
 # ---------------------------------------------------------------------- the forge: tasks on a frozen world
 
 
-def forge_task(world, task: Task, settings, open_ids: list[str]) -> dict:
+def forge_task(world, task: Task, settings, open_ids: list[str], gates: bool = True) -> dict:
     """One candidate task on a finished, frozen world, for one of the round's open ids. Its category and level are the
     proposer's own, and its tries re-level it; it is checked as every task is (T1-T7, readable facts, the columns the
-    tools show), with no planned level's needs: the forge measures difficulty instead of planning it. Returns its
-    gold rows and code's measures."""
+    tools show), with no planned level's needs: the forge measures difficulty instead of planning it. Without `gates`
+    (a finished run's own task, measured as it was written), the forge's own gates (the shortcut panel, the near-miss
+    queries) are left out. Returns its gold rows and code's measures."""
     if task.id not in open_ids:
         raise ValueError(f"a candidate's id is one of this round's open ids: {open_ids}")
     spec = settings.taxonomy.get(task.category)
@@ -913,13 +914,13 @@ def forge_task(world, task: Task, settings, open_ids: list[str]) -> dict:
     world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
     result = {"task": task.id} | record_task(world, task, settings, slot, needs=False)
     lazy = panel(world, task.id, result["gold"])
-    if task.level > 1 and not task.facts and task.answer_type != "refusal" and not task.near_sql:
+    if gates and task.level > 1 and not task.facts and task.answer_type != "refusal" and not task.near_sql:
         raise ValueError(
             f"{task.id}: a task above level 1 with no facts names in near_sql its gold query with one condition "
             "relaxed (a day, a channel, a reaction or a thread left out), which answers otherwise: the answer a hasty "
             "reader gives"
         )
-    if task.level > 1 and lazy["shortcut"]:
+    if gates and task.level > 1 and lazy["shortcut"]:
         raise ValueError(
             f"{task.id}: a search for the question's own words reaches its answer first ({lazy['guesses']['top']!r}), "
             "so it is a level-1 task: GLM never missed such a task in S2 or S3. Put a near-miss where that search "
