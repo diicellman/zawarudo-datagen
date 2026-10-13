@@ -9,7 +9,7 @@ from pydantic import Field, JsonValue
 from worldgen_slack.db import World
 from worldgen_slack.tools import Call, file_hash, watch_parent
 
-from ..contracts import measures, style
+from ..contracts import frozen_before, measures, style
 
 
 class ReviewToolsConfig(vf.ToolsetConfig):
@@ -67,7 +67,7 @@ class ReviewTools(vf.Toolset[ReviewToolsConfig, ReviewState]):
         result = {
             "violations": world.violations(complete=self.config.task_ids),
             "tasks": tasks,
-            "style": style(world),
+            "style": style(world, frozen_before(world)),
         }
         self.state.checked = True
         return json.loads(json.dumps(result, default=str))

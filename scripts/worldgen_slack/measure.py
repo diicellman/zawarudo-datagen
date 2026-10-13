@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from generators.worldgen_slack.chronicle import bounds, posted, quotas
 from generators.worldgen_slack.config import ROOT, ActivityConfig, AuthorSettings
-from generators.worldgen_slack.contracts import SeedPersona, activity, normalized, style, user_id
+from generators.worldgen_slack.contracts import SeedPersona, activity, frozen_before, normalized, style, user_id
 from worldgen_slack.db import World
 
 TYPING = {
@@ -31,8 +31,8 @@ def real_users(path: Path) -> dict:
 
 
 def scorecard(world: World, targets: ActivityConfig) -> dict:
-    """Each [activity] target beside the world's measured value."""
-    measured = activity(world)
+    """Each [activity] target beside the world's measured value: a chapter's own days against its own targets."""
+    measured = activity(world, frozen_before(world))
     one = lambda sql: world.db.execute(sql).fetchone()[0]  # noqa: E731
     shares = ("reply_share", "reaction_rate", "dm_share", "mention_rate", "emoji_rate")
     return (
@@ -115,7 +115,8 @@ def author(run: Path, world: World, settings) -> dict | None:
 def measure(run: Path) -> dict:
     state = json.loads((run / "state.json").read_text())
     summary = json.loads((run / "summary.json").read_text()) if (run / "summary.json").exists() else {}
-    stats = style(World(run / "world.sqlite"))
+    world = World(run / "world.sqlite")
+    stats = style(world, frozen_before(world))  # a chapter: its own messages
     # Profiles exported before long_share was measured read it as unknown (0).
     cast = {
         user_id(p["uuid"]): SeedPersona.model_validate_json(

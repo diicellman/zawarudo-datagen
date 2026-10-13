@@ -1,11 +1,13 @@
 """Offline invariant checks, one per rule group the pipeline relies on: uv run --frozen python -m generators.worldgen_slack.check"""
 
+import ast
 import asyncio
 import inspect
 import io
 import json
 import math
 import os
+import shutil
 import sqlite3
 import statistics
 import subprocess
@@ -37,7 +39,7 @@ from worldgen_slack.tools import SlackTools, WorldToolsConfig, file_hash, stage_
 from .agents.inspection import ReviewState
 from .agents.judge import PHASE_GUIDES, JudgeTask, review_payload
 from .agents.synthesizer import parse_premise
-from .agents.world import WorldAuthorTask, context_of, files, ledger_digest
+from .agents.world import AUTHOR_GUIDE, CHAPTER_GUIDE, CRAFT_GUIDE, WorldAuthorTask, context_of, files, forge_guide, ledger_digest, ledger_document
 from .chronicle import (
     Annotation,
     forge_task,
@@ -68,11 +70,15 @@ from .chronicle import (
     start_clock,
     today,
     today_line,
+    unplanned,
 )
+from .chapter import ChapterConfig, ChapterEnv, Material, adopt, brief_slots, chapter_settings, version_of
+from .chapter import provenance as chapter_provenance
 from .env import GenerationEnv, ended, keep_awake, rates, try_digest
 from .generate import failure, provenance, run_label
 from .store import ReviewLimit, SessionLost, Store
 from .forge import ForgeConfig, ForgeEnv, bucket, measured_level
+from .profile import profile
 from .forge import provenance as forge_provenance
 from .config import ROOT, Acceptance, Category, Config, Needs
 from .contracts import (
@@ -101,6 +107,11 @@ from .contracts import (
     Verdict,
     accepted_task,
     at,
+    chapter_start,
+    frozen_before,
+    frozen_digest,
+    meta,
+    style,
     background_plan,
     failure_cases,
     features,
@@ -2424,6 +2435,10 @@ async def check_author(root):
     assert state.phase == "done" and state.rounds["day-03"] == 2 and state.rounds["review-02"] == 2, (
         state.rounds
     )
+    # The finished world as its run left it, for a chapter to continue (the checks below change it).
+    parent = root / "parent"
+    shutil.copytree(store.root, parent, ignore=shutil.ignore_patterns(".lock", "world.sqlite"))
+    store.world.snapshot(parent / "world.sqlite")
     assert state.rounds["plan"] == 2 and not state.feedback
     assert not store.world.db.execute("SELECT 1 FROM messages WHERE text = 'morning'").fetchone(), (
         "the crashed day's start is gone"
@@ -2819,9 +2834,195 @@ async def check_author(root):
     )
     assert failure("day", SimpleNamespace(errors=[], traces=[retried])) == "TaskError: malformed verdict"
     assert failure("done", SimpleNamespace(errors=[limit], traces=[])) == "ReviewLimit: no valid ledger"
+    await check_chapter(root / "chapter", parent, settings)
     print(
         "PASS author: plan, days closed only when done, review issues delivered, crash and resume, tasks, probes, fix"
     )
+
+
+async def check_chapter(root, parent, settings):
+    """A chapter of the scripted world: its settings and brief; the parent adopted, frozen, with no tasks and its
+    last day's notes; a plan that keeps the earlier storylines first, leaves the earlier facts, events and board as they
+    are, plants the brief fresh and spreads only its own facts; the past never revised; a brief answer that needs
+    hiding posted only where it is hidden; then the chapter written by a scripted author, its reviews reading the past
+    as frozen (an issue on it blocks nothing and reaches no one), and a forge on the version it leaves."""
+    root.mkdir(parents=True)
+    chapter = ChapterConfig(base=Path("worldgen.toml"), world=parent, output=root / "unit", seed=11, days=2, messages=6, storylines=1, review_days=[1], material=[Material(category="semantic", level=3, needs={"values": 2, "hidden": True})])  # fmt: skip
+    cfg = chapter_settings(chapter, settings)
+    assert (cfg.storylines, cfg.author.review_days, cfg.activity.messages, cfg.seed) == (3, [5], 6, 11), cfg
+    fails(chapter_settings, chapter.model_copy(update={"material": [Material(category="nowhere", level=1)]}), settings)  # fmt: skip
+    fails(ChapterConfig, **chapter.model_dump() | {"review_days": [2]})  # a review after the last day
+    before = World(parent / "world.sqlite")
+    slots, parent_quotas, parent_hash = brief_slots(chapter, cfg, version_of(before) + 1), quotas(before, settings), sha256(parent / "world.sqlite")  # fmt: skip
+    board_rows = before.db.execute("SELECT COUNT(*) FROM board").fetchone()[0]
+    before.close()
+    assert [s.id for s in slots] == ["semantic-l3-v2-1"] and slots[0].needs.fresh and slots[0].needs.values == 2
+    store = TestStore(chapter.output, chapter_provenance(chapter, cfg))
+    adopt(store, chapter, cfg, slots)
+    world = store.world
+    first = chapter_start(world)
+    assert (first, today(world), present(world), meta(world, "version"), meta(world, "parent_hash")) == (5, 5, window(world, 5, "early")[0], "2", parent_hash)  # fmt: skip
+    assert {d: q for d, q in quotas(world, cfg).items() if d < first} == parent_quotas, "closed days keep their quotas"
+    assert sum(q["messages"] for d, q in quotas(world, cfg).items() if d >= first) == 6
+    assert world.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0, "a chapter carries no tasks"
+    assert (store.root / "attempts/source/notes/recap.md").read_text() == "day 4: done", "the last day's notes"
+    frozen = meta(world, "frozen_digest")
+    assert frozen == frozen_digest(world)
+    ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
+    a, other = [r[0] for r in world.db.execute("SELECT user_id FROM members WHERE channel_id = ? ORDER BY user_id", (leads,))][:2]  # fmt: skip
+    owner = world.db.execute("SELECT author_id FROM facts WHERE id = 'f3'").fetchone()[0]
+    a, other = (owner, other if other != owner else a)
+    document = ledger_document(world, {s.id for s in slots})
+    assert document["board"] == [], "the earlier board stays out of the chapter's plan"
+    plan = Plan.model_validate(document)
+    mine = Storyline(id="s3", summary="the next audit")
+    later = PlanFact(id="g1", storyline="s3", subject="Audit", attribute="owner", value="Mia", anchor="Mia", channel_id=leads, author_id=a, day=5, supersedes="f4", summary="s")  # fmt: skip
+    lure = PlanFact(id="d1", storyline="s3", subject="Audit", attribute="owner", value="Raj", anchor="Raj", channel_id=ops, author_id=a, day=5, decoy=True, summary="s")  # fmt: skip
+    entry = [BoardEntry(slot=slots[0].id, facts=["f4", "g1"])]
+
+    def planned(**changes):
+        return plan.model_copy(update={"storylines": [*plan.storylines, mine], "facts": [*plan.facts, later, lure], "board": entry} | changes)  # fmt: skip
+
+    def tried(act):
+        with world.trial() as copy:
+            act(copy)
+
+    def recorded(document, brief=slots):
+        tried(lambda copy: record_plan(copy, document, cfg, brief))
+
+    unfinished = unplanned(world, cfg, slots)
+    assert any("3 storylines" in e for e in unfinished) and any("none is planned for day 5" in e for e in unfinished) and any("['semantic-l3-v2-1']" in e for e in unfinished), unfinished  # fmt: skip
+    old_facts = planned().facts
+    for expected, bad, brief in (
+        ("keep ['s1', 's2'] in this order, first", planned(storylines=[mine, *plan.storylines]), slots),
+        ("plan exactly 3 storylines", planned(storylines=plan.storylines), slots),
+        ("f1 is an earlier chapter's, written and frozen", planned(facts=[old_facts[0].model_copy(update={"summary": "said again"}), *old_facts[1:]]), slots),
+        ("an earlier chapter's days are written and frozen", planned(events=[*plan.events, Event(id="e9", storyline="s3", title="look back", day=3, time="10:00")]), slots),
+        ("planned for today (day 5) or later", planned(facts=[*plan.facts, later.model_copy(update={"day": 4}), lure]), slots),
+        ("taking at least 4 values", planned(), [s.model_copy(update={"needs": s.needs.model_copy(update={"values": 4})}) for s in slots]),
+        ("first stated in this chapter", planned(board=[BoardEntry(slot=slots[0].id, facts=["f4"])]), slots),
+    ):  # fmt: skip
+        refused(expected, recorded, bad, brief)
+    # The chapter's facts run through its own days (Friday 5 messages, Saturday 1): twelve on its first day leave its
+    # second short, and an earlier chapter's facts are not spread over them.
+    many = [later.model_copy(update={"id": f"g{k}"}) for k in range(12)]
+    assert "days 6-6 first state 0 of the plan's 12 facts; they hold 17% of this chapter's messages" in (front_loaded(world, cfg, many, 5) or "")  # fmt: skip
+    assert front_loaded(world, cfg, [*[plan.facts[0]] * 10, later, lure], 5) is None
+    recorded(planned())
+    assert unplanned(world, cfg, slots) == []
+    assert world.db.execute("SELECT COUNT(*) FROM board").fetchone()[0] == board_rows + 2, "the earlier board stays"
+    assert [r[0] for r in world.db.execute("SELECT id FROM storylines ORDER BY position")] == ["s1", "s2", "s3"]
+    assert json.loads(meta(world, "segments"))[-1]["busy"] == [], "the chapter's first plan marks its own event days"
+    old = world.db.execute("SELECT MIN(id) FROM messages").fetchone()[0]
+    refused("earlier chapter, written and frozen", tried, lambda copy: revise(copy, old, "edited"))
+    gaps, rng = Gaps(cfg.personas.gaps), random.Random(3)
+
+    def said(*lines, channel=leads):
+        tried(lambda copy: post(copy, Conversation(channel_id=channel, about="audit", lines=[PostLine(**line) for line in lines]), cfg, rng, gaps))  # fmt: skip
+
+    said(dict(author_id=a, text="I heard Raj owns it", conveys=["d1"]), channel=ops)
+    refused("answers the brief's ['semantic-l3-v2-1']", said, dict(author_id=a, text="Mia has the audit now", conveys=["g1"]))  # fmt: skip
+    said(dict(author_id=other, text="who has the audit now?"), dict(author_id=a, text="Mia has it", reply_to=0, conveys=["g1"]))  # fmt: skip
+    assert frozen_digest(world) == frozen, "the chapter wrote nothing before its first day"
+    assert style(world, frozen_before(world))["messages"] == 3, "the chapter's style is its own messages'"
+    store.close()
+
+    # The chapter written through the driver: a scripted author, and a judge whose issues name the frozen past.
+    run = chapter.model_copy(update={"output": root / "run"})
+    turns = []
+
+    async def script(prompt, tools, runtime):
+        call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
+        world = World(tools.config.db_path)
+        turns.append((tools.config.mode, tools.config.day, prompt))
+        if tools.config.mode == "plan":
+            if prompt.startswith("Before day 5"):
+                assert "days 1-4 are written and frozen" in prompt and b"Brief: what this chapter plants" in runtime.files["/task/memory/now.md"] and b"semantic-l3-v2-1" in runtime.files["/task/memory/now.md"]  # fmt: skip
+                assert json.loads(runtime.files["/task/memory/ledger.json"])["board"] == [] and runtime.files["/task/notes/recap.md"] == b"day 4: done"  # fmt: skip
+                return  # nothing planned: the turn is told what is owed
+            if "plan this chapter's facts" in prompt:
+                await call("plan", ledger=planned())
+                return  # plan.md left as the parent's: the turn is told to write it
+            assert "write /task/notes/plan.md" in prompt, prompt
+            await runtime.write("/task/notes/plan.md", b"the chapter: the audit changes hands, said in a thread")
+            return
+        day = tools.config.day
+        assert f"day {day} of 6 (this chapter writes days 5-6)" in prompt, prompt
+        try:
+            await call("revise", message_id=old, text="edited")
+            raise AssertionError("a frozen message was revised")
+        except ValueError as error:
+            assert "earlier chapter" in str(error), error
+        if day == 5:
+            await call("post", conversation=Conversation(channel_id=ops, about="audit", lines=[PostLine(author_id=a, text="I heard Raj owns it", conveys=["d1"])]))  # fmt: skip
+            await call("post", conversation=Conversation(channel_id=leads, about="audit", lines=[PostLine(author_id=other, text="who has the audit now?"), PostLine(author_id=a, text="Mia has it", reply_to=0, conveys=["g1"])]))  # fmt: skip
+        while today(world) == day:
+            await call("advance", to=onward(world))
+        await runtime.write("/task/notes/recap.md", f"day {day}: done".encode())
+
+    reviewed = []
+
+    class ScriptedJudge(ScriptedAgent):
+        async def run(self, task):
+            payload, attempt = json.loads(task.config.payload), task.data.attempt
+            reviewed.append((attempt, "written_from" in payload, "written_through" in payload))
+            judged = World(task.config.tools.db_path)
+            old_id = judged.db.execute("SELECT MIN(id) FROM messages").fetchone()[0]
+            new_id = judged.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+            issues = [Issue(artifact="workspace", message_ids=[old_id], defect="a stiff old line", requested_change="loosen it", blocking=True)]  # fmt: skip
+            if attempt.startswith("review-"):
+                issues.append(Issue(artifact="workspace", message_ids=[new_id], defect="a chapter line reads flat", requested_change="loosen it", blocking=False))  # fmt: skip
+            verdict = Verdict(approved=False, tasks=[], issues=issues, criteria=dict.fromkeys(PHASE_CRITERIA["world"], 1.0), summary="s")  # fmt: skip
+            return SimpleNamespace(ok=True, info={"verdict": verdict.model_dump(mode="json")}, errors=[], id=f"judge-{attempt}")  # fmt: skip
+
+    agents = SimpleNamespace(judge=ScriptedJudge(), solver=ScriptedAgent(), witness=ScriptedAgent(), author=ScriptedAuthor(script))  # fmt: skip
+    manifest = chapter_provenance(run, cfg)
+    store = TestStore(run.output, manifest)
+    env = ChapterEnv(run, cfg, store, slots)
+    await env.setup(agents)
+    await env.run(None, agents)
+    state = store.state
+    assert state.phase == "done" and state.rounds["final"] == 1 and state.rounds["plan"] == 1, state.rounds
+    assert [t[2][:20] for t in turns if t[0] == "plan"] == ["Before day 5 (Fri 20", "The plan is not done", "The plan is not done"], [t[2][:20] for t in turns]  # fmt: skip
+    day6 = next(t[2] for t in turns if t[:2] == ("day", 6))
+    assert "a chapter line reads flat" in day6 and "a stiff old line" not in day6, "a frozen issue reaches no one"
+    assert reviewed == [("review-05-01", True, True), ("final-01", True, False)], reviewed
+    assert (store.root / "attempts/final-01/frozen_issues-world.json").exists(), "it is kept apart"
+    world = store.world
+    assert meta(world, "frozen_digest") == frozen_digest(world) == frozen and world.violations(complete=True) == []
+    assert {d: q for d, q in quotas(world, cfg).items() if d < 5} == parent_quotas
+    assert world.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0 and sha256(parent / "world.sqlite") == parent_hash  # fmt: skip
+    # Its profile: the group the brief planted, in the version it was planted in, its current value where few read it.
+    found = profile(world)
+    owners = next(g for g in found["groups"] if (g["subject"], g["attribute"]) == ("Audit", "owner"))
+    assert (owners["values"], owners["current"], owners["version"], owners["current_where"]) == (3, ["g1"], 2, ["thread reply in private"]) and "semantic-l3-v2-1" in owners["board"], owners  # fmt: skip
+    leads_members = world.db.execute("SELECT COUNT(*) FROM members WHERE channel_id = ?", (leads,)).fetchone()[0]
+    assert owners["readers"] == [leads_members, 4] and found["world"]["version"] == 2 and found["material"]["groups_3_values"] >= 1, owners  # fmt: skip
+    tools_task = WorldAuthorTask.create("tasks", 0, world.path, env.author_context(), "check")
+    (tools,) = tools_task.toolsets(tools_task.config)
+    await tools.setup()
+    with_state(tools)
+    try:
+        await tools._with_state(tools.add_task)(task=Task(id=slots[0].id, category="semantic", level=3, actor_id=a, question="Who owns the audit now?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'g1'", facts=["g1"]))  # fmt: skip
+        raise AssertionError("a chapter wrote a task")
+    except ValueError as error:
+        assert "a chapter writes no tasks" in str(error), error
+    world.db.execute("UPDATE messages SET text = text || ', edited' WHERE id = ?", (old,))  # the past, changed behind code
+    try:
+        await env.final_world(agents)
+        raise AssertionError("a changed past passed the final check")
+    except ValueError as error:
+        assert "an earlier chapter's world changed" in str(error), error
+    store.close()
+    fails(Store, run.output, chapter_provenance(run.model_copy(update={"days": 3}), cfg))  # its own config only
+    # A forge on the version the chapter leaves: the brief is its board; the earlier entries were covered before.
+    forge = ForgeConfig(base=Path("worldgen.toml"), world=run.output, output=root / "forge", rounds=1, candidates=1, tasks=1)  # fmt: skip
+    forging = TestStore(forge.output, forge_provenance(forge, cfg))
+    on_chapter = ForgeEnv(forge, cfg, forging)
+    on_chapter.adopt()
+    assert on_chapter.covered()[1] == ["semantic-l3-v2-1"], on_chapter.covered()
+    forging.close()
+    print("PASS chapter: adopted frozen, plan and brief checked, the past never written, reviews thawed, forged on")
 
 
 def scripted_task(settings, slot, actor):
@@ -2841,6 +3042,59 @@ def scripted_task(settings, slot, actor):
     return Task(id=slot["id"], category=category, level=level, actor_id=actor, question=question, answer_type=kind, gold_sql=sql, facts=facts)  # fmt: skip
 
 
+# The files whose strings a model reads: guides, turn prompts, refusals, memory pages and tool descriptions.
+PROMPT_SOURCES = [
+    *(ROOT / "generators/worldgen_slack" / n for n in ("agents/world.py", "agents/judge.py", "agents/synthesizer.py", "agents/author.py", "agents/inspection.py", "chronicle.py", "contracts.py", "env.py", "forge.py", "chapter.py")),
+    *(ROOT / "environments/worldgen_slack/worldgen_slack" / n for n in ("taskset.py", "tools.py", "db.py")),
+]  # fmt: skip
+
+
+def prompt_strings(path: Path) -> list[tuple[int, str]]:
+    """A source file's strings that reach a model: every literal (f-strings' parts too) but docstrings, which no model
+    reads unless they describe a tool, and model ids (a provider/model path)."""
+    tree, skip = ast.parse(path.read_text()), set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):  # fmt: skip
+            if not any(getattr(d, "attr", getattr(d, "id", None)) == "tool" for d in getattr(node, "decorator_list", [])):
+                skip.add(id(body[0].value))
+    return [(n.lineno, n.value) for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in skip and not re.fullmatch(r"[\w.-]+/[\w.-]+", n.value)]  # fmt: skip
+
+
+def check_prompts(root):
+    """What a model reads names no model and no earlier run: a proposer knows the solver by its tries, an author the
+    world by its memory. Guides render their numbers from code: the forge's tries and middle rates, the parts of the
+    day, the near-miss queries a task may name."""
+    root.mkdir(parents=True)
+    settings = contracts_settings(root)
+    models = [settings.env.author.model, settings.env.judge.model, settings.env.solver.model, settings.env.witness.model, settings.answer_judge.model, "deepseek/deepseek-v4.1-flash"]  # fmt: skip
+    names = {"glm", "gpt", "claude", "opus", "sonnet", "haiku", "gemini", "deepseek", "qwen", "kimi", "llama", "openai", "anthropic"}  # fmt: skip
+    names |= {w for m in models for w in (m.split("/")[0], re.match(r"[a-z]+", m.split("/")[-1]).group()) if len(w) > 2}
+    banned = re.compile(r"\b(?:" + "|".join(sorted(names)) + r")\b|\b[SFM]\d\b|\bforge-t\d", re.IGNORECASE)
+    found = [f"{path.relative_to(ROOT)}:{line}: {m.group(0)!r}" for path in PROMPT_SOURCES for line, text in prompt_strings(path) for m in banned.finditer(text)]  # fmt: skip
+    configured = [settings.tasks.styles, *([c.definition, *c.levels, *(x for level in c.concepts for x in level)] for c in settings.taxonomy.values())]  # fmt: skip
+    found += [f"config: {m.group(0)!r} in {text[:60]!r}" for texts in configured for text in texts for m in banned.finditer(text)]  # fmt: skip
+    assert not found, "model or run names in what a model reads: " + "; ".join(found)
+    guide = forge_guide(settings.model_dump(mode="json"))
+    assert "tries each one 8 times" in guide and "right in 25%-75% of its tries" in guide, "the forge's own numbers"
+    other = settings.model_copy(update={"author": settings.author.model_copy(update={"tries": 3}), "tasks": settings.tasks.model_copy(update={"bands": [(0.8, 1.0), (0.2, 0.8), (0.0, 0.2)]})})  # fmt: skip
+    guide = forge_guide(other.model_dump(mode="json"))
+    assert "tries each one 3 times" in guide and "right in 20%-80% of its tries" in guide, guide[:600]
+    parts = ", ".join(f"{p} {a:02d}-{b:02d}" for p, (a, b) in PARTS.items())
+    assert parts in " ".join(AUTHOR_GUIDE.split()) and "PARTS_OF_THE_DAY" not in AUTHOR_GUIDE and "NEAR_SQL" not in AUTHOR_GUIDE  # fmt: skip
+    assert f"up to {Task.model_fields['near_sql'].metadata[0].max_length} queries" in AUTHOR_GUIDE
+    assert "written and frozen" in CHAPTER_GUIDE and "No tasks are written in a chapter" in CHAPTER_GUIDE
+    # The world's author writes with the craft page (voice lab 02); the proposer has its own guide, and a chapter's
+    # author has the chapter's too.
+    world = World.create(root / "w.sqlite")
+    context = {"settings": settings.model_dump(mode="json")}
+    systems = {name: WorldAuthorTask.create(mode, 1, world.path, context | extra, "x").data.system_prompt for name, mode, extra in (("plan", "plan", {}), ("day", "day", {}), ("forge", "forge", {}), ("chapter", "day", {"chapter": {"first": 5}}))}  # fmt: skip
+    assert all("Nobody states the lesson" in systems[m] and "Stakes move" in systems[m] for m in ("plan", "day", "chapter")) and "Stakes move" not in systems["forge"]  # fmt: skip
+    assert CHAPTER_GUIDE in systems["chapter"] and CHAPTER_GUIDE not in systems["day"] and CRAFT_GUIDE.strip() in systems["day"]  # fmt: skip
+    world.close()
+    print("PASS prompts: no model or run names in what models read; guides render their numbers from code")
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as directory:
         asyncio.run(check_world(Path(directory) / "world"))
@@ -2850,4 +3104,5 @@ if __name__ == "__main__":
         asyncio.run(check_tools(Path(directory) / "tools"))
         asyncio.run(check_reviews(Path(directory) / "reviews"))
         asyncio.run(check_author(Path(directory) / "author"))
+        check_prompts(Path(directory) / "prompts")
     print("All generation checks passed.")

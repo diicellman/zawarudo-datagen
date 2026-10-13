@@ -62,6 +62,9 @@ for realism only (would this person say it, on what they knew), and leave the cl
 only when the story later acts on it as true and nothing in the workspace ever settles it; never ask for a decoy to be
 corrected or hedged. When it has written_through, the
 workspace is written up to that moment and goes on later: judge what exists, and leave open what is still open.
+When it has written_from, the workspace before that moment is an earlier chapter's, written and frozen: read it as the
+record this chapter goes on from, and judge the chapter's messages, from that moment on, and how they go on from it. An
+earlier chapter's message is not changed; name it only as evidence.
 """,
 }
 

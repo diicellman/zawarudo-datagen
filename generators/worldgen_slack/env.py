@@ -36,7 +36,7 @@ from .agents.world import (
     plan_prompt,
     tasks_prompt,
 )
-from .chronicle import agenda_budget, answer_of, bounds, close_day, posted, present, start_clock, today
+from .chronicle import agenda_budget, answer_of, bounds, close_day, posted, present, start_clock, today, unplanned
 from .config import Config, PipelineConfig
 from .contracts import (
     PHASE_CRITERIA,
@@ -50,6 +50,9 @@ from .contracts import (
     cards,
     clock,
     failure_cases,
+    frozen_before,
+    frozen_digest,
+    meta,
     organize,
     pick_cast,
     quality,
@@ -214,7 +217,27 @@ JOIN evidence e ON e.fact_id = d.id JOIN messages m ON m.id = e.message_id
 WHERE tf.task_id = ? GROUP BY m.id ORDER BY m.ts_us, m.id"""
 
 
+def thaw(verdict: Verdict, world) -> tuple[Verdict, list[Issue]]:
+    """A verdict on a chapter's world, its earlier chapters read as written and frozen: an issue's messages from before
+    the chapter become its evidence, and an issue left with nothing of this chapter's to change (no message, and no
+    fact or task of its own) leaves the verdict, kept apart: nothing can act on it. A world written in one run has
+    nothing frozen. Returns the verdict and the issues it set apart."""
+    if not (start := frozen_before(world)):
+        return verdict, []
+    old = {r[0] for r in world.db.execute("SELECT id FROM messages WHERE ts_us < ?", (start,))}
+    parent = {r[0] for r in world.db.execute("SELECT f.id FROM facts f JOIN calendar c ON c.day = f.day WHERE c.start_us < ?", (start,))}  # fmt: skip
+    kept, apart = [], []
+    for issue in verdict.issues:
+        live = [m for m in issue.message_ids if m not in old]
+        moved = issue.model_copy(update={"message_ids": live, "evidence_message_ids": list(dict.fromkeys([*issue.evidence_message_ids, *(m for m in issue.message_ids if m in old)]))})  # fmt: skip
+        frozen = (issue.message_ids or issue.fact_ids) and not live and set(issue.fact_ids) <= parent and not issue.task_ids  # fmt: skip
+        (apart if frozen else kept).append(moved)
+    return verdict.model_copy(update={"issues": kept}), apart
+
+
 class GenerationEnv(vf.Env[PipelineConfig]):
+    after_days = "tasks"  # what follows the last day: the tasks of a world run; a chapter's final review
+
     def __init__(self, settings: Config, store: Store):
         self.settings, self.store = settings, store
         self.used = used_names(settings.corpus, store.root)
@@ -354,6 +377,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         require_trace(trace)
         verdict = Verdict.model_validate(trace.info["verdict"])
         self.store.artifact(attempt, "verdict" + suffix, verdict.model_dump(mode="json"))
+        verdict, frozen = thaw(verdict, self.world)
+        if frozen:
+            self.store.artifact(attempt, "frozen_issues" + suffix, [i.model_dump(mode="json") for i in frozen])
         verdict = verdict.model_copy(update={"approved": accepted(verdict, self.settings.acceptance)})
         if payload["phase"] in PHASE_CRITERIA:
             self.store.artifact(
@@ -460,7 +486,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         # The world's open issues: the last final review's, and those task reviews raised that name no task.
         workspace = [i.model_dump(mode="json") for i in previous if i.artifact == "workspace"]
         workspace += [i.model_dump(mode="json") for i in state.open_issues]
-        world_payload = review_payload(self.world, "world", [], people=people, ledger=ledger_digest(self.world), **({"previous_issues": workspace} if workspace else {}))  # fmt: skip
+        world_payload = review_payload(self.world, "world", [], people=people, ledger=ledger_digest(self.world), **({"previous_issues": workspace} if workspace else {}), **self.written_from())  # fmt: skip
         async with asyncio.TaskGroup() as group:
             world = group.create_task(self.review(agents, world_payload, attempt, {}, "world"))
             checked = group.create_task(self.judge_tasks(agents, due, keys, attempt, n, previous)) if due else None  # fmt: skip
@@ -472,6 +498,11 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             attempt, "acceptance", {"approved": verdict.approved, "reviewed_tasks": list(runs)}
         )
         return verdict
+
+    def written_from(self) -> dict:
+        """A chapter's reviews: the moment its own days start, before which the world is written and frozen."""
+        start = frozen_before(self.world)
+        return {"written_from": clock(self.world, start)} if start else {}
 
     # ------------------------------------------------------------------ the world, written in time order
     def author_context(self) -> dict:
@@ -521,23 +552,24 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         require_session(interaction.trace)
 
     async def plan_world(self, agents, runtime) -> None:
-        """The ledger, before day 1: storylines, events and facts, and the author's plan of them."""
+        """The ledger, before the first day it plans (day 1, or a chapter's first): storylines, events and facts, the
+        board, and the author's plan of them. A chapter starts from its parent's notes, and its plan.md must change."""
         state, cfg = self.store.state, self.settings
         if not self.world.db.execute("SELECT 1 FROM world_meta WHERE key = 'chronological'").fetchone():
             with self.world.trial() as copy:
                 start_clock(copy)
+        if state.restore_point:  # a chapter: the notes its parent's last day left
+            await self.bring_notes(runtime, state.restore_point)
+        imported = await self.note(runtime, "plan.md") if state.restore_point else None
         attempt = self.store.reserve("plan", cfg.author.plan_attempts)
         task = WorldAuthorTask.create("plan", 0, self.world.path, self.author_context(), attempt)
-        count = cfg.storylines
         async with agents.author.interaction(task, runtime=runtime) as interaction:
             prompt, errors = plan_prompt(self.world, cfg, state.feedback), []
             for _ in range(3):
                 await self.author_step(interaction, runtime, prompt, attempt, "plan")
-                planned = self.world.db.execute("SELECT COUNT(*) FROM storylines").fetchone()[0]
-                errors = [f"plan the ledger with world_plan ({count} storylines)"] * (planned != count)
-                errors += ["write /task/notes/plan.md"] * (
-                    not (await self.note(runtime, "plan.md") or "").strip()
-                )
+                errors = unplanned(self.world, cfg, state.quota)
+                note = await self.note(runtime, "plan.md")
+                errors += ["write /task/notes/plan.md"] * (not (note or "").strip() or note == imported)
                 if not errors:
                     break
                 prompt = "The plan is not done: " + "; ".join(errors) + ". Finish it, then end your turn."
@@ -546,7 +578,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         if errors:
             return self.reject_structure(attempt, "; ".join(errors))
         await self.keep_notes(runtime, attempt)
-        state.phase, state.day, state.restore_point, state.feedback = "day", 1, attempt, ""
+        state.phase, state.day, state.restore_point, state.feedback = "day", today(self.world), attempt, ""
         self.store.finish_attempt(True)
 
     async def write_day(self, agents, runtime) -> None:
@@ -595,7 +627,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         if day in cfg.author.review_days and day < total:
             state.phase = "review"  # the closed day's review; a resume runs it, not the day again
         else:
-            state.day, state.phase = (day + 1, "day") if day < total else (day, "tasks")
+            state.day, state.phase = (day + 1, "day") if day < total else (day, self.after_days)
         self.store.save()
 
     async def review_so_far(self, agents) -> None:
@@ -609,6 +641,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             people=cards(state.cast),
             written_through=clock(self.world, present(self.world)),
             ledger=ledger_digest(self.world),
+            **self.written_from(),
         )
         verdict = await self.review(agents, payload, attempt, {}, "world")
         # It rejects nothing, so every issue is a note for what is written next, blocking or not.
@@ -887,6 +920,8 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         state, cfg = self.store.state, self.settings
         if broken := self.world.violations(complete=True):
             raise ValueError("final deterministic check failed: " + "; ".join(broken))
+        if (kept := meta(self.world, "frozen_digest")) is not None and frozen_digest(self.world) != kept:
+            raise ValueError("final deterministic check failed: an earlier chapter's world changed")
         attempt = self.store.reserve("final", cfg.review_rounds.final)
         verdict = await self.assess(agents, attempt)
         if verdict.approved:

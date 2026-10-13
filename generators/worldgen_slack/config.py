@@ -121,17 +121,21 @@ class Needs(Section):
     answer is stated where it is harder to see than they are (`hidden`: a thread reply, a DM, or a later day); and at
     most how many of its evidence's channel names and identifiers (words with digits, as PWSQL-03) the question names.
     Search rank and depth are measured and reported, not needed: S2's author met a rank need by rewording, and at a
-    world's size every channel reads in one page."""
+    world's size every channel reads in one page. A chapter's brief may also need `values`, how many values its
+    answer's subject and attribute takes (the answer's among them), and `fresh`, an answer first stated in the
+    chapter, so that what it plants is new."""
 
     channels: int = Field(default=0, ge=0)
     relations: int = Field(default=0, ge=0)
     decoys: int = Field(default=0, ge=0)
     hidden: bool = False
     named: int | None = Field(default=None, ge=0)
+    values: int = Field(default=0, ge=0)
+    fresh: bool = False
 
     def facts(self) -> bool:
         """Whether a level needs anything of its facts, so its slots are planned on the board before day 1."""
-        return bool(self.channels or self.relations or self.decoys or self.hidden)
+        return bool(self.channels or self.relations or self.decoys or self.hidden or self.values or self.fresh)
 
 
 class Category(Section):

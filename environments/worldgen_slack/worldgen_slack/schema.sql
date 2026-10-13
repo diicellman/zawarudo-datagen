@@ -166,8 +166,8 @@ CREATE TABLE events (                                -- a story moment: one time
 CREATE TABLE facts (
   id          TEXT PRIMARY KEY,
   storyline   TEXT NOT NULL REFERENCES storylines(id),
-  subject     TEXT NOT NULL,                         -- 'Release 8.14'
-  attribute   TEXT NOT NULL,                         -- 'launch time'
+  subject     TEXT NOT NULL,                         -- what it is about, as the workspace names it
+  attribute   TEXT NOT NULL,                         -- which property of the subject it gives
   value       TEXT NOT NULL,                         -- canonical value
   anchor      TEXT,                                  -- words every message stating it must contain
   channel_id  TEXT NOT NULL REFERENCES channels(id), -- where it is first stated

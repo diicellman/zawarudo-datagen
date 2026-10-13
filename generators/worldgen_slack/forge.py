@@ -22,7 +22,7 @@ from worldgen_slack.db import SCHEMA, World
 import verifiers.v1 as vf
 
 from .agents.world import WorldAuthorTask, forge_prompt
-from .chronicle import forge_task
+from .chronicle import brief, forge_task
 from .config import ROOT, Config, Section, load_config
 from .contracts import Task, features
 from .env import SETUP_FILES, GenerationEnv, keep_awake, rates, require_session
@@ -82,6 +82,13 @@ def provenance(forge: ForgeConfig, settings: Config) -> dict:
 
 
 TASK_TABLES = ("task_facts", "tasks")
+
+
+def reset_tasks(world) -> None:
+    """A world's task tables emptied, as the schema now has them: a forge and a chapter start with no tasks."""
+    tables = {m.group(1): m.group(0) for m in re.finditer(r"CREATE TABLE (\w+) \(.*?\n\);", SCHEMA.read_text(), re.S)}  # fmt: skip
+    world.db.executescript("".join(f"DROP TABLE {t};" for t in TASK_TABLES))
+    world.db.executescript("\n".join(tables[t] for t in reversed(TASK_TABLES)))
 
 
 def bucket(shape: dict) -> str:
@@ -149,9 +156,7 @@ class ForgeEnv(GenerationEnv):
         source = World(self.forge.world / "world.sqlite")
         source.db.backup(self.world.db)
         source.close()
-        tables = {m.group(1): m.group(0) for m in re.finditer(r"CREATE TABLE (\w+) \(.*?\n\);", SCHEMA.read_text(), re.S)}  # fmt: skip
-        self.world.db.executescript("".join(f"DROP TABLE {t};" for t in TASK_TABLES))
-        self.world.db.executescript("\n".join(tables[t] for t in reversed(TASK_TABLES)))
+        reset_tasks(self.world)
         state = json.loads((self.forge.world / "state.json").read_text())
         notes = self.forge.world / "attempts" / state.get("restore_point", "") / "notes"
         if state.get("restore_point") and notes.is_dir():
@@ -201,7 +206,7 @@ class ForgeEnv(GenerationEnv):
 
     async def weigh(self, agents, attempt: str, ids: list[str]) -> int:
         """The round's candidates tried and reviewed (the screen, the solver's tries, the witness, the judge); those
-        GLM misses half the time or more are tried twice more with the messages their answer rests on. Each approved
+        the solver misses half the time or more are tried twice more with the messages their answer rests on. Each approved
         one is placed in the archive. Returns how many it kept."""
         state = self.store.state
         if not ids:
@@ -227,7 +232,7 @@ class ForgeEnv(GenerationEnv):
         """One candidate's outcome. Its tries give its level; the lowest band also needs the witness to answer it
         (hard, not broken). Its place is its category and that level, which holds up to `target` tasks (MAP-Elites
         over task features, as OMNI-EPIC keeps its archive). A newcomer to a full place replaces a holder when it
-        brings a structure the place lacks while two holders share one, or when GLM's tries are more mixed on it than
+        brings a structure the place lacks while two holders share one, or when the solver's tries are more mixed on it than
         on the weakest holder, by 4p(1-p), the shorter question winning a tie. forge-t1's 10 tasks filled 10 cells of
         their own, so nothing competed and every easy task was kept."""
         state, bands = self.store.state, self.settings.tasks.bands
@@ -273,7 +278,10 @@ class ForgeEnv(GenerationEnv):
         kept task of the entry's category on one of its facts)."""
         kept = {(c, lvl): n for c, lvl, n in self.world.db.execute("SELECT category, level, COUNT(*) FROM tasks GROUP BY category, level")}  # fmt: skip
         rests = {(c, f) for c, f in self.world.db.execute("SELECT t.category, tf.fact_id FROM tasks t JOIN task_facts tf ON tf.task_id = t.id")}  # fmt: skip
-        open_ = [slot for slot, facts in self.world.db.execute("SELECT slot, group_concat(fact_id) FROM board GROUP BY slot") if not any((slot.split("-l")[0], f) in rests for f in facts.split(","))]  # fmt: skip
+        # A chapter's world: its brief is the board, and an earlier version's entries were covered by that version's
+        # own tasks, which stay with it.
+        ours = brief(self.world) or None
+        open_ = [slot for slot, facts in self.world.db.execute("SELECT slot, group_concat(fact_id) FROM board GROUP BY slot") if (ours is None or slot in ours) and not any((slot.split("-l")[0], f) in rests for f in facts.split(","))]  # fmt: skip
         return kept, sorted(open_)
 
     def done(self) -> bool:
@@ -289,16 +297,16 @@ class ForgeEnv(GenerationEnv):
     def pages(self) -> dict[str, str]:
         """The forge's own memory pages, beside the world's: the taxonomy, the board the world was planned for, and the archive:
         what each category and level holds against its target, the board's open entries, each kept task, and every
-        candidate of the last two rounds with its tries, its traps and how GLM went wrong (SENTINEL's failure-driven
+        candidate of the last two rounds with its tries, its traps and how the solver went wrong (SENTINEL's failure-driven
         proposer, 2606.12908)."""
         kept, open_ = self.covered()
         board = ["# Board: the tasks the world was planned for, and the facts each rests on", ""]
         for slot, facts in self.world.db.execute("SELECT slot, group_concat(fact_id, ', ') FROM board GROUP BY slot ORDER BY slot"):  # fmt: skip
             board.append(f"- {slot}: {facts}" + ("  (open)" if slot in open_ else "  (covered)"))
-        lines = ["# Archive", "", f"Goal: {self.forge.tasks} kept tasks, at most {self.forge.target} per category and level, and every board entry covered. It holds {sum(kept.values())}. GLM tries each candidate {self.settings.author.tries} times.", ""]  # fmt: skip
+        lines = ["# Archive", "", f"Goal: {self.forge.tasks} kept tasks, at most {self.forge.target} per category and level, and every board entry covered. It holds {sum(kept.values())}. The solver tries each candidate {self.settings.author.tries} times.", ""]  # fmt: skip
         for category, spec in self.settings.taxonomy.items():
             lines.append(f"- {category}: " + " · ".join(f"L{lvl} {kept.get((category, lvl), 0)}/{self.forge.target}" for lvl in range(1, len(spec.levels) + 1)))  # fmt: skip
-        lines += ["", f"Board entries no kept task rests on: {', '.join(open_) or 'none'}", "", "## Kept (a full place takes a newcomer only if GLM's tries are more mixed on it, or it brings a new structure)"]  # fmt: skip
+        lines += ["", f"Board entries no kept task rests on: {', '.join(open_) or 'none'}", "", "## Kept (a full place takes a newcomer only if the solver's tries are more mixed on it, or it brings a new structure)"]  # fmt: skip
         for where, holders in sorted(self.store.state.archive.items()):
             full = " (full)" if len(holders) >= self.forge.target else ""
             for held in holders:
@@ -309,7 +317,7 @@ class ForgeEnv(GenerationEnv):
         for t in last:
             o = self.store.state.forged[t]
             tried = f"right {o['right']:.2f} of {o['tries']} {o.get('interval')}, witness {o.get('witness')}, hint {o.get('hint')}" if "right" in o else ""  # fmt: skip
-            lines.append(f"- {t} ({o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features']) if o['features'] else '-'}" + "".join(f"\n  GLM answered: {m['answer']!r}; the grade: {m['why']!r}" for m in o.get("misses", [])) + "".join(f"\n  issue: {i}" for i in o.get("issues", [])))  # fmt: skip
+            lines.append(f"- {t} ({o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features']) if o['features'] else '-'}" + "".join(f"\n  the solver answered: {m['answer']!r}; the grade: {m['why']!r}" for m in o.get("misses", [])) + "".join(f"\n  issue: {i}" for i in o.get("issues", [])))  # fmt: skip
         taxonomy = ["# Taxonomy: the categories and levels a candidate takes", ""]
         for category, spec in self.settings.taxonomy.items():
             taxonomy += [f"## {category}", spec.definition, f"gold: {spec.gold}; answer types: {', '.join(spec.answer_types)}"]  # fmt: skip

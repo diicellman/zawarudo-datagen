@@ -1,5 +1,6 @@
 """Generate one Slack world with its tasks, on native Verifiers agents: uv run --frozen worldgen-slack --config <toml>
-(or `worldgen-slack forge --config <toml>`: tasks on a finished world)."""
+(or `worldgen-slack forge --config <toml>`: tasks on a finished world; `worldgen-slack chapter --config <toml>`: a
+finished world continued forward in time, into a new version)."""
 
 import argparse
 import asyncio
@@ -78,11 +79,25 @@ async def run(config: Config) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", nargs="?", choices=["forge"], help="forge: tasks on a finished world (forge.py)"
+        "command",
+        nargs="?",
+        choices=["forge", "chapter", "profile"],
+        help="forge: tasks on a finished world (forge.py); chapter: a finished world continued (chapter.py); "
+        "profile: a finished world's material for tasks (profile.py)",
     )
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--world", type=Path, help="profile: the run directory whose world.sqlite to profile")
     parser.add_argument("--dry-run", action="store_true", help="validate the configuration; spend nothing")
     args = parser.parse_args()
+    if args.command == "profile":
+        from . import profile
+
+        if args.world is None:
+            parser.error("profile takes --world")
+        print(json.dumps(profile.write(args.world), indent=1))
+        return 0
+    if args.config is None:
+        parser.error("--config is required")
     if args.command == "forge":
         from . import forge
 
@@ -96,6 +111,24 @@ def main() -> int:
         except KeyboardInterrupt:
             print(
                 "interrupted: the forge is stopped and its sandboxes deleted; rerun to resume",
+                file=sys.stderr,
+            )
+            return 130
+        print(json.dumps(result, indent=2))
+        return 0 if result["status"] == "complete" else 2
+    if args.command == "chapter":
+        from . import chapter
+
+        plan, settings = chapter.load_chapter(args.config)
+        if args.dry_run:
+            print(json.dumps(chapter.dry_run(plan, settings), indent=1))
+            return 0
+        install_interrupt()
+        try:
+            result = asyncio.run(chapter.run(plan, settings))
+        except KeyboardInterrupt:
+            print(
+                "interrupted: the chapter is stopped and its sandboxes deleted; rerun to resume",
                 file=sys.stderr,
             )
             return 130

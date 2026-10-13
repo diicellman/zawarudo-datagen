@@ -28,8 +28,16 @@ from .contracts import (
     Zone,
     at,
     clock,
+    board_measures,
+    chapter_start,
     fact_measures,
+    frozen_before,
+    near_misses,
+    answer_facts,
+    on_board,
+    slot_needs,
     insert_lines,
+    meta,
     normalized,
     Slot,
     features,
@@ -138,12 +146,13 @@ class Conversation(StrictModel):
 # ---------------------------------------------------------------------- the clock
 
 
-def start_clock(world) -> None:
-    """From now on the world only grows forward: its present moves to day 1 at the start of the early part."""
+def start_clock(world, day: int = 1) -> None:
+    """From now on the world only grows forward: its present moves to `day` (day 1, or a chapter's first) at the start
+    of the early part."""
     world.db.execute(
-        "UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(window(world, 1, "early")[0]),)
+        "UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(window(world, day, "early")[0]),)
     )
-    world.insert("world_meta", [{"key": "chronological", "value": "1"}])
+    world.db.execute("INSERT OR REPLACE INTO world_meta (key, value) VALUES ('chronological', '1')")
 
 
 def present(world) -> int:
@@ -184,28 +193,67 @@ def apportion(total: int, weights: list[float]) -> list[int]:
     return counts
 
 
+def spread(dates: list[str], first: int, messages: int, weekend: float, parts: dict, busy=()) -> list[dict]:
+    """`messages` over the dates (day numbers from `first`), a weekend day weighing `weekend` of a workday unless it is
+    `busy` (a day number with a planned event), and each day split by the parts' rhythm."""
+    weights = [
+        1.0 if day in busy or date.fromisoformat(d).weekday() < 5 else weekend
+        for day, d in enumerate(dates, first)
+    ]
+    rhythm = [parts.get(p, 0.0) for p in PARTS]
+    return [
+        {"messages": n, "parts": dict(zip(PARTS, apportion(n, rhythm)))} for n in apportion(messages, weights)
+    ]
+
+
 def daily(dates: list[str], settings, busy=()) -> list[dict]:
     """Code's share of the world per calendar date and part: `[activity].messages` over the dates, a weekend day
     weighing `[author].weekend` of a workday unless it is `busy` (a day number with a planned event), and each day
     split by the parts' rhythm."""
-    weights = [
-        1.0 if day in busy or date.fromisoformat(d).weekday() < 5 else settings.author.weekend
-        for day, d in enumerate(dates, 1)
-    ]
-    rhythm = [settings.activity.parts.get(p, 0.0) for p in PARTS]
-    return [
-        {"messages": n, "parts": dict(zip(PARTS, apportion(n, rhythm)))}
-        for n in apportion(settings.activity.messages, weights)
-    ]
+    return spread(dates, 1, settings.activity.messages, settings.author.weekend, settings.activity.parts, busy)
+
+
+def segments(world, settings) -> list[dict]:
+    """The calendar's segments, each spreading its own messages over its own days: a world written in one run is one,
+    by its settings, with the days its first plan put an event on; a chapter appends one of its own after its parent's
+    (`world_meta.segments`, written when it starts), so a closed day's quota never changes."""
+    if (stored := meta(world, "segments")) is not None:
+        return json.loads(stored)
+    first, last = world.db.execute("SELECT MIN(day), MAX(day) FROM calendar").fetchone()
+    busy = meta(world, "busy_days")
+    return [dict(first=first, last=last, messages=settings.activity.messages, busy=json.loads(busy) if busy else None, weekend=settings.author.weekend, parts=settings.activity.parts)]  # fmt: skip
+
+
+def segment_of(world, settings, day: int) -> dict:
+    return next(s for s in segments(world, settings) if s["first"] <= day <= s["last"])
 
 
 def quotas(world, settings) -> dict[int, dict]:
-    """Each day's quota. A day the first plan put an event on weighs as a workday, so a storyline's busiest night is
-    not a quiet day's handful of messages; the days are fixed by that plan, so a closed day's quota never changes."""
-    days = world.db.execute("SELECT day, date FROM calendar ORDER BY day").fetchall()
-    busy = world.db.execute("SELECT value FROM world_meta WHERE key = 'busy_days'").fetchone()
-    shares = daily([d for _, d in days], settings, json.loads(busy[0]) if busy else ())
-    return {day: quota for (day, _), quota in zip(days, shares)}
+    """Each day's quota, by its segment. A day the segment's first plan put an event on weighs as a workday, so a
+    storyline's busiest night is not a quiet day's handful of messages; the days are fixed by that plan, so a closed
+    day's quota never changes."""
+    dates = dict(world.db.execute("SELECT day, date FROM calendar ORDER BY day").fetchall())
+    out = {}
+    for s in segments(world, settings):
+        days = range(s["first"], s["last"] + 1)
+        out |= dict(zip(days, spread([dates[d] for d in days], s["first"], s["messages"], s["weekend"], s["parts"], s["busy"] or ())))  # fmt: skip
+    return out
+
+
+def keep_busy(world, settings, events: list) -> None:
+    """The days the first plan of a segment puts an event on, kept from then on: a world in one run's first plan, or
+    a chapter's, for its own days only."""
+    if (stored := meta(world, "segments")) is None:
+        world.db.execute(
+            "INSERT OR IGNORE INTO world_meta (key, value) VALUES ('busy_days', ?)",
+            (json.dumps(sorted({e.day for e in events})),),
+        )
+        return
+    spans = json.loads(stored)
+    current = next(s for s in spans if s["first"] <= today(world) <= s["last"])
+    if current["busy"] is None:
+        current["busy"] = sorted({e.day for e in events if current["first"] <= e.day <= current["last"]})
+        world.db.execute("UPDATE world_meta SET value = ? WHERE key = 'segments'", (json.dumps(spans),))
 
 
 # A day's shares, each checked on that day's own messages at its close, and named as the author reads them.
@@ -388,13 +436,16 @@ def fact_row(fact: PlanFact, events: dict[str, Event], moment: dict[str, int], z
 
 
 def front_loaded(world, settings, facts: list, day: int) -> str | None:
-    """Why the plan's facts are front-loaded, if they are: each third of the calendar not yet over first states at
-    least half its share of them, its share of the world's messages (an event day weighs as a workday). S1's
-    storylines were told by day 8, and its last days had nothing left to state. A third still open can always take
-    more facts, today or later."""
+    """Why the plan's facts are front-loaded, if they are: each third of the segment being written (the world's
+    calendar, or a chapter's days) not yet over first states at least half its share of the facts first stated in that
+    segment, its share of the segment's messages (an event day weighs as a workday). S1's storylines were told by day
+    8, and its last days had nothing left to state. A third still open can always take more facts, today or later."""
+    span = segment_of(world, settings, day)
     shares = quotas(world, settings)
-    days = sorted(shares)
-    total = sum(q["messages"] for q in shares.values()) or 1
+    days = list(range(span["first"], span["last"] + 1))
+    facts = [f for f in facts if f.day >= span["first"]]  # an earlier chapter's facts are its own
+    total = sum(shares[d]["messages"] for d in days) or 1
+    whose = "the world's" if span["first"] == 1 else "this chapter's"
     start = 0
     for size in apportion(len(days), [1, 1, 1]):
         third, start = days[start : start + size], start + size
@@ -404,26 +455,21 @@ def front_loaded(world, settings, facts: list, day: int) -> str | None:
         if (planned := sum(f.day in third for f in facts)) < (least := int(share / 2)):
             return (
                 f"days {third[0]}-{third[-1]} first state {planned} of the plan's {len(facts)} facts; they hold "
-                f"{share / len(facts):.0%} of the world's messages, so they first state at least {least}: plan facts "
+                f"{share / len(facts):.0%} of {whose} messages, so they first state at least {least}: plan facts "
                 "for them, so the storylines run to the end"
             )
     return None
 
 
-def planned_on_board(category, level: int) -> bool:
-    """Whether a slot rests on planned facts, so the board plans them before day 1: a ledger or hybrid slot, and one
-    whose level needs something of its facts (robustness level 4: a near-miss in sight, the truth out of it)."""
-    needs = category.needs[level - 1] if category.needs else None
-    return category.gold in ("ledger", "hybrid") or bool(needs and needs.facts())
-
-
 def record_plan(world, plan: Plan, settings, slots=()) -> None:
-    """The ledger in time order. Storylines are fixed once planned (summaries may change); an event, once planned,
-    never moves or goes; a stated fact keeps everything but its summary, while an unstated one may change or go and is
-    planned for today or later. A fact about an event carries the event's moment. The board gives each ledger and
-    hybrid slot of `slots` the planned facts it will rest on (and each slot whose level needs something of its facts),
-    as many channels, relations and near-misses as its level needs: the material of a hard backward task exists before
-    day 1, when it can still be posted."""
+    """The ledger in time order. Storylines are fixed once planned (summaries may change; a chapter adds its own after
+    them); an event, once planned, never moves or goes; a stated fact keeps everything but its summary, while an
+    unstated one may change or go and is planned for today or later. A fact about an event carries the event's moment.
+    An earlier chapter's facts and events stay as they are, and a new event is in this chapter. The board gives each
+    ledger and hybrid slot of `slots` the planned facts it will rest on (and each slot whose level needs something of
+    its facts, and each entry of a chapter's brief), as many channels, relations, near-misses and values as it needs:
+    the material of a hard backward task exists before its first day, when it can still be posted. Board entries of
+    other slots (an earlier chapter's) stay."""
     count = settings.storylines
     if len(plan.storylines) != count:
         raise ValueError(f"plan exactly {count} storylines")
@@ -431,20 +477,23 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
     if repeated := sorted({i for i in ids if ids.count(i) > 1}):
         raise ValueError(f"storyline, event and fact ids are distinct; repeated {repeated}")
     kept = [r[0] for r in world.db.execute("SELECT id FROM storylines ORDER BY position")]
-    if kept and kept != [s.id for s in plan.storylines]:
-        raise ValueError(f"the storylines are planned: keep {kept} in this order (summaries may change)")
+    if kept and kept != [s.id for s in plan.storylines[: len(kept)]]:
+        raise ValueError(f"the storylines are planned: keep {kept} in this order, first (summaries may change)")
     check_facts(plan.facts, {s.id for s in plan.storylines})
     day, zone = today(world), world_meta(world, "zone")
     if day is None:
         raise ValueError("the calendar is closed: the ledger is final")
     events, moment = {e.id: e for e in plan.events}, {}
     old = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM events")}
+    old_ids, frozen, first = set(old), frozen_before(world), chapter_start(world)
     for e in plan.events:
         if e.storyline not in {s.id for s in plan.storylines}:
             raise ValueError(f"{e.id}: storyline {e.storyline} is not in storylines")
         if TIME_LITERAL.search(e.title):
             raise ValueError(f"{e.id}: a title has no time or date in it; day and time say when")
         moment[e.id] = at(world, Moment(day=e.day, time=e.time, zone=e.zone or zone))
+        if e.id not in old_ids and moment[e.id] < frozen:
+            raise ValueError(f"{e.id}: an earlier chapter's days are written and frozen; a new event is in this one (day {first} or later)")  # fmt: skip
         if e.id in old and (old[e.id]["moment_us"], old[e.id]["zone"], old[e.id]["title"]) != (
             moment[e.id],
             e.zone or zone,
@@ -468,7 +517,7 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
     planned = {f.id: f for f in plan.facts}
     if gone := sorted(stated - planned.keys()):
         raise ValueError(f"stated facts stay in the ledger: {gone}")
-    backward = {s.id: s for s in slots if planned_on_board(settings.taxonomy[s.category], s.level)}
+    backward = {s.id: s for s in slots if on_board(settings, s)}
     board = {e.slot: list(dict.fromkeys(e.facts)) for e in plan.board}
     if len(board) < len(plan.board):
         raise ValueError("the board has one entry for each slot")
@@ -493,6 +542,8 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
                 k: current[f.id][k] for k in rows[f.id] if k != "summary"
             } or mine != {r for r in relations if r[0] == f.id}:
                 raise ValueError(f"{f.id} is stated: only its summary may change")
+            if current[f.id]["day"] < first and f.summary != current[f.id]["summary"]:
+                raise ValueError(f"{f.id} is an earlier chapter's, written and frozen: it stays as it is, its summary too")  # fmt: skip
             continue
         if (f.channel_id, f.author_id) not in members:
             raise ValueError(f"{f.id}: its author {f.author_id} is a member of {f.channel_id}")
@@ -508,14 +559,15 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
         if later := [d for d in earlier if planned[d].day > f.day]:
             raise ValueError(f"{f.id} comes after {later}, which are first stated on a later day")
     with world.batch():
-        world.db.execute("DELETE FROM board")  # the plan's board is whole, as its facts are
-        if kept:
-            for s in plan.storylines:
-                world.db.execute("UPDATE storylines SET summary = ? WHERE id = ?", (s.summary, s.id))
-        else:
-            world.insert(
-                "storylines", [s.model_dump() | {"position": i} for i, s in enumerate(plan.storylines, 1)]
-            )
+        # The plan's board is whole, as its facts are; in a chapter, an earlier chapter's entries (on stated facts) stay.
+        scope = list(backward) if first > 1 else [r[0] for r in world.db.execute("SELECT DISTINCT slot FROM board")]  # fmt: skip
+        world.db.execute(f"DELETE FROM board WHERE slot IN ({', '.join('?' * len(scope))})", scope)
+        for s in plan.storylines[: len(kept)]:
+            world.db.execute("UPDATE storylines SET summary = ? WHERE id = ?", (s.summary, s.id))
+        world.insert(
+            "storylines",
+            [s.model_dump() | {"position": i} for i, s in enumerate(plan.storylines, 1) if i > len(kept)],
+        )
         world.insert(
             "events",
             [
@@ -526,10 +578,7 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
                 if e.id not in old
             ],
         )
-        world.db.execute(  # the first plan's event days, kept from then on
-            "INSERT OR IGNORE INTO world_meta (key, value) VALUES ('busy_days', ?)",
-            (json.dumps(sorted({e.day for e in plan.events})),),
-        )
+        keep_busy(world, settings, plan.events)
         world.db.execute("DELETE FROM fact_relations")
         unstated = [f for f in current if f not in stated]
         world.db.execute(f"DELETE FROM facts WHERE id IN ({', '.join('?' * len(unstated))})", unstated)
@@ -553,13 +602,28 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
             raise ValueError(short)
         world.insert("board", [dict(slot=s, fact_id=f) for s, facts in board.items() for f in facts])
         for s, facts in board.items():
-            spec, level = settings.taxonomy[backward[s].category], backward[s].level
-            if spec.needs and (short := unmet(spec.needs[level - 1], fact_measures(world, facts))):
+            needs, level = slot_needs(settings, backward[s]), backward[s].level
+            if needs and (short := unmet(needs, fact_measures(world, facts) | board_measures(world, facts))):
                 raise ValueError(
                     f"the board's {s} (level-{level} {backward[s].category}) needs " + "; ".join(short)
                 )
         if room(world, settings, day) is None:  # inside the batch: the refusal takes the plan back
             raise ValueError(f"this plan leaves today no way to close: {today_line(world, settings, day)}")
+
+
+def unplanned(world, settings, slots=()) -> list[str]:
+    """What a plan turn still owes: its storylines, a chapter's own facts (a chapter that plants nothing new is no
+    chapter), and a board entry for each slot that rests on planned facts."""
+    errors, count = [], settings.storylines
+    if world.db.execute("SELECT COUNT(*) FROM storylines").fetchone()[0] != count:
+        errors.append(f"plan the ledger with world_plan ({count} storylines)")
+    first = chapter_start(world)
+    if first > 1 and not world.db.execute("SELECT 1 FROM facts WHERE day >= ?", (first,)).fetchone():
+        errors.append(f"plan this chapter's facts with world_plan: none is planned for day {first} or later")
+    boarded = {r[0] for r in world.db.execute("SELECT DISTINCT slot FROM board")}
+    if missing := [s.id for s in slots if on_board(settings, s) and s.id not in boarded]:
+        errors.append(f"give the board an entry for {missing} with world_plan")
+    return errors
 
 
 # ---------------------------------------------------------------------- conversations, at the present
@@ -592,6 +656,26 @@ def stated_anchors(facts: dict[str, dict], text: str) -> list[str]:
     return [f for f, x in facts.items() if x["anchor"] and f" {normalized(x['anchor'])} " in said]
 
 
+def brief(world) -> dict[str, dict]:
+    """A chapter's brief, as it was written when the chapter started: each entry's needs, by slot."""
+    return json.loads(meta(world, "brief", "{}"))
+
+
+def hidden_answers(world) -> dict[str, list[tuple[str, int | None]]]:
+    """The answer facts of the brief's entries that need their answer out of easy sight, by fact: each entry, with
+    the last day a near-miss of it is first stated (None when it has none)."""
+    needs, out = brief(world), {}
+    for slot, ids in world.db.execute("SELECT slot, group_concat(fact_id) FROM board GROUP BY slot").fetchall():
+        if not needs.get(slot, {}).get("hidden"):
+            continue
+        answers = answer_facts(world, ids.split(","))
+        misses = near_misses(world, answers)
+        last = max((world.db.execute("SELECT day FROM facts WHERE id = ?", (m,)).fetchone()[0] for m in misses), default=None)  # fmt: skip
+        for answer in answers:
+            out.setdefault(answer, []).append((slot, last))
+    return out
+
+
 def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
     """One conversation at the present, in one channel among its members. A line that contains a planned fact's
     anchor states that fact and lists it in conveys; a fact's first statement is its planned author's, in its planned
@@ -619,7 +703,8 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
     follows = {}
     for src, dst in world.db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind IN ('after', 'supersedes')"):  # fmt: skip
         follows.setdefault(src, {})[dst] = None  # a fact may both follow and supersede another
-    first = set()
+    first, hide = set(), hidden_answers(world)
+    direct = world.db.execute("SELECT type IN ('im', 'mpim') FROM channels WHERE id = ?", (channel,)).fetchone()
     for i, line in enumerate(lines):
         for f in line.conveys:
             if f in facts and f not in anchored and f not in first:
@@ -627,6 +712,13 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
                 if (channel, line.author_id, day) != (x["channel_id"], x["author_id"], x["day"]):
                     errors.append(
                         f"line {i}: {f} is first stated by {x['author_id']} in {x['channel_id']} on day {x['day']}"
+                    )
+                reply = line.reply_to is not None or conversation.thread is not None
+                if f in hide and not (reply or (direct and direct[0])) and [s for s, last in hide[f] if last is None or day <= last]:  # fmt: skip
+                    errors.append(
+                        f"line {i}: {f} answers the brief's {[s for s, _ in hide[f]]}, which needs its answer stated where "
+                        "it is harder to see than its near-misses: in a thread reply, in a DM, or on a later day than "
+                        "every near-miss"
                     )
                 if pending := [d for d in follows.get(f, []) if d not in anchored and d not in first]:
                     errors.append(f"line {i}: {f} comes after {pending}, which are not stated yet")
@@ -828,6 +920,8 @@ def revise(world, message_id: int, text: str) -> dict:
     row = world.db.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if row is None:
         raise ValueError(f"no message {message_id}")
+    if row["ts_us"] < frozen_before(world):
+        raise ValueError(f"m{message_id} is in an earlier chapter, written and frozen: it is not revised")
     facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
     conveyed = [
         r[0] for r in world.db.execute("SELECT fact_id FROM evidence WHERE message_id = ?", (message_id,))
@@ -923,7 +1017,7 @@ def forge_task(world, task: Task, settings, open_ids: list[str], gates: bool = T
     if gates and task.level > 1 and lazy["shortcut"]:
         raise ValueError(
             f"{task.id}: a search for the question's own words reaches its answer first ({lazy['guesses']['top']!r}), "
-            "so it is a level-1 task: GLM never missed such a task in S2 or S3. Put a near-miss where that search "
+            "so it is a level-1 task: the first search a solver makes answers it. Put a near-miss where that search "
             "reaches first (ask with the words its stale or wrong value uses, or where the correction is out of that "
             "search's way), or write it as level 1"
         )

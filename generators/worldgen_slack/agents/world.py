@@ -32,7 +32,6 @@ from ..chronicle import (
     drift,
     forge_task,
     part_of,
-    planned_on_board,
     post,
     posted,
     present,
@@ -42,9 +41,10 @@ from ..chronicle import (
     today,
     today_line,
 )
-from ..config import Config
+from ..config import Config, Needs
 from ..contracts import (
     LONG,
+    PARTS,
     SHORT,
     Gaps,
     Part,
@@ -52,8 +52,12 @@ from ..contracts import (
     Task,
     cards,
     channel_id,
+    chapter_start,
     clock,
+    frozen_before,
     needs_text,
+    on_board,
+    slot_needs,
     selves,
     window,
     world_meta,
@@ -73,10 +77,10 @@ GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor see
   to find); status is one row, the latest value the actor can see, which a fact out of their sight settles: its gold
   reads that value from the ledger, and its facts name the settling fact. A status is answered right by giving the
   value as not settled.
-- near_sql, optional: up to 3 queries, the gold with one condition relaxed, each answering otherwise (the answer a
-  hasty reader gives); the forge asks for one of a task above level 1 that rests on no facts.
+- near_sql, optional: up to NEAR_SQL queries, the gold with one condition relaxed, each answering otherwise (the answer
+  a hasty reader gives).
 - question is what actor_id asks, in `language`; it does not contain its answer.
-"""
+""".replace("NEAR_SQL", str(next(m.max_length for m in Task.model_fields["near_sql"].metadata if hasattr(m, "max_length"))))
 
 AUTHOR_GUIDE = (
     """You write one company's Slack workspace, as its people live it, in time order: first the company and its
@@ -96,14 +100,15 @@ Memory and notes
 
 Time
 - The world has a present. world_post writes a conversation at the present and moves it to its last line;
-  world_advance(to=part) moves it to a later part of the day: early 06-09, morning 09-12, afternoon 12-17, evening
-  17-21, night 21-24. From the night, world_advance(to="tomorrow") closes the day, once the day's checks pass, and
-  moves to the next morning. Nothing is ever written before the present, so write the day in the order it happens.
+  world_advance(to=part) moves it to a later part of the day: PARTS_OF_THE_DAY. From the night,
+  world_advance(to="tomorrow") closes the day, once the day's checks pass, and moves to the next day's early part.
+  Nothing is ever written before the present, so write the day in the order it happens.
 - A message never contains a clock time or a date. It writes {at:id} for an event, or for a fact about one; code
   renders it on the author's clock. Relative words (tomorrow, Friday, this morning) are fine when true at the present.
 
 The ledger (world_plan)
-- storylines: exactly the number now.md asks for, the company's workstreams. Fixed once planned; summaries may change.
+- storylines: exactly the number the plan's prompt gives, the company's workstreams. Fixed once planned; summaries
+  may change.
 - events: the story's moments: a day of the calendar, a time and, if not the company's, a clock (IANA zone). An event
   never moves once planned: a change of plan is a new event, and a fact that supersedes the old one.
 - facts: what someone states in Slack: subject, attribute and value (no time in a value); its author, its channel and
@@ -114,8 +119,8 @@ The ledger (world_plan)
   another's comes after it. A value said again is the same fact conveyed again, not a new fact. A fact about an event
   with no anchor is stated with its time, {at:...}.
 - A stated fact never changes; an unstated one may be re-planned for today or later.
-- The facts run through the calendar: each third of it first states at least half its share of them, as it holds
-  of the world's messages, so the storylines unfold to the last day.
+- The facts run through the days being written: each third of them first states at least half its share of the
+  facts first stated in those days, as it holds of their messages, so the storylines unfold to the last day.
 
 Conversations (world_post)
 - One channel; lines by its members, each in its author's way (their typing card is on their page). reply_to is the
@@ -128,7 +133,7 @@ Conversations (world_post)
 - commits opens a promise with the day it is due; closes ends one: kept, changed or dropped. Every promise ends by
   its due day.
 - Each day holds about the number of messages now.md gives, spread by the parts' rhythm, and its own shares of thread
-  replies, reacted messages and DMs. A weekend day is quiet, unless your first plan puts an event on it: a day with
+  replies, reacted messages and DMs. A weekend day is quiet, unless the first plan of its days puts an event on it: a day with
   an event gets a workday's messages; now.md's today line shows them, and what closing the day still takes. A
   conversation or a plan after which the day could no longer close is refused. now.md lists the everyday
   conversations code drew for the day from the channels' routines; the storylines happen among them. Each person
@@ -149,7 +154,7 @@ Voice
 
 Tasks (after the last day, world_add_task)
 - One task for each slot of now.md, with the slot's id: a question an actor asks, as hard as its level and concept
-  say, in its style. Nothing can be posted after the last day, so plan from day 1 what each slot will rest on (the
+  say, in its style. Nothing can be posted after the last day, so plan before the first day what each slot will rest on (the
   plan's board, checked against each level's needs): facts in several channels; near-misses, a teammate's confident
   wrong claim, a stale reading, a plan changed out of the asker's sight, that nothing in their sight retracts; the
   answer where it is harder to see than its near-misses (a thread reply, a DM, a later day); private conversations.
@@ -164,7 +169,7 @@ Reviews
 - An independent judge reviews the world after some days and at the end. Its issues come back to you: message_ids
   are the messages to change (world_revise rewrites one where it stands), evidence_message_ids show the defect.
 """
-)
+).replace("PARTS_OF_THE_DAY", ", ".join(f"{part} {start:02d}-{end:02d}" for part, (start, end) in PARTS.items()))
 
 
 # ---------------------------------------------------------------------- memory: rendered from the world
@@ -238,14 +243,16 @@ def fact_line(world, fact: dict, who: dict) -> str:
 def now_page(world, settings, context: dict) -> str:
     """The one-pager: everything the author needs at the present, on one page."""
     who, total = people(world), world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0]
-    day, now = today(world), present(world)
+    day, now, first = today(world), present(world), chapter_start(world)
     out = []
+    span = f" (this chapter writes days {first}-{total}; days 1-{first - 1} are written and frozen)" if first > 1 else ""  # fmt: skip
     if day is None:
         out.append(
-            f"# Now: the calendar is closed; its {total} days ended {clock(world, now)}. Tasks are written now."
+            f"# Now: the calendar is closed; its {total} days ended {clock(world, now)}."
+            + (" Tasks are written now." if not context.get("chapter") else "")
         )
     else:
-        out.append(f"# Now: {clock(world, now)}, day {day} of {total}, {part_of(world, now)}")
+        out.append(f"# Now: {clock(world, now)}, day {day} of {total}{span}, {part_of(world, now)}")
         start, end = bounds(world, day)
         quota = quotas(world, settings)[day]
         parts = ", ".join(
@@ -295,27 +302,27 @@ def now_page(world, settings, context: dict) -> str:
             f"(made in [[m{c['message_id']}]])"
             for c in promises
         ]
-    out += ["", "## Task slots (written after the last day; a task's id is its slot's)"]
+    out += ["", "## Brief: what this chapter plants, each entry on the board (a later forge writes its tasks)" if context.get("chapter") else "## Task slots (written after the last day; a task's id is its slot's)"]  # fmt: skip
     board = {}
     for slot, fact in world.db.execute("SELECT slot, fact_id FROM board ORDER BY fact_id"):
         board.setdefault(slot, []).append(f"[[{fact}]]")
-    for slot in context.get("slots", []):
-        spec, level = settings.taxonomy[slot["category"]], slot["level"]
-        needs = needs_text(spec.needs[level - 1]) if spec.needs else ""
+    for slot in map(Slot.model_validate, context.get("slots", [])):
+        spec, level = settings.taxonomy[slot.category], slot.level
+        needs = needs_text(slot_needs(settings, slot) or Needs())
         out.append(
-            f"- {slot['id']}: {slot['category']} level {level}: {spec.levels[level - 1]}; concept: {slot['concept']}; "
-            f"style: {slot['style']}"
+            f"- {slot.id}: {slot.category} level {level}: {spec.levels[level - 1]}; concept: {slot.concept}; "
+            f"style: {slot.style}"
             + (f"; needs: {needs}" if needs else "")
             + (
-                f"; the board rests it on {', '.join(board[slot['id']])}"
-                if slot["id"] in board
+                f"; the board rests it on {', '.join(board[slot.id])}"
+                if slot.id in board
                 else "; for the board"
-                if planned_on_board(spec, level)
+                if on_board(settings, slot)
                 else ""
             )
-            + ("; written in this turn" if slot["id"] in context.get("writable", []) else "")
+            + ("; written in this turn" if slot.id in context.get("writable", []) else "")
         )
-    if notes := drift(world, context.get("cards", {})):
+    if notes := drift(world, context.get("cards", {}), frozen_before(world)):
         out += ["", "## Style drift (people far from their typing card)"]
         out += [f"- {who[user]['real_name']} [[{user}]]: {note}" for user, note in notes.items()]
     return "\n".join(out) + "\n"
@@ -465,8 +472,9 @@ def view(world, ref: str, context: dict) -> str:
     )
 
 
-def ledger_document(world) -> dict:
-    """The ledger as world_plan takes it, so the author can edit and plan it again."""
+def ledger_document(world, slots=None) -> dict:
+    """The ledger as world_plan takes it, so the author can edit and plan it again: its board holds the entries of
+    `slots` (an earlier chapter's entries stay as they are, apart from the plan)."""
     company = world_meta(world, "zone")
     days = {d: n for n, d in world.db.execute("SELECT day, date FROM calendar")}
 
@@ -478,6 +486,8 @@ def ledger_document(world) -> dict:
 
     relations = world.db.execute("SELECT src_fact, dst_fact, kind FROM fact_relations").fetchall()
     board = world.db.execute("SELECT slot, fact_id FROM board ORDER BY slot, fact_id").fetchall()
+    if slots is not None:
+        board = [(t, f) for t, f in board if t in slots]
     return {
         "storylines": [
             {"id": s, "summary": t}
@@ -538,7 +548,7 @@ def files(world, settings, context: dict, mode: str) -> dict[str, str]:
     """The memory code writes to /task/memory before a turn."""
     out = {
         "memory/now.md": now_page(world, settings, context),
-        "memory/ledger.json": json.dumps(ledger_document(world), ensure_ascii=False, indent=1),
+        "memory/ledger.json": json.dumps(ledger_document(world, {x["id"] for x in context.get("slots", [])} if context.get("chapter") else None), ensure_ascii=False, indent=1),  # fmt: skip
     }
     for user in people(world).values():
         out[f"memory/people/{user['handle']}.md"] = person_page(world, user["id"], context)
@@ -787,7 +797,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
     @vf.tool
     async def advance(self, to: Part | Literal["tomorrow"]) -> dict:
         """Move the present to the part `to` of today; from the night, "tomorrow" closes the day and moves to the
-        next morning. The present's own part leaves it where it is. Reports what keeps a day open, and the day's style
+        next day's early part. The present's own part leaves it where it is. Reports what keeps a day open, and the day's style
         drift once it closes."""
 
         def act():
@@ -820,6 +830,8 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         and level you choose."""
 
         def act(copy):
+            if self.context.get("chapter"):
+                raise ValueError("a chapter writes no tasks: the forge writes them on its finished world")
             if self.config.mode == "forge":
                 return forge_task(copy, task, self.settings, self.allowed().get("ids", []))
             return add_task(copy, task, self.settings, self.writable(), self.allowed().get("keep"))
@@ -867,7 +879,7 @@ class WorldAuthorTask(vf.Task[WorldTaskData, vf.State, WorldAuthorConfig]):
             raise ValueError("the world file requires a host-side tool server")
         data = WorldTaskData(
             prompt=None,
-            system_prompt=FORGE_GUIDE if mode == "forge" else AUTHOR_GUIDE,
+            system_prompt=forge_guide(context["settings"]) if mode == "forge" else AUTHOR_GUIDE + CRAFT_GUIDE + (CHAPTER_GUIDE if context.get("chapter") else ""),
             attempt=attempt,
             world_hash=tools.db_hash,
             network_allow=[],
@@ -876,14 +888,60 @@ class WorldAuthorTask(vf.Task[WorldTaskData, vf.State, WorldAuthorConfig]):
         return cls(data, WorldAuthorConfig(tools=tools))
 
 
-FORGE_GUIDE = (
-    """You propose tasks on one company's finished Slack workspace, for training agents that answer colleagues'
+# How a real workspace's days go, beyond how each line is typed: discourse-level craft from StoryScope (arXiv
+# 2604.03136). Voice lab 02 (2026-10-12) tested it after the guide: blind judges of two families preferred the days it
+# wrote 72% and 66% of the time, and its plans escalated more and left more open.
+CRAFT_GUIDE = """
+Story and talk (how a real workspace's days go, beyond how each line is typed)
+- Stakes move. A storyline grows, stalls, flares or fizzles from day to day: a small issue turns serious, a scare
+  turns out to be nothing, a quiet week gets one bad night. It is not a steady run of status updates.
+- More than one track. Concerns that have nothing to do with the storylines run alongside them, and some echo a
+  storyline without serving it: another team's outage, a contract question, a hiring loop, a flaky test nobody owns.
+- Not everything closes. Some questions get no answer; some promises slip or are quietly dropped; some outcomes stay
+  partial or unclear. Nobody writes the epilogue.
+- Some outcomes come from outside. A vendor ships a fix, a customer changes their mind, a problem stops on its own:
+  not every resolution is someone's decision or insight.
+- Late and elsewhere. What matters often surfaces later, or in a DM or a thread, and changes how earlier talk reads
+  ("oh, so that's why the import failed"). People refer back to old incidents and earlier days, by name.
+- Defensible calls go wrong. People make reasonable calls that turn out badly, blame stays unclear, and some
+  disagreements are never settled.
+- Nobody states the lesson. No line spells out the takeaway, the moral or what the episode shows; wrap-ups are rare
+  and short, and most threads just stop.
+- Feelings are named plainly when people show them ("ugh", "kinda nervous about tonight", "annoyed tbh"), not acted
+  out through the body or the room.
+- People show who they are by what they do and say, not by introducing their role.
+- Registers differ: from person to person, and for one person from a calm morning to a bad night.
+"""
+
+
+CHAPTER_GUIDE = """
+This run is a chapter
+- The workspace was written before: its days up to the chapter's first are written and frozen. Nothing in them is
+  posted, revised or re-planned; world_revise refuses their messages, and their facts and events stay as they are.
+  You write the chapter's days, from its first, in time order, as the same company and people, going on from where
+  the last day left off (your notes are where it ended).
+- The ledger goes on: the earlier storylines stay first and may carry on; the chapter adds its own after them. A later
+  value of an earlier fact is a new fact that supersedes it, stated in the chapter.
+- No tasks are written in a chapter. Its brief, in now.md, is the board for a later forge: each entry names what its
+  facts need (values, near-misses, channels, relations, where the answer is stated), all of it planted in the chapter.
+"""
+
+
+def forge_guide(settings: dict) -> str:
+    """The proposer's guide, with the forge's own numbers: the solver's tries, and the right-answer rates of the
+    middle levels (the bands between the first and the last). It names no model: the proposer knows the solver by
+    its tries."""
+    tries, bands = settings["author"]["tries"], settings["tasks"]["bands"]
+    middle = bands[1:-1] or bands
+    low, high = min(b[0] for b in middle), max(b[1] for b in middle)
+    return (
+        f"""You propose tasks on one company's finished Slack workspace, for training agents that answer colleagues'
 questions from Slack. The workspace is written and frozen: nothing is posted, revised or moved. Each round you write
-candidate tasks; then a small solver model (GLM) tries each one 8 times with the asker's Slack tools, a stronger
-model tries the ones GLM rarely answers, and a judge reviews each. What lands is kept in an archive by category, by
-the level its tries measure, and by its structure; the rest is dropped. Your aim is tasks of every level, and
-above all the middle ones (GLM right in 25-75% of its tries) that are fair: a careful colleague with the same access
-answers them right.
+candidate tasks; then a solver model tries each one {tries} times with the asker's Slack tools, a stronger model tries
+the ones the solver rarely answers, and a judge reviews each. What lands is kept in an archive by category, by the
+level its tries measure, and by its structure; the rest is dropped. Your aim is tasks of every level, and above all
+the middle ones (the solver right in {low:.0%}-{high:.0%} of its tries) that are fair: a careful colleague with the
+same access answers them right.
 
 Tools and memory
 - world_now(), world_view(ref), world_sql(sql, actor_id=None) and world_read(actor_id, tool, arguments) read the
@@ -895,44 +953,44 @@ Tools and memory
   world already states, on its messages, when a task needs one the ledger lacks; the ledger is the world's own
   record of who stated what, with its decoys (planned wrong claims) and its changes (supersedes).
 - /task/memory/ is code's: taxonomy.md (each category, what its levels ask for, its gold and answer types),
-  archive.md (what each round kept and dropped, how often GLM was right, how it went wrong, and the cells still
-  empty), board.md (the tasks the world was planned for, and the facts each rests on: write these first),
+  archive.md (what each round kept and dropped, how often the solver was right, how it went wrong, and the cells
+  still empty), board.md (the tasks the world was planned for, and the facts each rests on: write these first),
   ledger.json, and a page per person (its id, U..., is what actor_id and world_read take), channel, storyline and
-  event. /task/notes/ is yours; the world's
-  author left its plan.md there.
+  event. /task/notes/ is yours; the world's author left its plan.md there.
 
-What makes a task hard, and what does not (from the world's earlier runs and the literature)
-- GLM searches well and reads threads. It answers wrong when the cheapest route ends at a wrong value: the first
-  value its search for the question's own words finds is stale, a near-miss or a decoy. A near-miss read beside its
-  correction misleads no one; one whose correction sits where that search does not reach (a thread under another
+What makes a task hard, and what does not
+- A solver that searches well and reads threads answers wrong when the cheapest route ends at a wrong value: the
+  first value its search for the question's own words finds is stale, a near-miss or a decoy. A near-miss read beside
+  its correction misleads no one; one whose correction sits where that search does not reach (a thread under another
   post, a DM, a later day, other words) does.
-- What moved GLM: a correction that is itself out of date; a value that changed more than once across channels; a
-  false premise matching a near-miss ("kyong or juancarlos?"); a set or a count that is complete only when every
-  place is read (each missed place costs it); an answer as of a moment, not the latest; who asks (the same question
-  has another answer for someone who cannot read the DM that settles it); answers to work out, not to copy
-  (durations across zones, counts nobody wrote).
-- What did not: rewording; a long question that spells out the route; naming a near-miss and calling it wrong ("the
+- What makes a solver miss: a correction that is itself out of date; a value that changed more than once across
+  channels; a false premise matching a near-miss (a choice between two people when the answer is a third); a set or
+  a count that is complete only when every place is read (each missed place costs it); an answer as of a moment, not
+  the latest; who asks (the same question has another answer for someone who cannot read the DM that settles it);
+  answers to work out, not to copy (durations across zones, counts nobody wrote).
+- What does not: rewording; a long question that spells out the route; naming a near-miss and calling it wrong ("the
   count going around is wrong, so go by QA's post"): that hands over the answer. Ask as a colleague would, briefly.
-- Middle rates come from two or three soft obstacles stacked, each of which GLM gets past most of the time, not from
-  one trap it always or never falls into.
+- Middle rates come from two or three soft obstacles stacked, each of which the solver gets past most of the time,
+  not from one trap it always or never falls into.
 - A task is fair: its gold is the complete, correct answer from what its asker can read, and nothing else in their
-  sight is as good an answer. Code grades a task's wrong answers before GLM tries it: a near-miss, a hedge, a set
-  missing a row; a task whose grade accepts one is dropped.
+  sight is as good an answer. Code grades a task's wrong answers before the solver tries it: a near-miss, a hedge, a
+  set missing a row; a task whose grade accepts one is dropped.
 
 Tasks
-- category and level from taxonomy.md; the level is your guess, and GLM's tries decide.
+- category and level from taxonomy.md; the level is your guess, and the solver's tries decide.
+- A task above level 1 that rests on no facts names a near_sql: the answer a hasty reader gives.
 - A status task (robustness) is for a value its asker can see that a fact out of their sight settles: its gold is
   that visible value from the ledger, its facts name the settling fact, and the right answer gives it as not settled.
   A refusal is for what is not there to see at all.
 """
-    + GOLD_SQL
-)
+        + GOLD_SQL
+    )
 
 
 def forge_prompt(round_: int, rounds: int, ids: list[str], held: int, goal: int) -> str:
     return (
         f"Round {round_}, of at most {rounds}. The archive holds {held} of the {goal} tasks it aims for; a full place "
-        "takes a task only if GLM's tries are more mixed on it, or it brings a structure the place lacks. Read "
+        "takes a task only if the solver's tries are more mixed on it, or it brings a structure the place lacks. Read "
         "/task/memory/archive.md and board.md, and your notes. Then write one "
         f"candidate with world_add_task for each open id: {', '.join(ids)}. Walk each one's route as its asker first. "
         "Write in /task/notes/plan.md what you tried and why, then end your turn."
@@ -945,7 +1003,17 @@ def rejected(feedback: str, restored: str = "") -> str:
 
 
 def plan_prompt(world, settings, feedback: str = "") -> str:
-    count = settings.storylines
+    count, first = settings.storylines, chapter_start(world)
+    total = world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0]
+    if first > 1:
+        return (
+            f"Before day {first} ({clock(world, bounds(world, first)[0])[:14]}): days 1-{first - 1} are written and "
+            f"frozen, and this chapter writes days {first}-{total}. Plan its ledger with world_plan: the ledger.json "
+            f"you have, going on, with {count} storylines in all (the earlier ones first), and the chapter's events "
+            "and facts over its days, and the board: the facts each entry of now.md's brief will rest on, as it "
+            "needs. Then rewrite /task/notes/plan.md for the chapter: each storyline's arc day by day, and how each "
+            f"brief entry is planted. End your turn when the ledger is planned.{rejected(feedback)}"
+        )
     return (
         f"Before day 1 ({clock(world, bounds(world, 1)[0])[:14]}): plan the ledger with world_plan: exactly {count} "
         "storylines, their events and their facts, over the calendar in now.md, and its board: the facts each slot "
@@ -971,8 +1039,10 @@ def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") 
         if issues
         else ""
     )
+    first = chapter_start(world)
+    span = f" (this chapter writes days {first}-{total})" if first > 1 else ""
     return (
-        f"It is {clock(world, present(world))}, day {day} of {total}.{review}"
+        f"It is {clock(world, present(world))}, day {day} of {total}{span}.{review}"
         f"{rejected(feedback, ', and the world and your notes are back at the start of the day')}\nRead world_now() and your notes, and "
         "write today: post its conversations in the order they happen with world_post, and move on with "
         'world_advance(to=part); from the night, to="tomorrow" closes the day once today\'s checks pass. Then write '

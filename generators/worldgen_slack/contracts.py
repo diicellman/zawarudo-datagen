@@ -19,6 +19,8 @@ from worldgen_slack.db import SHOWN, World, canonical, digest
 from worldgen_slack.db import words
 from worldgen_slack.dataset import NonEmptyText, SafeId, StrictModel
 
+from .config import Needs
+
 
 def _meaningful_tokens(value: str) -> set[str]:
     normalized = unicodedata.normalize("NFKC", value).casefold()
@@ -132,6 +134,23 @@ class Slot(StrictModel):
     level: int = Field(ge=1)
     concept: NonEmptyText
     style: NonEmptyText
+    needs: Needs | None = None  # a chapter's brief: what its board entry needs, in place of its level's
+
+
+def slot_needs(settings, slot: Slot) -> Needs | None:
+    """What a slot's board entry needs: a chapter's brief sets its own, else its level's."""
+    if slot.needs is not None:
+        return slot.needs
+    spec = settings.taxonomy[slot.category]
+    return spec.needs[slot.level - 1] if spec.needs else None
+
+
+def on_board(settings, slot: Slot) -> bool:
+    """Whether a slot rests on planned facts, so the board plans them before its first day: a ledger or hybrid slot,
+    one whose level needs something of its facts (robustness level 4: a near-miss in sight, the truth out of it), and
+    every entry of a chapter's brief."""
+    needs = slot_needs(settings, slot)
+    return slot.needs is not None or settings.taxonomy[slot.category].gold in ("ledger", "hybrid") or bool(needs and needs.facts())  # fmt: skip
 
 
 def quota(taxonomy: dict, styles: list[str], seed: int, count: int) -> list[Slot]:
@@ -296,21 +315,33 @@ def company_zone(cast: list[SeedPersona], chosen: list[str]) -> str:
     return min(counts, key=lambda z: (-counts[z], z))
 
 
-def calendar(seed: int, settings, place: str) -> list[dict]:
-    """Day 1 is a Monday of the configured year picked by the run seed; days are company-clock midnights."""
-    first = date(settings.year, 1, 1)
-    mondays = [first + timedelta(days=d) for d in range(366) if (first + timedelta(days=d)).weekday() == 0]
-    start, tz = random.Random(seed).choice(mondays), ZoneInfo(place)
-    days = [start + timedelta(days=n) for n in range(settings.days + 1)]
+def calendar_days(start: date, count: int, place: str, first: int = 1) -> list[dict]:
+    """`count` calendar days from `start`, numbered from `first`; days are company-clock midnights."""
+    tz = ZoneInfo(place)
+    days = [start + timedelta(days=n) for n in range(count + 1)]
     return [
         {
-            "day": n + 1,
+            "day": first + n,
             "date": d.isoformat(),
             "start_us": us(datetime(d.year, d.month, d.day, tzinfo=tz)),
             "end_us": us(datetime(nd.year, nd.month, nd.day, tzinfo=tz)),
         }
         for n, (d, nd) in enumerate(zip(days, days[1:]))
     ]
+
+
+def calendar(seed: int, settings, place: str) -> list[dict]:
+    """Day 1 is a Monday of the configured year picked by the run seed; days are company-clock midnights."""
+    first = date(settings.year, 1, 1)
+    mondays = [first + timedelta(days=d) for d in range(366) if (first + timedelta(days=d)).weekday() == 0]
+    return calendar_days(random.Random(seed).choice(mondays), settings.days, place)
+
+
+def extend_calendar(world, count: int) -> int:
+    """`count` more days after the calendar's last, the dates running on (a chapter's days); returns the first."""
+    last, on = world.db.execute("SELECT day, date FROM calendar ORDER BY day DESC LIMIT 1").fetchone()
+    world.insert("calendar", calendar_days(date.fromisoformat(on) + timedelta(days=1), count, world_meta(world, "zone"), last + 1))  # fmt: skip
+    return last + 1
 
 
 def at(world, moment: Moment) -> int:
@@ -342,6 +373,51 @@ def clock(world, moment_us: int) -> str:
 
 def world_meta(world, key: str) -> str:
     return world.db.execute("SELECT value FROM world_meta WHERE key = ?", (key,)).fetchone()[0]
+
+
+def meta(world, key: str, default=None):
+    """A world_meta value that may be absent: a world with no chapter has no lineage."""
+    row = world.db.execute("SELECT value FROM world_meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def chapter_start(world) -> int:
+    """The first day of the chapter being written: 1 for a world written in one run."""
+    return int(meta(world, "chapter_start_day", 1))
+
+
+def frozen_before(world) -> int:
+    """The moment before which the world is an earlier chapter's, written and frozen: 0 when there is none."""
+    first = chapter_start(world)
+    if first == 1:
+        return 0
+    return world.db.execute("SELECT start_us FROM calendar WHERE day = ?", (first,)).fetchone()[0]
+
+
+# What an earlier chapter wrote, by table: its days, people and channels, its messages with what hangs on them, its
+# conversations, its ledger (facts, their relations, events) and its promises. :t is the chapter's first moment.
+FROZEN = {
+    "calendar": "SELECT * FROM calendar WHERE start_us < :t",
+    "users": "SELECT * FROM users",
+    "channels": "SELECT * FROM channels",
+    "members": "SELECT * FROM members",
+    "messages": "SELECT * FROM messages WHERE ts_us < :t",
+    "message_mentions": "SELECT x.* FROM message_mentions x JOIN messages m ON m.id = x.message_id WHERE m.ts_us < :t",
+    "reactions": "SELECT x.* FROM reactions x JOIN messages m ON m.id = x.message_id WHERE m.ts_us < :t",
+    "evidence": "SELECT x.* FROM evidence x JOIN messages m ON m.id = x.message_id WHERE m.ts_us < :t",
+    "scenes": "SELECT * FROM scenes WHERE slot_start_us < :t",
+    "scene_messages": "SELECT x.* FROM scene_messages x JOIN messages m ON m.id = x.message_id WHERE m.ts_us < :t",
+    "facts": "SELECT f.* FROM facts f JOIN calendar c ON c.day = f.day WHERE c.start_us < :t",
+    "fact_relations": "SELECT r.* FROM fact_relations r JOIN facts f ON f.id = r.src_fact JOIN calendar c ON c.day = f.day WHERE c.start_us < :t",  # fmt: skip
+    "events": "SELECT * FROM events WHERE moment_us < :t",
+    "commitments": "SELECT x.* FROM commitments x JOIN messages m ON m.id = x.message_id WHERE m.ts_us < :t",
+}
+
+
+def frozen_digest(world) -> str:
+    """A digest of everything before the chapter's first day: a chapter changes none of it."""
+    t = frozen_before(world)
+    return digest({name: sorted((list(r) for r in world.db.execute(sql, {"t": t})), key=repr) for name, sql in FROZEN.items()})  # fmt: skip
 
 
 def render(moment_us: int, place: str, said_us: int) -> str:
@@ -659,6 +735,10 @@ def unmet(needs, measured: dict) -> list[str]:
         out.append("its answer stated where it is harder to see than its near-misses: in a thread reply, in a DM, or on a later day than every near-miss")  # fmt: skip
     if needs.named is not None and measured.get("named", 0) > needs.named:
         out.append(f"a question naming at most {needs.named} of its evidence's channels and identifiers (it names {measured['named']})")  # fmt: skip
+    if measured.get("values", needs.values) < needs.values:
+        out.append(f"its answer's subject and attribute taking at least {needs.values} values, its answer among them (it takes {measured['values']})")  # fmt: skip
+    if needs.fresh and measured.get("fresh") is False:
+        out.append("its answer first stated in this chapter, on its first day or later: what it plants is new")
     return out
 
 
@@ -676,6 +756,10 @@ def needs_text(needs) -> str:
         out.append("its answer in a thread reply, a DM, or later than its near-misses")
     if needs.named is not None:
         out.append("a question that names none of its evidence's channels and identifiers" if needs.named == 0 else f"a question naming at most {needs.named} of its evidence's channels and identifiers")  # fmt: skip
+    if needs.values:
+        out.append(f"its answer's subject and attribute taking {needs.values} or more values, its answer among them")
+    if needs.fresh:
+        out.append("its answer first stated in this chapter")
     return "; ".join(out)
 
 
@@ -705,7 +789,35 @@ def fact_measures(world, ids: list[str], actor: str | None = None, gold=None, re
     channels = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", ids).fetchone()[0]  # fmt: skip
     relations = world.db.execute(f"SELECT COUNT(*) FROM fact_relations WHERE src_fact IN ({marks}) AND dst_fact IN ({marks})", [*ids, *ids]).fetchone()[0]  # fmt: skip
     answers = answer_facts(world, ids, actor, gold, refusal)
-    return {"channels": channels, "relations": relations, "decoys": len(near_misses(world, answers, actor))}
+    return {"channels": channels, "relations": relations, "decoys": len(near_misses(world, answers, actor)), "values": values(world, answers, actor)}  # fmt: skip
+
+
+def values(world, answers: list[str], actor: str | None = None) -> int:
+    """How many values an answer's subject and attribute takes, its own among them, as `actor` can read them (every
+    one, before any actor is chosen): the most of any answer fact's."""
+    most = 0
+    for answer in answers:
+        subject, attribute = world.db.execute("SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (answer,)).fetchone()  # fmt: skip
+        rows = world.db.execute("SELECT id, lower(trim(value)) FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ?", (subject, attribute)).fetchall()  # fmt: skip
+        seen = {v for f, v in rows if f == answer or not actor or any(readable(world, actor, c) for c in places(world, f))}  # fmt: skip
+        most = max(most, len(seen))
+    return most
+
+
+def board_measures(world, ids: list[str]) -> dict:
+    """What only the plan can say of a board entry's facts: whether its answer is first stated where it is harder to
+    see than its near-misses (`hidden`: in a DM, or on a later day than every near-miss; None when it may yet be, in a
+    thread reply, which code checks when it is posted), and whether it is `fresh`, first stated in the chapter being
+    written."""
+    answers = answer_facts(world, ids)
+    if not answers:
+        return {"hidden": None, "fresh": None}
+    marks = ", ".join("?" * len(answers))
+    rows = world.db.execute(f"SELECT f.day, c.type FROM facts f JOIN channels c ON c.id = f.channel_id WHERE f.id IN ({marks})", answers).fetchall()  # fmt: skip
+    misses = near_misses(world, answers)
+    last = max((world.db.execute("SELECT day FROM facts WHERE id = ?", (f,)).fetchone()[0] for f in misses), default=None)  # fmt: skip
+    hidden = any(t in ("im", "mpim") or (last is not None and d > last) for d, t in rows)
+    return {"hidden": True if hidden else None, "fresh": any(d >= chapter_start(world) for d, _ in rows)}
 
 
 def places(world, fact: str) -> set[str]:
@@ -1160,11 +1272,12 @@ def activity(world, start_us: int | None = None, end_us: int | None = None) -> d
     }
 
 
-def style(world) -> dict:
-    """Surface statistics of voice and timing, overall and per author; the world judge compares them with people's
-    typing."""
+def style(world, since_us: int = 0) -> dict:
+    """Surface statistics of voice and timing, overall and per author, of the messages since `since_us` (a chapter's
+    own); the world judge compares them with people's typing."""
     rows = world.db.execute(
-        "SELECT m.user_id, m.text, m.ts_us, u.tz FROM messages m JOIN users u ON u.id = m.user_id WHERE m.is_deleted = 0"
+        "SELECT m.user_id, m.text, m.ts_us, u.tz FROM messages m JOIN users u ON u.id = m.user_id WHERE m.is_deleted = 0 AND m.ts_us >= ?",
+        (since_us,),
     ).fetchall()
 
     def measure(items):
