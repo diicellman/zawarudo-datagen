@@ -1,0 +1,21 @@
+# One forge: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-c1.toml [--dry-run]
+# FC1 (2026-10-13): the validation forge on version 2 (S3's world continued by C1, data/v7-06/chapter-c1), solved by
+# the student, DeepSeek V4.1 flash. It asks whether C1's planted material gives tasks in the student's [0.2, 0.8]
+# window: at least 25% of the kept tasks that rest on C1's facts, and at least 4 of them (S3+F1's pool: 7 of 76, 9%).
+# The proposer writes on the whole workspace; the board's open entries are C1's brief (S3's were covered by S3's own
+# tasks, which stay with version 1), and tasks on S3's material are the run's own control. A place holds every task
+# the rounds can give, so nothing valid is dropped for room: the run measures, it does not curate. The grader stays
+# gpt-6-sol, as in phase 0, so the rates read beside phase 0's.
+base = "configs/worldgen_slack/worldgen.toml"   # S3's configuration: its people, taxonomy and roles
+world = "data/v7-06/chapter-c1"
+output = "data/v7-06/forge-c1"
+tasks = 36                # the goal: every candidate the rounds write, kept if valid
+target = 36               # the tasks one place (a category and a measured level) holds: no room limit
+rounds = 3
+candidates = 12           # one round's candidates, tried 8 times each
+
+[settings.env.solver]
+model = "deepseek/deepseek-v4.1-flash"
+
+[settings.tasks]
+max_answer_rows = 12      # exhaustive sets: a set of n is right about p^n of the time (WideSearch)
