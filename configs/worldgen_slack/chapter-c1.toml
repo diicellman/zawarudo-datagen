@@ -1,0 +1,44 @@
+# One chapter: uv run --frozen worldgen-slack chapter --config configs/worldgen_slack/chapter-c1.toml [--dry-run]
+# C1 (2026-10-13): S3's finished world (data/v7-05/software, 10 days, 953 messages) continued by a week, into version 2.
+# Nothing before day 11 is written again; the chapter writes no tasks (a forge does, on version 2). Its brief plants
+# the material phase 0 found missing for the student (DeepSeek V4.1 flash solved 69 of S3+F1's 76 tasks at L1): S3
+# holds 3 value groups of 4+ values, all of them used by tasks, and every decoy is used. Each entry is a board entry
+# whose facts code checks when the ledger is planned (its level's needs, these on top, and always first stated in the
+# chapter), and whose hidden answer code checks where it is posted.
+base = "configs/worldgen_slack/worldgen.toml"   # S3's configuration: its people, taxonomy and roles
+world = "data/v7-05/software"
+output = "data/v7-06/chapter-c1"
+seed = 20261013
+days = 7                  # Thu 2026-08-20 to Wed 08-26: five workdays and a weekend
+messages = 500            # S3's pace, about 100 a workday
+storylines = 2            # new, after S3's three, which may go on
+review_days = [4]         # the judge reviews after the chapter's fourth day, and at the end
+
+# Contested values: a value that changes four or more times across channels, its latest out of easy sight (a DM, a
+# thread reply, or later than every near-miss), beside a near-miss nothing in plain sight retracts. Semantic level 4
+# needs, besides: 2 relations, 3 channels, 1 near-miss, and a question naming none of its evidence's identifiers.
+[[material]]
+category = "semantic"
+level = 4
+count = 3
+needs = { values = 4 }
+
+# Refusal temptations: near-answers in sight (two of them), the truth stated only where the asker cannot read.
+[[material]]
+category = "robustness"
+level = 4
+count = 2
+needs = { decoys = 2 }
+
+# Sets complete only when three channels are read, with a near-miss among them.
+[[material]]
+category = "hybrid"
+level = 3
+count = 2
+needs = { channels = 3 }
+
+# A search past two near-misses to an answer out of easy sight, asked without naming its identifiers.
+[[material]]
+category = "search"
+level = 4
+count = 1
