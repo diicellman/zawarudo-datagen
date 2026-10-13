@@ -69,6 +69,7 @@ button.chip:hover{border-color:var(--fg3)}.chip.good{color:var(--good);border-co
 .linkish{background:none;border:0;padding:0;color:var(--fg2);font:11px var(--mono);text-decoration:underline;text-underline-offset:3px}
 .mention{color:var(--ev);background:var(--evbg);padding:0 2px;border-radius:2px}
 .reacts{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}.react{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);background:var(--raise);padding:0 7px;border-radius:10px;font-size:12px;line-height:20px}
+.chapsep{display:flex;align-items:center;gap:10px;padding:14px 16px 4px;font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--ev)}.chapsep::before,.chapsep::after{content:"";flex:1;border-top:1px dashed var(--ev)}
 .react b{font:500 11px var(--mono);color:var(--fg2)}.chip.decoy{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent);border-style:dashed}
 .daysep{display:flex;align-items:center;gap:10px;padding:10px 16px 2px;font:11px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--fg3)}.daysep::before,.daysep::after{content:"";flex:1;border-top:1px solid var(--line)}
 .chan-head details summary{cursor:pointer}.chan-head details[open]{max-height:120px;overflow:auto}
@@ -293,6 +294,15 @@ function overview() {
           usage.map(([role, u]) => h('tr', {}, h('td', {class: 'mono', text: role}), h('td', {class: 'num', text: num(u.traces)}), h('td', {class: 'num', text: num(u.input_tokens)}),
             h('td', {class: 'num', text: num(u.output_tokens)}), h('td', {class: 'num', text: usd(u.reported_cost)}), h('td', {class: 'num', text: num(u.unpriced_calls)}))))
           : empty('No summary yet'))),
+    R.chapter ? h('section', {}, h('div', {class: 'card'}, label('Chapter'),
+      h('p', {}, `Version ${R.chapter.version}: days ${R.chapter.first_day}-${R.chapter.last_day}, from ${dayOf(R.chapter.start)}. The days before are the world it continues (`,
+        h('span', {class: 'mono', text: (R.chapter.parent_hash || '').slice(0, 12)}), '), written and frozen.'),
+      label('Brief: what the chapter plants, each entry on the board'),
+      list(R.chapter.brief).map(b => h('div', {class: 'small', style: 'margin:8px 0'},
+        h('span', {class: 'chip', text: b.slot}), h('span', {class: 'mono faint', text: `${b.category} · L${b.level}  `}), b.concept || '',
+        h('div', {class: 'faint mono', text: 'needs ' + Object.entries(b.needs || {}).filter(([, v]) => v !== 0 && v !== false && v !== null).map(([k, v]) => v === true ? k : `${k} ${v}`).join(', ')}),
+        S.spoilers ? h('div', {}, list(b.facts).map(f => h('span', {class: 'chip' + (X.facts[f] && R.fact_marks && Object.values(R.fact_marks).some(fs => fs.some(x => x.fact === f && x.decoy)) ? ' decoy' : ''),
+          title: X.facts[f] ? `${X.facts[f].subject} · ${X.facts[f].predicate}: ${X.facts[f].value} (${X.facts[f].valid_from})` : '', text: f}))) : null)))) : null,
     h('section', {class: 'grid2'},
       h('div', {class: 'card'}, label('Premise'), Object.entries(p).map(([k, v]) => h('p', {}, h('span', {class: 'label', text: k + ' '}), h('span', {text: v})))),
       h('div', {class: 'card'}, label('Storylines'), list(cat.groups).map(g => h('p', {}, h('span', {class: 'chip', text: g.id}), g.description)),
@@ -559,8 +569,16 @@ function renderMessages() {
   const rows = list(W.world.messages).filter(m => m.conversation_id === S.conv && !m.thread_root_id && (!q || (plain(m.text) + ' ' + personName(m.author_id)).toLowerCase().includes(q)
     || list(W.replies[m.id]).some(r => plain(r.text).toLowerCase().includes(q)))).sort((a, b) => a.timestamp < b.timestamp ? -1 : 1);
   // A divider at each new day on the world's clock, as Slack draws one.
-  let day = null;
-  const drawn = rows.flatMap(m => { const d = dayOf(m.timestamp), row = messageRow(m); if (d === day) return [row]; day = d; return [h('div', {class: 'daysep', text: d}), row]; });
+  // A chapter's world: a divider where the chapter starts (what comes before is an earlier chapter's, frozen).
+  let day = null, inside = false;
+  const ch = R.chapter, starts = ch ? Date.parse(ch.start) : Infinity;
+  const drawn = rows.flatMap(m => {
+    const d = dayOf(m.timestamp), row = messageRow(m), now = Date.parse(m.timestamp) >= starts, out = [];
+    if (now && !inside) out.push(h('div', {class: 'chapsep', text: `chapter · version ${ch.version} · days ${ch.first_day}-${ch.last_day} (days before are frozen)`}));
+    inside = now;
+    if (d !== day) { day = d; out.push(h('div', {class: 'daysep', text: d + (now ? ' · chapter' : '')})); }
+    return [...out, row];
+  });
   box.replaceChildren(...(rows.length ? drawn : [empty('No messages')]));
   if (S.message) document.getElementById('m-' + S.message)?.scrollIntoView({block: 'center'});
 }

@@ -150,6 +150,30 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
     return catalog, bindings, scenes, owner, marks
 
 
+def chapter_of(db, state: dict, board: dict) -> dict | None:
+    """A chapter's world: its version, its first day and when it starts (the days before are an earlier chapter's,
+    frozen), the world it continues, and its brief, each entry with its needs and the facts the board plants for it.
+    None for a world written in one run."""
+    meta = dict(db.execute("SELECT key, value FROM world_meta").fetchall())
+    if "chapter_start_day" not in meta:
+        return None
+    first = int(meta["chapter_start_day"])
+    start, last = db.execute("SELECT (SELECT start_us FROM calendar WHERE day = ?), MAX(day) FROM calendar", (first,)).fetchone()  # fmt: skip
+    brief = json.loads(meta.get("brief", "{}"))
+    slots = {q["id"]: q for q in state.get("quota", [])}
+    return {
+        "version": int(meta.get("version", 2)),
+        "first_day": first,
+        "last_day": last,
+        "start": iso(start),
+        "parent_hash": meta.get("parent_hash"),
+        "brief": [
+            {"slot": slot, "category": slots.get(slot, {}).get("category"), "level": slots.get(slot, {}).get("level"), "concept": slots.get(slot, {}).get("concept"), "needs": needs, "facts": board.get(slot, [])}
+            for slot, needs in brief.items()
+        ],
+    }  # fmt: skip
+
+
 def load_run(path, full=False):
     """Everything the page shows, read from the run's saved files and world snapshots."""
     run = path.resolve()
@@ -166,6 +190,7 @@ def load_run(path, full=False):
     if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'board'").fetchone():  # worlds since the board
         for slot, fact in db.execute("SELECT slot, fact_id FROM board ORDER BY slot, fact_id"):
             board.setdefault(slot, []).append(fact)
+    chapter = chapter_of(db, state, board)
     db.close()
     snapshots, attempts = {}, []
     folders = sorted((p for p in (run / "attempts").iterdir() if p.is_dir()), key=lambda p: (order.get(p.name, -1 if p.name in ("premise", "organization") else 1e9), p.name))  # fmt: skip
@@ -206,6 +231,7 @@ def load_run(path, full=False):
         "fact_marks": marks,
         "task_reviews": state.get("task_reviews") or {},
         "board": board,
+        "chapter": chapter,
         "scenes": scenes,
         "scene_of": owner,
         "attempts": attempts,

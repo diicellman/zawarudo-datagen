@@ -56,6 +56,7 @@ def main():
         "the board per ledger slot"
     )
     assert run["world"]["zone"], "times are drawn on the world's clock"
+    assert run["chapter"] is None, "a world written in one run is no chapter"
     # A message shows its reactions and whom it mentions, as Slack does, and the facts it states.
     people = {u["id"] for u in run["world"]["users"]}
     reacted = [m for m in run["world"]["messages"] if m["reactions"]]
