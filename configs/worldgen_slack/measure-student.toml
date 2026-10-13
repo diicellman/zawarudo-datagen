@@ -1,0 +1,17 @@
+# Phase 0 (2026-10-12): the student, DeepSeek V4.1 flash, measured on the tasks GLM 5.3 flash was measured on, so the
+# levels can move to the student's own pass rate. The pool is S3's 40 released tasks plus F1's 43 approved candidates,
+# all on S3's world (built by local-docs/tools-v7/forge/pool_source.py). Everything but the solver is as S3-M ran it:
+# the screen, 8 tries at temperature 1, the witness, the hint and the judge. Nothing is proposed: the forge only measures.
+# uv run --frozen worldgen-slack forge --config configs/worldgen_slack/measure-student.toml [--dry-run]
+base = "configs/worldgen_slack/worldgen.toml"
+world = "data/v7-05/pool-source"
+output = "data/v7-05/student-measured"
+measure = true            # round 0 imports the pool's tasks, as written, and measures them
+rounds = 0                # and no proposer round follows
+target = 100              # a place keeps every task it is given: a measurement drops nothing for room
+
+[settings.env.solver]
+model = "deepseek/deepseek-v4.1-flash"
+
+[settings.tasks]
+max_answer_rows = 12      # F1 wrote its sets under 12 (forge.toml)
