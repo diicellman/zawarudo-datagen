@@ -7,7 +7,8 @@ uv run --frozen python scripts/worldgen_slack/regrade.py --run data/v7-06/forge-
 Reads each solver trace (`traces/*.json`: the question, the response, the observations and the recorded grade) and
 each task's gold from the run's `world.sqlite`. Writes every new grade beside the recorded one, then prints the
 agreement on right, abstained and wrong: overall, on the tries the run graded wrong, Cohen's kappa, and every
-disagreement. `--view raw` sends the raw outputs, as the recorded grades had them, to tell the grader from the view.
+disagreement. Each grade is written to --out as it lands, and a request that takes longer than --timeout seconds
+counts as failed and is tried once more. `--view raw` sends the raw outputs, as the recorded grades had them, to tell the grader from the view.
 `--screen` also regrades each task's failure cases, which a grader must all judge wrong, and its gold, which it must
 judge right. `--tries N` takes a seeded sample that keeps every try the run graded wrong. A dry run spends nothing."""
 
@@ -138,6 +139,7 @@ async def main() -> None:
     parser.add_argument("--tries", type=int, default=None)
     parser.add_argument("--screen", action="store_true")
     parser.add_argument("--jobs", type=int, default=6)
+    parser.add_argument("--timeout", type=float, default=300, help="seconds one grading request may take")
     parser.add_argument("--seed", type=int, default=20261014)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -182,14 +184,16 @@ async def main() -> None:
     judge, gate = AnswerJudge(vf.JudgeConfig(model=args.model)), asyncio.Semaphore(args.jobs)
 
     async def grade(question, ref, response, observations):
-        """A rate limit waits and tries again (GLM 5.3 takes 8 requests at a time); any other error, once more."""
+        """A rate limit waits and tries again (GLM 5.3 takes 8 requests at a time); any other error, a timeout
+        included, once more."""
         async with gate:
             failures = 0
             for wait in (2, 4, 8, 16, 32, 60, 60, 60):
                 try:
-                    result = await judge.evaluate(
-                        question=question, reference=ref, response=response, observations=observations
-                    )
+                    async with asyncio.timeout(args.timeout):
+                        result = await judge.evaluate(
+                            question=question, reference=ref, response=response, observations=observations
+                        )
                     usage = result.usage.model_dump(mode="json") if getattr(result, "usage", None) else {}
                     return result.parsed.model_dump(mode="json"), usage
                 except Exception as error:
@@ -211,14 +215,18 @@ async def main() -> None:
         new, usage = await grade(tasks[c["task"]]["question"], reference[c["task"]], c["response"], [])
         return c | {"new": new, "usage": usage}
 
-    graded = await asyncio.gather(*map(regrade, work))
-    screened = await asyncio.gather(*map(rescreen, cases))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w") as stream:
-        for row in graded:
+
+        async def kept(graded):
+            """A grade, written as it lands: a run stopped midway keeps every grade it paid for."""
+            row = await graded
             stream.write(json.dumps({k: v for k, v in row.items() if k != "observations"}) + "\n")
-        for row in screened:
-            stream.write(json.dumps(row) + "\n")
+            stream.flush()
+            return row
+
+        graded = await asyncio.gather(*(kept(regrade(t)) for t in work))
+        screened = await asyncio.gather(*(kept(rescreen(c)) for c in cases))
 
     done = [g for g in graded if g["new"] and "error" not in g["new"]]
     failed = [g for g in graded if g["new"] and "error" in g["new"]]
@@ -227,9 +235,10 @@ async def main() -> None:
     print(
         f"\ngraded {len(done)} of {len(graded)} tries ({len(graded) - len(done) - len(failed)} empty, {len(failed)} failed)"
     )
-    print(
-        f"agreement {sum(a == b for a, b in pairs) / len(pairs):.1%}, on the recorded wrong {sum(a == b for a, b in wrong) / max(len(wrong), 1):.1%} ({len(wrong)}), kappa {kappa(pairs):.3f}"
-    )
+    if pairs:  # nothing to compare when every request failed
+        print(
+            f"agreement {sum(a == b for a, b in pairs) / len(pairs):.1%}, on the recorded wrong {sum(a == b for a, b in wrong) / max(len(wrong), 1):.1%} ({len(wrong)}), kappa {kappa(pairs):.3f}"
+        )
     print("recorded → new:", dict(Counter(f"{a}→{b}" for a, b in pairs if a != b)))
     for g in done:
         if outcome(g["recorded"]) != outcome(g["new"]):
