@@ -74,8 +74,9 @@ class ReviewTools(vf.Toolset[ReviewToolsConfig, ReviewState]):
 
     @vf.tool
     async def read(self, actor_id: str, tool: str, arguments: dict[str, JsonValue]) -> dict:
-        """Call a Slack read tool as a task's actor: search_messages, search_users, search_channels,
-        list_user_channels, read_channel, read_thread, get_user, list_channel_members or get_reactions."""
+        """Call a Slack read tool as a task's actor, by the solver's tool names without slack_: search_public,
+        search_public_and_private, search_channels, search_users, read_channel, read_thread, read_user_profile,
+        get_reactions, list_channel_members or list_user_channels. Returns what it showed, structured."""
         output = World(self.config.db_path, actor=self._actor(actor_id)).call(tool, arguments)
         self.state.calls.append(Call(tool=tool, arguments=arguments | {"actor_id": actor_id}, output=output))
         return output

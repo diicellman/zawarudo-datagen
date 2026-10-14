@@ -40,6 +40,7 @@ from .chronicle import agenda_budget, answer_of, bounds, close_day, posted, pres
 from .config import Config, PipelineConfig
 from .contracts import (
     PHASE_CRITERIA,
+    READING,
     Organization,
     Verdict,
     Issue,
@@ -171,6 +172,11 @@ def rates(results: list[dict]) -> dict:
     }
 
 
+def read_one_way(verdict: Verdict) -> Verdict:
+    """A second reading the judge found is code's issue too: it blocks its task, and sends it back to be reworded."""
+    return verdict.model_copy(update={"issues": verdict.issues + [Issue(artifact="tasks", task_ids=[r.task_id], defect=READING + r.misread, requested_change="word the question so it rules that reading out, for the same asker and gold answer", blocking=True) for r in verdict.tasks if r.misread]})  # fmt: skip
+
+
 def merged(verdicts: list[Verdict]) -> Verdict:
     """Several reviews as one verdict: approved when each is, with every task review and issue; a rejection's feedback
     carries only the rejecting reviews' words."""
@@ -236,7 +242,11 @@ def thaw(verdict: Verdict, world) -> tuple[Verdict, list[Issue]]:
 
 
 class GenerationEnv(vf.Env[PipelineConfig]):
-    after_days = "tasks"  # what follows the last day: the tasks of a world run; a chapter's final review
+    @property
+    def after_days(self) -> str:
+        """What follows the last day: the world run's own tasks, or, when the forge writes them, its final review (as
+        a chapter's)."""
+        return "tasks" if self.settings.tasks.in_world else "final"
 
     def __init__(self, settings: Config, store: Store):
         self.settings, self.store = settings, store
@@ -682,6 +692,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         verdicts = await asyncio.gather(*(judged(k, chunk) for k, chunk in enumerate(chunks, 1)))
         issues = {t: Issue(artifact="tasks", task_ids=[t], defect="the answer judge accepts a wrong answer to it: " + "; ".join(failed), requested_change="ask it so that its gold, and only its gold, is the right answer: tell it apart from what the judge accepted", blocking=True) for t, failed in loose.items() if failed}  # fmt: skip
         verdicts = [v.model_copy(update={"issues": v.issues + [issues[t] for t in chunk if t in issues], "approved": v.approved and not any(t in issues for t in chunk)}) for chunk, v in zip(chunks, verdicts)]  # fmt: skip
+        verdicts = [read_one_way(v) for v in verdicts]
         verdict_of = {t: v for chunk, v in zip(chunks, verdicts) for t in chunk}
         for task_id in due:  # the issues each task's latest review raised, for the final review
             state.task_issues[task_id] = [i for i in verdict_of[task_id].issues if task_id in i.task_ids]
@@ -843,11 +854,12 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             if not changed:
                 return
 
-    def allow(self, ids, keep: dict | None = None) -> None:
+    def allow(self, ids, keep: dict | None = None, rework: dict | None = None) -> None:
         """The slots the author's next turn may write, and the answers those that came back to be harder or easier
-        keep: its memory marks them and its tools read them per call."""
+        keep (in the forge, the tasks sent back for another reading, each with its asker and gold answer): its memory
+        marks them and its tools read them per call."""
         self.writable = list(ids)
-        atomic_json(self.store.root / "writable.json", {"ids": self.writable, "keep": keep or {}})
+        atomic_json(self.store.root / "writable.json", {"ids": self.writable, "keep": keep or {}, "rework": rework or {}})  # fmt: skip
 
     def batches(self) -> list[list[str]]:
         """The world's slots in batches of `[tasks] batch`, each written and hardened in an interaction of its own."""

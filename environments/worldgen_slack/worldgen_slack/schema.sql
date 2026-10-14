@@ -21,7 +21,8 @@ CREATE TABLE users (
   is_admin     INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1)),
   is_deleted   INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0, 1)),
   created_us   INTEGER NOT NULL,
-  profile_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(profile_json))  -- custom profile fields
+  profile_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(profile_json)),  -- custom profile fields
+  deactivated_us INTEGER                             -- v2: when they left the company; is_deleted from then
 );
 
 CREATE TABLE channels (
@@ -33,6 +34,7 @@ CREATE TABLE channels (
   creator_id  TEXT REFERENCES users(id),
   is_archived INTEGER NOT NULL DEFAULT 0 CHECK (is_archived IN (0, 1)),
   created_us  INTEGER NOT NULL,
+  archived_us INTEGER,                               -- v2: when it was archived; is_archived from then
   CHECK ((type IN ('im', 'mpim')) = (name IS NULL))
 );
 CREATE UNIQUE INDEX channels_name ON channels(name) WHERE name IS NOT NULL;
@@ -57,6 +59,7 @@ CREATE TABLE messages (
   text       TEXT NOT NULL,
   is_deleted INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0, 1)),
   edited_us  INTEGER,
+  subtype    TEXT CHECK (subtype IS NULL OR subtype IN ('bot_message', 'channel_join', 'channel_leave')),  -- v2
   UNIQUE (channel_id, ts_us)
 );
 CREATE INDEX messages_parent ON messages(parent_id);
@@ -122,6 +125,46 @@ CREATE TRIGGER reactions_valid BEFORE INSERT ON reactions BEGIN
 END;
 
 -- ===================================================================== answer key: dropped from the solver copy
+CREATE TABLE usergroups (                            -- v2: @-mentionable groups (<!subteam^S..|@handle>)
+  id          TEXT PRIMARY KEY,                      -- 'S' + base36
+  handle      TEXT NOT NULL UNIQUE,
+  name        TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  created_us  INTEGER NOT NULL
+);
+
+CREATE TABLE usergroup_members (                     -- v2
+  usergroup_id TEXT NOT NULL REFERENCES usergroups(id),
+  user_id      TEXT NOT NULL REFERENCES users(id),
+  PRIMARY KEY (usergroup_id, user_id)
+);
+
+CREATE TABLE artifacts (                             -- v2: tickets, pull requests and docs messages link to
+  id         TEXT PRIMARY KEY,                       -- what people call it: TKT-4471, PR #1182, a doc's slug
+  kind       TEXT NOT NULL CHECK (kind IN ('ticket', 'pull_request', 'doc', 'incident')),
+  title      TEXT NOT NULL,
+  url        TEXT NOT NULL UNIQUE,
+  owner_id   TEXT REFERENCES users(id),
+  created_us INTEGER NOT NULL
+);
+
+CREATE TABLE integrations (                          -- v2: an app's bot user, what it posts, and where
+  user_id    TEXT PRIMARY KEY REFERENCES users(id),
+  kind       TEXT NOT NULL,
+  channel_id TEXT NOT NULL REFERENCES channels(id)
+);
+
+CREATE TABLE queue (                                 -- v2: code's own posts, due at a moment, written when the
+  id         INTEGER PRIMARY KEY,                    -- present reaches it, in time order with everyone else's
+  due_us     INTEGER NOT NULL,
+  channel_id TEXT NOT NULL REFERENCES channels(id),
+  user_id    TEXT NOT NULL REFERENCES users(id),
+  subtype    TEXT,
+  text       TEXT NOT NULL,
+  origin     TEXT NOT NULL,                          -- what made it: an event, an artifact, a join, noise
+  message_id INTEGER REFERENCES messages(id)         -- once written
+);
+
 CREATE TABLE calendar (                              -- the company clock's days, written by code
   day      INTEGER PRIMARY KEY CHECK (day >= 1),
   date     TEXT NOT NULL UNIQUE,                     -- YYYY-MM-DD on the company clock
@@ -160,7 +203,8 @@ CREATE TABLE events (                                -- a story moment: one time
   storyline TEXT REFERENCES storylines(id),
   title     TEXT NOT NULL,
   moment_us INTEGER NOT NULL,
-  zone      TEXT NOT NULL                            -- the clock the moment is told on
+  zone      TEXT NOT NULL,                           -- the clock the moment is told on
+  post_by   TEXT REFERENCES users(id)                -- v2: the app that posts when it happens, if any
 );
 
 CREATE TABLE facts (
@@ -213,7 +257,8 @@ CREATE TABLE tasks (
   near_sql     TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(near_sql)),   -- the gold, one condition relaxed
   min_calls    INTEGER,                              -- the fewest tool calls of a right probe
   right_rate   REAL,                                 -- the probes' share of right answers: the task's difficulty
-  strict_rate  REAL                                  -- the probes' share right and grounded: the released reward
+  strict_rate  REAL,                                 -- the probes' share right and grounded: the released reward
+  intent       TEXT                                  -- v2: the request it is, a person's to an assistant
 );
 
 CREATE TABLE task_facts (

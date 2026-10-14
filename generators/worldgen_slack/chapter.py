@@ -142,12 +142,16 @@ def parent_segments(path: Path, world) -> list[dict]:
 
 
 def same_schema(world) -> list[str]:
-    """The tables, views and triggers the world's schema differs in from the schema now, comments and spacing aside
-    (the task tables too, which a chapter empties)."""
+    """The tables, views and triggers the world's schema differs in from the schema now (the task tables aside, which
+    a chapter empties): a table by its columns (a column a migration added stands after the table's constraints, so
+    its text differs), anything else by its text, comments and spacing aside."""
 
     def defined(db) -> dict:
-        rows = db.execute("SELECT name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
-        return {name: " ".join(re.sub(r"--[^\n]*", "", sql or "").split()) for name, sql in rows}
+        rows = db.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
+        return {
+            name: sorted(tuple(c)[1:] for c in db.execute(f"PRAGMA table_info({name})")) if kind == "table" and not (sql or "").startswith("CREATE VIRTUAL") else " ".join(re.sub(r"--[^\n]*", "", sql or "").split())  # fmt: skip
+            for kind, name, sql in rows
+        }
 
     with tempfile.TemporaryDirectory() as directory:
         fresh = World.create(Path(directory) / "schema.sqlite")
@@ -174,6 +178,7 @@ def adopt(store: Store, chapter: ChapterConfig, settings: Config, slots: list[Sl
     source = parent_world(parent)
     source.db.backup(world.db)
     source.close()
+    world.migrate()  # a world of an older schema comes forward before anything is measured on it
     if drift := same_schema(world):
         raise ValueError(f"{parent}'s world has another schema in {drift}: a chapter continues a world of this one")
     reset_tasks(world)

@@ -43,7 +43,7 @@ def groups(world) -> list[dict]:
     decoys, channels and days, where the current value is stated (its channel's kind, a thread reply), how many
     people can read it, the version that last added to it, and the tasks and board entries resting on it."""
     depth, versions = chains(world), version_of_day(world)
-    people = [u for (u,) in world.db.execute("SELECT id FROM users")]
+    people = [u for (u,) in world.db.execute("SELECT id FROM users WHERE is_bot = 0")]
     by = defaultdict(list)
     for row in world.db.execute("SELECT f.*, c.type, c.name FROM facts f JOIN channels c ON c.id = f.channel_id ORDER BY f.day, f.id"):  # fmt: skip
         by[(row["subject"].strip().lower(), row["attribute"].strip().lower())].append(dict(row))

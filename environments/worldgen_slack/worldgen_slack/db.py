@@ -1,6 +1,5 @@
 """One Slack world in one SQLite file: code-only writes checked at insert time, and actor-scoped Slack reads."""
 
-import base64
 import hashlib
 import json
 import math
@@ -19,6 +18,18 @@ from zoneinfo import ZoneInfo
 
 
 SCHEMA = Path(__file__).with_name("schema.sql")
+# The schema's version, and how a world of an older one comes forward to it: the columns each version added (the
+# tables it added are made from schema.sql). A world adopted by a chapter or a forge is brought forward first.
+SCHEMA_VERSION = 2
+COLUMNS = {
+    2: [
+        ("users", "deactivated_us", "ALTER TABLE users ADD COLUMN deactivated_us INTEGER"),
+        ("channels", "archived_us", "ALTER TABLE channels ADD COLUMN archived_us INTEGER"),
+        ("messages", "subtype", "ALTER TABLE messages ADD COLUMN subtype TEXT CHECK (subtype IS NULL OR subtype IN ('bot_message', 'channel_join', 'channel_leave'))"),  # fmt: skip
+        ("events", "post_by", "ALTER TABLE events ADD COLUMN post_by TEXT REFERENCES users(id)"),
+        ("tasks", "intent", "ALTER TABLE tasks ADD COLUMN intent TEXT"),
+    ],
+}
 
 
 def canonical(value) -> bytes:
@@ -32,6 +43,9 @@ def digest(value) -> str:
 
 
 ANSWER_KEY = (
+    "queue",
+    "integrations",
+    "artifacts",
     "commitments",
     "task_facts",
     "board",
@@ -62,8 +76,9 @@ CREATE TEMP VIEW reactions AS SELECT x.* FROM main.reactions x JOIN temp.message
 CREATE TEMP VIEW thread_stats AS SELECT p.id AS root_id, COUNT(r.id) AS reply_count, MAX(r.ts_us) AS latest_reply_us
   FROM temp.messages p JOIN temp.messages r ON r.parent_id = p.id GROUP BY p.id;
 """
-# What a gold query may read: the world as its actor sees it, the directory, the calendar and the fact ledger.
-GOLD_READS = {*SHADOWED, "users", "calendar", "storylines", "facts", "fact_relations", "evidence"}
+# What a gold query may read: the world as its actor sees it, the directory, the calendar, the fact ledger and the
+# promises people made (what was promised, by whom, and how it ended: kept, changed or dropped).
+GOLD_READS = {*SHADOWED, "users", "calendar", "storylines", "facts", "fact_relations", "evidence", "commitments", "artifacts"}  # fmt: skip
 # Of the workspace, the columns the tools below show, or let the solver work out (a mention is <@U..> in a message's
 # text; a thread's latest reply is the last one it reads; a channel's members are those who have not left): a gold
 # query filters on and returns these alone. S3's gold read reactions.created_us, when the tools say who reacted but
@@ -86,23 +101,11 @@ SHOWN = {
     },  # fmt: skip
     "channels": {"id", "name", "type", "topic", "purpose", "is_archived"},
     "members": {"channel_id", "user_id", "left_us"},
-    "messages": {"id", "channel_id", "ts_us", "ts", "user_id", "parent_id", "text", "is_deleted"},
+    "messages": {"id", "channel_id", "ts_us", "ts", "user_id", "parent_id", "text", "is_deleted", "subtype"},
     "message_mentions": {"message_id", "user_id"},
     "reactions": {"message_id", "user_id", "emoji"},
     "thread_stats": {"root_id", "reply_count", "latest_reply_us"},
 }
-TOOLS = (
-    "search_messages",
-    "search_users",
-    "search_channels",
-    "list_user_channels",
-    "read_channel",
-    "read_thread",
-    "get_user",
-    "list_channel_members",
-    "get_reactions",
-    "whoami",
-)
 
 FIRST = """first AS (
   SELECT e.fact_id, MIN(m.ts_us) AS ts_us FROM evidence e JOIN messages m ON m.id = e.message_id
@@ -198,10 +201,6 @@ COMPLETION = {
     ),
 }
 
-MESSAGE = """SELECT m.id, m.channel_id, m.ts, m.ts_us, m.user_id, m.text, p.ts AS parent_ts, s.reply_count
-FROM messages m LEFT JOIN main.messages p ON p.id = m.parent_id
-LEFT JOIN thread_stats s ON s.root_id = m.id"""
-MODIFIER = re.compile(r"(?<!\S)(in|from|before|after|on):(\S+)", re.IGNORECASE)
 
 
 def bm25(info: bytes, k1: float = 1.2, b: float = 0.75) -> float:
@@ -223,12 +222,6 @@ def bm25(info: bytes, k1: float = 1.2, b: float = 0.75) -> float:
 
 def words(text: str) -> list[str]:
     return re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", text).casefold())
-
-
-def _limit(value: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
-        raise ValueError("limit must be an integer from 1 to 100")
-    return value
 
 
 class World:
@@ -256,6 +249,27 @@ class World:
 
     def close(self) -> None:
         self.db.close()
+
+    def migrate(self) -> int:
+        """Bring a world of an older schema forward, in place and idempotently: each version's columns, then every
+        table, index, view and trigger of schema.sql it lacks. Returns the version it was at."""
+        row = self.db.execute("SELECT value FROM world_meta WHERE key = 'schema_version'").fetchone()
+        was = int(row[0]) if row else 1
+        fresh = sqlite3.connect(":memory:")
+        fresh.executescript(SCHEMA.read_text())
+        objects = fresh.execute("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid").fetchall()  # fmt: skip
+        fresh.close()
+        have = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master")}
+        with self.batch():
+            for version in range(was + 1, SCHEMA_VERSION + 1):
+                for table, column, sql in COLUMNS.get(version, []):
+                    if column not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
+                        self.db.execute(sql)
+            for kind, name, sql in objects:
+                if name not in have and not name.startswith("messages_fts_"):
+                    self.db.execute(sql)
+            self.db.execute("INSERT OR REPLACE INTO world_meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))  # fmt: skip
+        return was
 
     # ------------------------------------------------------------------ writes (generation code only)
     def insert(self, table: str, rows: list[dict]) -> list[int]:
@@ -440,226 +454,7 @@ class World:
         self.db.execute("INSERT INTO temp.actor VALUES (?)", (actor,))
 
     def call(self, tool: str, arguments: dict) -> dict:
-        if tool not in TOOLS:
-            raise ValueError(f"unknown tool {tool!r}")
-        return getattr(self, tool)(**arguments)
+        """One Slack read tool's record, as the actor (`surface`: the tools of Slack's own MCP server)."""
+        from . import surface
 
-    def _page(self, items: list, scope: list, cursor: str | None, limit: int) -> dict:
-        """ponytail: queries load every match, then slice; fine for worlds of thousands of messages."""
-        key, offset = digest([self.actor["id"], scope]), 0
-        if cursor is not None:
-            try:
-                saved, offset = json.loads(base64.b64decode(cursor, validate=True))
-            except (ValueError, TypeError):
-                raise ValueError("invalid_cursor") from None
-            if saved != key or type(offset) is not int or not 0 <= offset <= len(items):
-                raise ValueError("invalid_cursor")
-        end = offset + _limit(limit)
-        more = base64.b64encode(canonical([key, end])).decode() if end < len(items) else None
-        return {"items": items[offset:end], "next_cursor": more}
-
-    def _times(self, us: int, prefix: str = "time") -> dict:
-        """A moment as a Slack client shows it to the actor: in UTC, and on the actor's own clock."""
-        moment = datetime.fromtimestamp(us / 1e6, ZoneInfo(self.actor["tz"]))
-        return {
-            f"{prefix}_utc": datetime.fromtimestamp(us / 1e6, ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            f"{prefix}_local": moment.strftime("%a %Y-%m-%d %H:%M %Z"),
-        }
-
-    def _message(self, row: sqlite3.Row) -> dict:
-        out = {"channel": row["channel_id"], "ts": row["ts"], "user": row["user_id"], "text": row["text"]}
-        out |= self._times(row["ts_us"])
-        if row["parent_ts"]:
-            out["thread_ts"] = row["parent_ts"]
-        elif row["reply_count"]:
-            out |= {"thread_ts": row["ts"], "reply_count": row["reply_count"]}
-        return out
-
-    def _channel(self, channel_id: str) -> sqlite3.Row:
-        row = self.db.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)).fetchone()
-        if row is None:
-            raise LookupError("channel_not_found")
-        return row
-
-    def _day_us(self, value: str, days: int = 0) -> int:
-        """Midnight starting the given YYYY-MM-DD (plus `days`) on the actor's clock."""
-        try:
-            start = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=ZoneInfo(self.actor["tz"]))
-        except ValueError:
-            raise ValueError(f"dates are YYYY-MM-DD, not {value!r}") from None
-        return int(
-            datetime.fromordinal(start.toordinal() + days).replace(tzinfo=start.tzinfo).timestamp() * 1e6
-        )
-
-    def search_messages(
-        self, query: str, sort: str = "score", cursor: str | None = None, limit: int = 20
-    ) -> dict:
-        if not isinstance(query, str) or not query.strip() or len(query) > 512:
-            raise ValueError("query must contain 1-512 characters")
-        if sort not in ("score", "timestamp"):
-            raise ValueError("sort is score or timestamp")
-        where, args = [], []
-        for name, value in MODIFIER.findall(query):
-            name, value = name.casefold(), value.strip("<>")
-            if name == "in":
-                where.append("m.channel_id IN (SELECT id FROM main.channels WHERE id = ? OR name = ?)")
-                args += [value.split("|")[0], value.split("|")[-1].lstrip("#")]
-            elif name == "from":
-                where.append("m.user_id IN (SELECT id FROM main.users WHERE id = ? OR handle = ?)")
-                args += [value.lstrip("@"), value.lstrip("@")]
-            else:
-                bounds = {"before": ("<", 0), "after": (">=", 1), "on": (">=", 0)}[name]
-                where.append(f"m.ts_us {bounds[0]} ?")
-                args.append(self._day_us(value, bounds[1]))
-                if name == "on":
-                    where.append("m.ts_us < ?")
-                    args.append(self._day_us(value, 1))
-        text = MODIFIER.sub(" ", query)
-        phrases = re.findall(r'"([^"]+)"', text)
-        terms = [f'"{" ".join(words(p))}"' for p in phrases if words(p)] + words(
-            re.sub(r'"[^"]*"', " ", text)
-        )
-        if terms:
-            sql = MESSAGE.replace(
-                "FROM messages m",
-                "FROM main.messages_fts JOIN messages m ON m.id = messages_fts.docid",
-            ).replace("SELECT m.id,", "SELECT bm25(matchinfo(messages_fts, 'pcnalx')) AS score, m.id,")
-            where.insert(0, "messages_fts MATCH ?")
-            args.insert(0, " ".join(terms))
-        else:
-            sql = MESSAGE.replace("SELECT m.id,", "SELECT 0 AS score, m.id,")
-        order = "score DESC, m.ts_us DESC" if sort == "score" and terms else "m.ts_us DESC"
-        rows = self.db.execute(f"{sql} WHERE {' AND '.join(where) or '1'} ORDER BY {order}, m.id", args)
-        items = [self._message(r) | {"channel_name": self._channel(r["channel_id"])["name"]} for r in rows]
-        return self._page(items, ["search", query, sort], cursor, limit)
-
-    def search_users(self, query: str, cursor: str | None = None, limit: int = 20) -> dict:
-        pattern = f"%{query.strip()}%"
-        rows = self.db.execute(
-            """SELECT * FROM users WHERE id = ? OR real_name LIKE ? OR display_name LIKE ? OR handle LIKE ?
-            OR email LIKE ? ORDER BY real_name, id""",
-            (query.strip(), pattern, pattern, pattern, pattern),
-        )
-        items = [
-            {k: r[k] for k in ("id", "real_name", "display_name", "title")} | {"name": r["handle"]}
-            for r in rows
-        ]
-        return self._page(items, ["users", query], cursor, limit)
-
-    def search_channels(self, query: str, cursor: str | None = None, limit: int = 20) -> dict:
-        pattern = f"%{query.strip()}%"
-        rows = self.db.execute(
-            """SELECT c.*, (SELECT COUNT(*) FROM main.members m WHERE m.channel_id = c.id AND m.left_us IS NULL) AS n
-            FROM channels c WHERE c.name IS NOT NULL AND (c.name LIKE ? OR c.topic LIKE ? OR c.purpose LIKE ?)
-            ORDER BY c.name""",
-            (pattern, pattern, pattern),
-        )
-        items = [self._channel_info(r) for r in rows]
-        return self._page(items, ["channels", query], cursor, limit)
-
-    @staticmethod
-    def _channel_info(row: sqlite3.Row) -> dict:
-        return {k: row[k] for k in ("id", "name", "type", "topic", "purpose")} | {
-            "is_archived": bool(row["is_archived"]),
-            "num_members": row["n"],
-        }
-
-    def list_user_channels(
-        self, types: str = "public,private,mpim,im", cursor: str | None = None, limit: int = 50
-    ) -> dict:
-        kinds = [t.strip() for t in types.split(",") if t.strip()]
-        if not kinds or set(kinds) - {"public", "private", "mpim", "im"}:
-            raise ValueError("types is a comma-separated subset of public, private, mpim, im")
-        # A direct conversation lists all its members, the user among them, as Slack's conversations.members does.
-        rows = self.db.execute(
-            f"""SELECT c.*, (SELECT COUNT(*) FROM main.members m WHERE m.channel_id = c.id AND m.left_us IS NULL) AS n,
-            (SELECT group_concat(m.user_id) FROM main.members m WHERE m.channel_id = c.id AND m.left_us IS NULL) AS everyone
-            FROM main.channels c JOIN main.members mine ON mine.channel_id = c.id AND mine.user_id = ?
-              AND mine.left_us IS NULL
-            WHERE c.type IN ({", ".join("?" * len(kinds))}) ORDER BY c.type, c.name, c.id""",
-            (self.actor["id"], *kinds),
-        )
-        items = [
-            self._channel_info(r)
-            | ({"users": sorted((r["everyone"] or "").split(","))} if r["name"] is None else {})
-            for r in rows
-        ]
-        return self._page(items, ["mine", kinds], cursor, limit)
-
-    def read_channel(
-        self,
-        channel_id: str,
-        oldest: str | None = None,
-        latest: str | None = None,
-        cursor: str | None = None,
-        limit: int = 50,
-    ) -> dict:
-        self._channel(channel_id)
-        where, args = ["m.channel_id = ?", "m.parent_id IS NULL"], [channel_id]
-        for op, bound in ((">", oldest), ("<", latest)):
-            if bound is not None:
-                where.append(f"m.ts {op} ?")
-                args.append(bound)
-        rows = self.db.execute(f"{MESSAGE} WHERE {' AND '.join(where)} ORDER BY m.ts_us DESC", args)
-        return self._page(
-            [self._message(r) for r in rows], ["history", channel_id, oldest, latest], cursor, limit
-        )
-
-    def read_thread(
-        self, channel_id: str, thread_ts: str, cursor: str | None = None, limit: int = 50
-    ) -> dict:
-        self._channel(channel_id)
-        root = self.db.execute(
-            "SELECT id FROM messages WHERE channel_id = ? AND ts = ? AND parent_id IS NULL",
-            (channel_id, thread_ts),
-        ).fetchone()
-        if root is None:
-            raise LookupError("thread_not_found")
-        rows = self.db.execute(
-            f"{MESSAGE} WHERE m.id = ? OR m.parent_id = ? ORDER BY m.ts_us", (root[0], root[0])
-        )
-        return self._page([self._message(r) for r in rows], ["thread", channel_id, thread_ts], cursor, limit)
-
-    def get_user(self, user_id: str) -> dict:
-        row = self.db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        if row is None:
-            raise LookupError("user_not_found")
-        keys = ("id", "real_name", "display_name", "title", "tz", "status_text", "status_emoji", "email")
-        return {k: row[k] for k in keys} | {
-            "name": row["handle"],
-            "is_bot": bool(row["is_bot"]),
-            "is_admin": bool(row["is_admin"]),
-            "deleted": bool(row["is_deleted"]),
-            "profile": json.loads(row["profile_json"]),
-        }
-
-    def list_channel_members(self, channel_id: str, cursor: str | None = None, limit: int = 50) -> dict:
-        self._channel(channel_id)
-        rows = self.db.execute(
-            "SELECT user_id FROM members WHERE channel_id = ? AND left_us IS NULL ORDER BY user_id",
-            (channel_id,),
-        )
-        return self._page([r[0] for r in rows], ["members", channel_id], cursor, limit)
-
-    def get_reactions(self, channel_id: str, ts: str) -> dict:
-        self._channel(channel_id)
-        message = self.db.execute(
-            "SELECT id FROM messages WHERE channel_id = ? AND ts = ?", (channel_id, ts)
-        ).fetchone()
-        if message is None:
-            raise LookupError("message_not_found")
-        rows = self.db.execute(
-            """SELECT emoji, COUNT(*) AS n, group_concat(user_id) AS users FROM
-            (SELECT * FROM reactions WHERE message_id = ? ORDER BY created_us) GROUP BY emoji ORDER BY MIN(created_us)""",
-            (message[0],),
-        )
-        reactions = [{"name": r["emoji"], "count": r["n"], "users": r["users"].split(",")} for r in rows]
-        return {"channel": channel_id, "ts": ts, "reactions": reactions}
-
-    def whoami(self) -> dict:
-        """The user the tools act as, and the present on their clock (Slack's auth.test)."""
-        me, now = self.actor, self.db.execute("SELECT value FROM world_meta WHERE key = 'now_us'").fetchone()
-        team = self.db.execute("SELECT value FROM world_meta WHERE key = 'company'").fetchone()
-        out = {"user_id": me["id"], "name": me["handle"], "real_name": me["real_name"], "title": me["title"]}
-        out |= {"tz": me["tz"], "team": team[0] if team else None}
-        return out | (self._times(int(now[0]), "now") if now else {})
+        return surface.read(self, tool, arguments)

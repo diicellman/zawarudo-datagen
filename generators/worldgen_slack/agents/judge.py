@@ -38,9 +38,14 @@ and its gold rows are the complete, correct answer; a status task's answer is it
 the actor can see it, while the fact that settles it is out of their sight. Score each criterion of schemas.json from 0 to 1:
 - question_fit: each gold query answers its question as asked; test variants with inspect_sql.
 - discoverability: the actor can find the answer with Slack's read tools; try inspect_read, and read the solves.
-  Solvers that answer differently or fail can reveal ambiguity or a missing time scope; a mistake the evidence rules
-  out is the solver's. When input.json has witness, a stronger solver tried the tasks the solves rarely answer: one
-  it answers is hard, not broken; one it fails too may be ambiguous or unanswerable as asked.
+  When input.json has witness, a stronger solver tried the tasks the solves rarely answer: one it answers can be
+  solved, which shows nothing about whether its question has one reading; one it fails too may be unanswerable.
+- One reading. Each wrong solve's grade gives the answer it committed to and the gold rows it missed or added. For
+  each, decide whether the question's own words allow a reading under which that answer is right: does a thread
+  reply count as posting, is the poster among those who replied, does a reaction break a quiet spell, what comes
+  before what in "then", whose clock and which week, a team or a channel. A mistake the question's words rule out is
+  the solver's. If a reading allows it, the task is not valid: set its review's misread to that answer and the
+  reading, and raise a blocking issue asking for the wording that rules the reading out with the same gold.
 - shortcut_free: nothing in the workspace hands over the answer outside its evidence.
 - level_fit, on each task's review, from 0 to 4: how fully answering it needs the level and concept its `means`
   names. 4: it needs them, with no shortcut; 3: it needs them, but one route is easier than the level; 2: partly;

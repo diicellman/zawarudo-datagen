@@ -34,7 +34,7 @@ dm_share = 0.25           # share of background messages in DMs (estimate)
 conversation_lines = 6    # mean lines of a background conversation (estimate)
 reply_share = 0.3         # share of messages that are thread replies (vendor survey, low confidence)
 reaction_rate = 0.2       # share of messages with at least one reaction (estimate)
-mention_rate = 0.11       # measured: spencer/software_slacks, deduplicated; scorecard only
+mention_rate = 0.11       # measured: spencer/software_slacks, deduplicated; checked per day, ± mention_tolerance
 emoji_rate = 0.08         # measured, same corpus; scorecard only
 parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 0.03 }  # workday rhythm (estimate)
 

@@ -78,6 +78,12 @@ class PublicTask(StrictModel):
     coverage: float | None = None
     witness: str | None = None
     witness_right: float | None = None
+    # v10: the tool surface and turn limit its tries had (rates on one do not carry to another), and how its wrong
+    # tries went wrong, by code (search, budget, abstained, overclaim, trap, saw_all).
+    surface: str | None = None
+    turns: int | None = None
+    miss_classes: dict[str, int] | None = None
+    intent: str | None = None  # v10: the request it is, a person's to an assistant
 
 
 class PrivateAnswer(StrictModel):
@@ -93,10 +99,17 @@ class PrivateAnswer(StrictModel):
 
 
 class Manifest(StrictModel):
-    format: Literal["worldgen-slack.v6", "worldgen-slack.v7", "worldgen-slack.v8", "worldgen-slack.v9"] = (
+    format: Literal[
+        "worldgen-slack.v6",
+        "worldgen-slack.v7",
+        "worldgen-slack.v8",
+        "worldgen-slack.v9",
+        "worldgen-slack.v10",
+    ] = (  # fmt: skip
         # v7: tasks carry their rates; v8: strict grounds the answer's claims, unanswered counted; v9: status answers,
-        # the abstain rate and the right rate's interval, and a reward of +1, 0 or -1
-        "worldgen-slack.v9"
+        # the abstain rate and the right rate's interval, and a reward of +1, 0 or -1; v10: Slack's own MCP tools,
+        # each task's surface and turn limit, its miss classes, and evidence that is its answer's own
+        "worldgen-slack.v10"
     )
     world_hash: str
     files: dict[str, str]
@@ -131,7 +144,8 @@ def load_release(root: Path) -> tuple[Path, list[PublicTask], dict[str, PrivateA
             if readable and [channel, ts] in answer.unseen:
                 raise ValueError(f"{row.task_id}: evidence out of sight that its actor can read")
         for user in answers[row.task_id].users:
-            reader.get_user(user)
+            if not reader.db.execute("SELECT 1 FROM users WHERE id = ?", (user,)).fetchone():
+                raise ValueError(f"{row.task_id}: a gold person who is not in the workspace")
         reader.close()
     return root / "world.sqlite", rows, answers
 

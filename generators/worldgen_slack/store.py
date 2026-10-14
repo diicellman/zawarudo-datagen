@@ -1,6 +1,7 @@
 """The run directory: the world file, one atomic checkpoint, attempt snapshots, events, traces and the release."""
 
 import fcntl
+from collections import Counter
 import json
 import os
 import sqlite3
@@ -18,9 +19,11 @@ from worldgen_slack.dataset import (
     sha256,
     write_release,
 )
+from worldgen_slack import surface
+from worldgen_slack.config import role
 from worldgen_slack.db import World, canonical
 
-from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, band_move, measures
+from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, band_move, measures, miss_class
 
 
 def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
@@ -301,31 +304,40 @@ class Store:
 
     def release_rows(self, world_hash: str) -> tuple[list[PublicTask], dict[str, PrivateAnswer]]:
         """Each task's public row and private answer: its gold rows, and the messages and people they rest on; a
-        refusal's truth out of its actor's sight goes apart, as `unseen`."""
+        refusal's truth out of its actor's sight goes apart, as `unseen`. The messages an answer rests on are its gold
+        rows' and those stating its answer facts: the task's facts its actor can read that are no decoy and that no
+        other of them supersedes. A stale value or a decoy beside them is not its evidence."""
         rows, answers = [], {}
         db = self.world.db
         for task in db.execute("SELECT * FROM tasks ORDER BY id").fetchall():
             gold = json.loads(task["gold_json"])
-            ids = {r["message_id"] for r in gold if r.get("message_id") is not None}
-            ids |= {
-                r[0]
-                for r in db.execute(
-                    """SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id
-                    WHERE tf.task_id = ? AND e.role = 'anchor'""",
+            anchors = {
+                (f, m)
+                for f, m in db.execute(
+                    """SELECT e.fact_id, e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id
+                    WHERE tf.task_id = ?""",
                     (task["id"],),
                 )
             }
-            marks = ", ".join("?" * len(ids))
+            stating = {m for _, m in anchors} | {r["message_id"] for r in gold if r.get("message_id") is not None}
+            marks = ", ".join("?" * len(stating))
             reader = World(self.world.path, actor=task["actor_id"])
-            readable = {r[0] for r in reader.db.execute(f"SELECT id FROM messages WHERE id IN ({marks})", sorted(ids))}  # fmt: skip
+            readable = {r[0] for r in reader.db.execute(f"SELECT id FROM messages WHERE id IN ({marks})", sorted(stating))}  # fmt: skip
             reader.close()
-            stated = db.execute(f"SELECT id, channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us", sorted(ids)).fetchall()  # fmt: skip
-            messages = [[r["channel_id"], r["ts"]] for r in stated if r["id"] in readable]
+            decoys = {f for (f,) in db.execute("SELECT f.id FROM task_facts tf JOIN facts f ON f.id = tf.fact_id WHERE tf.task_id = ? AND f.is_decoy = 1", (task["id"],))}  # fmt: skip
+            seen = {f for f, m in anchors if m in readable} - decoys
+            stale = {d for s, d in db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind = 'supersedes'") if s in seen}  # fmt: skip
+            ids = {m for f, m in anchors if f in seen - stale} | {r["message_id"] for r in gold if r.get("message_id") is not None}  # fmt: skip
+            stated = db.execute(f"SELECT id, channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us", sorted(stating)).fetchall()  # fmt: skip
+            messages = [[r["channel_id"], r["ts"]] for r in stated if r["id"] in readable and r["id"] in ids]
             unseen = [[r["channel_id"], r["ts"]] for r in stated if r["id"] not in readable]
             review, env = self.state.task_reviews.get(task["id"]), self.settings.get("env", {})
             measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "unanswered", "right_rate", "right_interval", "strict_rate", "abstain_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
+            if review is not None:
+                wrong = [r for r in review.get("results", []) if not r.get("correct") and not r.get("crashed")]
+                measured |= {"surface": surface.VERSION, "turns": env.get("solver", {}).get("max_turns") or role("", solver=True).max_turns, "miss_classes": dict(Counter(miss_class(r, task["answer_type"]) for r in wrong))}  # fmt: skip
             rows.append(
-                PublicTask(task_id=task["id"], question=task["question"], actor_id=task["actor_id"], category=task["category"], level=task["level"], answer_type=task["answer_type"], world_hash=world_hash, **measured)
+                PublicTask(task_id=task["id"], question=task["question"], actor_id=task["actor_id"], category=task["category"], level=task["level"], answer_type=task["answer_type"], world_hash=world_hash, intent=task["intent"], **measured)
             )  # fmt: skip
             answers[task["id"]] = PrivateAnswer(
                 answer_type=task["answer_type"],

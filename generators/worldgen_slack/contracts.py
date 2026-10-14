@@ -15,9 +15,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
-from worldgen_slack.db import SHOWN, World, canonical, digest
+from worldgen_slack.db import SCHEMA_VERSION, SHOWN, World, canonical, digest
 from worldgen_slack.db import words
+from worldgen_slack.surface import PAGE
 from worldgen_slack.dataset import NonEmptyText, SafeId, StrictModel
+from worldgen_slack.taskset import EMPTY
 
 from .config import Needs
 
@@ -172,7 +174,7 @@ def quota(taxonomy: dict, styles: list[str], seed: int, count: int) -> list[Slot
 
 def cards(cast: list) -> dict[str, dict]:
     """Each person's typing card, by user id: how they write, as the author and the judge read it."""
-    return {user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) for p in cast if p.typing}
+    return {user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) | {"timezone": p.timezone} for p in cast if p.typing}  # fmt: skip
 
 
 def selves(cast: list) -> dict[str, dict]:
@@ -229,6 +231,8 @@ class Person(StrictModel):
     user_id: SafeId
     title: NonEmptyText
     team: NonEmptyText
+    status_emoji: str | None = Field(default=None, pattern=r"^:[a-z0-9_+-]+:$")  # their Slack status, if they set one
+    status_text: str | None = Field(default=None, max_length=100)
 
 
 class Routine(StrictModel):
@@ -245,15 +249,52 @@ class Channel(StrictModel):
     routines: list[Routine] = Field(default_factory=list)
 
 
+APP_KINDS = ("deploys", "alerts", "tickets", "ci", "reminders")
+
+
+class Integration(StrictModel):
+    """An app the workspace runs: its bot's name, what it posts, the channel it posts in, the matters it posts about
+    (services, checks, ticket subjects, reminders), and for tickets the prefix of their numbers."""
+
+    name: NonEmptyText
+    kind: Literal["deploys", "alerts", "tickets", "ci", "reminders"]
+    channel: NonEmptyText
+    subjects: list[NonEmptyText] = Field(min_length=3, max_length=12)
+    prefix: str | None = Field(default=None, pattern=r"^[A-Z]{2,6}$")
+
+
+class UserGroup(StrictModel):
+    """A group people @-mention at once: @oncall, @eng-leads."""
+
+    handle: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    name: NonEmptyText
+    description: str = ""
+    members: Ids = Field(min_length=2)
+
+
 class Organization(StrictModel):
     people: list[Person] = Field(min_length=3)
     channels: list[Channel] = Field(min_length=1)
     dm_routines: list[Routine] = Field(default_factory=list)
+    integrations: list[Integration] = Field(default_factory=list)
+    usergroups: list[UserGroup] = Field(default_factory=list, max_length=6)
 
 
 class Storyline(StrictModel):
     id: SafeId
     summary: NonEmptyText
+
+
+# What a person asks an assistant for, each checkable against the workspace and its ledger.
+INTENTS = {
+    "find": "find a fact: what was decided, said or chosen",
+    "status": "the status of something, or what changed about it",
+    "owner": "who owns or handles something, now or at a moment",
+    "promised": "what someone promised, and whether it is still open",
+    "when": "when something happens or happened, on whose clock",
+    "stance": "who said, agreed or objected",
+    "structure": "who posted, reacted or replied where: the workspace's own record",
+}
 
 
 class Task(StrictModel):
@@ -267,6 +308,11 @@ class Task(StrictModel):
     facts: Ids = Field(default_factory=list)
     # The gold query with one condition relaxed (a day, a channel, a reaction left out): what a hasty reader answers.
     near_sql: list[NonEmptyText] = Field(default_factory=list, max_length=3)
+    # In the forge, the id of a task sent back for another reading of its question: this one rewords it, for the same
+    # asker and the same gold answer.
+    rewords: SafeId | None = None
+    # In the forge, the request it is (INTENTS): the archive balances them, so the tasks read like real requests.
+    intent: Literal["find", "status", "owner", "promised", "when", "stance", "structure"] | None = None
 
 
 class Scene(StrictModel):
@@ -294,6 +340,13 @@ SHORT, LONG = 4, 20
 # ---------------------------------------------------------------------- time: code owns every timestamp
 
 PLACEHOLDER = re.compile(r"\{at:([A-Za-z0-9][A-Za-z0-9_.-]*)\}")
+# A person's own message, as SQL over messages m joined to users u: not a bot's post, not a join or a leave.
+PEOPLE = "u.is_bot = 0 AND m.subtype IS NULL"
+# Links and groups are code's too: {link:TKT-4471} renders as Slack's <url|TKT-4471> for an artifact of the registry,
+# {group:oncall} as <!subteam^S..|@oncall>; a raw URL in authored text is refused.
+LINK = re.compile(r"\{link:([A-Za-z0-9][A-Za-z0-9#._/-]*)\}")
+GROUP = re.compile(r"\{group:([a-z0-9][a-z0-9_-]*)\}")
+RAW_URL = re.compile(r"https?://|www\.", re.IGNORECASE)
 MENTION = re.compile(r"<@([A-Za-z0-9]+)>")
 # ponytail: clock times and calendar dates only; relative words ("tomorrow", "Friday") are left to the judge,
 # and "may 2" (the verb) is read as a date.
@@ -420,11 +473,75 @@ def frozen_digest(world) -> str:
     return digest({name: sorted((list(r) for r in world.db.execute(sql, {"t": t})), key=repr) for name, sql in FROZEN.items()})  # fmt: skip
 
 
-def render(moment_us: int, place: str, said_us: int) -> str:
-    """A moment as its writer reads it on their own clock; the day is named when it is not the day of writing."""
+# How a person writes a time, drawn once per person: "5pm", "5 PM" or "17:00". A world written before 2026-10-14 has
+# no `time_style` and keeps its clock style ("17:00 EDT", "Tue Aug 25 17:00 EDT"), chapters included.
+HABITS = ("12h", "12h spaced", "24h")
+# A word that names a day: before {at:id}, which names its own day, it would name it twice.
+DAY_WORD = re.compile(
+    r"\b(?:today|tonight|tomorrow|tmrw|yesterday|(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)(?:day)?|"
+    r"wednesday|saturday)\.?,?\s*(?:at\s+|@\s*)?$",
+    re.IGNORECASE,
+)
+
+
+def habit(person: str) -> str:
+    return HABITS[int(digest(["habit", person])[:8], 16) % len(HABITS)]
+
+
+def writing(world) -> tuple[dict[str, str], dict[str, str], str | None]:
+    """How each person writes a time: their clock, their habit (none in a world kept in the clock style), and the
+    company's clock, whose people leave the zone out."""
+    zones = {r[0]: r[1] for r in world.db.execute("SELECT id, tz FROM users")}
+    styled = world.db.execute("SELECT value FROM world_meta WHERE key = 'time_style'").fetchone()
+    home = world.db.execute("SELECT value FROM world_meta WHERE key = 'zone'").fetchone()
+    habits = {u: habit(u) for u in zones} if styled and styled[0] == "habit" else {}
+    return zones, habits, home[0] if home else None
+
+
+def render(moment_us: int, place: str, said_us: int, way: str | None = None, home: str | None = None) -> str:
+    """A moment as its writer writes it on their own clock. In a person's habit (`way`): the time ("5pm", "5:30 PM",
+    "17:00", "12pm"), the day only when it is not the day of writing ("tomorrow", "yesterday", a weekday within the
+    next six days, else the date), and the zone only when theirs is not the company's (`home`). Every form reads back
+    to the exact moment given the writer's clock and the day they wrote it (`reread`). With no habit, the clock style:
+    the day is named when it is not the day of writing."""
     tz = ZoneInfo(place)
     when, said = datetime.fromtimestamp(moment_us / 1e6, tz), datetime.fromtimestamp(said_us / 1e6, tz)
-    return f"{when:%H:%M %Z}" if when.date() == said.date() else f"{when:%a %b} {when.day} {when:%H:%M %Z}"
+    if way is None:
+        return f"{when:%H:%M %Z}" if when.date() == said.date() else f"{when:%a %b} {when.day} {when:%H:%M %Z}"
+    if way == "24h":
+        hour = f"{when:%H:%M}"
+    else:  # "12pm", not "noon": a word people also write freely, which code could not tell from its own
+        h, m = when.hour % 12 or 12, f":{when.minute:02d}" if when.minute else ""
+        hour = f"{h}{m}{' ' if way == '12h spaced' else ''}{('pm' if when.hour >= 12 else 'am') if way == '12h' else ('PM' if when.hour >= 12 else 'AM')}"  # fmt: skip
+    gap = (when.date() - said.date()).days
+    day = "" if gap == 0 else "tomorrow " if gap == 1 else "yesterday " if gap == -1 else f"{when:%a} " if 1 < gap < 7 else f"{when:%b} {when.day} "  # fmt: skip
+    return day + hour + ("" if home is None or place == home else f" {when:%Z}")
+
+
+READ_BACK = re.compile(
+    r"^(?:(?P<rel>tomorrow|yesterday) |(?P<wd>Mon|Tue|Wed|Thu|Fri|Sat|Sun) |(?P<mon>[A-Z][a-z]{2}) (?P<md>\d{1,2}) )?"
+    r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?(?: ?(?P<ap>am|pm|AM|PM))?(?: (?P<zone>[A-Z]{2,5}))?$"
+)
+
+
+def reread(text: str, place: str, said_us: int) -> int:
+    """A rendered time read back: the moment it names on its writer's clock, from the day they wrote it."""
+    tz, said = ZoneInfo(place), datetime.fromtimestamp(said_us / 1e6, ZoneInfo(place))
+    found = READ_BACK.match(text)
+    if not found:
+        raise ValueError(f"not a rendered time: {text!r}")
+    g = found.groupdict()
+    hour, minute = int(g["h"]), int(g["m"] or 0)
+    if g["ap"]:
+        hour = hour % 12 + (12 if g["ap"].lower() == "pm" else 0)
+    day = said.date()
+    if g["rel"]:
+        day += timedelta(days=1 if g["rel"] == "tomorrow" else -1)
+    elif g["wd"]:
+        day += timedelta(days=next(k for k in range(2, 7) if (said.date() + timedelta(days=k)).strftime("%a") == g["wd"]))  # fmt: skip
+    elif g["mon"]:
+        day = datetime.strptime(f"{g['mon']} {g['md']} {said.year}", "%b %d %Y").date()
+    return us(datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz))
 
 
 class Gaps:
@@ -446,7 +563,7 @@ class Gaps:
 
 # ---------------------------------------------------------------------- documents → rows, checked
 
-LEDGER_TABLES = {"facts", "fact_relations", "evidence"}
+LEDGER_TABLES = {"facts", "fact_relations", "evidence", "commitments", "artifacts"}  # promises and the registry too
 STRUCTURE = {"channels", "members", "messages", "message_mentions", "reactions", "thread_stats"}
 
 
@@ -506,12 +623,33 @@ def organize(world, org: Organization, cast: list[SeedPersona], premise: Premise
                 email=f"{handle}@{domain}", title=person.title, tz=seed.timezone, created_us=start - 365 * DAY
             )
             | dict(profile_json=json.dumps({"Team": person.team}))
+            | dict(status_emoji=person.status_emoji, status_text=person.status_text)
+        )
+        if person.status_text and TIME_LITERAL.search(person.status_text):
+            raise ValueError(f"{person.user_id}: a status names no time: {person.status_text!r}")
+    named = {ch.name for ch in org.channels if ch.name}
+    if settings.activity.bot_posts > 0 and not 2 <= len(org.integrations) <= 5:
+        raise ValueError("integrations lists 2 to 5 apps the company runs, each posting in one of its channels")
+    for app in org.integrations:
+        if app.channel not in named:
+            raise ValueError(f"integration {app.name}: channel is one of the organization's channels, not {app.channel!r}")  # fmt: skip
+        if spoken := [x for x in app.subjects if TIME_LITERAL.search(x)]:
+            raise ValueError(f"integration {app.name}: a subject names no time: {spoken}")
+    if len({a.name for a in org.integrations}) != len(org.integrations):
+        raise ValueError("each integration has a name of its own")
+    for app in org.integrations:
+        handle = re.sub(r"[^a-z0-9]+", "-", app.name.lower()).strip("-")
+        users.append(
+            dict(id=bot_id(app.name), handle=handle, real_name=app.name, display_name=app.name, is_bot=1)
+            | dict(email=f"{handle}@bots.{domain}", title="App", tz=place, created_us=start - 30 * DAY)
+            | dict(profile_json=json.dumps({"subjects": app.subjects} | ({"prefix": app.prefix} if app.prefix else {})))  # fmt: skip
         )
     meta = {
-        "schema_version": "1",
+        "schema_version": str(SCHEMA_VERSION),
         "company": premise.company,
         "zone": place,
         "now_us": str(days[-1]["end_us"]),
+        "time_style": "habit",  # each person writes times their own way
     }
     with world.batch():
         world.insert("world_meta", [{"key": k, "value": v} for k, v in meta.items()])
@@ -521,6 +659,62 @@ def organize(world, org: Organization, cast: list[SeedPersona], premise: Premise
         rows, members = channel_rows(world, channels, start - 30 * DAY)
         world.insert("channels", rows)
         world.insert("members", members)
+        by_name = {r["name"]: r["id"] for r in rows if r["name"]}
+        world.insert("members", [dict(channel_id=by_name[a.channel], user_id=bot_id(a.name), joined_us=start - 30 * DAY) for a in org.integrations])  # fmt: skip
+        world.insert("integrations", [dict(user_id=bot_id(a.name), kind=a.kind, channel_id=by_name[a.channel]) for a in org.integrations])  # fmt: skip
+        if len({g.handle for g in org.usergroups}) != len(org.usergroups):
+            raise ValueError("each usergroup has a handle of its own")
+        for g in org.usergroups:
+            if strangers := set(g.members) - set(chosen):
+                raise ValueError(f"usergroup @{g.handle}: members are people of the company, not {sorted(strangers)}")  # fmt: skip
+            group = "S" + digest(["group", g.handle])[:10].upper()
+            world.insert("usergroups", [dict(id=group, handle=g.handle, name=g.name, description=g.description, created_us=start - 30 * DAY)])  # fmt: skip
+            world.insert("usergroup_members", [dict(usergroup_id=group, user_id=m) for m in dict.fromkeys(g.members)])  # fmt: skip
+
+
+def linked(world, text: str, at_us: int) -> str:
+    """A line's links and group mentions as Slack writes them; an artifact is linked once it exists."""
+
+    def link(m):
+        row = world.db.execute("SELECT url, created_us FROM artifacts WHERE id = ?", (m[1],)).fetchone()
+        if row["created_us"] > at_us:
+            raise ValueError(f"{m[1]} does not exist yet: it is made on a later day")
+        return f"<{row['url']}|{m[1]}>"
+
+    def group(m):
+        row = world.db.execute("SELECT id FROM usergroups WHERE handle = ?", (m[1],)).fetchone()
+        return f"<!subteam^{row[0]}|@{m[1]}>"
+
+    return GROUP.sub(group, LINK.sub(link, text))
+
+
+def bot_id(name: str) -> str:
+    return "U" + digest(["bot", name])[:10].upper()
+
+
+def queue(world, due_us: int, channel_id: str, user_id: str, text: str, origin: str, subtype: str | None) -> bool:
+    """Queue one of code's posts (an app's, a join or a leave) for its moment; a post of the same origin is queued
+    once. Returns whether it was queued."""
+    if world.db.execute("SELECT 1 FROM queue WHERE origin = ?", (origin,)).fetchone():
+        return False
+    world.insert("queue", [dict(due_us=due_us, channel_id=channel_id, user_id=user_id, text=text, origin=origin, subtype=subtype)])  # fmt: skip
+    return True
+
+
+def drain(world, until_us: int) -> list[int]:
+    """Write every queued post due before `until_us`, in time order: code's posts reach the workspace as the present
+    reaches them, so the world stays one written forward. One due at the very moment of a message in its channel waits
+    a microsecond."""
+    written = []
+    for row in world.db.execute("SELECT * FROM queue WHERE message_id IS NULL AND due_us < ? ORDER BY due_us, id", (until_us,)).fetchall():  # fmt: skip
+        at = row["due_us"]
+        while world.db.execute("SELECT 1 FROM messages WHERE channel_id = ? AND ts_us = ?", (row["channel_id"], at)).fetchone():  # fmt: skip
+            at += 1
+        (message,) = world.insert("messages", [dict(channel_id=row["channel_id"], ts_us=at, user_id=row["user_id"], text=row["text"], subtype=row["subtype"])])  # fmt: skip
+        world.insert("message_mentions", [dict(message_id=message, user_id=u) for u in dict.fromkeys(MENTION.findall(row["text"]))])  # fmt: skip
+        world.db.execute("UPDATE queue SET message_id = ? WHERE id = ?", (message, row["id"]))
+        written.append(message)
+    return written
 
 
 def direct_messages(org: Organization, settings) -> list[Channel]:
@@ -547,7 +741,10 @@ def background_plan(world, org: Organization, activity, seed: int, day: int, bud
     about `conversation_lines` lines, in channels by Zipf weight on their members and in DMs by `dm_share`, in parts
     by the day's rhythm. Each takes its kind from its conversation's routines, drawn by their stated probabilities."""
     rng = random.Random(digest([seed, "agenda", day]))
-    routines = {channel_id(c.type, c.name, c.members): c.routines for c in org.channels if c.routines}
+    span = world.db.execute("SELECT start_us, end_us FROM calendar WHERE day = ?", (day,)).fetchone()[:]
+    # Conversations happen in channels open all day (not archived by its end), among people there all day.
+    archived = {r[0] for r in world.db.execute("SELECT id FROM channels WHERE archived_us IS NOT NULL AND archived_us < ?", (span[1],))}  # fmt: skip
+    routines = {i: c.routines for c in org.channels if c.routines and (i := channel_id(c.type, c.name, c.members)) not in archived}  # fmt: skip
     named = sorted(
         routines,
         key=lambda c: (
@@ -570,8 +767,8 @@ def background_plan(world, org: Organization, activity, seed: int, day: int, bud
         members = [
             r[0]
             for r in world.db.execute(
-                "SELECT user_id FROM members WHERE channel_id = ? AND left_us IS NULL ORDER BY user_id",
-                (place,),
+                "SELECT m.user_id FROM members m JOIN users u ON u.id = m.user_id WHERE m.channel_id = ? AND m.joined_us <= ? AND (m.left_us IS NULL OR m.left_us >= ?) AND u.is_bot = 0 ORDER BY m.user_id",
+                (place, *span),
             )
         ]
         talkers = min(len(members), 2 + min(int(rng.expovariate(1.0)), 2))
@@ -612,6 +809,9 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
             f"{task.id}: a {task.category} task has a level from 1 to {len(category.levels)} and an answer type in "
             f"{category.answer_types}"
         )
+    asker = world.db.execute("SELECT is_bot, is_deleted FROM users WHERE id = ?", (task.actor_id,)).fetchone()
+    if asker is not None and (asker["is_bot"] or asker["is_deleted"]):
+        raise ValueError(f"{task.id}: actor_id {task.actor_id} is a bot or no longer at the company; a person asks")
     try:
         out = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)
     except LookupError:
@@ -764,8 +964,8 @@ def needs_text(needs) -> str:
 
 
 IDENTIFIER = re.compile(
-    r"(?<![\w-])(?=[\w-]*\d)(?=[\w-]*[^\W\d_])\w[\w-]*\w(?![\w-])"
-)  # PWSQL-03, CHG-2291, CU12
+    r"(?<![\w-])(?!\d{1,2}(?:am|pm)\b)(?=[\w-]*\d)(?=[\w-]*[^\W\d_])\w[\w-]*\w(?![\w-])", re.IGNORECASE
+)  # PWSQL-03, CHG-2291, CU12; a time ("5pm") is not one
 
 
 def named(world, question: str, evidence: list[int]) -> int:
@@ -918,7 +1118,7 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
     seen = [m for m in evidence if reader.db.execute("SELECT 1 FROM messages WHERE id = ?", (m,)).fetchone()]
     pages = [
         reader.db.execute(
-            """SELECT COUNT(*) / 50 + 1 FROM messages m, messages e
+            f"""SELECT COUNT(*) / {PAGE} + 1 FROM messages m, messages e
             WHERE e.id = ? AND m.channel_id = e.channel_id AND m.parent_id IS NULL
             AND m.ts_us > (SELECT ts_us FROM messages WHERE id = COALESCE(e.parent_id, e.id))""",
             (message_id,),
@@ -1031,7 +1231,7 @@ def features(world, task_id: str, rows: list[dict]) -> dict:
         first = min(world.db.execute(f"SELECT MIN(ts_us) FROM messages WHERE id IN ({', '.join('?' * len(ms))})", ms).fetchone()[0] for ms in stated.values())  # fmt: skip
         link += "·later" if message["ts_us"] > first and len(stated) > 1 else ""
     others = []
-    for (user,) in world.db.execute("SELECT id FROM users WHERE id != ? ORDER BY id", (task["actor_id"],)):
+    for (user,) in world.db.execute("SELECT id FROM users WHERE id != ? AND is_bot = 0 ORDER BY id", (task["actor_id"],)):
         try:
             others.append(sorted(str(r.get("answer")) for r in world.gold(user, task["gold_sql"], max_rows=50)["rows"]))  # fmt: skip
         except ValueError:
@@ -1146,7 +1346,7 @@ def unsettled(world, task: Task, rows: list[dict]) -> None:
 
 def task_row(task: Task, settings) -> dict:
     return task.model_dump(
-        include={"id", "category", "level", "actor_id", "question", "answer_type", "gold_sql"}
+        include={"id", "category", "level", "actor_id", "question", "answer_type", "gold_sql", "intent"}
     ) | {"gold_source": gold_source(task, settings), "near_sql": json.dumps(task.near_sql)}
 
 
@@ -1166,6 +1366,8 @@ def text_errors(world, lines, conveyable: set[str], moments: set[str]) -> list[s
     people."""
     ids = [r[0] for r in world.db.execute("SELECT id FROM facts UNION SELECT id FROM events")]
     people = {r[0] for r in world.db.execute("SELECT id FROM users")}
+    artifacts = {r[0] for r in world.db.execute("SELECT id FROM artifacts")}
+    groups = {r[0] for r in world.db.execute("SELECT handle FROM usergroups")}
     errors = []
     for i, line in enumerate(lines):
         if line.reply_to is not None and line.reply_to >= i:
@@ -1176,6 +1378,8 @@ def text_errors(world, lines, conveyable: set[str], moments: set[str]) -> list[s
             )
         if unknown := set(PLACEHOLDER.findall(line.text)) - moments:
             errors.append(f"line {i}: {{at:...}} names a moment; not {sorted(unknown)}")
+        if named_twice := [m.group(1) for m in PLACEHOLDER.finditer(line.text) if DAY_WORD.search(line.text[: m.start()])]:  # fmt: skip
+            errors.append(f"line {i}: {{at:...}} names its own day; drop the day word before {named_twice}")
         if literal := TIME_LITERAL.findall(PLACEHOLDER.sub(" ", line.text)):
             errors.append(f"line {i}: write times and dates only as {{at:id}}; found {literal}")
         if named := [
@@ -1186,6 +1390,12 @@ def text_errors(world, lines, conveyable: set[str], moments: set[str]) -> list[s
             errors.append(f"line {i}: no line names a fact or event id; found {named}")
         if strangers := set(MENTION.findall(line.text)) - people:
             errors.append(f"line {i}: <@...> names a person's user_id; not {sorted(strangers)}")
+        if lost := set(LINK.findall(line.text)) - artifacts:
+            errors.append(f"line {i}: {{link:...}} names an artifact of the plan; not {sorted(lost)}")
+        if lost := set(GROUP.findall(line.text)) - groups:
+            errors.append(f"line {i}: {{group:...}} names a usergroup's handle; not {sorted(lost)}")
+        if RAW_URL.search(LINK.sub(" ", line.text)):
+            errors.append(f"line {i}: a link is {{link:id}} of an artifact; code writes its URL")
     return errors
 
 
@@ -1196,11 +1406,12 @@ def insert_lines(
     author's clock, replies in their thread (or every line in `thread`), mentions, reactions after their message
     (and before `latest`), and evidence: a fact in `first` is anchored by its author's first line conveying it."""
     facts = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
-    zones = {r[0]: r[1] for r in world.db.execute("SELECT id, tz FROM users")}
+    zones, habits, home = writing(world)
     world.insert("scenes", [scene])
     ids = [None] * len(lines)
     for i, (line, ts) in enumerate(zip(lines, stamps)):
-        text = PLACEHOLDER.sub(lambda m: render(moments[m[1]], zones[line.author_id], ts), line.text)
+        drain(world, ts)  # code's posts due before this line come first
+        text = linked(world, PLACEHOLDER.sub(lambda m: render(moments[m[1]], zones[line.author_id], ts, habits.get(line.author_id), home), line.text), ts)  # fmt: skip
         root = i
         while lines[root].reply_to is not None:
             root = lines[root].reply_to
@@ -1234,7 +1445,7 @@ def insert_lines(
         for fact_id in dict.fromkeys(line.conveys):
             fact = facts[fact_id]
             token = fact["anchor"] or (
-                render(fact["moment_us"], zones[line.author_id], ts)
+                render(fact["moment_us"], zones[line.author_id], ts, habits.get(line.author_id), home)
                 if fact["moment_us"] is not None
                 else None
             )
@@ -1258,7 +1469,8 @@ def activity(world, start_us: int | None = None, end_us: int | None = None) -> d
         """SELECT m.id, m.parent_id IS NOT NULL AS reply, c.type IN ('im', 'mpim') AS dm, m.text,
         EXISTS (SELECT 1 FROM reactions r WHERE r.message_id = m.id) AS reacted,
         EXISTS (SELECT 1 FROM message_mentions x WHERE x.message_id = m.id) AS mentions
-        FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.ts_us >= ? AND m.ts_us < ?""",
+        FROM messages m JOIN channels c ON c.id = m.channel_id JOIN users u ON u.id = m.user_id
+        WHERE {PEOPLE} AND m.ts_us >= ? AND m.ts_us < ?""".format(PEOPLE=PEOPLE),
         span,
     ).fetchall()
     share = lambda values: round(sum(values) / len(rows), 3) if rows else 0.0  # noqa: E731
@@ -1276,7 +1488,7 @@ def style(world, since_us: int = 0) -> dict:
     """Surface statistics of voice and timing, overall and per author, of the messages since `since_us` (a chapter's
     own); the world judge compares them with people's typing."""
     rows = world.db.execute(
-        "SELECT m.user_id, m.text, m.ts_us, u.tz FROM messages m JOIN users u ON u.id = m.user_id WHERE m.is_deleted = 0 AND m.ts_us >= ?",
+        f"SELECT m.user_id, m.text, m.ts_us, u.tz FROM messages m JOIN users u ON u.id = m.user_id WHERE {PEOPLE} AND m.is_deleted = 0 AND m.ts_us >= ?",
         (since_us,),
     ).fetchall()
 
@@ -1302,6 +1514,28 @@ def style(world, since_us: int = 0) -> dict:
     return measure(rows) | {"authors": {a: measure(items) for a, items in sorted(by_author.items())}}
 
 
+# A task the judge finds a second reading of: one of its wrong answers is right as its question can also be read.
+READING = "another reading of its question makes a wrong answer right: "
+
+
+def miss_class(result: dict, answer_type: str) -> str:
+    """How a wrong try went wrong, by code: `budget` (no answer: empty, or out of turns), `abstained` (declined),
+    `overclaim` (a status answer's value given as final), `trap` (a refusal answered with a value), `search` (some of
+    the evidence its answer rests on never shown) or `saw_all` (shown all of it, and answered otherwise). Whether a
+    wrong answer is a reasoning slip or a reading the question allows is the judge's ruling, on every wrong answer."""
+    if result.get("unanswered") or result.get("reason") == EMPTY:
+        return "budget"
+    if result.get("abstained"):
+        return "abstained"
+    aligned = "missing" in result and not result["missing"] and not result.get("extra")
+    if answer_type == "status" and aligned:
+        return "overclaim"
+    if answer_type == "refusal" and result.get("committed"):
+        return "trap"
+    coverage = result.get("evidence_coverage")
+    return "search" if coverage is not None and coverage < 1 else "saw_all"
+
+
 # ---------------------------------------------------------------------- reviews
 
 
@@ -1321,10 +1555,20 @@ class Issue(StrictModel):
 
 
 class TaskReview(StrictModel):
+    """One task's review. `misread` quotes a wrong solve's answer that a reading the question's own words allow makes
+    right, with that reading: such a task is not valid, and goes back to be reworded, not kept as hard."""
+
     task_id: SafeId
     valid: bool
     reason: NonEmptyText
     level_fit: int | None = Field(default=None, ge=0, le=4)
+    misread: NonEmptyText | None = None
+
+    @model_validator(mode="after")
+    def read_one_way(self) -> Self:
+        if self.misread and self.valid:
+            raise ValueError("a task whose wrong answer another reading of its question makes right is not valid")
+        return self
 
 
 # A task review scores one task; a world review scores the workspace text.

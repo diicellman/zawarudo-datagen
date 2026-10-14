@@ -37,8 +37,9 @@ class PipelineConfig(vf.EnvConfig):
         update={"runtime": vf.SubprocessConfig()}
     )
     # A stronger solver with the same tools, for the tasks GLM rarely answers: hard, or broken?
+    # It thinks hard (FC1's took 2-5 calls and lost tasks the solver answered): it shows a task can be answered.
     witness: vf.AgentConfig = role("openai/gpt-6-sol", solver=True).model_copy(
-        update={"runtime": vf.SubprocessConfig()}
+        update={"runtime": vf.SubprocessConfig(), "sampling": role("openai/gpt-6-sol", solver=True).sampling.model_copy(update={"reasoning_effort": "high"})}  # fmt: skip
     )
     retries: RetryConfig = RetryConfig(max_retries=0)
     # The episode's agents at once. GLM, whose account allows 8 concurrent requests, is gated on its own by
@@ -82,6 +83,9 @@ class TasksConfig(Section):
     batch: int = Field(default=10, ge=1, le=50)  # slots written and hardened in one author interaction
     max_answer_rows: int = Field(default=5, ge=1, le=50)
     styles: list[Text] = Field(min_length=1)
+    # Whether the world run writes its own tasks after its last day; without, it ends at its final review and the
+    # forge writes its tasks on the finished world (the way of worlds from 2026-10-14).
+    in_world: bool = True
 
     @model_validator(mode="after")
     def ordered(self):
@@ -112,6 +116,12 @@ class ActivityConfig(Section):
     )
     mention_rate: float = Field(default=0.11, ge=0, le=1)
     emoji_rate: float = Field(default=0.08, ge=0, le=1)
+    # Promises made per message, at least, each day ("I'll have it by Friday"): what was promised and is still open is
+    # a request people bring to an assistant. Off unless a world's config sets it (S3 and its chapters left it out).
+    promise_rate: float = Field(default=0.0, ge=0, le=0.2)
+    # Each app's routine posts per workday (builds, alerts, staging deploys, tickets; a reminder posts once): code's,
+    # never a person's. Off unless a world's config sets it, with the apps its organization lists.
+    bot_posts: float = Field(default=0.0, ge=0, le=30)
 
 
 class Needs(Section):
@@ -179,6 +189,7 @@ class AuthorSettings(Section):
     share_tolerance: float = Field(
         default=0.1, ge=0, le=1
     )  # reply, reaction and DM shares, checked at the end
+    mention_tolerance: float = Field(default=0.05, ge=0, le=1)  # the share of messages mentioning someone, per day
     review_days: list[int] = Field(
         default_factory=lambda: [5]
     )  # the judge reviews the world after these days
@@ -229,8 +240,9 @@ class Config(Section):
 
     @property
     def task_count(self) -> int:
-        """How many tasks the world holds: `[tasks].per_100` for every 100 messages, and at least one."""
-        return max(1, round(self.activity.messages * self.tasks.per_100 / 100))
+        """How many tasks the world run writes: `[tasks].per_100` for every 100 messages, at least one; none when the
+        forge writes them."""
+        return max(1, round(self.activity.messages * self.tasks.per_100 / 100)) if self.tasks.in_world else 0
 
     @model_validator(mode="after")
     def secure(self):

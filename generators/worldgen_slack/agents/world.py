@@ -21,7 +21,9 @@ from verifiers.v1.utils.decorators import discover_decorated
 from worldgen_slack.db import World, digest
 from worldgen_slack.tools import WorldTaskData, file_hash, watch_parent
 
+from ..profile import profile
 from ..chronicle import (
+    edit,
     Annotation,
     Conversation,
     Plan,
@@ -43,6 +45,7 @@ from ..chronicle import (
 )
 from ..config import Config, Needs
 from ..contracts import (
+    failure_cases,
     LONG,
     PARTS,
     SHORT,
@@ -103,8 +106,15 @@ Time
   world_advance(to=part) moves it to a later part of the day: PARTS_OF_THE_DAY. From the night,
   world_advance(to="tomorrow") closes the day, once the day's checks pass, and moves to the next day's early part.
   Nothing is ever written before the present, so write the day in the order it happens.
+- People come and go: the plan's moves have someone join or leave a channel, leave the company, or a channel archived,
+  on a day; Slack posts the joins and leaves, and from then the conversations are theirs, or not.
+- The company's apps post by themselves (code writes them): builds, alerts, deploys, tickets, reminders. People read
+  them, react, and reply in their threads; an event in the ledger may name the app that reports it (post_by), and
+  then its title is all the app says, so a title names no fact's value and no time.
 - A message never contains a clock time or a date. It writes {at:id} for an event, or for a fact about one; code
-  renders it on the author's clock. Relative words (tomorrow, Friday, this morning) are fine when true at the present.
+  renders it on the author's clock, the way that person writes times, with its day when it is not today ("tomorrow
+  5pm", "Tue 17:00"): no day word right before it. Relative words (tomorrow, Friday, this morning) are fine elsewhere
+  when true at the present.
 
 The ledger (world_plan)
 - storylines: exactly the number the plan's prompt gives, the company's workstreams. Fixed once planned; summaries
@@ -340,7 +350,8 @@ def person_page(world, user_id: str, context: dict) -> str:
     out.append(f"# {me['real_name']}: {me['title']}, {team} ({me['tz']})")
     if typing := context.get("cards", {}).get(user_id):
         out.append(f"- how they type: {card(typing)}")
-    channels = [r[0] for r in world.db.execute("SELECT channel_id FROM members WHERE user_id = ? AND left_us IS NULL", (user_id,))]  # fmt: skip
+    now = int(world.db.execute("SELECT value FROM world_meta WHERE key = 'now_us'").fetchone()[0])
+    channels = [r[0] for r in world.db.execute("SELECT channel_id FROM members WHERE user_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us > ?)", (user_id, now, now))]  # fmt: skip
     out.append("- conversations: " + ", ".join(f"{label(world, c)} [[{c}]]" for c in channels))
     lines = world.db.execute(
         "SELECT * FROM messages WHERE user_id = ? ORDER BY ts_us DESC LIMIT 8", (user_id,)
@@ -373,7 +384,8 @@ def channel_page(world, channel_id: str, context: dict) -> str:
     out.append(f"# {label(world, channel_id)} ({channel['type']})")
     if channel["topic"] or channel["purpose"]:
         out.append(f"- topic: {channel['topic']}; purpose: {channel['purpose']}")
-    members = [r[0] for r in world.db.execute("SELECT user_id FROM members WHERE channel_id = ? AND left_us IS NULL", (channel_id,))]  # fmt: skip
+    now = int(world.db.execute("SELECT value FROM world_meta WHERE key = 'now_us'").fetchone()[0])
+    members = [r[0] for r in world.db.execute("SELECT user_id FROM members WHERE channel_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us > ?)", (channel_id, now, now))]  # fmt: skip
     out.append("- members: " + ", ".join(f"{who[m]['real_name']} [[{m}]]" for m in members))
     if routines := context.get("routines", {}).get(channel_id):
         out.append(
@@ -747,8 +759,9 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def read(self, actor_id: str, tool: str, arguments: dict[str, JsonValue]) -> dict:
-        """A Slack read tool as any person: search_messages, search_users, search_channels, list_user_channels,
-        read_channel, read_thread, get_user, list_channel_members or get_reactions."""
+        """A Slack read tool as any person, by the solver's own tool names without slack_: search_public,
+        search_public_and_private, search_channels, search_users, read_channel, read_thread, read_user_profile,
+        get_reactions, list_channel_members or list_user_channels. Returns what it showed, structured."""
         return self._logged(
             "read",
             {"actor_id": actor_id, "tool": tool, "arguments": arguments},
@@ -824,6 +837,17 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         )
 
     @vf.tool
+    async def edit(self, message_id: int, text: str) -> dict:
+        """Its author edits a message posted earlier today, now: the same statements, as a person fixes a typo or
+        adds a word. Slack marks it edited; what it said before is gone."""
+        return self._logged(
+            "edit",
+            {"message_id": message_id, "text": text},
+            lambda: self._write(lambda copy: edit(copy, message_id, text)),
+            "day",
+        )
+
+    @vf.tool
     async def add_task(self, task: Task) -> dict:
         """Write the task of one slot, with the slot's id (it replaces the slot's task, if any): checked, then its gold
         rows and code's measures returned. In the forge, a candidate for one of the round's open ids, of the category
@@ -833,12 +857,39 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
             if self.context.get("chapter"):
                 raise ValueError("a chapter writes no tasks: the forge writes them on its finished world")
             if self.config.mode == "forge":
-                return forge_task(copy, task, self.settings, self.allowed().get("ids", []))
+                return forge_task(copy, task, self.settings, self.allowed().get("ids", []), rework=self.allowed().get("rework"))  # fmt: skip
             return add_task(copy, task, self.settings, self.writable(), self.allowed().get("keep"))
 
         return self._logged(
             "add_task", {"task": task.model_dump(mode="json")}, lambda: self._write(act), "tasks", "forge"
         )
+
+    @vf.tool
+    async def profile(self) -> dict:
+        """The finished world's inventory, by code: its value groups (values, chains, decoys, where each value sits and
+        who can read it), threads, recurring conversations, people, its apps, promises, artifacts and groups, and what
+        kept tasks and the board rest on. Read it to find where a hard, fair task can be."""
+        return self._logged("profile", {}, lambda: profile(self._world()), "forge")
+
+    @vf.tool
+    async def probe(self, task: Task) -> dict:
+        """A candidate tried on a copy and written nowhere: its gold rows, code's measures, the lazy panel, its features
+        and the wrong answers the screen will grade. Shape a task with it, then write it with world_add_task."""
+
+        def act():
+            world, out = self._world(), {}
+            try:
+                with world.trial() as copy:
+                    result = forge_task(copy, task, self.settings, self.allowed().get("ids", []), rework=self.allowed().get("rework"))  # fmt: skip
+                    _, cases = failure_cases(copy, task.id, result["gold"])
+                    out = result | {"failure_cases": [name for name, _ in cases]}
+                    raise LookupError("a probe writes nothing")
+            except LookupError as dropped:
+                if out:
+                    return out
+                raise ValueError(str(dropped)) from None
+
+        return self._logged("probe", {"task": task.model_dump(mode="json")}, act, "forge")
 
     @vf.tool
     async def annotate(self, fact: Annotation) -> dict:
@@ -948,8 +999,10 @@ Tools and memory
   world: the whole file, or what one person sees, through the solver's own tools. Walk a task's route as its asker
   before you write it: search with the question's words, read what comes up, and see what a hasty reader would
   answer.
-- world_add_task(task) writes a candidate for one of the round's open ids, with the category and level you choose;
-  code checks it and returns its gold rows, its measures and its traps. world_annotate(fact) registers a fact the
+- world_profile() is the world's inventory by code; world_probe(task) tries a candidate on a copy and writes nothing.
+- world_add_task(task) writes a candidate for one of the round's open ids, with the category, level and intent you
+  choose (taxonomy.md lists the intents: the request it is, a person's to an assistant); code checks it and returns
+  its gold rows, its measures and its traps. Ask what people ask: balance the intents. world_annotate(fact) registers a fact the
   world already states, on its messages, when a task needs one the ledger lacks; the ledger is the world's own
   record of who stated what, with its decoys (planned wrong claims) and its changes (supersedes).
 - /task/memory/ is code's: taxonomy.md (each category, what its levels ask for, its gold and answer types),
@@ -975,6 +1028,10 @@ What makes a task hard, and what does not
 - A task is fair: its gold is the complete, correct answer from what its asker can read, and nothing else in their
   sight is as good an answer. Code grades a task's wrong answers before the solver tries it: a near-miss, a hedge, a
   set missing a row; a task whose grade accepts one is dropped.
+- A task has one reading. Say what counts where a reader could take it two ways: whether thread replies count as
+  posting, whether the poster counts among those who replied, whether a reaction breaks a quiet spell, what "then"
+  orders, whose clock and which days. A task the judge finds a second reading of is sent back, not kept: the next
+  round may reword it (world_add_task with rewords set to its id, the same asker and the same gold answer).
 
 Tasks
 - category and level from taxonomy.md; the level is your guess, and the solver's tries decide.

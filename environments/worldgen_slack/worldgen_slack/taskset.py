@@ -9,28 +9,102 @@ from pydantic import Field
 
 from .config import role
 from .dataset import NonEmptyText, PrivateAnswer, PublicTask, StrictModel, load_release
+from .db import World
+from .surface import briefing
 from .tools import CallState, SlackTools, WorldTaskData, WorldToolsConfig, stage_world
+
+
+# A person's own profile, read by the tool that shows it: the current read tools and the ones before 2026-10-14.
+PROFILES = {"read_user_profile": "id", "get_user": "id", "whoami": "user_id"}
+
+
+def _items(call: dict) -> list:
+    """What a recorded call listed: its items, and a search hit's context (the messages around it it also showed)."""
+    items = call["output"].get("items")
+    items = items if isinstance(items, list) else []
+    around = [c for i in items if isinstance(i, dict) for side in ("before", "after") for c in (i.get("context") or {}).get(side, [])]  # fmt: skip
+    return items + around
 
 
 def shown(call: dict) -> set[tuple[str, str]]:
     """The messages one recorded call showed the solver, as (channel, ts)."""
+    return {(item["channel"], item["ts"]) for item in _items(call) if isinstance(item, dict) and "ts" in item}
+
+
+def people_shown(call: dict) -> set[str]:
+    """The people one recorded call showed the solver: a message's author, a reactor, a member, a profile, a user
+    search's hit, a direct conversation's members, a channel's creator, the user themself."""
+    out, items = call["output"], _items(call)
+    ids = {i for i in items if isinstance(i, str)}
+    for item in (i for i in items if isinstance(i, dict)):
+        ids |= {item.get("user"), item.get("creator"), *item.get("users", [])} | (
+            {item.get("id")} if "real_name" in item else set()
+        )
+    ids |= {u for r in out.get("reactions", []) for u in r.get("users", [])}
+    ids |= {out.get(PROFILES[call["tool"]])} if call["tool"] in PROFILES else set()
+    return ids - {None}
+
+
+def compact(observations: list[dict]) -> dict:
+    """What a try's calls showed, each thing once: the messages in time order (with the reactions it read on them),
+    the people and channels it looked up, the members it listed, and a log of its calls with how many results each
+    returned (an empty search is a refusal's evidence). The grader reads this, not the raw outputs."""
+    messages, people, channels, members, reactions, calls = {}, {}, {}, {}, {}, []
+    for call in observations:
+        out, tool = call["output"], call["tool"]
+        listed = out.get("items") if isinstance(out.get("items"), list) else []
+        calls.append({"tool": tool, "arguments": call["arguments"], "results": len(listed) if "items" in out else 1})  # fmt: skip
+        for item in _items(call):
+            if isinstance(item, dict) and "ts" in item:
+                key = (item["channel"], item["ts"])
+                messages[key] = messages.get(key, {}) | {k: v for k, v in item.items() if k not in ("time_utc", "context")}  # fmt: skip
+            elif isinstance(item, dict) and "real_name" in item and tool != "list_channel_members":
+                people.setdefault(item["id"], item)
+            elif isinstance(item, dict) and "id" in item and "real_name" not in item:
+                channels.setdefault(item["id"], item)
+        if tool == "list_channel_members":
+            members.setdefault(call["arguments"]["channel_id"], set()).update(i["id"] if isinstance(i, dict) else i for i in listed)  # fmt: skip
+        elif tool == "get_reactions":
+            reactions[(out["channel"], out["ts"])] = out["reactions"]
+        elif tool in PROFILES:
+            people[out[PROFILES[tool]]] = out
+    for key, read in reactions.items():
+        messages.setdefault(key, {"channel": key[0], "ts": key[1]})["reactions"] = read
     return {
-        (item["channel"], item["ts"])
-        for item in call["output"].get("items", [])
-        if isinstance(item, dict) and "ts" in item
+        "messages": sorted(messages.values(), key=lambda m: (float(m["ts"]), m["channel"])),
+        "people": list(people.values()),
+        "channels": list(channels.values()),
+        "members": {channel: sorted(ids) for channel, ids in members.items()},
+        "calls": calls,
     }
 
 
 class AnswerGrade(StrictModel):
     """The committed answer against the reference (correct), whether the response declined to give one (abstained),
     whether the observations support the claims that make its answer (grounded), and how many of the response's other
-    material claims they don't (counted, not scored)."""
+    material claims they don't (counted, not scored). The alignment says what it committed to, which of the
+    reference's rows it lacks, and which values it has that the reference does not: code classes a miss from it."""
 
     correct: bool
     abstained: bool
     grounded: bool
     unsupported_asides: int = Field(ge=0)
+    committed: list[str]
+    missing: list[str]
+    extra: list[str]
     reason: NonEmptyText
+
+
+EMPTY = "The response is empty: it gives no answer and does not say the request cannot be answered."
+
+
+def empty_grade(reference: dict) -> AnswerGrade:
+    """An empty response is wrong by rule, with no grader call: it lacks every reference row."""
+    rows = [str(r["answer"]) for r in reference.get("rows", [])]
+    return AnswerGrade(
+        correct=False, abstained=False, grounded=False, unsupported_asides=0, committed=[], missing=rows, extra=[],
+        reason=EMPTY,
+    )  # fmt: skip
 
 
 class AnswerJudge(vf.Judge[AnswerGrade]):
@@ -55,9 +129,14 @@ class AnswerJudge(vf.Judge[AnswerGrade]):
                     "the solver's RECORDED observations support the claims that make its answer (the value and what "
                     "it rests on; for a status, also that it is unsettled; for a refusal, that the thing is not there "
                     "to see or its premise is contradicted); the reference is not an observation, and no observations "
-                    "means ungrounded. Count the response's other material claims the observations do not support "
-                    "(unsupported_asides); they do not change grounded. Return correct, abstained, grounded, "
-                    "unsupported_asides and a concise reason.\n" + json.dumps(fields, ensure_ascii=False)
+                    "means ungrounded. The observations are what the solver's calls showed, each thing once: messages "
+                    "in time order, the people, channels and members it looked up, and a log of its calls with how "
+                    "many results each returned. Count the response's other material claims the observations do not "
+                    "support (unsupported_asides); they do not change grounded. Then align: committed lists the answer "
+                    "the response commits to, one entry per value or row (empty when it abstains); missing lists the "
+                    "reference rows it lacks; extra lists committed values the reference does not have. Return "
+                    "correct, abstained, grounded, unsupported_asides, committed, missing, extra and a concise "
+                    "reason.\n" + json.dumps(fields, ensure_ascii=False)
                 )
             )
         ]
@@ -98,6 +177,7 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
                 task_id=task.task_id,
                 world_hash=config.tools.db_hash,
                 prompt=task.question,
+                system_prompt=briefing(World(world, actor=task.actor_id)),
                 **({"network_allow": [], "network_block": ["*"]} if network_policy else {}),
             ),
             config,
@@ -140,18 +220,22 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         trace.info["grading_started"] = True
         observations = trace.info.get("observations", [])
         reference = self.config.reference
-        result = await AnswerJudge(self.config.judge).evaluate(
-            trace=trace,
-            question=self.data.prompt,
-            reference={"answer_type": reference.answer_type, "rows": reference.rows},
-            response=trace.last_reply,
-            observations=observations,
-        )
-        grade = result.parsed
+        expected = {"answer_type": reference.answer_type, "rows": reference.rows}
+        if (trace.last_reply or "").strip():
+            result = await AnswerJudge(self.config.judge).evaluate(
+                trace=trace,
+                question=self.data.prompt,
+                reference=expected,
+                response=trace.last_reply,
+                observations=compact(observations),
+            )
+            grade = result.parsed
+        else:
+            grade = empty_grade(expected)
         if grade.grounded and not observations:
             raise ValueError("judge claimed grounding without observations")
         seen = set().union(*map(shown, observations))
-        users = {c["output"].get("id") for c in observations if c["tool"] == "get_user"}
+        users = set().union(*map(people_shown, observations))
         needed = len(reference.messages) + len(reference.users)
         found = len({tuple(m) for m in reference.messages} & seen) + len(set(reference.users) & users)
         coverage = found / needed if needed else None
