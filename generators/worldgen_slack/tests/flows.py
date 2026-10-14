@@ -78,7 +78,8 @@ async def offline(*args, **kwargs):
     raise AssertionError("the offline checks call no model: script the agent or the judge")
 
 
-GRADER = {"on": False, "loose": False, "blind": False}  # the flows' answer judge, played by code
+# The flows' answer judge, played by code; `grounded` has it ground every answer in what the solver read.
+GRADER = {"on": False, "loose": False, "blind": False, "grounded": False}
 
 
 async def scripted_complete(self, messages, *, trace=None, schema=None, parse=None, **sampling):
@@ -100,7 +101,7 @@ async def scripted_complete(self, messages, *, trace=None, schema=None, parse=No
     grade = AnswerGrade(
         correct=correct,
         abstained=False,
-        grounded=False,
+        grounded=GRADER["grounded"],
         unsupported_asides=0,
         committed=[],
         missing=[],
