@@ -13,7 +13,6 @@ storylines = 3            # the plot the ledger plans before day 1
 [author]
 review_days = [3, 6]      # the judge reviews the world after these days, and at the end
 tries = 8                 # the solver's tries of a task, each time it is probed, sampled at temperature 1 (C54)
-task_rounds = 3           # turns a task outside its level's band comes back to the author
 keepalive = 600           # seconds between pings of the author's VM while the solver and the judge work
 
 # Built by: duckdb < scripts/worldgen_slack/personas.sql
@@ -39,11 +38,9 @@ emoji_rate = 0.08         # measured, same corpus; scorecard only
 parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 0.03 }  # workday rhythm (estimate)
 
 [tasks]
-per_100 = 4               # tasks per 100 messages: 40 for S3's 1,000 (S2: 10 per 100, 40 of 400)
 # Per level, the band of GLM's right-answer rate a task aims for (the user's decision, 2026-10-05): level 1 anchors
 # that most tries get right; level 4 tasks GLM rarely answers, and the witness must.
 bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5], [0.0, 0.25]]
-batch = 10                # slots written and hardened in one author interaction (4 for a smoke)
 max_answer_rows = 5
 # How a question is asked; the seed draws one per task, as DataDesigner draws instruction styles.
 styles = [

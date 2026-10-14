@@ -155,23 +155,6 @@ def on_board(settings, slot: Slot) -> bool:
     return slot.needs is not None or settings.taxonomy[slot.category].gold in ("ledger", "hybrid") or bool(needs and needs.facts())  # fmt: skip
 
 
-def quota(taxonomy: dict, styles: list[str], seed: int, count: int) -> list[Slot]:
-    """Entropy comes from code: a world's tasks walk a seeded shuffle of every taxonomy cell, again and again when it
-    holds more tasks than cells. A cell's repeats take its level's concepts in a seeded order, so a repeat requires
-    another concept while one is left, and every task draws a question style, as DataDesigner's category and
-    subcategory samplers do."""
-    rng = random.Random(seed)
-    cells = [(name, level) for name, c in taxonomy.items() for level in range(1, len(c.levels) + 1)]
-    order = rng.sample(cells, len(cells))
-    concepts = {(c, level): rng.sample(taxonomy[c].concepts[level - 1], len(taxonomy[c].concepts[level - 1])) for c, level in order}  # fmt: skip
-    slots = []
-    for i in range(count):
-        (category, level), n = order[i % len(order)], i // len(order)
-        pool = concepts[(category, level)]
-        slots.append(Slot(id=f"{category}-l{level}-{n + 1}", category=category, level=level, concept=pool[n % len(pool)], style=rng.choice(styles)))  # fmt: skip
-    return slots
-
-
 def cards(cast: list) -> dict[str, dict]:
     """Each person's typing card, by user id: how they write, as the author and the judge read it."""
     return {user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) | {"timezone": p.timezone} for p in cast if p.typing}  # fmt: skip
@@ -888,10 +871,10 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
     return rows
 
 
-def record_task(world, task: Task, settings, slot: Slot, needs: bool = True) -> dict:
+def record_task(world, task: Task, settings, slot: Slot) -> dict:
     """T6: a task fills its slot. Code checks it (its slot's cell, a question no other task asks, facts its actor can
-    read, T1-T5, T7, and, with `needs`, its level's needs) and inserts it with its slot's concept and its gold rows.
-    Returns its gold rows and code's measures. Run inside `World.trial()`."""
+    read, T1-T5, T7) and inserts it with its slot's concept and its gold rows. Returns its gold rows and code's
+    measures. Run inside `World.trial()`."""
     if (task.id, task.category, task.level) != (slot.id, slot.category, slot.level):
         raise ValueError(f"{slot.id} is a {slot.category} level {slot.level} task, with the slot's id")
 
@@ -914,16 +897,12 @@ def record_task(world, task: Task, settings, slot: Slot, needs: bool = True) -> 
         world.insert("task_facts", [dict(task_id=task.id, fact_id=f) for f in dict.fromkeys(task.facts)])
     world.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(gold), task.id))
     tables = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)["tables"]
-    measured = measures(world, task.id, gold, tables)
-    spec = settings.taxonomy.get(task.category)
-    if needs and spec and spec.needs and (short := unmet(spec.needs[task.level - 1], measured)):
-        raise ValueError(f"{task.id}: a level-{task.level} {task.category} task needs " + "; ".join(short))
-    return {"gold": gold} | measured
+    return {"gold": gold} | measures(world, task.id, gold, tables)
 
 
 def unmet(needs, measured: dict) -> list[str]:
-    """Each of a level's needs that a task's measures fall short of, with what was measured; a need whose measure is
-    not given (a board entry has only its facts') is not checked."""
+    """Each of a level's needs that a board entry's facts fall short of, with what was measured. Whether its answer is
+    hidden is checked when it is posted."""
     out = []
     if measured["channels"] < needs.channels:
         out.append(f"its facts first stated in at least {needs.channels} channels (they are in {measured['channels']})")  # fmt: skip
@@ -931,10 +910,6 @@ def unmet(needs, measured: dict) -> list[str]:
         out.append(f"at least {needs.relations} supersedes or after relations among its facts (it has {measured['relations']})")  # fmt: skip
     if measured["decoys"] < needs.decoys:
         out.append(f"at least {needs.decoys} near-misses: decoys, or values whose change its actor cannot see, on its answer's subject and attribute, that its actor can read and no change it can see retracts (it has {measured['decoys']})")  # fmt: skip
-    if needs.hidden and measured.get("hidden") is False:
-        out.append("its answer stated where it is harder to see than its near-misses: in a thread reply, in a DM, or on a later day than every near-miss")  # fmt: skip
-    if needs.named is not None and measured.get("named", 0) > needs.named:
-        out.append(f"a question naming at most {needs.named} of its evidence's channels and identifiers (it names {measured['named']})")  # fmt: skip
     if measured.get("values", needs.values) < needs.values:
         out.append(f"its answer's subject and attribute taking at least {needs.values} values, its answer among them (it takes {measured['values']})")  # fmt: skip
     if needs.fresh and measured.get("fresh") is False:
@@ -1296,19 +1271,6 @@ def failure_cases(world, task_id: str, rows: list[dict]) -> tuple[str, list[tupl
     return f"{gold}.", cases
 
 
-def band_move(probe: dict) -> str | None:
-    """What a probed task needs: a fix the judge asks for, or to be harder or easier to land in its level's band of
-    right-answer rates. A band that starts at 0 also needs the witness to answer it: one even it fails is too hard."""
-    (lo, hi), right, witness = probe["band"], probe["right_rate"], probe.get("witness_right")
-    if not probe["approved"]:
-        return "fix"
-    if right > hi:
-        return "harder"
-    if right < lo or (lo == 0 and witness == 0):
-        return "easier"
-    return None
-
-
 def gold_source(task: Task, settings) -> str:
     """Where a task's answer comes from: its category's gold, but a status answer is a value of the ledger as its
     actor can see it stated."""
@@ -1643,17 +1605,12 @@ def validate_verdict(verdict: Verdict, payload: dict) -> None:
         )
 
 
-def deciding(verdict: Verdict, acceptance) -> list[Issue]:
-    """The issues that decide acceptance and a rejection's route: blocking ones, and minor ones when they block."""
-    return [i for i in verdict.issues if i.blocking or acceptance.minor_issues_block]
+def accepted(verdict: Verdict) -> bool:
+    """Blocking issues decide; the judge's scores are reported, not thresholds."""
+    return all(t.valid for t in verdict.tasks) and not any(i.blocking for i in verdict.issues)
 
 
-def accepted(verdict: Verdict, acceptance) -> bool:
-    """Blocking issues decide (`config.Acceptance`); the judge's scores are reported, not thresholds."""
-    return all(t.valid for t in verdict.tasks) and not deciding(verdict, acceptance)
-
-
-def accepted_task(verdict: Verdict, acceptance, task_id: str) -> bool:
+def accepted_task(verdict: Verdict, task_id: str) -> bool:
     """One task of a batched review passes on its own review and the issues that name it: an issue naming no task is
     the world's, and the final review decides it."""
     return accepted(
@@ -1662,6 +1619,5 @@ def accepted_task(verdict: Verdict, acceptance, task_id: str) -> bool:
                 "tasks": [r for r in verdict.tasks if r.task_id == task_id],
                 "issues": [i for i in verdict.issues if task_id in i.task_ids],
             }
-        ),
-        acceptance,
+        )
     )

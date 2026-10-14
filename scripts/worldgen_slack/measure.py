@@ -6,7 +6,9 @@ uv run --frozen python scripts/worldgen_slack/measure.py data/v7-01/software [mo
 
 import argparse
 import json
+import shutil
 import statistics
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -53,8 +55,6 @@ def author(run: Path, world: World, settings) -> dict | None:
     """A world, as its author wrote it: each day against its quota, the ledger and its events, promises, the
     author's turns and tool calls, the solver's probes, the reviews, and how often a ledger task's answer sits in one
     message."""
-    if not world.db.execute("SELECT 1 FROM world_meta WHERE key = 'chronological'").fetchone():
-        return None
     one = lambda sql, *args: world.db.execute(sql, args).fetchone()[0]  # noqa: E731
     events = [json.loads(line) for line in (run / "progress.jsonl").read_text().splitlines()]
     calls = [json.loads(line) for line in (run / "world-calls.jsonl").read_text().splitlines()] if (run / "world-calls.jsonl").exists() else []  # fmt: skip
@@ -115,15 +115,18 @@ def author(run: Path, world: World, settings) -> dict | None:
 def measure(run: Path) -> dict:
     state = json.loads((run / "state.json").read_text())
     summary = json.loads((run / "summary.json").read_text()) if (run / "summary.json").exists() else {}
-    world = World(run / "world.sqlite")
+    with tempfile.TemporaryDirectory() as directory:  # a world of an older schema, read as today's code reads it
+        shutil.copy(run / "world.sqlite", Path(directory) / "world.sqlite")
+        world = World(Path(directory) / "world.sqlite", writable=True)
+        world.migrate()
+        report = read(run, world, state, summary)
+        world.close()
+    return report
+
+
+def read(run: Path, world: World, state: dict, summary: dict) -> dict:
     stats = style(world, frozen_before(world))  # a chapter: its own messages
-    # Profiles exported before long_share was measured read it as unknown (0).
-    cast = {
-        user_id(p["uuid"]): SeedPersona.model_validate_json(
-            json.dumps(p | {"typing": {"long_share": 0.0} | p["typing"]})
-        )
-        for p in state["cast"]
-    }
+    cast = {user_id(p["uuid"]): SeedPersona.model_validate(p) for p in state["cast"]}
     authors = {
         author: {k: values[k] for k in TYPING} | {"messages": values["messages"]}
         | {"target": {ours: getattr(cast[author].typing, theirs) for ours, theirs in TYPING.items()}}
@@ -133,15 +136,15 @@ def measure(run: Path) -> dict:
     config = json.loads((run / "run.json").read_text())["config"]
     targets = known(ActivityConfig, config.get("activity", {}))
     settings = SimpleNamespace(activity=targets, author=known(AuthorSettings, config.get("author", {})))
-    written = author(run, World(run / "world.sqlite"), settings)
+    written = author(run, world, settings)
     return {
         "run": str(run),
         "author": written,
-        "scorecard": scorecard(World(run / "world.sqlite"), targets),
+        "scorecard": scorecard(world, targets),
         "overall": {k: stats.get(k) for k in ("messages", *TYPING, "off_hours")},
         "authors": authors,
         "task_mix": summary.get("task_mix"),
-        "rates": summary.get("rates", summary.get("solve_rates")),
+        "rates": summary.get("rates"),
         "difficulty": summary.get("difficulty"),
         "cost": summary.get("reported_model_cost"),
         "minutes": round(summary.get("elapsed_seconds", 0) / 60, 1),

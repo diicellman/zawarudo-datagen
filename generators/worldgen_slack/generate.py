@@ -1,4 +1,4 @@
-"""Generate one Slack world with its tasks, on native Verifiers agents: uv run --frozen worldgen-slack --config <toml>
+"""Generate one Slack world, on native Verifiers agents: uv run --frozen worldgen-slack --config <toml>
 (or `worldgen-slack forge --config <toml>`: tasks on a finished world; `worldgen-slack chapter --config <toml>`: a
 finished world continued forward in time, into a new version)."""
 
@@ -18,7 +18,7 @@ from worldgen_slack.dataset import atomic_json
 
 from .chronicle import daily
 from .config import ROOT, Config, load_config
-from .contracts import calendar, census, pick_cast, quota
+from .contracts import calendar, census, pick_cast
 from .env import GenerationEnv
 from .store import Store
 
@@ -66,9 +66,7 @@ async def run(config: Config) -> dict:
                 return store.summary(
                     "incomplete" if "ReviewLimit" in reason else "infrastructure_error", reason
                 )
-        summary = store.summary("complete")
-        store.publish()
-        return summary
+        return store.summary("complete")
     except asyncio.CancelledError:
         store.summary("interrupted", "run interrupted; committed progress and available traces are preserved")
         raise
@@ -138,13 +136,7 @@ def main() -> int:
     if args.dry_run:
         (occupation, _), *_ = census(config.personas)[1].most_common(1)
         pick_cast(config.personas, config.seed, [], {occupation: config.personas.pool})
-        plan = {
-            "config": config.model_dump(mode="json"),
-            "quota": [
-                s.model_dump()
-                for s in quota(config.taxonomy, config.tasks.styles, config.seed, config.task_count)
-            ],
-        }
+        plan = {"config": config.model_dump(mode="json")}
         dates = [d["date"] for d in calendar(config.seed, config.calendar, "UTC")]
         plan["daily"] = dict(zip(dates, daily(dates, config)))  # each date's messages and their parts
         print(json.dumps(plan, indent=1))

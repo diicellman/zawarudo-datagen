@@ -23,7 +23,7 @@ from worldgen_slack import surface
 from worldgen_slack.config import role
 from worldgen_slack.db import World, canonical
 
-from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, band_move, measures, miss_class
+from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, measures, miss_class
 
 
 def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
@@ -47,7 +47,7 @@ class RunState(StrictModel):
     phase: Literal["premise", "organization", "plan", "day", "review", "tasks", "final", "done"] = "premise"
     premise: Premise | None = None
     cast: list[SeedPersona] = Field(default_factory=list)
-    quota: list[Slot] = Field(default_factory=list)  # the world's tasks, one per slot
+    quota: list[Slot] = Field(default_factory=list)  # the board's entries: a chapter's brief
     organization: list[str] = Field(default_factory=list)  # the channels the organization made
     drafts: dict[str, dict] = Field(default_factory=dict)  # each setup phase's last document
     plans: dict[str, dict] = Field(
@@ -60,21 +60,15 @@ class RunState(StrictModel):
     active_attempt: str | None = None
     last_verdict: Verdict | None = None
     # The world author: the day being written (or reviewed), the attempt whose world and notes it starts from, a
-    # review's issues waiting for the author's next turn, the solver's runs of each task as it was when solved
-    # (probes and the final review share them), each task's latest probe, and the rounds it was given back in.
+    # review's issues waiting for the author's next turn. The forge: the solver's runs of each task as it was when
+    # solved, and the round it writes next.
     day: int = 0
     restore_point: str = ""
     issues: list[Issue] = Field(default_factory=list)
     solves: dict[str, dict] = Field(default_factory=dict)  # task → {key, results, traces}
-    probes: dict[str, dict] = Field(default_factory=dict)  # task → its latest probe, with its key
-    task_rounds: dict[str, int] = Field(
-        default_factory=dict
-    )  # task → the turns it came back to the author in
-    batch: int = 0  # the batch of slots the tasks phase writes next
+    batch: int = 0  # the round the forge writes next
     witness: dict[str, dict] = Field(default_factory=dict)  # task → the witness's runs, with its key
-    # Task reviews' issues: those naming no task, which wait for the final review, and each task's latest ones.
-    open_issues: list[Issue] = Field(default_factory=list)
-    task_issues: dict[str, list[Issue]] = Field(default_factory=dict)
+    task_issues: dict[str, list[Issue]] = Field(default_factory=dict)  # each task's latest review's issues
     lost: dict[str, int] = Field(default_factory=dict)  # attempts a lost session cut off: they spend no round
     # Each task's screen: the wrong answers its grade accepted, with its key. The forge: each candidate's outcome,
     # and the archive's places (category and measured level), each holding its tasks.
@@ -228,21 +222,12 @@ class Store:
         events = []
         if (self.root / "progress.jsonl").exists():
             events = [json.loads(line) for line in (self.root / "progress.jsonl").read_text().splitlines()]
-        bands, levels = self.settings.get("tasks", {}).get("bands"), dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())  # fmt: skip
-        rates, in_band = {}, {}
+        levels = dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())
+        rates = {}
         for task, review in self.state.task_reviews.items():
             rates[task] = {k: review.get(k) for k in ("right_rate", "strict_rate", "coverage", "tries", "crashed", "unanswered", "witness_right", "level_fit")}  # fmt: skip
-            if bands and task in levels:
-                band = bands[levels[task] - 1]
-                landed = band_move(review | {"approved": True, "band": band}) is None
-                spent = self.state.task_rounds.get(task, 0)
-                rates[task] |= {"level": levels[task], "band": band, "in_band": landed, "rounds": spent}
-                # Out of its band with no rewrite left: the author kept it, and it is released as it stands.
-                rates[task]["kept"] = not landed and spent >= self.settings.get("author", {}).get(
-                    "task_rounds", 0
-                )
-                count = in_band.setdefault(levels[task], [0, 0])
-                count[0], count[1] = count[0] + landed, count[1] + 1
+            if task in levels:
+                rates[task]["level"] = levels[task]
         right = [r["right_rate"] for r in rates.values()]
         count = lambda sql: self.world.db.execute(sql).fetchone()[0]  # noqa: E731
         summary = {
@@ -259,9 +244,6 @@ class Store:
                 for r in self.world.db.execute("SELECT category, level, COUNT(*) FROM tasks GROUP BY 1, 2")
             ],
             "rates": rates,
-            "in_band": {
-                str(level): count for level, count in sorted(in_band.items())
-            },  # level: [in its band, of]
             "crashed_solves": sum(r["crashed"] or 0 for r in rates.values()),
             "unanswered_tries": sum(r["unanswered"] or 0 for r in rates.values()),
             "witness_tries": sum(len(w["results"]) for w in self.state.witness.values()),

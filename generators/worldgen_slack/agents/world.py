@@ -27,7 +27,6 @@ from ..chronicle import (
     Annotation,
     Conversation,
     Plan,
-    add_task,
     annotate,
     advance,
     bounds,
@@ -85,9 +84,8 @@ GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor see
 - question is what actor_id asks, in `language`; it does not contain its answer.
 """.replace("NEAR_SQL", str(next(m.max_length for m in Task.model_fields["near_sql"].metadata if hasattr(m, "max_length"))))
 
-AUTHOR_GUIDE = (
-    """You write one company's Slack workspace, as its people live it, in time order: first the company and its
-people, then the ledger of what will be stated, then each day's conversations, then tasks on the finished world.
+AUTHOR_GUIDE = """You write one company's Slack workspace, as its people live it, in time order: first the company and its
+people, then the ledger of what will be stated, then each day's conversations.
 The workspace is a SQLite file that only code writes. You change it with the world_* tools: async functions in your
 IPython (`r = await world_post(conversation={...})`) that return JSON text and raise with the reason when a write
 breaks a rule; fix and call again. They are live: world_now(), world_view(ref), world_sql(sql, actor_id=None) and
@@ -95,10 +93,10 @@ world_read(actor_id, tool, arguments) read the world as it is now.
 
 Memory and notes
 - /task/memory/ is code's, rendered from the world before every turn: now.md (the present, today's quota, the
-  conversations code drew for today, each storyline's facts, events, open promises, task slots, style drift),
+  conversations code drew for today, each storyline's facts, events, open promises, a chapter's brief, style drift),
   ledger.json (the ledger as world_plan takes it), and a page per person, channel, storyline and event. Pages name
   each other as [[id]]; grep them. Every time in them is on the company clock, as a weekday and a date.
-- /task/notes/ is yours: plan.md (the story's arcs day by day, and a board of what each task slot will rest on) and
+- /task/notes/ is yours: plan.md (the story's arcs day by day, and what each brief entry will rest on) and
   recap.md (what happened today, what is open). Besides the world, they are all you keep from one turn to the next.
 
 Time
@@ -162,24 +160,10 @@ Voice
   complaints, jokes, side topics, disagreement. Not every line moves the story; not every line is an update.
 - A line that states a fact contains the fact's anchor words; the rest of the line is still in its author's voice.
 
-Tasks (after the last day, world_add_task)
-- One task for each slot of now.md, with the slot's id: a question an actor asks, as hard as its level and concept
-  say, in its style. Nothing can be posted after the last day, so plan before the first day what each slot will rest on (the
-  plan's board, checked against each level's needs): facts in several channels; near-misses, a teammate's confident
-  wrong claim, a stale reading, a plan changed out of the asker's sight, that nothing in their sight retracts; the
-  answer where it is harder to see than its near-misses (a thread reply, a DM, a later day); private conversations.
-"""
-    + GOLD_SQL
-    + """- world_add_task checks the task, refuses it below its level's needs (now.md lists each slot's), and returns its
-  gold rows and code's measures (read_channel pages deep, messages above it, tables read, search rank, the channels
-  and identifiers the question names, its facts' channels, relations and decoys). A solver then tries each task, and
-  one outside its level's band comes back to you with the solver's route: keep its answer and change the route.
-
 Reviews
 - An independent judge reviews the world after some days and at the end. Its issues come back to you: message_ids
   are the messages to change (world_revise rewrites one where it stands), evidence_message_ids show the defect.
-"""
-).replace("PARTS_OF_THE_DAY", ", ".join(f"{part} {start:02d}-{end:02d}" for part, (start, end) in PARTS.items()))
+""".replace("PARTS_OF_THE_DAY", ", ".join(f"{part} {start:02d}-{end:02d}" for part, (start, end) in PARTS.items()))
 
 
 # ---------------------------------------------------------------------- memory: rendered from the world
@@ -257,10 +241,7 @@ def now_page(world, settings, context: dict) -> str:
     out = []
     span = f" (this chapter writes days {first}-{total}; days 1-{first - 1} are written and frozen)" if first > 1 else ""  # fmt: skip
     if day is None:
-        out.append(
-            f"# Now: the calendar is closed; its {total} days ended {clock(world, now)}."
-            + (" Tasks are written now." if not context.get("chapter") else "")
-        )
+        out.append(f"# Now: the calendar is closed; its {total} days ended {clock(world, now)}.")
     else:
         out.append(f"# Now: {clock(world, now)}, day {day} of {total}{span}, {part_of(world, now)}")
         start, end = bounds(world, day)
@@ -312,7 +293,8 @@ def now_page(world, settings, context: dict) -> str:
             f"(made in [[m{c['message_id']}]])"
             for c in promises
         ]
-    out += ["", "## Brief: what this chapter plants, each entry on the board (a later forge writes its tasks)" if context.get("chapter") else "## Task slots (written after the last day; a task's id is its slot's)"]  # fmt: skip
+    if context.get("slots"):
+        out += ["", "## Brief: what this chapter plants, each entry on the board (a later forge writes its tasks)"]
     board = {}
     for slot, fact in world.db.execute("SELECT slot, fact_id FROM board ORDER BY fact_id"):
         board.setdefault(slot, []).append(f"[[{fact}]]")
@@ -330,7 +312,6 @@ def now_page(world, settings, context: dict) -> str:
                 if on_board(settings, slot)
                 else ""
             )
-            + ("; written in this turn" if slot.id in context.get("writable", []) else "")
         )
     if notes := drift(world, context.get("cards", {}), frozen_before(world)):
         out += ["", "## Style drift (people far from their typing card)"]
@@ -440,7 +421,7 @@ def message_page(world, message_id: int) -> str:
     return "\n".join(out) + "\n"
 
 
-def task_page(world, task: dict) -> str:
+def task_page(task: dict) -> str:
     out = [
         f"- [[{task['id']}]] {task['category']} level {task['level']} ({task['concept']}), asked by [[{task['actor_id']}]]: "
         f"{task['question']}",
@@ -470,7 +451,7 @@ def view(world, ref: str, context: dict) -> str:
     if fact := world.db.execute("SELECT * FROM facts WHERE id = ?", (ref,)).fetchone():
         return fact_line(world, dict(fact), people(world)) + "\n"
     if task := world.db.execute("SELECT * FROM tasks WHERE id = ?", (ref,)).fetchone():
-        return task_page(world, dict(task)) + "\n"
+        return task_page(dict(task)) + "\n"
     if world.db.execute("SELECT 1 FROM scenes WHERE id = ?", (ref,)).fetchone():
         who = people(world)
         rows = world.db.execute(
@@ -570,8 +551,8 @@ def files(world, settings, context: dict, mode: str) -> dict[str, str]:
         out[f"memory/storylines/{storyline}.md"] = storyline_page(world, storyline)
     for (event,) in world.db.execute("SELECT id FROM events"):
         out[f"memory/events/{event}.md"] = event_page(world, event)
-    if mode in ("tasks", "forge"):
-        tasks = [task_page(world, dict(t)) for t in world.db.execute("SELECT * FROM tasks ORDER BY id")]
+    if mode == "forge":
+        tasks = [task_page(dict(t)) for t in world.db.execute("SELECT * FROM tasks ORDER BY id")]
         out["memory/tasks.md"] = "# Tasks\n" + "\n".join(tasks) + "\n"
     return out
 
@@ -580,7 +561,7 @@ def files(world, settings, context: dict, mode: str) -> dict[str, str]:
 
 
 class AuthoringToolsConfig(vf.ToolsetConfig):
-    mode: Literal["plan", "day", "tasks", "forge"] = "plan"
+    mode: Literal["plan", "day", "fix", "forge"] = "plan"
     day: int = 0
     db_path: str = ""
     db_hash: str = ""
@@ -637,18 +618,11 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         self.gaps = Gaps(self.settings.personas.gaps)
         self.posted = None  # the last post: its conversation, the present it left, and its result
 
-    def writable(self) -> list:
-        """The slots the turn at hand may write: the env sets them before each turn (a hardening turn rewrites only
-        the tasks that came back), so they are read on every call, not when the interaction opened."""
-        ids = self.allowed().get("ids", [])
-        return [s for s in self.every_slot if s.id in ids]
-
     def allowed(self) -> dict:
-        """What the env allows the turn at hand, read per call: the slots it may write, and the answers the tasks
-        that came back to be harder or easier keep."""
+        """What the env allows the proposer's turn at hand, read per call: the ids it may write, and the tasks sent
+        back for another reading."""
         path = Path(self.context.get("writable_file") or "")
-        saved = json.loads(path.read_text()) if path.is_file() else {"ids": self.context.get("writable", [])}
-        return saved if isinstance(saved, dict) else {"ids": saved}
+        return json.loads(path.read_text()) if path.is_file() else {"ids": []}
 
     def _with_state(self, fn):
         synced = super()._with_state(fn)
@@ -737,7 +711,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
     @vf.tool
     async def now(self) -> str:
         """The one-pager: the present, today's quota and drawn conversations, each storyline's facts, events, open
-        promises, task slots and style drift."""
+        promises, a chapter's brief and style drift."""
         return self._logged("now", {}, lambda: now_page(self._world(), self.settings, self.context))
 
     @vf.tool
@@ -770,9 +744,9 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def plan(self, ledger: Plan) -> str:
-        """Plan the ledger, whole: storylines, events, facts, and the board (the facts each task slot now.md marks for
-        the board will rest on, as its level needs). Planned events and stated facts stay as they are; the rest may
-        change. Returns what the ledger now holds."""
+        """Plan the ledger, whole: storylines, events, facts, and the board (the facts each entry of a chapter's brief
+        will rest on, as its level needs). Planned events and stated facts stay as they are; the rest may change.
+        Returns what the ledger now holds."""
 
         def act():
             self._write(lambda copy: record_plan(copy, ledger, self.settings, self.every_slot))
@@ -826,14 +800,13 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def revise(self, message_id: int, text: str) -> dict:
-        """Rewrite one message's text where it stands: same author, time, thread and statements; no task's gold
-        answer may change."""
+        """Rewrite one message's text where it stands: same author, time, thread and statements."""
         return self._logged(
             "revise",
             {"message_id": message_id, "text": text},
             lambda: self._write(lambda copy: revise(copy, message_id, text)),
             "day",
-            "tasks",
+            "fix",
         )
 
     @vf.tool
@@ -849,20 +822,13 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def add_task(self, task: Task) -> dict:
-        """Write the task of one slot, with the slot's id (it replaces the slot's task, if any): checked, then its gold
-        rows and code's measures returned. In the forge, a candidate for one of the round's open ids, of the category
-        and level you choose."""
+        """Write a candidate for one of the round's open ids, of the category and level you choose: checked, then its
+        gold rows and code's measures returned."""
 
         def act(copy):
-            if self.context.get("chapter"):
-                raise ValueError("a chapter writes no tasks: the forge writes them on its finished world")
-            if self.config.mode == "forge":
-                return forge_task(copy, task, self.settings, self.allowed().get("ids", []), rework=self.allowed().get("rework"))  # fmt: skip
-            return add_task(copy, task, self.settings, self.writable(), self.allowed().get("keep"))
+            return forge_task(copy, task, self.settings, self.allowed().get("ids", []), rework=self.allowed().get("rework"))  # fmt: skip
 
-        return self._logged(
-            "add_task", {"task": task.model_dump(mode="json")}, lambda: self._write(act), "tasks", "forge"
-        )
+        return self._logged("add_task", {"task": task.model_dump(mode="json")}, lambda: self._write(act), "forge")
 
     @vf.tool
     async def profile(self) -> dict:
@@ -1108,53 +1074,18 @@ def day_prompt(world, day: int, issues: list | None = None, feedback: str = "") 
     )
 
 
-def tasks_prompt(settings, ids: list[str]) -> str:
-    return (
-        f"The last day is closed: nothing more is posted. Write the tasks of these slots of now.md: {', '.join(ids)}; "
-        "one each, with world_add_task and the slot's id. It returns the task's gold rows and code's measures. The "
-        "other slots are written in turns of their own. After this turn a solver tries each "
-        f"task {settings.author.tries} times and the judge reviews it; a task whose share of right answers misses its "
-        "level's band, or that the judge does not approve, comes back to you."
-    )
-
-
-def harden_prompt(back: dict) -> str:
-    return (
-        "These tasks come back to you, each with what it asks, its gold rows and gold SQL and who asks it, its earlier "
-        "versions with how often the solver was right on each (history), the solver's tries (right_rate, the share of "
-        "right answers, is how hard the task is; strict_rate also needs the answer's claims grounded; each try's "
-        "route: the step at which the gold evidence first showed (evidence_at), the call that showed it (found_by), "
-        "how many calls showed a decoy (decoy_reads), the answer; the whole tries are in /task/memory/solves/<task>/), "
-        "the witness's tries, the judge's review, code's measures, its level's band of right-answer rates, and what "
-        "it needs (move): harder, easier, or the fix the judge asks for. Each rewrite is tried and reviewed again, the "
-        "last one too; tries_left counts the rewrites still tried after this one: "
-        f"{json.dumps(back, ensure_ascii=False)}\nRewrite each in its slot so that answering it needs its level and "
-        "concept with no easier route, and lands in its band. Keep its answer and change its route: lean the question "
-        "on a near-miss the world holds (a decoy on its subject); name what it asks about by what surrounds it rather "
-        "than by a name, ID or date the solver can search for (a sub-question the world answers elsewhere); add a "
-        "condition that singles the answer out only together with the others; point it at one of several look-alike "
-        "posts. To make it easier, give back a name or narrow a condition. world_revise can remove a giveaway from a "
-        "message. A task you keep stands as it is. Only these tasks may be rewritten in this turn. End your turn when "
-        "the tasks stand."
-    )
-
-
-def fix_prompt(issues: list, writable: list[str]) -> str:
-    rewrite = (
-        f"world_add_task may rewrite only {', '.join(writable)}" if writable else "no task is to be rewritten"
-    )
+def fix_prompt(issues: list) -> str:
     return (
         f"The review rejected the world: {json.dumps(issues, ensure_ascii=False)}\nFix each blocking issue with "
-        f"world_revise or world_add_task ({rewrite}): message_ids are the messages to change, evidence_message_ids "
+        "world_revise: message_ids are the messages to change, evidence_message_ids "
         "show the defect. Fix the others too, or write in /task/notes/plan.md why you leave one; if you judge an issue "
         f"mistaken, write why there. {DECOY_ISSUES} End your turn when done."
     )
 
 
-def context_of(settings, state, store_root: Path, organization: dict | None, writable=()) -> dict:
-    """What the author's tools are configured with: the settings, the world's task slots and those this turn writes,
-    each person's typing card
-    and seeded self, the conversations code drew per day, the channels' routines, and the call log."""
+def context_of(settings, state, store_root: Path, organization: dict | None) -> dict:
+    """What the author's tools are configured with: the settings, a chapter's brief, each person's typing card and
+    seeded self, the conversations code drew per day, the channels' routines, and the call log."""
     routines = {}
     if organization:
         for c in organization["channels"]:
@@ -1169,10 +1100,7 @@ def context_of(settings, state, store_root: Path, organization: dict | None, wri
     return {
         "settings": json.loads(settings.model_dump_json()),
         "slots": [s.model_dump(mode="json") for s in state.quota],
-        "writable": list(writable),
-        "writable_file": str(
-            store_root / "writable.json"
-        ),  # the slots the turn at hand may write, read per call
+        "writable_file": str(store_root / "writable.json"),  # the ids the proposer's turn may write, read per call
         "cards": cards(state.cast),
         "selves": selves(state.cast),
         "agenda": agenda,

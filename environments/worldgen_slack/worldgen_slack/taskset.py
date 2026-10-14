@@ -14,8 +14,8 @@ from .surface import briefing
 from .tools import CallState, SlackTools, WorldTaskData, WorldToolsConfig, stage_world
 
 
-# A person's own profile, read by the tool that shows it: the current read tools and the ones before 2026-10-14.
-PROFILES = {"read_user_profile": "id", "get_user": "id", "whoami": "user_id"}
+# A person's own profile, by the field the tool that shows it names them in.
+PROFILES = {"read_user_profile": "id"}
 
 
 def _items(call: dict) -> list:
@@ -57,7 +57,7 @@ def compact(observations: list[dict]) -> dict:
         for item in _items(call):
             if isinstance(item, dict) and "ts" in item:
                 key = (item["channel"], item["ts"])
-                messages[key] = messages.get(key, {}) | {k: v for k, v in item.items() if k not in ("time_utc", "context")}  # fmt: skip
+                messages[key] = messages.get(key, {}) | {k: v for k, v in item.items() if k != "context"}
             elif isinstance(item, dict) and "real_name" in item and tool != "list_channel_members":
                 people.setdefault(item["id"], item)
             elif isinstance(item, dict) and "id" in item and "real_name" not in item:
@@ -266,13 +266,19 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
 
 
 class EvaluationConfig(vf.TaskConfig):
-    release_dir: Path = Path("data/v6-01/software/release")
+    release_dir: Path | None = None  # the release to evaluate: a generated world's release/ directory
     judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
+
+
+def release(config: EvaluationConfig):
+    if config.release_dir is None:
+        raise ValueError("set the release to evaluate: --env.taskset.task.release_dir")
+    return load_release(config.release_dir)
 
 
 class EvaluationTask(vf.Task[WorldTaskData, vf.State, EvaluationConfig]):
     def solver_task(self):
-        world, rows, answers = load_release(self.config.release_dir)
+        world, rows, answers = release(self.config)
         row = next(r for r in rows if r.task_id == self.data.task_id)
         if (row.question, row.world_hash) != (self.data.prompt, self.data.world_hash):
             raise ValueError("task differs from the immutable release")
@@ -288,7 +294,7 @@ class SlackTasksetConfig(vf.TasksetConfig):
 
 class SlackTaskset(vf.Taskset[EvaluationTask, SlackTasksetConfig]):
     def load(self):
-        _, rows, _ = load_release(self.config.task.release_dir)
+        _, rows, _ = release(self.config.task)
         return [
             EvaluationTask(
                 WorldTaskData(
@@ -302,7 +308,8 @@ class SlackTaskset(vf.Taskset[EvaluationTask, SlackTasksetConfig]):
 
 class SlackEnvConfig(vf.EnvConfig):
     taskset: SlackTasksetConfig = SlackTasksetConfig(id="worldgen-slack")
-    solver: vf.AgentConfig = role("z-ai/glm-5.2", solver=True)
+    # The model is the run's; the solver runs no code, so no VM.
+    solver: vf.AgentConfig = role(None, solver=True).model_copy(update={"runtime": vf.SubprocessConfig()})
 
 
 class SlackEnv(vf.Env[SlackEnvConfig]):

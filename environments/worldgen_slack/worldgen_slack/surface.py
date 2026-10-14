@@ -397,7 +397,7 @@ def read_thread(world, channel_id: str, message_ts: str, oldest: str | None = No
     return {"channel": row["id"], "parent": parent[0]["ts"], "replies": len(replies), "items": items, "next_cursor": more, "format": response_format}  # fmt: skip
 
 
-def profile(world, row) -> dict:
+def profile(row) -> dict:
     return {
         "id": row["id"],
         "handle": row["handle"],
@@ -419,7 +419,7 @@ def read_user_profile(world, user_id: str | None = None, include_locale: bool = 
     """A person's profile; with no user_id, the caller's own."""
     row = person(world, user_id or world.actor["id"])
     company = world.db.execute("SELECT value FROM world_meta WHERE key = 'company'").fetchone()
-    return profile(world, row) | {"organization": company[0] if company else "", "format": response_format}
+    return profile(row) | {"organization": company[0] if company else "", "format": response_format}
 
 
 def get_reactions(world, channel_id: str, message_ts: str) -> dict:
@@ -458,7 +458,7 @@ def list_channel_members(world, channel_id: str, cursor: str | None = None, limi
         (row["id"],),
     ).fetchall()
     shown, more = _page(world, rows, ["members", row["id"], response_format, include_bots, include_deleted], cursor, limit, 30)  # fmt: skip
-    return {"channel": row["id"], "total": len(rows), "items": [profile(world, r) for r in shown], "next_cursor": more, "format": response_format}  # fmt: skip
+    return {"channel": row["id"], "total": len(rows), "items": [profile(r) for r in shown], "next_cursor": more, "format": response_format}  # fmt: skip
 
 
 def list_user_channels(world, types: str = "public_channel,private_channel", format: str = "full", limit: int = 50, cursor: str | None = None, name_prefix: str | None = None, exclude_archived: bool = False, team_id: str | None = None) -> dict:  # fmt: skip
@@ -502,7 +502,7 @@ def search_users(world, keywords: list[str] | None = None, natural_language_quer
         raise Failed("invalid_arguments: give keywords")
     rows = [r for r in world.db.execute("SELECT * FROM users WHERE is_deleted = 0 ORDER BY real_name, id") if matches([r["real_name"], r["display_name"], r["handle"], r["email"], r["title"] or "", r["id"], *map(str, json.loads(r["profile_json"]).values())], keywords)]  # fmt: skip
     shown, more = _page(world, rows, ["users", keywords], cursor, limit, 20)
-    return {"items": [profile(world, r) for r in shown], "next_cursor": more, "format": response_format}
+    return {"items": [profile(r) for r in shown], "next_cursor": more, "format": response_format}
 
 
 def search_channels(world, keywords: list[str] | None = None, natural_language_query: str = "", channel_types: str = "public_channel", include_archived: bool = False, limit: int = 20, cursor: str | None = None, response_format: str = "detailed") -> dict:  # fmt: skip

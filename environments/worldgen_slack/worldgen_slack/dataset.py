@@ -99,18 +99,7 @@ class PrivateAnswer(StrictModel):
 
 
 class Manifest(StrictModel):
-    format: Literal[
-        "worldgen-slack.v6",
-        "worldgen-slack.v7",
-        "worldgen-slack.v8",
-        "worldgen-slack.v9",
-        "worldgen-slack.v10",
-    ] = (  # fmt: skip
-        # v7: tasks carry their rates; v8: strict grounds the answer's claims, unanswered counted; v9: status answers,
-        # the abstain rate and the right rate's interval, and a reward of +1, 0 or -1; v10: Slack's own MCP tools,
-        # each task's surface and turn limit, its miss classes, and evidence that is its answer's own
-        "worldgen-slack.v10"
-    )
+    format: Literal["worldgen-slack.v10"] = "worldgen-slack.v10"
     world_hash: str
     files: dict[str, str]
 

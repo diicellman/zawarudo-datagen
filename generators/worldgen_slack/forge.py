@@ -378,7 +378,8 @@ async def run(forge: ForgeConfig, settings: Config) -> dict:
                     "incomplete" if "ReviewLimit" in reason else "infrastructure_error", reason
                 )
         summary = store.summary("complete")
-        store.publish()
+        if store.world.db.execute("SELECT 1 FROM tasks").fetchone():  # an archive that kept nothing has no release
+            store.publish()
         return summary
     except asyncio.CancelledError:
         store.summary(

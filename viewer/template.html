@@ -107,7 +107,7 @@ button.chip:hover{border-color:var(--fg3)}.chip.good{color:var(--good);border-co
 'use strict';
 const DATA = JSON.parse(document.getElementById('viewer-data').textContent);
 const TABS = [['overview', 'Overview'], ['lineage', 'Lineage'], ['world', 'World'], ['tasks', 'Tasks'], ['cast', 'Cast'], ['traces', 'Traces']];
-const ROLES = ['synthesizer', 'builder', 'writer', 'solver', 'judge'];
+const ROLES = ['author', 'proposer', 'judge', 'solver', 'witness'];
 const S = {tab: 'overview', run: 0, attempt: null, snapshot: null, conv: null, message: null, reader: '', search: '', task: null, trace: null, role: '', spoilers: true};
 let R, X;  // the selected run and its indexes
 
@@ -179,14 +179,10 @@ function index(run) {
   const t0 = Math.min(...[...events.map(e => e.time), ...run.traces.map(t => t.start).filter(Boolean)]);
   const t1 = Math.max(...[...events.map(e => e.time), ...run.traces.map(t => t.end).filter(Boolean)]);
   // attempt windows, outcomes and routes
-  const win = {}, outcome = {}, routed = {}, interrupted = {};
+  const win = {}, outcome = {}, interrupted = {};
   for (const e of events) {
     if (e.event === 'candidate_started') win[e.attempt] = [e.time, null];
     if (e.event === 'candidate_finished' && win[e.attempt]) { win[e.attempt][1] = e.time; outcome[e.attempt] = e.approved; }
-    if (e.event === 'attempt_routed') routed[e.attempt] = e.route;
-    if (e.event === 'scenes_repaired') routed[e.attempt] = 'repair';
-    if (e.event === 'bindings_repaired') routed[e.attempt] = 'rebind';
-    if (e.event === 'candidate_reused') routed[e.attempt] = 'reuse';
     if (e.event === 'interrupted') interrupted[e.attempt] = true;
     if (e.event === 'premise_selected') { win.premise = [t0, e.time]; outcome.premise = true; }
     if (e.event === 'organization_built') outcome.organization = true;
@@ -205,29 +201,23 @@ function index(run) {
   };
   const byAttempt = {};
   for (const tr of run.traces) (byAttempt[attemptOf(tr)] ||= []).push(tr);
-  return {cat, world, people, personas, convs, msgs, replies, evidence, tasks, facts, scenes, traces, t0, t1, win, outcome, routed, interrupted, byAttempt, views: {}};
+  return {cat, world, people, personas, convs, msgs, replies, evidence, tasks, facts, scenes, traces, t0, t1, win, outcome, interrupted, byAttempt, views: {}};
 }
 const personName = id => X.people[id]?.name || id;
+// An attempt's block: premise and organization, the plan, a day, a review, a world's own tasks (S3 and before), the
+// final review, a forge's round or measure, a chapter's or forge's adopted source.
 function column(id) {
-  if (id === 'premise' || id === 'organization') return id;
-  if (id.startsWith('ledger')) return 'ledger';
-  if (id.startsWith('tasks')) return 'tasks';
-  if (id.startsWith('final')) return 'final';
-  const m = id.match(/^build-(.+)-\d+$/);
+  if (['premise', 'organization', 'source'].includes(id)) return id;
+  const m = id.match(/^([a-z]+)-/);
   return m ? m[1] : 'other';
 }
+const ROUTES = {premise: 'seed pick', organization: 'organization', source: 'adopted', plan: 'plan', day: 'day', review: 'review', tasks: 'tasks', final: 'final review', round: 'round', measure: 'measure'};
 function routeOf(a, i, all) {
   const col = column(a.id), prev = all[i - 1];
-  if (col === 'premise') return 'seed pick';
-  if (col === 'organization') return 'organization';
   if (prev && X.interrupted[prev.id] && X.outcome[prev.id] === undefined) return 'resume';
-  if (col === 'ledger') return !prev || ['premise', 'organization'].includes(column(prev.id)) ? 'ledger' : column(prev.id) === 'ledger' ? 'repair' : 'ledger repair';
-  if (col === 'tasks') return prev && column(prev.id) === 'tasks' ? 'repair' : 'tasks';
-  if (col === 'final') return 'final review';
-  const r = X.routed[a.id];
-  if (prev && column(prev.id) === col) return r === 'plan' || !r ? 're-plan' : r;
-  if (prev && column(prev.id) === 'final') return 'regression';
-  return r === 'reuse' ? 'reuse' : 'build';
+  // the same block written again: a day, a review or the final review after a rejection
+  if (prev && col !== 'round' && prev.id.replace(/-\d+$/, '') === a.id.replace(/-\d+$/, '')) return 'again';
+  return ROUTES[col] || col;
 }
 
 /* ---------- chrome ---------- */
@@ -262,7 +252,7 @@ function render() {
 function overview() {
   const sum = R.summary || {}, p = R.premise || {}, cat = X.cat;
   const reviews = Object.values(R.task_reviews || {});
-  const rates = reviews.map(r => r.right_rate ?? r.solve_rate).filter(v => v !== undefined);
+  const rates = reviews.map(r => r.right_rate).filter(v => v !== undefined);
   const rejected = R.attempts.filter(a => X.outcome[a.id] === false).length;
   const tiles = [
     ['Status', sum.status || R.phase, sum.reason ? short(sum.reason, 40) : 'phase ' + R.phase],
@@ -285,7 +275,7 @@ function overview() {
     h('section', {class: 'grid2'},
       h('div', {class: 'card'}, label('Right answers by task'), h('p', {class: 'small faint', text: 'Share of independent solves whose answer was right: the task\'s difficulty. The strict share (right and grounded) is the reward.'}),
         list(cat.tasks).map(t => {
-          const r = R.task_reviews?.[t.id]?.right_rate ?? R.task_reviews?.[t.id]?.solve_rate;
+          const r = R.task_reviews?.[t.id]?.right_rate;
           return h('div', {class: 'hbar'}, h('button', {class: 'linkish', text: t.id, onclick: () => go('tasks', {task: t.id})}),
             h('div', {class: 'track'}, h('i', {style: `width:${Math.round((r || 0) * 100)}%`})), h('span', {class: 'mono small', text: pct(r)}));
         })),
@@ -465,7 +455,7 @@ function timeline() {
 }
 function traceTip(t) {
   return [`${t.role}${t.ok === false ? ' · FAILED' : ''}`, t.attempt || X.byAttempt && Object.entries(X.byAttempt).find(([, v]) => v.includes(t))?.[0], t.task_id && 'task ' + t.task_id,
-    t.scene_id && 'scene ' + t.scene_id, 'duration ' + dur((t.end || t.start) - t.start), `tokens ${num(t.input_tokens)} in · ${num(t.cached_tokens)} cached · ${num(t.output_tokens)} out`,
+    'duration ' + dur((t.end || t.start) - t.start), `tokens ${num(t.input_tokens)} in · ${num(t.cached_tokens)} cached · ${num(t.output_tokens)} out`,
     'cost ' + (t.cost === null ? 'unpriced' : usd(t.cost))].filter(Boolean).join('\n');
 }
 function tip(ev, text) {
@@ -594,7 +584,6 @@ function renderThread() {
       h('p', {class: 'small faint mono', text: `${scene.start} → ${scene.end} · ${list(scene.participant_ids).map(personName).join(', ')}`}),
       list(scene.beats).length ? h('div', {}, label('Beats'), list(scene.beats).map(b => spoil(h('p', {class: 'small'}, h('span', {class: 'chip', text: b.fact_id}),
         `${personName(b.author_id)} states ${X.facts[b.fact_id]?.predicate || ''}: ${X.facts[b.fact_id]?.value || ''}`)))) : null,
-      scene.revision_note ? h('p', {class: 'small warn'}, h('span', {class: 'label', text: 'Revision note  '}), scene.revision_note) : null,
       list(scene.promises).length ? h('div', {}, label('Promises left open'), list(scene.promises).map(p => h('p', {class: 'small muted', text: p}))) : null) : null);
   requestAnimationFrame(() => document.getElementById('m-' + root.id)?.scrollIntoView({block: 'nearest'}));
 }
@@ -642,7 +631,7 @@ function taskDetail(t) {
     h('div', {class: 'card'}, label(`${t.id} · ${t.group_id}`), h('div', {class: 'q', text: t.question}),
       h('span', {class: 'chip', text: 'reader · ' + (reader?.name || t.actor_id) + (persona ? ' · ' + persona.role : '')}),
       h('span', {class: 'chip', text: `${t.category} · level ${t.level}`}),
-      h('span', {class: 'chip', text: 'right answers · ' + pct(R.task_reviews?.[t.id]?.right_rate ?? R.task_reviews?.[t.id]?.solve_rate)}),
+      h('span', {class: 'chip', text: 'right answers · ' + pct(R.task_reviews?.[t.id]?.right_rate)}),
       R.task_reviews?.[t.id]?.strict_rate !== undefined ? h('span', {class: 'chip', text: 'right and grounded · ' + pct(R.task_reviews[t.id].strict_rate)}) : null,
       rate?.band ? h('span', {class: 'chip', text: `band ${pct(rate.band[0])}–${pct(rate.band[1])}`}) : null,
       rate?.band ? h('span', {class: 'chip ' + (rate.in_band ? 'good' : 'warn'), text: rate.in_band ? '✓ in its band' : '! outside its band'}) : null,
@@ -738,7 +727,7 @@ function traces() {
       rows.map(t => h('tr', {class: 'click' + (S.trace === t.id ? ' on' : ''), onclick: () => { S.trace = t.id; render(); }},
         h('td', {class: 'mono small', text: dur(t.start - X.t0)}), h('td', {class: 'mono small', text: t.role}),
         h('td', {class: 'mono small', text: Object.entries(X.byAttempt).find(([, v]) => v.includes(t))?.[0] || ''}),
-        h('td', {class: 'mono small', text: t.task_id || t.scene_id || ''}), h('td', {class: 'num small', text: dur((t.end || t.start) - t.start)}),
+        h('td', {class: 'mono small', text: t.task_id || ''}), h('td', {class: 'num small', text: dur((t.end || t.start) - t.start)}),
         h('td', {class: 'num small', text: num(t.input_tokens)}), h('td', {class: 'num small', text: num(t.cached_tokens)}), h('td', {class: 'num small', text: num(t.output_tokens)}),
         h('td', {class: 'num small', text: t.cost === null ? 'unpriced' : usd(t.cost)}), h('td', {}, t.ok === false ? h('span', {class: 'chip bad', text: '✕'}) : null)))));
   return h('div', {class: 'split'}, table, sel ? traceDetail(sel) : h('div', {class: 'card'}, empty('Select an agent run')));

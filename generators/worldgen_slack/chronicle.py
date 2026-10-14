@@ -364,7 +364,7 @@ def quotas(world, settings) -> dict[int, dict]:
     return out
 
 
-def keep_busy(world, settings, events: list) -> None:
+def keep_busy(world, events: list) -> None:
     """The days the first plan of a segment puts an event on, kept from then on: a world in one run's first plan, or
     a chapter's, for its own days only."""
     if (stored := meta(world, "segments")) is None:
@@ -725,7 +725,7 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
                 if e.id not in old
             ],
         )
-        keep_busy(world, settings, plan.events)
+        keep_busy(world, plan.events)
         world.db.execute("DELETE FROM fact_relations")
         unstated = [f for f in current if f not in stated]
         world.db.execute(f"DELETE FROM facts WHERE id IN ({', '.join('?' * len(unstated))})", unstated)
@@ -1073,8 +1073,8 @@ def drift(world, cards: dict[str, dict], since_us: int = 0) -> dict[str, str]:
 
 
 def revise(world, message_id: int, text: str) -> dict:
-    """A fix to one message's text where it stands: same author, time, thread and statements. Every rule runs again,
-    and no task's gold answer may change. Run inside `World.trial()`."""
+    """A fix to one message's text where it stands: same author, time, thread and statements. Every rule runs again.
+    Run inside `World.trial()`."""
     row = world.db.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if row is None:
         raise ValueError(f"no message {message_id}")
@@ -1093,7 +1093,6 @@ def revise(world, message_id: int, text: str) -> dict:
     zones, habits, home = writing(world)
     moment, who = moments(world), row["user_id"]
     rendered = linked(world, PLACEHOLDER.sub(lambda m: render(moment[m[1]], zones[who], row["ts_us"], habits.get(who), home), text), row["ts_us"])  # fmt: skip
-    gold = {t["id"]: json.loads(t["gold_json"]) for t in world.db.execute("SELECT id, gold_json FROM tasks")}
     with world.batch():
         world.db.execute("UPDATE messages SET text = ? WHERE id = ?", (rendered, message_id))
         world.db.execute("DELETE FROM message_mentions WHERE message_id = ?", (message_id,))
@@ -1101,9 +1100,6 @@ def revise(world, message_id: int, text: str) -> dict:
             "message_mentions",
             [dict(message_id=message_id, user_id=u) for u in dict.fromkeys(MENTION.findall(rendered))],
         )
-    for task in world.db.execute("SELECT id, actor_id, gold_sql FROM tasks").fetchall():
-        if world.gold(task["actor_id"], task["gold_sql"], max_rows=50)["rows"] != gold[task["id"]]:
-            raise ValueError(f"the revision changes task {task['id']}'s gold answer")
     return {"message": message_id, "text": rendered}
 
 
@@ -1129,33 +1125,6 @@ def answer_of(world, task_id: str) -> list:
             f for (f,) in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))
         )
     return sorted(str(r.get("answer")) for r in json.loads(row["gold_json"]))
-
-
-def add_task(world, task: Task, settings, slots: list, keep: dict | None = None) -> dict:
-    """One task for one of the slots being written, on the finished world; it replaces the slot's task, if any. Its
-    gold query is checked as every task is (T1-T7, readable facts, the level's needs). A task that came back to be
-    harder or easier keeps its answer (`keep`, from the version the solver tried): a rewrite changes the route to the
-    answer, not the answer (WebShaper's expansion keeps it); a refusal keeps one of the facts it rested on. Returns
-    its gold rows and code's measures of how hard it is."""
-    if today(world) is not None:
-        raise ValueError("tasks are written once the calendar is closed")
-    slot = next((s for s in slots if s.id == task.id), None)
-    if slot is None:
-        raise ValueError(f"a task's id is one of the slots you write now: {[s.id for s in slots]}")
-    world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
-    world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
-    result = {"task": task.id} | record_task(
-        world, task, settings, slot
-    )  # every planned fact is stated by now
-    if keep and (was := keep.get(task.id)) is not None:
-        now = answer_of(world, task.id)
-        if (now != was) if task.answer_type != "refusal" else (was and not set(was) & set(now)):
-            raise ValueError(
-                f"{task.id} came back to be harder or easier and keeps its answer: the version the solver tried "
-                f"answers {was}, this one {now}. Change the route to that answer (lean on a near-miss, name what it "
-                "asks about by what surrounds it, add a condition), not the answer"
-            )
-    return result
 
 
 # ---------------------------------------------------------------------- the forge: tasks on a frozen world
@@ -1186,7 +1155,7 @@ def forge_task(world, task: Task, settings, open_ids: list[str], gates: bool = T
     )
     world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
     world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
-    result = {"task": task.id} | record_task(world, task, settings, slot, needs=False)
+    result = {"task": task.id} | record_task(world, task, settings, slot)
     if was is not None and (now := answer_of(world, task.id)) != was["answer"]:
         raise ValueError(
             f"{task.id} rewords {task.rewords} and keeps its gold answer: that one answers {was['answer']}, this one "

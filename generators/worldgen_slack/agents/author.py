@@ -33,7 +33,6 @@ class AuthorTask(vf.Task[WorldTaskData, vf.State, AuthorConfig]):
             WorldTaskData(
                 prompt="Read /task/guide.md and /task/input.json. Write the current phase's document to /task/<phase>.json.",
                 attempt=attempt,
-                storyline=context.get("storyline", ""),
                 world_hash=file_hash(world),
                 network_allow=[],
                 network_block=["*"],

@@ -72,7 +72,6 @@ def summarize(record, full):
         "model": record["agent"]["config"].get("model"),
         "attempt": data.get("attempt") or None,
         "task_id": data.get("task_id") or None,
-        "scene_id": info.get("scene_id"),
         "start": timing.get("start"),
         "end": (timing.get("finalize") or {}).get("end") or (timing.get("agent") or {}).get("end"),
         "ok": record.get("ok"),
@@ -133,13 +132,13 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
         plan = json.loads(s["plan_json"])
         ids = [str(r[0]) for r in db.execute("SELECT sm.message_id FROM scene_messages sm JOIN messages m ON m.id = sm.message_id WHERE sm.scene_id = ? ORDER BY m.ts_us", (s["id"],))]  # fmt: skip
         owner.update(dict.fromkeys(ids, s["id"]))
-        # A conversation keeps its lines, whose authors, statements and promises it shows; older runs' scenes keep a plan.
+        # A conversation keeps its lines: their authors, the facts they state and the promises they make.
         lines = plan.get("lines", [])
-        participants = plan.get("participants") or list(dict.fromkeys(line["author_id"] for line in lines))
-        beats = [{"fact_id": b["fact"], "author_id": b["author_id"]} for b in plan.get("beats", [])] + [{"fact_id": f, "author_id": line["author_id"]} for line in lines for f in line.get("conveys", [])]  # fmt: skip
-        promises = plan.get("promises") or [c["text"] for line in lines for c in line.get("commits", [])]
+        participants = list(dict.fromkeys(line["author_id"] for line in lines))
+        beats = [{"fact_id": f, "author_id": line["author_id"]} for line in lines for f in line.get("conveys", [])]
+        promises = [c["text"] for line in lines for c in line.get("commits", [])]
         scenes.append(
-            {"id": s["id"], "conversation_id": s["channel_id"], "participant_ids": participants, "start": iso(s["slot_start_us"]), "end": iso(s["slot_end_us"]), "situation": s["situation"], "beats": beats, "messages": ids, "promises": promises, "revision_note": plan.get("revision_note", "")}
+            {"id": s["id"], "conversation_id": s["channel_id"], "participant_ids": participants, "start": iso(s["slot_start_us"]), "end": iso(s["slot_end_us"]), "situation": s["situation"], "beats": beats, "messages": ids, "promises": promises}
         )  # fmt: skip
     marks = {}
     for message, fact, role, decoy in db.execute(
@@ -187,9 +186,8 @@ def load_run(path, full=False):
     traces = [summarize(read_json(p), full) for p in (run / "traces").glob("*.json")]
     db = connect(run / "world.sqlite")
     board = {}
-    if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'board'").fetchone():  # worlds since the board
-        for slot, fact in db.execute("SELECT slot, fact_id FROM board ORDER BY slot, fact_id"):
-            board.setdefault(slot, []).append(fact)
+    for slot, fact in db.execute("SELECT slot, fact_id FROM board ORDER BY slot, fact_id"):
+        board.setdefault(slot, []).append(fact)
     chapter = chapter_of(db, state, board)
     db.close()
     snapshots, attempts = {}, []

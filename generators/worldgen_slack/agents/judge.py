@@ -106,7 +106,6 @@ class JudgeTask(vf.Task[WorldTaskData, ReviewState, JudgeConfig]):
                 prompt=REVIEW_PROMPT,
                 attempt=attempt,
                 world_hash=tools.db_hash,
-                storyline=payload.get("storyline", ""),
                 network_allow=[],
                 network_block=["*"],
             ),

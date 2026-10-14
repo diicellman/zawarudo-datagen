@@ -77,15 +77,10 @@ class CalendarConfig(Section):
 
 
 class TasksConfig(Section):
-    per_100: float = Field(gt=0, le=100)  # tasks per 100 messages: a bigger world holds more tasks
-    # Per level, the band of the solver's right-answer rate a task of that level aims for; hardening steers to it.
+    # Per level, the band of the solver's right-answer rate a task of that level measures in.
     bands: list[tuple[float, float]] = Field(min_length=1)
-    batch: int = Field(default=10, ge=1, le=50)  # slots written and hardened in one author interaction
     max_answer_rows: int = Field(default=5, ge=1, le=50)
-    styles: list[Text] = Field(min_length=1)
-    # Whether the world run writes its own tasks after its last day; without, it ends at its final review and the
-    # forge writes its tasks on the finished world (the way of worlds from 2026-10-14).
-    in_world: bool = True
+    styles: list[Text] = Field(min_length=1)  # how a question is asked: a chapter's brief draws one per entry
 
     @model_validator(mode="after")
     def ordered(self):
@@ -125,15 +120,15 @@ class ActivityConfig(Section):
 
 
 class Needs(Section):
-    """What code checks a task of one level for when it is written: the channels its facts are first stated in; the
-    relations among its facts; its near-misses (decoys, or values whose change its actor cannot see, on its answer's
-    subject and attribute, readable and unretracted in its actor's sight: `contracts.fact_measures`); whether its
-    answer is stated where it is harder to see than they are (`hidden`: a thread reply, a DM, or a later day); and at
-    most how many of its evidence's channel names and identifiers (words with digits, as PWSQL-03) the question names.
-    Search rank and depth are measured and reported, not needed: S2's author met a rank need by rewording, and at a
-    world's size every channel reads in one page. A chapter's brief may also need `values`, how many values its
-    answer's subject and attribute takes (the answer's among them), and `fresh`, an answer first stated in the
-    chapter, so that what it plants is new."""
+    """What a level needs of the facts a board entry rests on, checked when the plan is written: the channels its facts
+    are first stated in; the relations among them; its near-misses (decoys, or values whose change its actor cannot
+    see, on its answer's subject and attribute, readable and unretracted in its actor's sight:
+    `contracts.fact_measures`); and, for a chapter's brief, `values`, how many values its answer's subject and
+    attribute takes (the answer's among them), and `fresh`, an answer first stated in the chapter, so that what it
+    plants is new. `hidden`, an answer stated where it is harder to see than its near-misses (a thread reply, a DM, or
+    a later day), is checked when the answer is posted. `named`, at most how many of its evidence's channel names and
+    identifiers (words with digits, as PWSQL-03) a question names, is shown to the author and checked nowhere. Search
+    rank and depth are measured and reported, not needed: at a world's size every channel reads in one page."""
 
     channels: int = Field(default=0, ge=0)
     relations: int = Field(default=0, ge=0)
@@ -175,12 +170,6 @@ class ReviewRounds(Section):
     final: int = Field(default=4, ge=1, le=20)
 
 
-class Acceptance(Section):
-    """A review accepts when no issue blocks; minor issues block only if configured."""
-
-    minor_issues_block: bool = False
-
-
 class AuthorSettings(Section):
     """The world author: one agent writes the world in time order."""
 
@@ -193,12 +182,10 @@ class AuthorSettings(Section):
     review_days: list[int] = Field(
         default_factory=lambda: [5]
     )  # the judge reviews the world after these days
-    # The solver's tries of a task, each time it is probed or reviewed (8: at 4, a task right 80% of the time shows
-    # 4 of 4 in 41% of probes); the turns a task outside its band comes back to the author; the tasks in one judge
-    # review (a batch's reviews run side by side); GLM solves at once, as the account allows 8 concurrent requests;
-    # the witness's tries of a task below its band's floor.
+    # The solver's tries of a task (8: at 4, a task right 80% of the time shows 4 of 4 in 41% of probes); the tasks
+    # in one judge review (a round's reviews run side by side); the solver's tries at once; the witness's tries of a
+    # task below its band's floor.
     tries: int = Field(default=8, ge=1, le=16)
-    task_rounds: int = Field(default=3, ge=0, le=10)
     review_chunk: int = Field(default=5, ge=1, le=50)
     solvers: int = Field(default=8, ge=1, le=64)
     witness_tries: int = Field(default=2, ge=0, le=8)
@@ -227,7 +214,6 @@ class Config(Section):
     tasks: TasksConfig
     taxonomy: dict[Annotated[str, Field(pattern=r"^[a-z_]+$")], Category] = Field(min_length=1)
     review_rounds: ReviewRounds = Field(default_factory=ReviewRounds)
-    acceptance: Acceptance = Field(default_factory=Acceptance)
     author: AuthorSettings = Field(default_factory=AuthorSettings)
     env: PipelineConfig = Field(default_factory=PipelineConfig)
     answer_judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
@@ -237,12 +223,6 @@ class Config(Section):
         if short := [n for n, c in self.taxonomy.items() if len(c.levels) > len(self.tasks.bands)]:
             raise ValueError(f"[tasks] bands has one band for each level of {short}")
         return self
-
-    @property
-    def task_count(self) -> int:
-        """How many tasks the world run writes: `[tasks].per_100` for every 100 messages, at least one; none when the
-        forge writes them."""
-        return max(1, round(self.activity.messages * self.tasks.per_100 / 100)) if self.tasks.in_world else 0
 
     @model_validator(mode="after")
     def secure(self):

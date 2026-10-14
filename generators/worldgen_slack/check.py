@@ -60,7 +60,6 @@ from .chronicle import (
     Plan,
     PlanFact,
     PostLine,
-    add_task,
     advance,
     agenda_budget,
     band,
@@ -83,7 +82,7 @@ from .chronicle import (
 )
 from .chapter import ChapterConfig, ChapterEnv, Material, adopt, brief_slots, chapter_settings, same_schema, version_of
 from .chapter import provenance as chapter_provenance
-from .env import GenerationEnv, ended, keep_awake, rates, read_one_way, try_digest
+from .env import GenerationEnv, ended, keep_awake, rates, read_one_way
 from .generate import failure, provenance, run_label
 from .generate import run as generate_run
 from .store import ReviewLimit, SessionLost, Store
@@ -92,14 +91,14 @@ from .forge import measured as forge_measured
 from .profile import profile
 from .forge import provenance as forge_provenance
 from .forge import run as forge_run
-from .config import ROOT, Acceptance, Category, Config, Needs
+from .config import ROOT, Category, Config, Needs
 from .contracts import (
     READING,
     Integration,
     UserGroup,
     bot_id,
     miss_class,
-    band_move,
+    needs_text,
     DAY,
     PARTS,
     PHASE_CRITERIA,
@@ -135,12 +134,10 @@ from .contracts import (
     panel,
     channel_id,
     check_task,
-    deciding,
     direct_messages,
     measures,
     organize,
     pick_cast,
-    quota,
     record_task,
     render,
     reread,
@@ -720,11 +717,10 @@ def contracts_settings(root):
             "personas": {"path": str(root / "p.jsonl"), "typing": str(root / "t.jsonl"), "gaps": str(gaps)},
             "storylines": 2,
             "tasks": {
-                "per_100": 1,
                 "bands": spec["tasks"]["bands"],
                 "max_answer_rows": 2,
                 "styles": spec["tasks"]["styles"],
-            },  # 4 tasks  # fmt: skip
+            },
             "taxonomy": spec["taxonomy"],
         }
     )
@@ -765,24 +761,9 @@ def check_contracts(root):
     on a planned ledger (T2-T7), the agenda of everyday conversations; no literal times."""
     root.mkdir(parents=True)
     settings = contracts_settings(root)
-    styles = settings.tasks.styles
-    slots, cells = (
-        quota(settings.taxonomy, styles, 3, 40),
-        sum(len(c.levels) for c in settings.taxonomy.values()),
-    )
-    assert slots == quota(settings.taxonomy, styles, 3, 40) and [s.id for s in slots] != [s.id for s in quota(settings.taxonomy, styles, 4, 40)]  # fmt: skip
-    assert (
-        len({s.id for s in slots}) == 40 and len({(s.category, s.level) for s in slots[:cells]}) == cells
-    ), "every cell once before any twice, each slot its own id"
-    assert all(s.concept in settings.taxonomy[s.category].concepts[s.level - 1] and s.style in styles for s in slots), "concepts come from their own level"  # fmt: skip
-    repeats = [(slots[i], slots[i + cells]) for i in range(min(cells, 40 - cells))]
-    assert all(r.id == f"{s.category}-l{s.level}-2" and (r.concept != s.concept or len(settings.taxonomy[s.category].concepts[s.level - 1]) == 1) for s, r in repeats), "a repeat requires another concept while one is left"  # fmt: skip
     for wrong in ({"concepts": [["x"]]}, {"needs": [{}]}, {"concepts": [["x"], [], ["y"]]}):
         fails(Category.model_validate, settings.taxonomy["semantic"].model_dump() | wrong)
     whole = settings.model_dump(mode="json")
-    assert Config.model_validate(whole | {"tasks": whole["tasks"] | {"per_100": 10}}).task_count == 40, (
-        "10 tasks per 100 messages, of 400"
-    )
     fails(
         Config.model_validate, whole | {"tasks": whole["tasks"] | {"bands": whole["tasks"]["bands"][:2]}}
     )  # 3 levels
@@ -929,14 +910,12 @@ def check_contracts(root):
     directory = task(
         category="lookup", sql=f"SELECT real_name AS answer FROM users WHERE id = '{d}'", facts=()
     )
-    assert "t1" in recorded(directory, slot("lookup", 1)), (
-        "a task with no facts meets a level that needs none"
-    )
+    assert "t1" in recorded(directory, slot("lookup", 1)), "a task may rest on no facts"
     # A gold query asks only about what the tools show: who reacted, never when (S3's reactions "made on Aug 18").
     for unshown in ("SELECT u.real_name AS answer FROM reactions r JOIN users u ON u.id = r.user_id WHERE r.created_us > 0", "SELECT real_name AS answer FROM users WHERE created_us > 0 LIMIT 1", "SELECT name AS answer FROM channels WHERE creator_id IS NOT NULL LIMIT 1"):  # fmt: skip
         refused("which no Slack tool shows", recorded, task(category="lookup", sql=unshown, facts=()), slot("lookup", 1))  # fmt: skip
     nobody = task(category="robustness", answer_type="refusal", sql="SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", facts=())  # fmt: skip
-    assert "t1" in recorded(nobody, slot("robustness", 1)), "nor one whose level's needs are empty"
+    assert "t1" in recorded(nobody, slot("robustness", 1)), "nor a refusal"
     with world.trial() as copy:
         record_task(copy, search, settings, found)
     assert json.loads(world.db.execute("SELECT gold_json FROM tasks").fetchone()[0]) == [
@@ -975,31 +954,35 @@ def check_contracts(root):
         decoy(leads, id="f6")(copy)
         copy.insert("fact_relations", [dict(src_fact="f6", dst_fact="f5", kind="supersedes")])
 
-    for facts, actor, needs, setup, refusal in (
-        (["f1", "f4"], a, {"channels": 2}, None, "first stated in at least 2 channels (they are in 1)"),
-        (["f3", "f4"], a, {"relations": 3}, None, "at least 3 supersedes or after relations among its facts (it has 2)"),
-        (["f2", "f4"], c, {"decoys": 1}, decoy(leads), "at least 1 near-misses"),  # c is not in #leads
-        (["f2", "f4"], c, {"decoys": 1}, retracted(ops), "at least 1 near-misses"),  # f4 corrects it in plain sight
-        (["f2", "f4"], c, {"decoys": 1}, decoy(ops, attribute="budget"), "at least 1 near-misses"),  # another attribute
-        (["f4", "f3"], a, {"decoys": 1}, decoy(ops), "at least 1 near-misses"),  # it answers f3's window, not the owner
+    def measured_of(task_, slot_, setup=lambda copy: None):
+        """A task's measures once it is recorded into its slot, on a dropped trial."""
+        try:
+            with world.trial() as copy:
+                setup(copy)
+                raise LookupError(record_task(copy, task_, settings, slot_))
+        except LookupError as out:
+            return out.args[0]
+
+    for facts, actor, setup, measure, want in (
+        (["f1", "f4"], a, None, "channels", 1),
+        (["f1", "f3"], a, None, "channels", 2),
+        (["f3", "f4"], a, None, "relations", 2),
+        (["f2", "f4"], c, decoy(ops), "decoys", 1),
+        (["f2", "f4"], c, corrected_unseen, "decoys", 1),  # its correction is out of c's sight: it still misleads
+        (["f2", "f4"], c, decoy(leads), "decoys", 0),  # c is not in #leads
+        (["f2", "f4"], c, retracted(ops), "decoys", 0),  # f4 corrects it in plain sight
+        (["f2", "f4"], c, decoy(ops, attribute="budget"), "decoys", 0),  # another attribute
+        (["f4", "f3"], a, decoy(ops), "decoys", 0),  # it answers f3's window, not the owner
     ):  # fmt: skip
         asked = settled(facts).model_copy(update={"actor_id": actor})
-        refused(refusal, recorded, asked, nine, needing(settings, "semantic", 3, **needs), setup or (lambda copy: None))  # fmt: skip
-    assert "t9" in recorded(settled(["f1", "f3"]), nine, needing(settings, "semantic", 3, channels=2))
-    assert "t9" in recorded(settled(["f3", "f4"]), nine, needing(settings, "semantic", 3, relations=2))
+        assert measured_of(asked, nine, setup or (lambda copy: None))[measure] == want, (facts, measure, want)
     asked = settled(["f2", "f4"]).model_copy(update={"actor_id": c})
-    assert "t9" in recorded(asked, nine, needing(settings, "semantic", 3, decoys=1), decoy(ops))
-    assert "t9" in recorded(asked, nine, needing(settings, "semantic", 3, decoys=1), corrected_unseen), (
-        "a near-miss whose correction its actor cannot see still misleads"
-    )
     # A refusal rests on the truth its actor cannot see (f3, in #leads) beside the stale value it can (f7, in #ops).
     stale = lambda copy: (copy.insert("facts", [dict(id="f7", storyline="s2", subject="Audit", attribute="window", value="full test", channel_id=ops, author_id=a, day=3, summary="s")]), copy.insert("fact_relations", [dict(src_fact="f3", dst_fact="f7", kind="supersedes")]))  # noqa: E731  # fmt: skip
     unseen = Task(id="t9", category="robustness", level=4, actor_id=c, question="When is the audit's full test?", answer_type="refusal", gold_sql="SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", facts=["f3", "f7"])  # fmt: skip
     four = slot("robustness", 4, id="t9")
-    assert "t9" in recorded(unseen, four, needing(settings, "robustness", 4, decoys=1), stale), (
-        "its near-miss misleads"
-    )
-    refused("at least 1 near-misses", recorded, unseen.model_copy(update={"facts": ["f3"]}), four, needing(settings, "robustness", 4, decoys=1))  # fmt: skip  # no stale value in sight
+    assert measured_of(unseen, four, stale)["decoys"] == 1, "its near-miss misleads"
+    assert measured_of(unseen.model_copy(update={"facts": ["f3"]}), four)["decoys"] == 0, "no stale value in sight"
 
     # A status answer gives the latest value its actor can see (f7, in #ops), which a fact out of their sight settles
     # (f3, in #leads): the useful answer gives it as not settled, where a refusal said nothing.
@@ -1016,7 +999,7 @@ def check_contracts(root):
         with world.trial() as copy:
             decoy(ops)(copy)
             copy.insert("facts", [dict(id="f6", storyline="s2", subject="Audit", attribute="owner", value="Mia", channel_id=leads, author_id=a, day=3, summary="s", is_decoy=1)])  # fmt: skip  # out of c's sight
-            record_task(copy, asked, needing(settings, "semantic", 3, decoys=1), nine)
+            record_task(copy, asked, settings, nine)
             raise LookupError(failure_cases(copy, "t9", [{"answer": "Owen"}]))
     except LookupError as out:
         gold, cases = out.args[0]
@@ -1037,13 +1020,11 @@ def check_contracts(root):
     try:
         with world.trial() as copy:
             chain(copy)
-            record_task(copy, window, needing(settings, "semantic", 3), nine)
+            record_task(copy, window, settings, nine)
             count = Task(id="t8", category="lookup", level=1, actor_id=a, question="How many messages are there?", answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages")  # fmt: skip
             counted = record_task(copy, count, settings, slot("lookup", 1, id="t8"))["gold"]
             who = window.model_copy(update={"id": "t7", "question": "Who settled the audit's window?", "gold_sql": "SELECT u.real_name AS answer FROM facts f JOIN users u ON u.id = f.author_id WHERE f.id = 'f3'"})  # fmt: skip
-            settler = record_task(copy, who, needing(settings, "semantic", 3), slot("semantic", 3, id="t7"))[
-                "gold"
-            ]
+            settler = record_task(copy, who, settings, slot("semantic", 3, id="t7"))["gold"]
             raise LookupError((panel(copy, "t9", [{"answer": "dry run"}]), features(copy, "t9", [{"answer": "dry run"}]), features(copy, "t8", counted), features(copy, "t7", settler)))  # fmt: skip
     except LookupError as out:
         lazy, shape, counting, settled_by = out.args[0]
@@ -1067,7 +1048,7 @@ def check_contracts(root):
     try:
         with world.trial() as copy:
             stated_unseen(copy)
-            raise LookupError(record_task(copy, unseen, needing(settings, "robustness", 4, decoys=1), four))
+            raise LookupError(record_task(copy, unseen, settings, four))
     except LookupError as out:
         measured = out.args[0]
     assert (measured["unseen"], measured["evidence_pages"], measured["decoys"]) == (1, None, 1), (
@@ -1200,10 +1181,6 @@ def check_apps(root):
     assert not surface.read(reader, "search_public_and_private", {"keywords": ["production"]})["items"] and surface.read(reader, "search_public_and_private", {"keywords": ["production"], "include_bots": True})["items"], "a search leaves apps out unless asked"  # fmt: skip
     assert "✅ production release: deployed to production" in surface.render(reader, "read_channel", surface.read(reader, "read_channel", {"channel_id": ops}))["messages"]  # fmt: skip
     reader.close()
-    # A world whose forge writes its tasks: no slots, and its last day is followed by its final review.
-    forged_later = settings.model_copy(update={"tasks": settings.tasks.model_copy(update={"in_world": False})})
-    assert (forged_later.task_count, settings.task_count > 0) == (0, True)
-    assert GenerationEnv(forged_later, TestStore(root / "later", {"seed": 1})).after_days == "final" and GenerationEnv(settings, TestStore(root / "own", {"seed": 1})).after_days == "tasks"  # fmt: skip
     print("PASS apps: listed, members, an event's post at its moment, routine ones on workdays, in time order, counted by no one")
 
 
@@ -1472,6 +1449,17 @@ def check_clock(root):
     refused("['t4'] have none", boarded_robust, plan(board=usual))
     refused("the board's t4 (level-4 robustness) needs at least 1 near-misses", boarded_robust, plan(board=[*usual, *entries(("t4", ["f4"]))]))  # fmt: skip
     boarded_robust(plan(facts=[*facts, near], board=[*usual, *entries(("t4", ["f4", "f5"]))]))
+    # Relations among a slot's facts: f2 comes after f1; f4 comes after f3 and supersedes it.
+    related = needing(settings, "semantic", 3, relations=2)
+
+    def boarded_related(document):
+        with world.trial() as copy:
+            record_plan(copy, document, related, board_slots)
+
+    refused("the board's t1 (level-3 semantic) needs at least 2 supersedes or after relations among its facts (it has 1)", boarded_related, plan(board=entries(("t1", ["f1", "f2"]), ("t3", ["f4"]))))  # fmt: skip
+    boarded_related(plan(board=usual))
+    # The needs the author reads for a slot are only those its level sets.
+    assert needs_text(Needs(values=2, hidden=True)) == "its answer in a thread reply, a DM, or later than its near-misses; its answer's subject and attribute taking 2 or more values, its answer among them"  # fmt: skip
     try:  # facts may be shared; a replan's board replaces the last; a fact the board rests on stays planned
         with world.trial() as copy:
             record_plan(copy, plan(board=entries(("t1", ["f3", "f4"]), ("t3", ["f4"]))), spread, board_slots)
@@ -1487,12 +1475,14 @@ def check_clock(root):
     slots = [Slot(id="t1", category="semantic", level=3, concept="a concept", style="a style"), Slot(id="t2", category="lookup", level=1, concept="a concept", style="a style")]  # fmt: skip
     owner = Task(id="t1", category="semantic", level=3, actor_id=a, question="Who owns the audit after the dry run?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f4'", facts=["f3", "f4"])  # fmt: skip
 
-    def tasked(task, cfg=None, setup=lambda copy: None):
+    def tasked(task, setup=lambda copy: None):
+        """A task written into its slot of the closed world, as the forge writes one: it replaces the slot's task."""
+        slot = next(s for s in slots if s.id == task.id)
         with world.trial() as copy:
             setup(copy)
-            return add_task(copy, task, cfg or settings, slots)
-
-    refused("once the calendar is closed", tasked, owner)
+            copy.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
+            copy.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
+            return record_task(copy, task, settings, slot)
 
     def posted_(conversation):
         with world.trial() as copy:
@@ -1701,22 +1691,16 @@ def check_clock(root):
     promising = settings.model_copy(update={"activity": settings.activity.model_copy(update={"promise_rate": 0.5})})
     assert any(e == f"{promises_made(world, 1)} promises made today; the day holds at least 2 (a line's commits)" for e in close_day(world, promising, 1)), "a day makes its promises"  # fmt: skip
     refused("t1 is a semantic level 3 task", tasked, owner.model_copy(update={"level": 2}))
-    refused("one of the slots you write now: ['t1', 't2']", tasked, owner.model_copy(update={"id": "t9"}))
-    level3 = lambda **needs: needing(settings, "semantic", 3, **needs)  # noqa: E731
-    result = tasked(owner, level3(channels=2, relations=1))
+    result = tasked(owner)
     assert result["gold"] == [{"answer": "Owen"}] and result["bm25_rank"] and result["channels"] == 2, result
     assert "depth_share" in result and result["hidden"] is False, "rank and depth are measured, and reported"
-    # The needs its messages give: where its answer is stated beside its near-misses, what the question names.
-    refused("first stated in at least 2 channels", tasked, owner.model_copy(update={"facts": ["f1", "f4"]}), level3(channels=2))  # fmt: skip  # both in #ops
-    refused(
-        "its answer stated where it is harder to see", tasked, owner, level3(hidden=True)
-    )  # f4 is top-level in #ops
+    # What its messages give: where its answer is stated beside its near-misses, what the question names.
+    assert tasked(owner.model_copy(update={"facts": ["f1", "f4"]}))["channels"] == 1, "both in #ops"
     earlier = lambda copy: copy.insert("facts", [dict(id="f8", storyline="s2", subject="Audit", attribute="owner", value="Ines", channel_id=ops, author_id=a, day=2, summary="s", is_decoy=1)])  # noqa: E731  # fmt: skip
-    assert tasked(owner, level3(decoys=1, hidden=True), earlier)["hidden"], "stated after every near-miss"
+    assert tasked(owner, earlier)["hidden"], "stated after every near-miss"
     leads_named = owner.model_copy(update={"question": "Who owns the audit after the dry run in #leads?"})
-    refused("naming at most 0 of its evidence's channels and identifiers (it names 1)", tasked, leads_named, level3(named=0))  # fmt: skip
-    assert tasked(leads_named, level3(named=1))["named"] == 1
-    tasked(owner, level3())
+    assert tasked(leads_named)["named"] == 1
+    tasked(owner)
     replier = Task(id="t2", category="lookup", level=1, actor_id=c, question="Who said thanks in #ops?", answer_type="text", gold_sql="SELECT u.real_name AS answer FROM messages m JOIN users u ON u.id = m.user_id WHERE m.text = 'thanks'")  # fmt: skip
     tasked(replier.model_copy(update={"question": "Who said thanks?"}))
     tasked(replier)  # the slot's task is replaced
@@ -1728,7 +1712,6 @@ def check_clock(root):
         with world.trial() as copy:
             return revise(copy, message, text)
 
-    refused("changes task t2", revised, thanks, "thank you")  # t2's gold answer reads that text
     refused(
         "anchor_token_missing", revised, stated, "the audit has an owner"
     )  # f4's evidence keeps its token
@@ -1818,7 +1801,7 @@ async def check_tools(root):
     call = lambda tools, name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
     page = await call(day1, "now")
     assert (
-        page.startswith("# Now: ") and "day 1 of 10" in page and "[[f1]]" in page and "## Task slots" in page
+        page.startswith("# Now: ") and "day 1 of 10" in page and "[[f1]]" in page and "## Brief" in page
     )
     assert "everyday conversations code drew for today" in page and agenda[1]
     assert "- today: 0 messages today (thread replies 0, reacted to 0, in DMs 0, mention someone 0); it closes with" in page
@@ -2028,16 +2011,11 @@ async def check_reviews(root):
     fails(verdict, issues=[issue])
     fails(verdict, approved=False)
     batch = verdict(approved=False, issues=[issue], tasks=(("t1", True), ("t2", True)))
-    strict, lenient = Acceptance(minor_issues_block=True), Acceptance()
-    assert accepted_task(batch, lenient, "t1") and not accepted_task(batch, lenient, "t2")
+    assert accepted_task(batch, "t1") and not accepted_task(batch, "t2")
     general = batch.model_copy(update={"issues": [issue.model_copy(update={"task_ids": []})]})
-    assert accepted_task(general, lenient, "t1"), "an issue naming no task blocks none: it is the world's"
+    assert accepted_task(general, "t1"), "an issue naming no task blocks none: it is the world's"
     minor = batch.model_copy(update={"issues": [issue.model_copy(update={"blocking": False})]})
-    assert (
-        accepted_task(minor, lenient, "t2")
-        and not accepted_task(minor, strict, "t2")
-        and not deciding(minor, lenient)
-    )
+    assert accepted_task(minor, "t2"), "a minor issue blocks nothing"
 
     world.snapshot(root / "review.sqlite")
     judge = JudgeTask.create(payload, root / "review.sqlite", "final-01", 5)
@@ -2171,14 +2149,14 @@ async def check_reviews(root):
     assert "Then align: committed lists the answer the response commits to" in asks[0].content
     gold_ts = answer.messages[0][1]
     calls = [
-        {"tool": "search_messages", "arguments": {"query": "nothing"}, "output": {"items": [], "next_cursor": None}},  # fmt: skip
-        {"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C1", "ts": gold_ts, "user": "U1", "text": "a", "time_utc": "z"}]}},  # fmt: skip
-        {"tool": "search_messages", "arguments": {"query": "a"}, "output": {"items": [{"channel": "C1", "ts": gold_ts, "user": "U1", "text": "a", "channel_name": "c"}]}},  # fmt: skip
+        {"tool": "search_public", "arguments": {"keywords": ["nothing"]}, "output": {"items": [], "next_cursor": None}},  # fmt: skip
+        {"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C1", "ts": gold_ts, "user": "U1", "text": "a"}]}},  # fmt: skip
+        {"tool": "search_public", "arguments": {"keywords": ["a"]}, "output": {"items": [{"channel": "C1", "ts": gold_ts, "user": "U1", "text": "a", "channel_name": "c"}]}},  # fmt: skip
         {"tool": "get_reactions", "arguments": {}, "output": {"channel": "C1", "ts": gold_ts, "reactions": [{"name": "eyes", "count": 1, "users": ["U3"]}]}},  # fmt: skip
         {"tool": "list_channel_members", "arguments": {"channel_id": "C1"}, "output": {"items": ["U4", "U2"], "next_cursor": None}},  # fmt: skip
     ]
     view = compact(calls)
-    assert [(m["ts"], m.get("channel_name"), "time_utc" in m) for m in view["messages"]] == [(gold_ts, "c", False)]
+    assert [(m["ts"], m.get("channel_name")) for m in view["messages"]] == [(gold_ts, "c")], "a message once, merged"
     assert view["messages"][0]["reactions"][0]["users"] == ["U3"] and view["members"] == {"C1": ["U2", "U4"]}
     assert [c["results"] for c in view["calls"]] == [0, 1, 1, 1, 2], "an empty search stays in the log"
     assert set().union(*map(people_shown, calls)) == {"U1", "U2", "U3", "U4"}, "authors, reactors, members are seen"
@@ -2208,9 +2186,8 @@ async def check_reviews(root):
     assert load_release(root / "release")[1:] == ([task], {"t1": answer})
     manifest = json.loads((root / "release" / "manifest.json").read_text())
     assert manifest["format"] == "worldgen-slack.v10"
-    for old in ("worldgen-slack.v7", "worldgen-slack.v8"):
-        (root / "release" / "manifest.json").write_text(json.dumps(manifest | {"format": old}))
-        assert load_release(root / "release")[1:] == ([task], {"t1": answer}), f"a {old} release still loads"
+    (root / "release" / "manifest.json").write_text(json.dumps(manifest | {"format": "worldgen-slack.v9"}))
+    fails(load_release, root / "release")  # a release of another format
     (root / "release" / "manifest.json").write_text(json.dumps(manifest))
     write_release(root / "release", root / "solver.sqlite", [task], {"t1": answer})  # idempotent
     fails(
@@ -2442,6 +2419,9 @@ def world_seats():
                 await call("advance", to=onward(world))
             await runtime.write("/task/notes/recap.md", f"day {day}: done".encode())
         elif prompt.startswith("The review rejected"):
+            pinged = runtime.pings
+            await asyncio.sleep(0.01)
+            assert runtime.pings > pinged, "the VM is kept awake through the final review and its fix"
             issues = json.loads(prompt[prompt.index("[") : prompt.index("]\n") + 1])
             for issue in issues:
                 for message in issue.get("message_ids", []):
@@ -2466,7 +2446,7 @@ def world_seats():
 
 
 def flow_run_settings(root):
-    """The flows' settings: a 4-day world of 16 messages, 4 tasks in 2 batches, a review after day 2."""
+    """The flows' settings: a 4-day world of 16 messages, a review after day 2, 3 tries of a task."""
     base = flow_settings(root, 3)
     cut = {
         "robustness": 2
@@ -2477,17 +2457,14 @@ def flow_run_settings(root):
             "taxonomy": flow,
             "calendar": base.calendar.model_copy(update={"days": 4}),
             "activity": base.activity.model_copy(update={"messages": 16}),
-            # 4 tasks in 2 batches; level 3's band starts at 0, so the witness tries its task
-            "tasks": base.tasks.model_copy(
-                update={"per_100": 25, "batch": 2, "bands": [(0.75, 1.0), (0.5, 0.75), (0.0, 0.5)]}
-            ),  # fmt: skip
+            # level 3's band starts at 0, so the witness tries its tasks
+            "tasks": base.tasks.model_copy(update={"bands": [(0.75, 1.0), (0.5, 0.75), (0.0, 0.5)]}),
             "author": base.author.model_copy(
                 update={
                     "tolerance": 1.0,
                     "share_tolerance": 1.0,
                     "review_days": [2],
                     "tries": 3,
-                    "task_rounds": 1,
                     "review_chunk": 1,
                     "solvers": 2,
                     "keepalive": 0.0005,
@@ -2552,46 +2529,63 @@ def forge_seats(note_on=None) -> dict:
 
 
 async def world_run(root, settings, agents_of):
-    """A world written with no tasks of its own, as W1 is: setup, the plan, four days with a review after day 2 whose
-    note opens day 3, and a final review that rejects once and is fixed in the same session. It ends at the final
-    review. The forge, the measure and the chapter below start from it. Returns its run directory and settings."""
-    settings = settings.model_copy(update={"output": root / "world", "tasks": settings.tasks.model_copy(update={"in_world": False})})  # fmt: skip
+    """A world written through the CLI's own run: setup, the plan, four days with a review after day 2 whose note
+    opens day 3, and a final review that rejects once and is fixed in the same session. It ends at the final review,
+    and publishes nothing. The forge and the measure below start from it. Returns its run directory and settings."""
+    ScriptedAgent.traced.clear()  # each flow numbers its traces from 1
+    settings = settings.model_copy(update={"output": root / "world"})
     author, judge, fixed, reviewed = world_seats()
 
     with episodes(agents_of(judge=judge, author=author)):
-        try:
-            await generate_run(settings)
-            raise AssertionError("a world with no tasks published a release")
-        except ValueError as error:  # it publishes after its final review all the same, an empty release
-            assert "public tasks and private answers must match exactly" in str(error), error
+        summary = await generate_run(settings)
+    assert summary["status"] == "complete" and not (settings.output / "release").exists(), "a world run publishes nothing"  # fmt: skip
     store = TestStore(settings.output, provenance(settings))
     state = store.state
-    assert state.phase == "done" and GenerationEnv(settings, store).after_days == "final", (state.phase, state.rounds)
+    assert state.phase == "done", (state.phase, state.rounds)
     assert reviewed == ["review-02-01", "final-01", "final-02"] and len(fixed) == 1, (reviewed, fixed)
     assert store.world.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0 and not state.quota, "no tasks"
     assert [e["day"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines()) if e["event"] == "day_closed"] == [1, 2, 3, 4]  # fmt: skip
     assert store.world.violations(complete=True) == []
     store.close()
+    # A fix turn on a fresh VM, as after a lost session, starts from the notes of the last day closed: on a copy of
+    # the run, its final review reopened and rejected once more.
+    again = root / "world-again"
+    shutil.copytree(settings.output, again)
+    store, noted = TestStore(again, provenance(settings)), []
+    store.state.phase = "final"
+
+    async def fix(prompt, tools, runtime):
+        noted.append({name: runtime.files.get(f"/task/notes/{name}") for name in ("plan.md", "recap.md")})
+
+    class Rejecting(ScriptedAgent):  # the next final review rejects once, then approves
+        async def run(self, task):
+            world = World(task.config.tools.db_path)
+            first, second = [m for (m,) in world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")]
+            world.close()
+            issues = [] if noted else [Issue(artifact="workspace", message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=True)]  # fmt: skip
+            return await judged(task, Verdict(approved=not issues, tasks=[], issues=issues, criteria=dict.fromkeys(PHASE_CRITERIA["world"], 1.0), summary="s"))  # fmt: skip
+
+    await GenerationEnv(settings, store).fix_world(SimpleNamespace(author=ScriptedAuthor(fix), judge=Rejecting()), FakeRuntime())  # fmt: skip
+    kept = store.root / "attempts" / store.state.restore_point / "notes"
+    assert noted == [{name: (kept / name).read_bytes() for name in ("plan.md", "recap.md")}] and all(noted[0].values()), noted  # fmt: skip
+    assert store.state.phase == "done", store.state.phase
+    store.close()
     return settings.output, settings
 
 
 async def check_author(root):
-    """One world written by a scripted author through the v7 driver: setup, the plan, days that close only when done,
-    a review after day 2 whose issues open day 3, a crash in that review and in day 3 with resumes from day 2's world
-    and notes, tasks, probes and hardening toward each level's band, a final rejection fixed in the same session,
-    publish."""
+    """One world written by a scripted author through the driver: setup, the plan, days that close only when done, a
+    review after day 2 whose issues open day 3, a crash in that review and in day 3 with resumes from day 2's world
+    and notes, a final rejection fixed in the same session. Then the forge on a world with no tasks of its own (its
+    rounds, the screen, the tries, the witness, the hint, the archive, the release), a measure on the forge's output,
+    and a chapter of a world with tasks of its own."""
     root.mkdir(parents=True)
     settings = flow_run_settings(root)
-    seen, crash, solved, finished = [], {"armed": True, "review": True, "plans": 0, "tasks": True}, Counter(), Counter()  # fmt: skip
+    seen, crash, solved, finished = [], {"armed": True, "review": True, "plans": 0}, Counter(), Counter()
     GRADER.update(on=True, loose=False, blind=False)
-    t0, t1, t2, t3 = [
-        s.id for s in quota(settings.taxonomy, settings.tasks.styles, settings.seed, settings.task_count)
-    ]
-    # The solver: every other try is right, but t1 and t3 are right every time: t1 (search level 2) is too easy for its
-    # band, t3 (join level 1) is in its band. t2's right answers are never grounded, so only its strict rate is 0.
-    always = {t1, t3}
-    # Runs that crash: t0's first is run again; one try of t2 crashes twice and is left out of its rates.
-    crashes = {("tasks-01", t0): {1}, ("tasks-03", t2): {2, 3}}
+    # The solver: every other try is right, and a candidate hard to find only when shown its evidence. One try of
+    # r02-01 crashes twice and is left out of its rates.
+    crashes = {("forge", "r02-01"): {2, 3}}
 
     class ScriptedSolver(ScriptedAgent):
         async def run(self, task):
@@ -2601,7 +2595,7 @@ async def check_author(root):
             if solved[key] in crashes.get(key, ()):
                 return FakeTrace(name, "solver", ok=False, errors=[SimpleNamespace(message="model stream ended")], task=task)  # fmt: skip
             finished[key] += 1
-            right, grounded = task.data.task_id in always or finished[key] % 2 == 1, task.data.task_id != t2
+            right, grounded = finished[key] % 2 == 1, True
             if (
                 "hard to find" in task.data.prompt
             ):  # a forge candidate it answers only when shown the evidence
@@ -2626,7 +2620,7 @@ async def check_author(root):
 
     class FlowJudge(ScriptedAgent):
         """The judge at its seat: it reads the review's input and writes its verdict; a review after day 2 is cut off
-        once; the final review rejects the world once."""
+        once; the final review rejects the world once; a task review finds the vague candidates invalid."""
 
         async def run(self, task):
             payload, attempt, files = json.loads(task.config.payload), task.data.attempt, task.config.files
@@ -2641,19 +2635,14 @@ async def check_author(root):
             if payload["phase"] == "world" and attempt in ("review-02-02", "final-01"):
                 first, second = [m for (m,) in world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")]
                 # A mid-run review's note blocks nothing, and still opens the next day.
-                # The final one's defect touches t0, so its fix may rewrite t0 and no other task.
-                issues = [Issue(artifact="workspace", task_ids=[t0] if attempt == "final-01" else [], message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
+                issues = [Issue(artifact="workspace", message_ids=[second], evidence_message_ids=[first], defect="stiff", requested_change="looser", blocking=attempt != "review-02-02")]  # fmt: skip
                 if attempt == "final-01":  # a note beside the blocking defect, which the author hears too
                     issues.append(Issue(artifact="workspace", defect="a little formal", requested_change="loosen", blocking=False))  # fmt: skip
             criteria = dict.fromkeys(PHASE_CRITERIA.get(payload["phase"], ()), 1.0)
-            # The probe's review finds t3 invalid; unchanged, it is judged again at the final review, on its runs.
-            reviews = [TaskReview(task_id=t["id"], valid=not ((attempt.startswith("tasks-") and t["id"] == t3) or "vague" in t["question"]), reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
+            reviews = [TaskReview(task_id=t["id"], valid="vague" not in t["question"], reason="r", level_fit=3 if payload["phase"] == "task" else None) for t in payload["tasks"]]  # fmt: skip
             last = world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
             world.close()
             issues += [Issue(artifact="tasks", task_ids=[r.task_id], message_ids=[last], defect="vague", requested_change="sharpen") for r in reviews if not r.valid]  # fmt: skip
-            if attempt.startswith("tasks-") and payload["tasks"] and payload["tasks"][0]["id"] == t3:
-                # A defect of the world, naming no task: it blocks none, and the final review hears it.
-                issues.append(Issue(artifact="ledger", defect="a summary drifts", requested_change="restate it", blocking=False))  # fmt: skip
             verdict = Verdict(approved=not any(i.blocking for i in issues) and all(r.valid for r in reviews), tasks=reviews, issues=issues, criteria=criteria, summary="s")  # fmt: skip
             return await judged(task, verdict)
 
@@ -2697,9 +2686,8 @@ async def check_author(root):
                 PlanFact(id="f3", storyline="s2", subject="Audit", attribute="window", value="dry run", anchor="dry run", channel_id=leads, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
                 PlanFact(id="f4", storyline="s2", subject="Audit", attribute="owner", value="Owen", channel_id=ops, author_id=a, day=3, event="e1", kind="scheduled", summary="s"),
             ]  # fmt: skip
-            board = [BoardEntry(slot=t, facts=["f3", "f4"]) for t in (t0, t1, t2)]  # the ledger slots
-            await call("plan", ledger=Plan(storylines=[Storyline(id="s1", summary="the release"), Storyline(id="s2", summary="the audit")], events=events, facts=facts, board=board))  # fmt: skip
-            await runtime.write("/task/notes/plan.md", b"arcs; board: semantic and search rest on f3 and f4")
+            await call("plan", ledger=Plan(storylines=[Storyline(id="s1", summary="the release"), Storyline(id="s2", summary="the audit")], events=events, facts=facts, board=[]))  # fmt: skip
+            await runtime.write("/task/notes/plan.md", b"arcs: the release, then the audit")
         elif tools.config.mode == "day":
             day = tools.config.day
             if day == 1 and prompt.startswith(
@@ -2722,9 +2710,7 @@ async def check_author(root):
                     await talk(ops, dict(author_id=c, text="morning"))
                     crash["armed"] = False
                     raise KeyboardInterrupt("simulated crash")
-                assert b"board" in runtime.files["/task/notes/plan.md"], (
-                    "the author's notes come back with its world"
-                )
+                assert b"arcs" in runtime.files["/task/notes/plan.md"], "the author's notes come back with its world"
                 issue = json.loads(prompt[prompt.index("[{") : prompt.index("}]") + 2])[0]
                 for message in issue["message_ids"]:
                     await call("revise", message_id=message, text="ok, notes tomorrow then")
@@ -2819,79 +2805,6 @@ async def check_author(root):
                 ids[0] == "r02-01" and not forging["vague"]
             ):  # one GLM misses unless shown the evidence; the witness answers
                 await call("add_task", task=Task(id=ids[0], category="search", level=1, actor_id=a, question="When were the notes up for release 4.2? it is hard to find", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'f2'", facts=["f2"], intent="when"))  # fmt: skip
-        elif prompt.startswith("The last day is closed"):
-            context = json.loads(tools.config.context)
-            writable, slots = context["writable"], {s["id"]: s for s in context["slots"]}
-            seen.append(("tasks", tuple(writable), tuple(t for t in slots if t in prompt)))
-            if writable == [t0, t1]:
-                try:
-                    await call("add_task", task=scripted_task(settings, slots[t2], a))
-                    raise AssertionError("a slot of another batch was written")
-                except ValueError as error:
-                    assert "one of the slots you write now" in str(error), error
-                await runtime.write("/task/notes/recap.md", b"tasks: the first batch")
-            else:
-                assert runtime.files["/task/notes/recap.md"] == b"tasks: the first batch", (
-                    "the last batch's notes"
-                )
-            for t in writable:
-                if t in prompt:
-                    await call("add_task", task=scripted_task(settings, slots[t], a))
-                if t == t2 and crash["tasks"]:  # the second batch is cut off after its first task
-                    crash["tasks"] = False
-                    raise KeyboardInterrupt("simulated crash in a batch")
-        elif prompt.startswith("These tasks come back"):
-            back = json.loads(prompt[prompt.index("{") : prompt.index("\nRewrite")])
-            assert all(r["level_fit"] == 3 and "evidence_pages" in r and r["concept"] and r["band"] and "right_rate" in r and "strict_rate" in r for r in back.values()), (
-                "hardening reads the judge's level fit, code's measures, both rates and the level's band"
-            )  # fmt: skip
-            assert all(r["question"] and r["gold_sql"] and "gold" in r and r["asked_by"] and r["tries_left"] == 0 and "found_by" in r["solves"][0] and "decoy_reads" in r["solves"][0] for r in back.values()), (
-                "a returned task carries what it asks and answers, who asks it, and the route to beat"
-            )  # fmt: skip
-            assert all(len(json.dumps(r)) < 6000 for r in back.values()), "a returned task is small"
-            seen.append(("harden", sorted(back), sorted(r["move"] for r in back.values())))
-            seen.append(("pinged", runtime.pings))  # by now the probe ran, with the VM kept awake
-            for (
-                t,
-                r,
-            ) in back.items():  # each try as the author reads it: the route, and where the evidence showed
-                assert r["solves"] and all(s["steps"][0].startswith('search_messages {"query": "release"} → 0 items') for s in r["solves"]), r["solves"]  # fmt: skip
-                assert {s["evidence_at"] for s in r["solves"]} == ({2} if t == t1 else {None}), (
-                    t,
-                    r["solves"],
-                )  # t3 is a join
-                assert all(f"/task/memory/solves/{t}/{k}.json" in runtime.files for k in range(1, 4)), "the whole tries"  # fmt: skip
-            fixes = sum(1 for x in seen if x[0] == "harden" and t3 in x[1])
-            for slot in json.loads(tools.config.context)["slots"]:
-                task = scripted_task(settings, slot, a)
-                asked = task.model_copy(update={"question": f"Asked again ({len(seen)}): " + task.question})
-                if slot["id"] == t3 and slot["id"] in back:
-                    # Its first fix revises the message the review names, not the task: it is tried again all the
-                    # same. Its second rewrites it with another answer, which a fix may change.
-                    if fixes == 1:
-                        last = world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
-                        await call("revise", message_id=last, text="quiet day, nothing to report")
-                    else:
-                        await call("add_task", task=asked.model_copy(update={"gold_sql": "SELECT COUNT(*) AS answer FROM messages WHERE parent_id IS NULL"}))  # fmt: skip
-                elif slot["id"] in back:  # a task that came back is rewritten, so tried again
-                    if back[slot["id"]]["move"] == "harder":  # keeping its answer: another answer is refused
-                        swapped = asked.model_copy(update={"gold_sql": "SELECT value AS answer FROM facts WHERE id = 'f3'", "facts": ["f3"]})  # fmt: skip
-                        try:
-                            await call("add_task", task=swapped)
-                            raise AssertionError("a harder rewrite changed its answer")
-                        except ValueError as error:
-                            assert "keeps its answer" in str(error), error
-                            seen.append(("answer kept", slot["id"]))
-                    await call("add_task", task=asked)
-                elif (
-                    slot["id"] in json.loads(tools.config.context)["writable"]
-                ):  # in this batch, but in its band
-                    try:
-                        await call("add_task", task=asked)
-                        raise AssertionError("a task that did not come back was rewritten")
-                    except ValueError as error:
-                        assert "one of the slots you write now" in str(error), error
-                        seen.append(("kept", slot["id"]))
         elif prompt.startswith("The review rejected"):
             assert "hedging a decoy where its readers see it voids the near-miss" in prompt
             issues = json.loads(prompt[prompt.index("[") : prompt.index("]\n") + 1])
@@ -2900,17 +2813,6 @@ async def check_author(root):
                 for message in issue.get("message_ids", []):
                     await call("revise", message_id=message, text="ok, the notes come tomorrow")
             seen.append(("fixed", [m for i in issues for m in i.get("message_ids", [])]))
-            slots = json.loads(tools.config.context)["slots"]
-            task = scripted_task(settings, slots[0], a)  # t0, which the verdict names, rewritten in its slot
-            await call("add_task", task=task.model_copy(update={"question": "Asked anew: " + task.question}))
-            other = scripted_task(settings, slots[1], a)
-            try:
-                await call(
-                    "add_task", task=other.model_copy(update={"question": "Asked anew: " + other.question})
-                )
-                raise AssertionError("a fix rewrote a task the verdict does not name")
-            except ValueError as error:
-                assert "one of the slots you write now: ['" + t0 + "']" in str(error), error
 
     agents = SimpleNamespace(judge=FlowJudge(), solver=ScriptedSolver(), witness=ScriptedWitness(), author=ScriptedAuthor(script))  # fmt: skip
     manifest = provenance(settings)
@@ -2942,14 +2844,6 @@ async def check_author(root):
     )  # a run resumes only with its own config
     store = TestStore(settings.output, manifest)
     assert store.state.phase == "day" and store.state.day == 3 and store.state.restore_point == "day-02-01"
-    try:
-        await GenerationEnv(settings, store).run(None, agents)
-        raise AssertionError("the simulated crash did not happen")
-    except KeyboardInterrupt:
-        pass
-    store.close()
-    store = TestStore(settings.output, manifest)
-    assert store.state.phase == "tasks" and store.state.batch == 1, "a batch cut off is written again"
     env = GenerationEnv(settings, store)
     await env.run(None, agents)
     state = store.state
@@ -2975,213 +2869,32 @@ async def check_author(root):
     )
     assert store.world.db.execute("SELECT text FROM messages WHERE id = ?", (second,)).fetchone()[0] == "ok, the notes come tomorrow"  # fmt: skip
     assert "rollback" in store.world.db.execute("SELECT text FROM messages WHERE id = ?", (first,)).fetchone()[0], "the evidence stays"  # fmt: skip
-    # Too easy, t1 comes back for its one round; t3, which the judge does not approve, comes back after it too. The
-    # tasks in their bands never come back. A round counts what changed: t3's revised message, then t3 itself.
-    assert [s for s in seen if s[0] == "harden"] == [("harden", [t1], ["harder"]), ("harden", [t3], ["fix"]), ("harden", [t3], ["fix"])]  # fmt: skip
-    assert state.task_rounds == {t1: 1, t3: 2}, state.task_rounds
-    assert [s for s in seen if s[0] == "answer kept"] == [("answer kept", t1)], (
-        "a harder t1 keeps its answer; t3's fix need not"
-    )
-    # A hardening turn rewrites only what came back: t0 (in its band) is refused in t1's turn, t2 in t3's two turns.
-    assert [s for s in seen if s[0] == "kept"] == [("kept", t0), ("kept", t2), ("kept", t2)], [s for s in seen if s[0] == "kept"]  # fmt: skip
-    # Two batches, each in its own interaction; the second, cut off after t2, is written again: only t3 is asked for.
-    assert [s for s in seen if s[0] == "tasks"] == [("tasks", (t0, t1), (t0, t1)), ("tasks", (t2, t3), (t2, t3)), ("tasks", (t2, t3), (t3,))]  # fmt: skip
-    assert state.rounds["tasks"] == 3, state.rounds
-    # Each probe tries what changed; the final reviews solve only what changed since: t0, which a fix rewrote.
-    assert solved == {("tasks-01", t0): 4, ("tasks-01", t1): 6, ("tasks-03", t2): 4, ("tasks-03", t3): 9, ("final-02", t0): 3}, solved  # fmt: skip
-    assert set(state.solves) == {t0, t1, t2, t3}, "a rewritten task's runs are its new ones"
     assert ("review", "review-02-02", "world", True, True, False, ()) in seen
-    assert ("review", "final-01", "world", False, True, True, ()) in seen, "the world issue a probe raised"
-    assert state.open_issues == [], "the final review has heard them"
-    assert ("review", "final-02", "world", False, True, True, ()) in seen, (
-        "the final review checks the last issues"
-    )
-    assert ("review", "final-02", "task", False, False, True, (t0,)) in seen, (
-        "only the changed task is reviewed again, with the issue that named it"
-    )
-    probed = {a: [s[6] for s in seen if s[:3] == ("review", a, "task")] for a in ("tasks-01", "tasks-03")}
-    assert probed == {"tasks-01": [(t0,), (t1,), (t1,)], "tasks-03": [(t2,), (t3,), (t3,), (t3,)]}, (
-        "the judge reviews each probe's tasks, one chunk at a time; each passes on its own"
-    )  # fmt: skip
-    assert [s[6] for s in seen if s[:3] == ("review", "final-01", "task")] == [(t3,)], (
-        "the final review judges only what changed or failed since its probe's review"
-    )
-    assert ("review", "final-01", "task", False, False, True, (t3,)) in seen, (
-        "with the issues its probe raised"
-    )
-    assert ("fix issues", [True, False]) in seen, (
-        "a fix hears the review's notes as well as its blocking issues"
-    )
-    assert {e["attempt"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines()) if e["event"] == "candidate_finished" and e["approved"]} >= {"tasks-01", "tasks-03"}, "each batch's attempt is closed"  # fmt: skip
+    assert ("review", "final-01", "world", False, True, False, ()) in seen
+    assert ("review", "final-02", "world", False, True, True, ()) in seen, "the final review checks the last issues"
+    assert ("fix issues", [True, False]) in seen, "a fix hears the review's notes as well as its blocking issues"
     assert (store.root / "attempts" / "day-03-02" / "notes" / "recap.md").read_text() == "day 3: done"
     days = [json.loads(line) for line in (store.root / "progress.jsonl").read_text().splitlines()]
     assert [e["day"] for e in days if e["event"] == "day_closed"] == [1, 2, 3, 4]
     assert any(e["event"] == "interrupted" for e in days)
-    assert store.world.violations(complete=True) == [] and set(state.task_reviews) == {t for (t,) in store.world.db.execute("SELECT id FROM tasks")}  # fmt: skip
+    assert store.world.violations(complete=True) == [] and not store.world.db.execute("SELECT 1 FROM tasks").fetchone(), "a world run writes no task"  # fmt: skip
     ids = [r[0] for r in store.world.db.execute("SELECT id FROM messages ORDER BY ts_us")]
     assert ids == sorted(ids), "the world was written in time order"
     summary = store.summary("complete")
-    assert summary["rates"][t2] == {"right_rate": 0.5, "strict_rate": 0.0, "coverage": None, "tries": 2, "crashed": 1, "witness_right": 1.0, "level_fit": 3, "level": 3, "band": [0.0, 0.5], "in_band": True, "rounds": 0, "kept": False, "unanswered": 0}, (
-        "difficulty is the right-answer rate, the strict rate reported beside it; a try that crashed twice is counted, "
-        "and left out of the rates; the band it landed in"
-    )  # fmt: skip
-    # t1 (level 2) stayed too easy; t0 was rewritten at the fix, to 2 of 3 right; t3 is in its level-1 band
-    assert summary["in_band"] == {"1": [1, 1], "2": [1, 2], "3": [1, 1]}, summary["in_band"]
-    assert [t for t, r in summary["rates"].items() if r["kept"]] == [t1], (
-        "t1 stayed too easy with no rewrite left"
-    )
-    assert summary["crashed_solves"] == 1 and summary["witness_tries"] == 2, summary
-    assert abs(summary["mean_learnability"] - 17 / 36) < 1e-9, summary["mean_learnability"]  # t0 2/3, t2 1/2
-
-    # The witness tries only the task whose band starts at 0, twice; the judge reads its tries; they count in no rate.
-    assert witnessed == {("tasks-03", t2): 2}, witnessed
-    assert ("witnessed", "tasks-03", (t2,), 2, (f"witness_{t2}_1.json", f"witness_{t2}_2.json")) in seen
-    assert state.probes[t2]["witness_right"] == 1.0 and state.probes[t0]["witness_right"] is None
-    assert (await env.witness(agents, [t2], {t2: env.task_key(t2)}, "final-02"))[t2]["results"] and witnessed == {("tasks-03", t2): 2}, "an unchanged task keeps its witness"  # fmt: skip
-    probe = {"approved": True, "band": (0.0, 0.25), "right_rate": 0.0}
-    assert [band_move(probe | {"witness_right": w}) for w in (0.0, 0.5, None)] == ["easier", None, None], (
-        "a task whose band starts at 0 lands in it only if the witness answers it"
-    )
-    assert (
-        band_move(probe | {"approved": False}) == "fix" and band_move(probe | {"right_rate": 0.5}) == "harder"
-    )
-
+    assert (summary["tasks"], summary["rates"], summary["final_approved"]) == (0, {}, True), summary
+    assert (store.root / "world-calls.jsonl").exists()
     # The author's VM is pinged while only the env works, and no more once the block ends.
-    assert next(s[1] for s in seen if s[0] == "pinged") > 0, "the VM is kept awake through the probes"
     awake = FakeRuntime()
     async with keep_awake(awake, 0.01):
         await asyncio.sleep(0.05)
     pinged = awake.pings
     await asyncio.sleep(0.03)
     assert pinged >= 2 and awake.pings == pinged, (pinged, awake.pings)
-
-    class Slow(ScriptedAgent):  # GLM's gate holds its solves to [author] solvers, whatever the episode allows
-        active, peak = 0, 0
-
-        async def run(self, task):
-            Slow.active += 1
-            Slow.peak = max(Slow.peak, Slow.active)
-            await asyncio.sleep(0.01)
-            Slow.active -= 1
-            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r", "response": "an answer"}  # fmt: skip
-            return FakeTrace("slow", "solver", info={"evaluation": evaluation}, task=task)
-
-    await env.solves(SimpleNamespace(solver=Slow()), [t0, t1], "final-02", 3)
-    assert Slow.peak == settings.author.solvers == 2, Slow.peak
-
-    class Crashing(ScriptedAgent):
-        async def run(self, task):
-            return FakeTrace("crash", "solver", ok=False, info={"grading_started": True}, errors=[SimpleNamespace(message="judge timeout")], task=task)  # fmt: skip
-
-    try:
-        await env.solves(SimpleNamespace(solver=Crashing()), [t1], "final-02", 2)
-        raise AssertionError("a task whose every try crashed was kept")
-    except RuntimeError as error:
-        assert "crashed twice" in str(error), error
-    difficulty = summary["difficulty"]
-    assert set(difficulty) == set(state.task_reviews) and all(
-        d["level_fit"] == 3 and "evidence_pages" in d and d["concept"] for d in difficulty.values()
-    ), "the summary reports each task's measured difficulty beside its level"
-    some = sorted(state.task_reviews)[0]
-    review = state.task_reviews.pop(some)
-    fails(store.publish)  # a task nobody reviewed
-    state.task_reviews[some] = review
-    store.world.insert("facts", [dict(id="f9", storyline="s2", subject="x", attribute="y", value="z", channel_id=channel_id("public", "ops", []), author_id=store.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], day=3, summary="s")])  # fmt: skip
-    store.world.insert("task_facts", [dict(task_id=some, fact_id="f9")])
-    fails(store.publish)  # a task resting on a fact no message states
-    store.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
-    store.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
     # A try that finished without an answer, an empty last message or the turn cap mid-search, is wrong and counted.
-    graded = {"task_id": t1, "correct": False, "semantic_correctness": 0.0, "response": "an answer"}
+    graded = {"task_id": "t", "correct": False, "semantic_correctness": 0.0, "response": "an answer"}
     ends = [("an answer", "agent_completed"), ("", "agent_completed"), ("let me look further", "max_turns")]
     silent = [SolverTask.outcome(SimpleNamespace(ok=True, info={"evaluation": graded | {"response": r}}, stop_condition=stop))["unanswered"] for r, stop in ends]  # fmt: skip
     assert silent == [False, True, True] and rates([{"correct": False, "semantic_correctness": 0.0, "unanswered": u} for u in silent])["unanswered"] == 2  # fmt: skip
-    # A try as the author reads it: the call that first showed the evidence, how many showed a decoy, the route up to
-    # the evidence and then its last three calls, and a short answer.
-    read = lambda tool, ts=None: {"tool": tool, "arguments": {}, "output": {"items": [{"channel": "C1", "ts": ts}] if ts else []}}  # noqa: E731  # fmt: skip
-    route = [
-        read("read_channel", "2"),
-        read("read_thread", "1"),
-        *(read("search_messages") for _ in range(6)),
-    ]
-    digest_ = try_digest({"correct": True, "response": "x" * 500}, {"info": {"observations": route}}, {("C1", "1")}, {("C1", "2")})  # fmt: skip
-    assert (digest_["evidence_at"], digest_["decoy_reads"], digest_["calls"], len(digest_["answer"])) == (2, 1, 8, 300), digest_  # fmt: skip
-    assert digest_["found_by"].startswith("read_thread") and digest_["steps"][2] == "… 3 more calls …" and len(digest_["steps"]) == 6, digest_  # fmt: skip
-    # A hardening turn that changes nothing ends the loop, rounds to spare or not: the same tries would come back.
-    idle_turns = []
-
-    async def idle(prompt, extra=None):
-        idle_turns.append(prompt)
-
-    state.task_rounds[t1] = 0  # t1, too easy, has its round again
-    await env.harden(agents, idle, "final-02", [t1])
-    assert len(idle_turns) == 1 and state.task_rounds[t1] == 0, (len(idle_turns), state.task_rounds)
-    again = json.loads(idle_turns[0][idle_turns[0].index("{") : idle_turns[0].index("\nRewrite")])[t1]
-    assert [h["right_rate"] for h in again["history"]] == [1.0] and not again["history"][0]["question"].startswith("Asked again"), (
-        "a task comes back with its earlier versions and how often each was answered"
-    )  # fmt: skip
-    state.task_rounds[t1] = 1
-    # A task's key covers the decoys on its facts' subjects: a revised decoy is a changed task, tried again.
-    resting = next(
-        t for (t,) in store.world.db.execute("SELECT task_id FROM task_facts WHERE fact_id = 'f4'")
-    )
-    keyed, lure = env.task_key(resting), store.world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
-    store.world.insert("facts", [dict(id="f8", storyline="s2", subject="Audit", attribute="owner", value="Mia", is_decoy=1, channel_id=channel_id("public", "ops", []), author_id=store.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], day=3, summary="s")])  # fmt: skip
-    store.world.db.execute(
-        "INSERT INTO evidence (fact_id, message_id, role) VALUES ('f8', ?, 'supporting')", (lure,)
-    )
-    decoyed = env.task_key(resting)
-    store.world.db.execute("UPDATE messages SET text = 'Mia owns it now, I think' WHERE id = ?", (lure,))
-    assert len({keyed, decoyed, env.task_key(resting)}) == 3, "the key follows the task's decoys"
-    store.world.db.execute("DELETE FROM evidence WHERE fact_id = 'f8'")
-    store.world.db.execute("DELETE FROM facts WHERE id = 'f8'")
-    store.world.db.execute("UPDATE messages SET text = 'quiet day, nothing to report' WHERE id = ?", (lure,))
-    # A refusal resting on the truth out of its actor's sight ships that truth apart, as unseen.
-    leads = channel_id("private", "leads", [])
-    (outsider,) = store.world.db.execute("SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM members WHERE channel_id = ?) ORDER BY id LIMIT 1", (leads,)).fetchone()  # fmt: skip
-    (asker,) = store.world.db.execute("SELECT actor_id FROM tasks WHERE id = ?", (some,)).fetchone()
-    added = store.world.db.execute("INSERT OR IGNORE INTO task_facts (task_id, fact_id) VALUES (?, 'f3')", (some,)).rowcount  # fmt: skip
-    store.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = ?", (outsider, some))
-    truth = [list(r) for r in store.world.db.execute("SELECT m.channel_id, m.ts FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = 'f3' AND e.role = 'anchor'")]  # fmt: skip
-    private = store.release_rows("h")[1][some]
-    assert truth and private.unseen == truth and not [m for m in private.messages if m in truth], private
-    store.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = ?", (asker, some))
-    if added:
-        store.world.db.execute("DELETE FROM task_facts WHERE task_id = ? AND fact_id = 'f3'", (some,))
-    store.publish()
-    world, rows, answers = load_release(store.root / "release")
-    assert len(rows) == 4 and World(world).db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    assert json.loads((store.root / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v10"
-    assert all((r.surface, r.turns, type(r.miss_classes)) == (surface.VERSION, 40, dict) for r in rows), "each task's surface, turns and misses"  # fmt: skip
-    assert all((r.right_rate, r.strict_rate, r.tries, r.solver) == (state.task_reviews[r.task_id]["right_rate"], state.task_reviews[r.task_id]["strict_rate"], state.task_reviews[r.task_id]["tries"], settings.env.solver.model) for r in rows), "each task's rates are published"  # fmt: skip
-    assert {r.task_id: (r.witness, r.witness_right) for r in rows if r.witness} == {
-        t2: (settings.env.witness.model, 1.0)
-    }
-    assert all(a.rows or a.answer_type == "refusal" for a in answers.values())
-    ledger = [r for r in rows if settings.taxonomy[r.category].gold == "ledger"]
-    assert ledger and all(answers[r.task_id].rows == [{"answer": "Owen"}] and answers[r.task_id].messages for r in ledger)  # fmt: skip
-    # Its evidence is what states its answer, not a value that answer supersedes: that one is stale.
-    stating = lambda fact: {tuple(r) for r in store.world.db.execute("SELECT m.channel_id, m.ts FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?", (fact,))}  # noqa: E731  # fmt: skip
-    assert all({tuple(m) for m in answers[r.task_id].messages} == stating("f3") | stating("f4") for r in ledger), "two current values"  # fmt: skip
-    store.world.db.execute("INSERT INTO fact_relations (src_fact, dst_fact, kind) VALUES ('f4', 'f3', 'supersedes')")
-    released = store.release_rows("h")[1]
-    store.world.db.execute("DELETE FROM fact_relations WHERE src_fact = 'f4' AND dst_fact = 'f3'")
-    assert stating("f3") and all({tuple(m) for m in released[r.task_id].messages} == stating("f4") for r in ledger), "a stale value is no evidence"  # fmt: skip
-    store.world.db.execute("UPDATE facts SET is_decoy = 1 WHERE id = 'f3'")
-    released = store.release_rows("h")[1]
-    store.world.db.execute("UPDATE facts SET is_decoy = 0 WHERE id = 'f3'")
-    assert all({tuple(m) for m in released[r.task_id].messages} == stating("f4") for r in ledger), "a decoy is no evidence"  # fmt: skip
-    # An answer fact restated where its asker cannot read is not evidence they can be shown.
-    (asker,) = store.world.db.execute("SELECT actor_id FROM tasks WHERE id = ?", (ledger[0].task_id,)).fetchone()
-    hidden = store.world.db.execute("SELECT id, channel_id, ts FROM messages WHERE channel_id = ? ORDER BY id LIMIT 1", (leads,)).fetchone()  # fmt: skip
-    store.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = ?", (outsider, ledger[0].task_id))
-    store.world.db.execute("INSERT INTO evidence (fact_id, message_id, role) VALUES ('f4', ?, 'supporting')", (hidden[0],))  # fmt: skip
-    released = store.release_rows("h")[1]
-    store.world.db.execute("DELETE FROM evidence WHERE fact_id = 'f4' AND message_id = ?", (hidden[0],))
-    store.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = ?", (asker, ledger[0].task_id))
-    assert released[ledger[0].task_id].messages and [hidden[1], hidden[2]] not in released[ledger[0].task_id].messages, "out of sight, no evidence"  # fmt: skip
-    store.publish()  # idempotent
-    assert (store.root / "world-calls.jsonl").exists()
     assert run_label(Path("/x/data/v7-01/software")) == "worldgen-v7-01-software", (
         "a run's sandboxes are findable"
     )
@@ -3192,22 +2905,6 @@ async def check_author(root):
     assert rates([{"correct": True, "semantic_correctness": 1.0}] * 4)["right_interval"] == [0.596, 1.0], "4 of 4 still allows 0.6"  # fmt: skip
     graded = [{"correct": True, "grounded": True, "semantic_correctness": 1.0}, {"correct": False, "grounded": False, "semantic_correctness": -1.0}, {"correct": False, "abstained": True, "grounded": False, "semantic_correctness": 0.0}, {"correct": True, "grounded": False, "semantic_correctness": 0.0}]  # fmt: skip
     assert (rates(graded)["strict_rate"], rates(graded)["abstain_rate"]) == (0.25, 0.25), "strict is the share right and grounded, not the mean reward"  # fmt: skip
-    assert all(r.right_interval == state.task_reviews[r.task_id]["right_interval"] for r in rows), "intervals are published"  # fmt: skip
-    # A task ships with the wrong answers its grade must reject: one the answer judge accepts makes it ambiguous as
-    # asked, and it is not approved, whatever its tries.
-    assert store.state.screens and all(not s["failed"] for s in store.state.screens.values()), "every task was screened"  # fmt: skip
-    gold, cases = failure_cases(store.world, t1, json.loads(store.world.db.execute("SELECT gold_json FROM tasks WHERE id = ?", (t1,)).fetchone()[0]))  # fmt: skip
-    assert gold.endswith(".") and ("a bare opener", "Thought process:") in cases and any(n == "declining to answer" for n, _ in cases), cases  # fmt: skip
-    lax = GenerationEnv(settings, store)
-    GRADER["loose"], store.state.active_attempt = True, "final-02"
-    _, verdict = await lax.judge_tasks(agents, [t1], {t1: "screened loose"}, "final-02", 3)
-    assert not verdict.approved and any("accepts a wrong answer to it: a bare opener" in i.defect for i in store.state.task_issues[t1]), verdict  # fmt: skip
-    assert store.state.screens[t1]["failed"] == ["a bare opener ('Thought process:')"]
-    GRADER["loose"], GRADER["blind"] = False, True
-    assert (await lax.screen([t1], {t1: "screened blind"}, "final-02"))[t1] == [
-        "its gold answer, judged wrong"
-    ]
-    GRADER["blind"] = False
     # A session lost to its sandbox is none of the author's limits (S3 stopped three times on Prime's dropped process
     # stream, each reported as the author's limits): its block is written again once and spends no attempt, and a
     # second loss in a row stops the run.
@@ -3220,7 +2917,7 @@ async def check_author(root):
         return SimpleNamespace(terminated=True)
 
     try:
-        await env.author_step(SimpleNamespace(trace=FakeTrace("cut-off", "author", ok=False, errors=[rpc]), turn=cut_off), FakeRuntime(), "write", "final-02", "tasks")  # fmt: skip
+        await env.author_step(SimpleNamespace(trace=FakeTrace("cut-off", "author", ok=False, errors=[rpc]), turn=cut_off), FakeRuntime(), "write", "final-02", "fix")  # fmt: skip
         raise AssertionError("a dropped session was reported as the author's limits")
     except SessionLost:
         pass
@@ -3266,9 +2963,14 @@ async def check_author(root):
 
     Forging = ForgeEnv
 
+    ScriptedAgent.traced.clear()
     store.state.active_attempt = "forge"  # the scripted solver names its tries by the run it reads
     await Forging(plan, settings, forged).run(None, agents)
     assert [x[1] for x in seen if x[0] == "forge"] == [("r01-01", "r01-02"), ("r02-01", "r02-02")]
+    chunks = {a: sorted(s[6] for s in seen if s[:3] == ("review", a, "task")) for a in ("round-01", "round-02")}
+    assert chunks == {"round-01": [("r01-01",), ("r01-02",)], "round-02": [("r02-01",), ("r02-02",)]}, (
+        "the judge reviews a round's candidates one chunk at a time"
+    )
     assert forged.state.phase == "done" and sorted(t for (t,) in forged.world.db.execute("SELECT id FROM tasks")) == ["r01-01", "r02-01"], "the vague candidates are dropped"  # fmt: skip
     hard = forged.state.forged["r02-01"]
     assert (hard["right"], hard["witness"], hard["hint"], hard["level"], hard["verdict"]) == (0.0, 1.0, 1.0, 3, "kept in search·L3 as k1·when"), hard  # fmt: skip
@@ -3285,6 +2987,119 @@ async def check_author(root):
     assert {r.task_id for r in load_release(plan.output / "release")[1]} == {"r01-01", "r02-01"}
     _, cases = failure_cases(forged.world, "r01-01", json.loads(forged.world.db.execute("SELECT gold_json FROM tasks WHERE id = 'r01-01'").fetchone()[0]))  # fmt: skip
     assert any(name.startswith("the near-miss query's answer") for name, _ in cases), cases
+    # The forge's tries, as the forge keeps them. The witness tried the task the solver rarely answers, twice; an
+    # unchanged task keeps its witness. The scripted solver counts these tries apart from the forge runs'.
+    store.state.active_attempt = "check"
+    forge_env = Forging(plan, settings, forged)
+    assert len(forged.state.witness["r02-01"]["results"]) == settings.author.witness_tries
+    assert any(x[0] == "witnessed" and "r02-01" in x[2] and x[3] == 2 for x in seen), "the judge reads the witness's tries"  # fmt: skip
+    tried = sum(witnessed.values())
+    assert (await forge_env.witness(agents, ["r02-01"], {"r02-01": forge_env.task_key("r02-01")}, "check"))["r02-01"]["results"] and sum(witnessed.values()) == tried, "an unchanged task keeps its witness"  # fmt: skip
+
+    class Slow(ScriptedAgent):  # the solver's gate holds its solves to [author] solvers, whatever the episode allows
+        active, peak = 0, 0
+
+        async def run(self, task):
+            Slow.active += 1
+            Slow.peak = max(Slow.peak, Slow.active)
+            await asyncio.sleep(0.01)
+            Slow.active -= 1
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r", "response": "an answer"}  # fmt: skip
+            return FakeTrace("slow", "solver", info={"evaluation": evaluation}, task=task)
+
+    await forge_env.solves(SimpleNamespace(solver=Slow()), ["r01-01", "r02-01"], "check", 3)
+    assert Slow.peak == settings.author.solvers == 2, Slow.peak
+
+    class Crashing(ScriptedAgent):
+        async def run(self, task):
+            return FakeTrace("crash", "solver", ok=False, info={"grading_started": True}, errors=[SimpleNamespace(message="judge timeout")], task=task)  # fmt: skip
+
+    try:
+        await forge_env.solves(SimpleNamespace(solver=Crashing()), ["r01-01"], "check", 2)
+        raise AssertionError("a task whose every try crashed was kept")
+    except RuntimeError as error:
+        assert "crashed twice" in str(error), error
+    # Its summary: each task's rates, a try that crashed twice counted and left out of them, and its difficulty.
+    summary = forged.summary("complete")
+    assert summary["rates"]["r02-01"]["crashed"] == 1 and summary["rates"]["r02-01"]["tries"] == settings.author.tries - 1 and summary["rates"]["r01-01"]["level"] == 2, summary["rates"]  # fmt: skip
+    assert summary["witness_tries"] == 2 and summary["crashed_solves"] == 1, summary
+    difficulty = summary["difficulty"]
+    assert set(difficulty) == {t for (t,) in forged.world.db.execute("SELECT id FROM tasks")} and all("evidence_pages" in d and d["concept"] for d in difficulty.values()), "the summary reports each task's measured difficulty beside its level"  # fmt: skip
+    # A release takes every task reviewed, on facts the world states.
+    review = forged.state.task_reviews.pop("r01-01")
+    refused("an approved review of every task", forged.publish)  # a task nobody reviewed
+    forged.state.task_reviews["r01-01"] = review
+    forged.world.insert("facts", [dict(id="f9", storyline="s2", subject="x", attribute="y", value="z", channel_id=channel_id("public", "ops", []), author_id=forged.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], day=3, summary="s")])  # fmt: skip
+    forged.world.insert("task_facts", [dict(task_id="r01-01", fact_id="f9")])
+    refused("a world that breaks no rule", forged.publish)  # a task resting on a fact no message states
+    forged.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
+    forged.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
+    # A task's key covers the decoys on its facts' subjects: a revised decoy is a changed task, tried again.
+    keyed, lure = forge_env.task_key("r02-01"), forged.world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+    lured = forged.world.db.execute("SELECT text FROM messages WHERE id = ?", (lure,)).fetchone()[0]
+    forged.world.insert("facts", [dict(id="f8", storyline="s1", subject="Release 4.2", attribute="state", value="still down", is_decoy=1, channel_id=channel_id("public", "ops", []), author_id=forged.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], day=3, summary="s")])  # fmt: skip
+    forged.world.db.execute("INSERT INTO evidence (fact_id, message_id, role) VALUES ('f8', ?, 'supporting')", (lure,))
+    decoyed = forge_env.task_key("r02-01")
+    forged.world.db.execute("UPDATE messages SET text = 'still down, I think' WHERE id = ?", (lure,))
+    assert len({keyed, decoyed, forge_env.task_key("r02-01")}) == 3, "the key follows the task's decoys"
+    forged.world.db.execute("DELETE FROM evidence WHERE fact_id = 'f8'")
+    forged.world.db.execute("DELETE FROM facts WHERE id = 'f8'")
+    forged.world.db.execute("UPDATE messages SET text = ? WHERE id = ?", (lured, lure))
+    # A release's evidence is what states its answer: not a value that answer supersedes, not a decoy, not what its
+    # asker cannot read; a refusal's truth out of its asker's sight ships apart, as unseen.
+    stating = lambda fact: {tuple(r) for r in forged.world.db.execute("SELECT m.channel_id, m.ts FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?", (fact,))}  # noqa: E731  # fmt: skip
+    assert {tuple(m) for m in forged.release_rows("h")[1]["r02-01"].messages} == stating("f2"), "its answer's own"
+    forged.world.db.execute("INSERT INTO task_facts (task_id, fact_id) VALUES ('r02-01', 'f1')")
+    forged.world.db.execute("INSERT INTO fact_relations (src_fact, dst_fact, kind) VALUES ('f2', 'f1', 'supersedes')")
+    released = forged.release_rows("h")[1]["r02-01"]
+    forged.world.db.execute("DELETE FROM fact_relations WHERE src_fact = 'f2' AND dst_fact = 'f1'")
+    forged.world.db.execute("DELETE FROM task_facts WHERE task_id = 'r02-01' AND fact_id = 'f1'")
+    assert stating("f1") and {tuple(m) for m in released.messages} == stating("f2"), "a stale value is no evidence"
+    forged.world.db.execute("UPDATE facts SET is_decoy = 1 WHERE id = 'f2'")
+    released = forged.release_rows("h")[1]["r02-01"]
+    forged.world.db.execute("UPDATE facts SET is_decoy = 0 WHERE id = 'f2'")
+    assert not released.messages, "a decoy is no evidence"
+    leads = channel_id("private", "leads", [])
+    (outsider,) = forged.world.db.execute("SELECT id FROM users WHERE is_bot = 0 AND id NOT IN (SELECT user_id FROM members WHERE channel_id = ?) ORDER BY id LIMIT 1", (leads,)).fetchone()  # fmt: skip
+    (asker,) = forged.world.db.execute("SELECT actor_id FROM tasks WHERE id = 'r02-01'").fetchone()
+    hidden = forged.world.db.execute("SELECT id, channel_id, ts FROM messages WHERE channel_id = ? ORDER BY id LIMIT 1", (leads,)).fetchone()  # fmt: skip
+    forged.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = 'r02-01'", (outsider,))
+    forged.world.db.execute("INSERT INTO evidence (fact_id, message_id, role) VALUES ('f2', ?, 'supporting')", (hidden[0],))
+    released = forged.release_rows("h")[1]["r02-01"]
+    forged.world.db.execute("DELETE FROM evidence WHERE fact_id = 'f2' AND message_id = ?", (hidden[0],))
+    forged.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = 'r02-01'", (asker,))
+    assert released.messages and [hidden[1], hidden[2]] not in released.messages, "out of sight, no evidence"
+    (asker,) = forged.world.db.execute("SELECT actor_id FROM tasks WHERE id = 'r01-01'").fetchone()
+    forged.world.db.execute("INSERT INTO task_facts (task_id, fact_id) VALUES ('r01-01', 'f3')")
+    forged.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = 'r01-01'", (outsider,))
+    truth = [list(r) for r in forged.world.db.execute("SELECT m.channel_id, m.ts FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = 'f3' AND e.role = 'anchor'")]  # fmt: skip
+    private = forged.release_rows("h")[1]["r01-01"]
+    forged.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = 'r01-01'", (asker,))
+    forged.world.db.execute("DELETE FROM task_facts WHERE task_id = 'r01-01' AND fact_id = 'f3'")
+    assert truth and private.unseen == truth and not [m for m in private.messages if m in truth], private
+    rows = load_release(plan.output / "release")[1]
+    assert all(r.right_interval == forged.state.task_reviews[r.task_id]["right_interval"] for r in rows), "intervals are published"  # fmt: skip
+    reviews = forged.state.task_reviews
+    assert all((r.right_rate, r.strict_rate, r.tries, r.solver) == (reviews[r.task_id]["right_rate"], reviews[r.task_id]["strict_rate"], reviews[r.task_id]["tries"], settings.env.solver.model) for r in rows), "each task's rates are published"  # fmt: skip
+    assert all((r.surface, r.turns, type(r.miss_classes)) == (surface.VERSION, 40, dict) for r in rows), "each task's surface, turns and misses"  # fmt: skip
+    assert {r.task_id: (r.witness, r.witness_right) for r in rows if r.witness} == {"r02-01": (settings.env.witness.model, 1.0)}, "the witness, on the task it tried"  # fmt: skip
+    # A task ships with the wrong answers its grade must reject: one the answer judge accepts makes it ambiguous as
+    # asked, and it is not approved, whatever its tries.
+    assert forged.state.screens and all(not s["failed"] for s in forged.state.screens.values()), "every task was screened"  # fmt: skip
+    gold, cases = failure_cases(forged.world, "r01-01", json.loads(forged.world.db.execute("SELECT gold_json FROM tasks WHERE id = 'r01-01'").fetchone()[0]))  # fmt: skip
+    assert gold.endswith(".") and ("a bare opener", "Thought process:") in cases and any(n == "declining to answer" for n, _ in cases), cases  # fmt: skip
+    GRADER["loose"] = True
+    _, verdict = await forge_env.judge_tasks(agents, ["r01-01"], {"r01-01": "screened loose"}, "check", 3)
+    assert not verdict.approved and any("accepts a wrong answer to it: a bare opener" in i.defect for i in forged.state.task_issues["r01-01"]), verdict  # fmt: skip
+    assert forged.state.screens["r01-01"]["failed"] == ["a bare opener ('Thought process:')"]
+    GRADER["loose"], GRADER["blind"] = False, True
+    assert (await forge_env.screen(["r01-01"], {"r01-01": "screened blind"}, "check"))["r01-01"] == ["its gold answer, judged wrong"]  # fmt: skip
+    GRADER["blind"] = False
+    # An unchanged task keeps its tries: judged again, as a resumed round judges it, it is not solved again.
+    tried = sum(solved.values())
+    await forge_env.judge_tasks(agents, ["r02-01"], {"r02-01": forge_env.task_key("r02-01")}, "check", 3)
+    assert sum(solved.values()) == tried, "an unchanged task was solved again"
+    store.state.active_attempt = "forge"
     # A cell keeps the candidate GLM's tries are most mixed on; the lowest band also needs the witness to answer it.
     assert [measured_level(r, settings.tasks.bands) for r in (1.0, 0.75, 0.6, 0.5, 0.25, 0.0)] == [
         1,
@@ -3365,10 +3180,13 @@ async def check_author(root):
     # A forge stops early: at its goal (here, one task and no board), or after two rounds that place nothing. A goal
     # the archive's places cannot hold is refused.
     fails(Forging, plan.model_copy(update={"tasks": 1000}), settings, forged)
+    crashes.clear()  # the forge above is the one whose solver crashes
     for name, changes, vague, rounds in (
         ("forge-full", {"tasks": 1}, False, 1),
         ("forge-idle", {}, True, 2),
     ):
+        ScriptedAgent.traced.clear()
+        solved.clear(), finished.clear(), witnessed.clear()
         early = plan.model_copy(update={"output": root / name, "rounds": 4} | changes)
         forging["vague"], early_store = vague, TestStore(early.output, forge_provenance(early, settings))
         env_ = Forging(early, settings, early_store)
@@ -3387,6 +3205,8 @@ async def check_author(root):
         record_task(copy, Task(id="extra-l2", category="join", level=2, actor_id=store.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0], question="How many messages are there in all?", answer_type="number", gold_sql="SELECT COUNT(*) AS answer FROM messages"), settings, Slot(id="extra-l2", category="join", level=2, concept="c", style="s"))  # fmt: skip
     source_ids = sorted(t for (t,) in extra.db.execute("SELECT id FROM tasks"))
     extra.close()
+    ScriptedAgent.traced.clear()
+    solved.clear(), finished.clear(), witnessed.clear()
     measuring = plan.model_copy(update={"world": source, "output": root / "measured", "rounds": 0, "measure": True, "target": 30})  # fmt: skip
     measured, turns = TestStore(measuring.output, forge_provenance(measuring, settings)), len([x for x in seen if x[0] == "forge"])  # fmt: skip
     await Forging(measuring, settings, measured).run(None, agents)
@@ -3417,7 +3237,8 @@ async def check_author(root):
     await check_chapter(root / "chapter", parent, settings)
     GRADER["on"] = False
     print(
-        "PASS author: plan, days closed only when done, review issues delivered, crash and resume, tasks, probes, fix"
+        "PASS author: plan, days closed only when done, review issues delivered, crash and resume, a fix; the forge, "
+        "its tries and release; a measure; a chapter"
     )
 
 
@@ -3427,6 +3248,7 @@ async def check_chapter(root, parent, settings):
     are, plants the brief fresh and spreads only its own facts; the past never revised; a brief answer that needs
     hiding posted only where it is hidden; then the chapter written by a scripted author, its reviews reading the past
     as frozen (an issue on it blocks nothing and reaches no one), and a forge on the version it leaves."""
+    ScriptedAgent.traced.clear()
     root.mkdir(parents=True)
     # A world of the first schema (before 2026-10-14) comes forward in place, once: its rows as they were.
     old = root / "schema-1.sqlite"
@@ -3604,7 +3426,7 @@ async def check_chapter(root, parent, settings):
     assert (owners["values"], owners["current"], owners["version"], owners["current_where"]) == (3, ["g1"], 2, ["thread reply in private"]) and "semantic-l3-v2-1" in owners["board"], owners  # fmt: skip
     leads_members = world.db.execute("SELECT COUNT(*) FROM members WHERE channel_id = ?", (leads,)).fetchone()[0]
     assert owners["readers"] == [leads_members, 4] and found["world"]["version"] == 2 and found["material"]["groups_3_values"] >= 1, owners  # fmt: skip
-    tools_task = WorldAuthorTask.create("tasks", 0, world.path, env.author_context(), "check")
+    tools_task = WorldAuthorTask.create("fix", 0, world.path, env.author_context(), "check")
     (tools,) = tools_task.toolsets(tools_task.config)
     await tools.setup()
     with_state(tools)
@@ -3612,7 +3434,7 @@ async def check_chapter(root, parent, settings):
         await tools._with_state(tools.add_task)(task=Task(id=slots[0].id, category="semantic", level=3, actor_id=a, question="Who owns the audit now?", answer_type="text", gold_sql="SELECT value AS answer FROM facts WHERE id = 'g1'", facts=["g1"]))  # fmt: skip
         raise AssertionError("a chapter wrote a task")
     except ValueError as error:
-        assert "a chapter writes no tasks" in str(error), error
+        assert "add_task is for the forge turn; this is the fix turn" in str(error), error
     world.db.execute("UPDATE messages SET text = text || ', edited' WHERE id = ?", (old,))  # the past, changed behind code
     try:
         await env.final_world(agents)
@@ -3696,8 +3518,8 @@ def check_prompts(root):
     guide = forge_guide(other.model_dump(mode="json"))
     assert "tries each one 3 times" in guide and "right in 20%-80% of its tries" in guide, guide[:600]
     parts = ", ".join(f"{p} {a:02d}-{b:02d}" for p, (a, b) in PARTS.items())
-    assert parts in " ".join(AUTHOR_GUIDE.split()) and "PARTS_OF_THE_DAY" not in AUTHOR_GUIDE and "NEAR_SQL" not in AUTHOR_GUIDE  # fmt: skip
-    assert f"up to {Task.model_fields['near_sql'].metadata[0].max_length} queries" in AUTHOR_GUIDE
+    assert parts in " ".join(AUTHOR_GUIDE.split()) and "PARTS_OF_THE_DAY" not in AUTHOR_GUIDE and "NEAR_SQL" not in guide  # fmt: skip
+    assert f"up to {Task.model_fields['near_sql'].metadata[0].max_length} queries" in guide
     assert "written and frozen" in CHAPTER_GUIDE and "No tasks are written in a chapter" in CHAPTER_GUIDE
     # The world's author writes with the craft page (voice lab 02); the proposer has its own guide, and a chapter's
     # author has the chapter's too.

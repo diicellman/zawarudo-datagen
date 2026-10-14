@@ -209,8 +209,6 @@ class ChapterEnv(GenerationEnv):
     """The world author in a chapter: the plan of its days, its days, and a final review of the world, with no
     tasks; its reviews read the earlier chapters as written and frozen."""
 
-    after_days = "final"
-
     def __init__(self, chapter: ChapterConfig, settings: Config, store: Store, slots: list[Slot]):
         self.chapter, self.slots = chapter, slots
         super().__init__(settings, store)

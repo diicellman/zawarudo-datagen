@@ -5,5 +5,6 @@ rollouts_per_example = 1
 [env.taskset]
 id = "worldgen-slack"
 
+# The release the FC1 re-measure writes (P2); any generated world's release/ directory evaluates the same way.
 [env.taskset.task]
-release_dir = "data/v6-01/software/release"
+release_dir = "data/v7-06/remeasure-c1/release"

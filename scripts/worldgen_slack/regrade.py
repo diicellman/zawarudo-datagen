@@ -20,7 +20,7 @@ from collections import Counter
 from pathlib import Path
 
 import verifiers.v1 as vf
-from worldgen_slack.taskset import AnswerJudge, compact
+from worldgen_slack.taskset import AnswerJudge
 
 from generators.worldgen_slack.contracts import failure_cases
 from worldgen_slack.db import World
@@ -50,6 +50,49 @@ def cost(model: str, usage: dict) -> float:
     return (
         (usage.get("prompt_tokens", 0) - hit) * fresh + hit * cached + usage.get("completion_tokens", 0) * out
     ) / 1e6
+
+
+# FC1's tries were recorded on the tools before Slack's own: a person read by get_user or whoami, and messages with
+# time_utc. Grading's view of them, as it was when they were graded, so a regrade sees what the recorded grade saw.
+PROFILES = {"read_user_profile": "id", "get_user": "id", "whoami": "user_id"}
+
+
+def recorded_view(observations: list[dict]) -> dict:
+    """What a try's calls showed, each thing once, as grading read the tools of the time (`compact` then)."""
+
+    def items(call: dict) -> list:
+        listed = call["output"].get("items")
+        listed = listed if isinstance(listed, list) else []
+        return listed + [c for i in listed if isinstance(i, dict) for side in ("before", "after") for c in (i.get("context") or {}).get(side, [])]  # fmt: skip
+
+    messages, people, channels, members, reactions, calls = {}, {}, {}, {}, {}, []
+    for call in observations:
+        out, tool = call["output"], call["tool"]
+        listed = out.get("items") if isinstance(out.get("items"), list) else []
+        calls.append({"tool": tool, "arguments": call["arguments"], "results": len(listed) if "items" in out else 1})
+        for item in items(call):
+            if isinstance(item, dict) and "ts" in item:
+                key = (item["channel"], item["ts"])
+                messages[key] = messages.get(key, {}) | {k: v for k, v in item.items() if k not in ("time_utc", "context")}  # fmt: skip
+            elif isinstance(item, dict) and "real_name" in item and tool != "list_channel_members":
+                people.setdefault(item["id"], item)
+            elif isinstance(item, dict) and "id" in item and "real_name" not in item:
+                channels.setdefault(item["id"], item)
+        if tool == "list_channel_members":
+            members.setdefault(call["arguments"]["channel_id"], set()).update(i["id"] if isinstance(i, dict) else i for i in listed)  # fmt: skip
+        elif tool == "get_reactions":
+            reactions[(out["channel"], out["ts"])] = out["reactions"]
+        elif tool in PROFILES:
+            people[out[PROFILES[tool]]] = out
+    for key, read in reactions.items():
+        messages.setdefault(key, {"channel": key[0], "ts": key[1]})["reactions"] = read
+    return {
+        "messages": sorted(messages.values(), key=lambda m: (float(m["ts"]), m["channel"])),
+        "people": list(people.values()),
+        "channels": list(channels.values()),
+        "members": {channel: sorted(ids) for channel, ids in members.items()},
+        "calls": calls,
+    }
 
 
 def tries(run: Path) -> list[dict]:
@@ -106,7 +149,7 @@ async def main() -> None:
             cases += [dict(task=t, case=name, response=response, expect=False) for name, response in failures]
         world.close()
     views = [
-        len(json.dumps(compact(t["observations"]) if args.view == "compact" else t["observations"]))
+        len(json.dumps(recorded_view(t["observations"]) if args.view == "compact" else t["observations"]))
         for t in work
     ]
     print(f"{len(work)} tries ({sum(not t['recorded']['correct'] for t in work)} graded wrong) and {len(cases)} screen cases for {args.model}, {args.view} view: {sum(views) / max(len(views), 1):,.0f} characters of observations a try")  # fmt: skip
@@ -133,7 +176,7 @@ async def main() -> None:
             return {"error": "rate limited past every retry"}, {}
 
     async def regrade(t):
-        view = compact(t["observations"]) if args.view == "compact" else t["observations"]
+        view = recorded_view(t["observations"]) if args.view == "compact" else t["observations"]
         if not t["response"].strip():
             return t | {"new": None, "usage": {}}
         new, usage = await grade(t["question"], reference[t["task"]], t["response"], view)

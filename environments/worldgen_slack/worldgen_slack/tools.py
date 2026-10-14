@@ -83,11 +83,10 @@ class CallState(vf.State):
 
 
 class WorldTaskData(vf.TaskData):
-    """Which task, attempt and storyline a run belongs to, and which world file it was given."""
+    """Which task and attempt a run belongs to, and which world file it was given."""
 
     task_id: str = ""
     attempt: str = ""
-    storyline: str = ""
     world_hash: str = ""
 
 
