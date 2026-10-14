@@ -8,73 +8,17 @@ import verifiers.v1 as vf
 from pydantic import Field
 from worldgen_slack.taskset import WorldTaskData
 from worldgen_slack.world import SCHEMA, file_hash
-from ..workspace import Workspace
 
-from ..world.clock import frozen_before
+from ..prompt import prompt
 from ..session import require_trace
+from ..workspace import Workspace
+from ..world.clock import frozen_before
 from .tools import ReviewState, ReviewTools, ReviewToolsConfig
 from .verdict import PHASE_CRITERIA, Issue, Verdict, accepted, quality, validate_verdict, verdict_schema
 
-REVIEW_PROMPT = """Review what /task/input.json names, as /task/review.md says. /task/world.sqlite is the workspace
-with its facts and tasks; /task/schema.sql is its schema. inspect_check runs code's checks and re-runs the reviewed
-tasks' gold queries; inspect_read reads Slack as a task's actor; inspect_sql runs SQL as a task's actor. Other JSON
-files in /task are agents' traces: solver_<task_id>_<n>.json are independent solves of that task, and
-witness_<task_id>_<n>.json a stronger solver's tries of a task the solves rarely answer. Write the verdict to
-/task/verdict.json following /task/schemas.json.
-"""
-
-COMMON_GUIDE = """Approve only after investigating. Call inspect_check before writing the verdict.
-- tasks: one review per task in input.json; when a task is valid depends on the review, below.
-- issues: each defect, with its artifact, the ids it concerns, the defect and the requested_change. artifact is ledger
-  for facts, storylines, people's titles and channels; tasks for a task's question, actor, answer type or gold query;
-  workspace for messages: message_ids are the messages to change, evidence_message_ids the messages that show the
-  defect and stay as they are.
-- blocking is true when a defect changes, contradicts, hides or hands over a task's answer, or breaks the ledger;
-  otherwise it is false.
-- approved is true only when every task is valid and no issue blocks.
-- When input.json has previous_issues, check that each is resolved.
-"""
-
-PHASE_GUIDES = {
-    "task": """Task review. A task is valid when its actor can answer its question as asked from what they can read,
-and its gold rows are the complete, correct answer; a status task's answer is its gold value given as not settled, as
-the actor can see it, while the fact that settles it is out of their sight. Score each criterion of schemas.json from 0 to 1:
-- question_fit: each gold query answers its question as asked; test variants with inspect_sql.
-- discoverability: the actor can find the answer with Slack's read tools; try inspect_read, and read the solves.
-  When input.json has witness, a stronger solver tried the tasks the solves rarely answer: one it answers can be
-  solved, which shows nothing about whether its question has one reading; one it fails too may be unanswerable.
-- One reading. Each wrong solve's grade gives the answer it committed to and the gold rows it missed or added. For
-  each, decide whether the question's own words allow a reading under which that answer is right: does a thread
-  reply count as posting, is the poster among those who replied, does a reaction break a quiet spell, what comes
-  before what in "then", whose clock and which week, a team or a channel. A mistake the question's words rule out is
-  the solver's. If a reading allows it, the task is not valid: set its review's misread to that answer and the
-  reading, and raise a blocking issue asking for the wording that rules the reading out with the same gold.
-- shortcut_free: nothing in the workspace hands over the answer outside its evidence.
-- level_fit, on each task's review, from 0 to 4: how fully answering it needs the level and concept its `means`
-  names. 4: it needs them, with no shortcut; 3: it needs them, but one route is easier than the level; 2: partly;
-  1: in name only; 0: one obvious step answers it. inspect_check measures each task: how many read_channel pages deep
-  its evidence sits for its actor, the tables its gold query reads, and its evidence's search rank for the question's
-  own words; the solves show the calls it took. level_fit is reported beside the task; it decides neither valid nor
-  blocking.
-""",
-    "world": """World review: the workspace as a record of real work. Score each criterion of schemas.json from 0 to 1:
-- scenario_alignment: the messages tell the storylines.
-- world_coherence: messages agree with each other and with the facts; nothing is reported done or known before it
-  happens; promises are kept or explicitly changed.
-- professional_realism: it reads as real work. inspect_check's style shows each author's messages beside their typing
-  (people in input.json); different people writing in one register is a defect.
-Message times and order are code's; report text that contradicts them, not the times themselves. When input.json has
-ledger, it gives every planned event and fact with its moment on the company clock. A fact marked (decoy) is a planned
-near-miss: a wrong claim someone makes, which tasks rely on a reader taking for the answer. Judge a decoy's messages
-for realism only (would this person say it, on what they knew), and leave the claim standing: it is a coherence defect
-only when the story later acts on it as true and nothing in the workspace ever settles it; never ask for a decoy to be
-corrected or hedged. When it has written_through, the
-workspace is written up to that moment and goes on later: judge what exists, and leave open what is still open.
-When it has written_from, the workspace before that moment is an earlier chapter's, written and frozen: read it as the
-record this chapter goes on from, and judge the chapter's messages, from that moment on, and how they go on from it. An
-earlier chapter's message is not changed; name it only as evidence.
-""",
-}
+REVIEW_PROMPT = prompt(__file__, "review.md")
+COMMON_GUIDE = prompt(__file__, "common.md")
+PHASE_GUIDES = {phase: prompt(__file__, f"{phase}.md") for phase in ("task", "world")}
 
 
 class JudgeConfig(vf.TaskConfig):

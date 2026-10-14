@@ -5990,6 +5990,7 @@ PROMPT_SOURCES = [
     ),
     *sorted((ROOT / "generators/worldgen_slack/world").rglob("*.py")),
     *sorted((ROOT / "generators/worldgen_slack/forge").rglob("*.py")),
+    *sorted((ROOT / "generators/worldgen_slack").rglob("prompts/*.md")),
     *(
         ROOT / "environments/worldgen_slack/worldgen_slack" / n
         for n in ("taskset.py", "judge.py", "toolset.py", "slack.py", "world.py")
@@ -6000,6 +6001,8 @@ PROMPT_SOURCES = [
 def prompt_strings(path: Path) -> list[tuple[int, str]]:
     """A source file's strings that reach a model: every literal (f-strings' parts too) but docstrings, which no model
     reads unless they describe a tool, and model ids (a provider/model path)."""
+    if path.suffix == ".md":  # a prompt file reaches a model whole
+        return list(enumerate(path.read_text().splitlines(), 1))
     tree, skip = ast.parse(path.read_text()), set()
     for node in ast.walk(tree):
         body = getattr(node, "body", None)
