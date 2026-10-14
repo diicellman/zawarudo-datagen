@@ -28,7 +28,7 @@ from .cast import cards, census, pick_cast
 from .clock import calendar, clock, frozen_before, frozen_digest, meta
 from .organization import Organization, background_plan, organize
 from ..judge.verdict import Verdict, combined
-from ..store import ReviewLimit
+from ..store import ReviewLimit, Store, used_names
 from ..session import (
     SETUP_FILES,
     SessionEnv,
@@ -58,6 +58,16 @@ def dry_run(config: Config) -> dict:
 class WorldEnv(SessionEnv):
     """One world written in time order by one author: the premise and the organization, the plan, each day with
     reviews on the way, and a final review the author fixes until the judge approves."""
+
+    def __init__(self, settings: Config, store: Store):
+        super().__init__(settings, store)
+        self.used = used_names(settings.corpus, store.root)
+
+    def provision_task(self) -> SynthesizerTask:
+        """The setup author's task: the premise and the organization are written in the VM's first block."""
+        return SynthesizerTask.create(
+            synthesizer.premise_context(self.settings, self.used), "setup", self.world.path
+        )
 
     # ------------------------------------------------------------------ authors
     async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):

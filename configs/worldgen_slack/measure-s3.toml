@@ -8,3 +8,11 @@ output = "data/v7-05/s3-measured"
 measure = true            # round 0 imports S3's own tasks, as written, and measures them
 rounds = 0                # and no proposer round follows
 target = 40               # a place keeps every task it is given: a measurement drops nothing for room
+
+# The proposer's seat, stated whole: the author's model, its prompt cached for an hour, as a round keeps it waiting
+# while the solver tries the candidates.
+[settings.env.proposer]
+model = "anthropic/claude-opus-5.5"
+
+[settings.env.proposer.sampling]
+cache_control = { type = "ephemeral", ttl = "1h" }

@@ -12,11 +12,9 @@ from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.utils.interrupt import cleaning_up
 
-from .agents import synthesizer
-from .agents.synthesizer import SynthesizerTask
 from .agents.world import context_of, files
 from .config import Config, PipelineConfig
-from .store import ReviewLimit, SessionLost, Store, used_names
+from .store import ReviewLimit, SessionLost, Store
 
 ARCHIVE = "/tmp/task-files.tgz"
 # What verifiers tells every agent on a restricted network, on the first user message of each request: by default,
@@ -118,11 +116,13 @@ SETUP_FILES = (
 class SessionEnv(vf.Env[PipelineConfig]):
     """An env whose author works in one VM for the whole run, one interaction per block of work: the VM provisioned
     again after a lost session, code's memory rendered before every turn, and the notes an attempt kept brought back.
-    A subclass says what its blocks are."""
+    A subclass says which seat works its blocks, what the VM is provisioned with, and what its blocks are."""
+
+    seat = "author"  # the seat whose agent works in the VM
+    seats = ("author", "judge", "solver", "witness")  # every seat of the run, none trained
 
     def __init__(self, settings: Config, store: Store):
         self.settings, self.store = settings, store
-        self.used = used_names(settings.corpus, store.root)
         apply_network_notice()
         super().__init__(settings.env)
 
@@ -131,7 +131,7 @@ class SessionEnv(vf.Env[PipelineConfig]):
         return self.store.world
 
     async def setup(self, agents):
-        for name in ("author", "judge", "solver", "witness"):
+        for name in self.seats:
             getattr(agents, name).trainable = False
 
     def author_context(self) -> dict:
@@ -146,7 +146,7 @@ class SessionEnv(vf.Env[PipelineConfig]):
         ends."""
         memory = files(self.world, self.settings, self.author_context(), mode) | (extra or {})
         await upload(runtime, memory, "/task/memory")
-        self.store.event("author_turn", attempt=attempt, mode=mode, day=self.store.state.day)
+        self.store.event(f"{self.seat}_turn", attempt=attempt, mode=mode, day=self.store.state.day)
         segment = await interaction.turn(prompt)
         self.store.trace(interaction.trace)
         if segment.terminated:
@@ -177,12 +177,10 @@ class SessionEnv(vf.Env[PipelineConfig]):
         where its state says, as a resume does, and the attempt it cut off spends no round. A second loss in the same
         block stops the run."""
         state, last = self.store.state, None
-        setup = SynthesizerTask.create(
-            synthesizer.premise_context(self.settings, self.used), "setup", self.world.path
-        )
+        setup = self.provision_task()
         while True:
             try:
-                async with agents.author.provision(setup) as runtime:
+                async with getattr(agents, self.seat).provision(setup) as runtime:
                     return await self.blocks(agents, runtime, setup)
             except (SessionLost, SandboxError) as error:
                 if cleaning_up():  # a stop cancels the session's streams: it is a stop, not a loss
@@ -198,6 +196,10 @@ class SessionEnv(vf.Env[PipelineConfig]):
 
     async def run(self, task, agents):
         return await self.author_world(agents)
+
+    def provision_task(self) -> vf.Task:
+        """The task the VM is provisioned with: provisioning runs none of its setup."""
+        raise NotImplementedError
 
     async def blocks(self, agents, runtime, setup) -> None:
         raise NotImplementedError

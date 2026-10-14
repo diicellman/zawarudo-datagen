@@ -271,8 +271,10 @@ class Config(Section):
     def secure(self):
         if self.env.retries.max_retries:
             raise ValueError("whole-pipeline retries would replay mutable work")
-        for name in ("author", "judge", "solver", "witness"):
+        for name in type(self.env).model_fields:
             agent = getattr(self.env, name)
+            if not isinstance(agent, vf.AgentConfig):
+                continue
             runtime = agent.runtime
             if not isinstance(agent.harness, NullHarnessConfig) and (
                 not isinstance(runtime, vf.PrimeConfig)
@@ -287,6 +289,18 @@ class Config(Section):
             if not agent.model:
                 raise ValueError(f"{name} needs an explicit model")
         return self
+
+
+class ForgeSeats(PipelineConfig):
+    # The forge's proposer: an rlm agent in one VM, one interaction per round, as the world's author is. Each forge
+    # config states the seat whole: a partial table would merge over this default, not over the world's author.
+    proposer: vf.AgentConfig = world_author("z-ai/glm-5.3")
+
+
+class ForgeSettings(Config):
+    """The settings a forge runs under: its world's, with the proposer's seat."""
+
+    env: ForgeSeats = Field(default_factory=ForgeSeats)
 
 
 def load_config(path: Path) -> Config:

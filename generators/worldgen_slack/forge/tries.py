@@ -95,10 +95,11 @@ class Tries:
                 rows = copy.gold(actor, sql, max_rows=self.settings.tasks.max_answer_rows)["rows"]
                 copy.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(rows), task_id))
 
-    def solver_task(self, task_id, world, hint: bool = False):
-        """The task as the solver gets it; with `hint`, its question is followed by the messages its answer rests on
-        (SPADE's privileged hint: a task the solver misses even so is hard to reason, or broken, not hard to find)."""
-        row, answer = next((r, a) for r, a in zip(*self.answers(world)) if r.task_id == task_id)
+    def solver_task(self, task_id, world, release: dict, hint: bool = False):
+        """The task as the solver gets it, from its release row (`release`: each task's public row and private answer
+        on `world`); with `hint`, its question is followed by the messages its answer rests on (SPADE's privileged
+        hint: a task the solver misses even so is hard to reason, or broken, not hard to find)."""
+        row, answer = release[task_id]
         if hint:
             texts = [
                 self.world.db.execute(
@@ -121,9 +122,10 @@ class Tries:
             isinstance(self.settings.env.solver.runtime, NetworkPolicyConfig),
         )
 
-    def answers(self, world):
+    def answers(self, world) -> dict:
+        """Each task's release row on `world`: its public row and its private answer."""
         rows, answers = release_rows(self.store, file_hash(world))
-        return rows, [answers[r.task_id] for r in rows]
+        return {r.task_id: (r, answers[r.task_id]) for r in rows}
 
     async def solve(self, agents, task, seat: str = "solver"):
         """One independent solve of a task by `seat` (GLM, or the witness), graded for correctness and grounding. A
@@ -141,9 +143,12 @@ class Tries:
         copy = self.store.path(attempt, f"{seat}.sqlite")
         copy.unlink(missing_ok=True)
         self.world.solver_copy(copy)
+        release = self.answers(copy)  # once: every try reads the same copy
         runs = await asyncio.gather(
             *(
-                asyncio.gather(*(self.solve(agents, self.solver_task(t, copy, hint), seat) for _ in range(n)))
+                asyncio.gather(
+                    *(self.solve(agents, self.solver_task(t, copy, release, hint), seat) for _ in range(n))
+                )
                 for t in task_ids
             )
         )

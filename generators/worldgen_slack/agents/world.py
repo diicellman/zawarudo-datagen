@@ -29,7 +29,7 @@ from ..forge.tasks import Annotation, annotate, forge_task
 from ..world.clock import bounds, part_of, present, today
 from ..world.ledger import Plan, record_plan
 from ..world.writing import Conversation, advance, drift, edit, post, posted, quotas, revise, today_line
-from ..config import Config, Needs
+from ..config import Config, ForgeSettings, Needs
 from ..forge.difficulty import failure_cases
 from ..forge.tasks import Task
 from ..world.board import Slot, needs_text, on_board, slot_needs
@@ -629,7 +629,8 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         if file_hash(self.config.db_path) != self.config.db_hash:
             raise ValueError("world file hash mismatch")
         self.context = json.loads(self.config.context)
-        self.settings = Config.model_validate(self.context["settings"])
+        settings_type = ForgeSettings if self.config.mode == "forge" else Config
+        self.settings = settings_type.model_validate(self.context["settings"])
         self.every_slot = [Slot.model_validate(s) for s in self.context.get("slots", [])]
         self.gaps = Gaps(self.settings.personas.gaps)
         self.posted = None  # the last post: its conversation, the present it left, and its result

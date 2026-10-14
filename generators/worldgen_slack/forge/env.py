@@ -16,7 +16,7 @@ from worldgen_slack.release import atomic_json
 from worldgen_slack.world import file_hash
 
 from ..agents.world import WorldAuthorTask, forge_prompt
-from ..config import Config, Section, load_config, merged, pinned, rooted
+from ..config import Config, ForgeSettings, Section, load_config, merged, pinned, rooted
 from ..judge.verdict import READING
 from ..session import SETUP_FILES, SessionEnv, keep_awake, require_session
 from ..store import Store
@@ -52,12 +52,12 @@ class ForgeConfig(Section):
         return self
 
 
-def load_forge(path: Path) -> tuple[ForgeConfig, Config]:
+def load_forge(path: Path) -> tuple[ForgeConfig, ForgeSettings]:
     """The forge's configuration, and the run settings it works under: the base's, with its changes and output."""
     forge = ForgeConfig.model_validate(tomllib.loads(path.read_text()))
     forge.base, forge.world, forge.output = rooted(forge.base), rooted(forge.world), rooted(forge.output)
     base = load_config(forge.base).model_dump(mode="json")
-    settings = Config.model_validate(merged(base, forge.settings) | {"output": str(forge.output)})
+    settings = ForgeSettings.model_validate(merged(base, forge.settings) | {"output": str(forge.output)})
     return forge, settings
 
 
@@ -110,6 +110,9 @@ def measured_level(right: float, bands) -> int:
 
 
 class ForgeEnv(SessionEnv):
+    seat = "proposer"
+    seats = ("author", "proposer", "judge", "solver", "witness")
+
     def __init__(self, forge: ForgeConfig, settings: Config, store: Store):
         self.forge = forge
         places = sum(len(spec.levels) for spec in settings.taxonomy.values())
@@ -124,6 +127,10 @@ class ForgeEnv(SessionEnv):
         """The ids the proposer's next turn may write, and the tasks sent back for another reading, each with its asker
         and gold answer: its tools read them per call."""
         atomic_json(self.store.root / "writable.json", {"ids": list(ids), "rework": rework or {}})
+
+    def provision_task(self) -> WorldAuthorTask:
+        """The proposer's own task: no persona file is read to provision its VM."""
+        return WorldAuthorTask.create("forge", 0, self.world.path, self.author_context(), "setup")
 
     async def run(self, task, agents):
         state = self.store.state
@@ -227,7 +234,7 @@ class ForgeEnv(SessionEnv):
         )
         await self.bring_notes(runtime, state.restore_point)
         task = WorldAuthorTask.create("forge", 0, self.world.path, self.author_context(), attempt)
-        async with agents.author.interaction(task, runtime=runtime) as interaction:
+        async with agents.proposer.interaction(task, runtime=runtime) as interaction:
             for n in range(2):
                 if not (missing := [t for t in ids if t not in self.written(ids)]):
                     break
@@ -511,6 +518,6 @@ def dry_run(forge: ForgeConfig, settings: Config) -> dict:
         "rounds": forge.rounds,
         "candidates": forge.candidates,
         "tries": settings.author.tries,
-        "proposer": settings.env.author.model,
+        "proposer": settings.env.proposer.model,
         "solver": settings.env.solver.model,
     }

@@ -111,7 +111,7 @@ from .forge.env import ForgeConfig, ForgeEnv, bucket, measured_level
 from .forge.env import measured as forge_measured
 from .forge.profile import profile
 from .forge.env import provenance as forge_provenance
-from .config import ROOT, Category, Config, Needs
+from .config import ROOT, Category, Config, ForgeSettings, Needs
 from .forge.difficulty import IDENTIFIER, failure_cases, features, measures, panel
 from .forge.tasks import Task, check_task, record_task
 from .world.board import Slot, needs_text
@@ -1611,6 +1611,19 @@ def check_contracts(root):
         "CHG-2291",
         "v2",
     ]
+    # Every seat that runs code needs an immutable VM with no egress: the world's author, and the forge's proposer.
+    forge = seated(settings)
+    for seat in ("author", "proposer"):
+        agent = getattr(forge.env, seat)
+        loose = agent.model_copy(
+            update={"runtime": agent.runtime.model_copy(update={"image": "python:3.12-slim"})}
+        )
+        refused(
+            f"{seat} executes code, so it requires an immutable Prime VM",
+            ForgeSettings.model_validate,
+            forge.model_dump(mode="json")
+            | {"env": forge.env.model_dump(mode="json") | {seat: loose.model_dump(mode="json")}},
+        )
     print(
         "PASS contracts: cast, premise, organization, task gold (T2-T7) on a planned ledger, agenda, no literal times"
     )
@@ -3629,10 +3642,11 @@ class FakeRuntime:
 
 
 class ScriptedAuthor(ScriptedAgent):
-    """A world author played by a script: each turn runs it against the turn's own world tools and VM."""
+    """A world author (or the forge's proposer) played by a script: each turn runs it against the turn's own world
+    tools and VM. Its traces are named by the seat it plays, as the harness names them."""
 
-    def __init__(self, script):
-        self.script = script
+    def __init__(self, script, role="author"):
+        self.script, self.role = script, role
 
     @asynccontextmanager
     async def provision(self, task):
@@ -3650,7 +3664,7 @@ class ScriptedAuthor(ScriptedAgent):
             await self.script(prompt, tools, runtime)
             return SimpleNamespace(terminated=False)
 
-        yield SimpleNamespace(trace=self.trace("author", task), turn=turn)
+        yield SimpleNamespace(trace=self.trace(self.role, task), turn=turn)
 
 
 def setup_document(runtime) -> None:
@@ -3915,6 +3929,15 @@ def world_seats():
     return ScriptedAuthor(script), Judge(), fixed, reviewed
 
 
+def seated(settings) -> ForgeSettings:
+    """A world's settings as a forge runs under them: its proposer seated as its author is, as each forge config states
+    it."""
+    seats = settings.env.model_dump(mode="json")
+    return ForgeSettings.model_validate(
+        settings.model_dump(mode="json") | {"env": seats | {"proposer": seats["author"]}}
+    )
+
+
 def flow_run_settings(root):
     """The flows' settings: a 4-day world of 16 messages, a review after day 2, 3 tries of a task."""
     base = flow_settings(root, 3)
@@ -4051,7 +4074,11 @@ def forge_seats(note_on=None) -> dict:
             return FakeTrace(self.trace("solver").id, "solver", info={"evaluation": evaluation}, task=task)
 
     return dict(
-        judge=TaskJudge(), solver=RightSolver(), witness=RightSolver(), author=ScriptedAuthor(propose)
+        judge=TaskJudge(),
+        solver=RightSolver(),
+        witness=RightSolver(),
+        proposer=ScriptedAuthor(propose, role="proposer"),
+        author=ScriptedAgent(),
     )
 
 
@@ -4671,7 +4698,11 @@ async def check_author(root):
             seen.append(("fixed", [m for i in issues for m in i.get("message_ids", [])]))
 
     agents = SimpleNamespace(
-        judge=FlowJudge(), solver=ScriptedSolver(), witness=ScriptedWitness(), author=ScriptedAuthor(script)
+        judge=FlowJudge(),
+        solver=ScriptedSolver(),
+        witness=ScriptedWitness(),
+        author=ScriptedAuthor(script),
+        proposer=ScriptedAuthor(script, role="proposer"),
     )
     manifest = provenance(settings)
     store = TestStore(settings.output, manifest)
@@ -4879,19 +4910,20 @@ async def check_author(root):
     )
     source_world = Workspace(world_dir / "world.sqlite")
     # The forge: tasks proposed on the finished world, which stays frozen; what the judge approves is kept.
+    forge_settings = seated(settings)
     plan = ForgeConfig(
         base=Path("worldgen.toml"), world=world_dir, output=root / "forge", rounds=2, candidates=2, tasks=30
     )
     workspace = source_world.db.execute(
         "SELECT group_concat(id || ':' || text, '|') FROM messages"
     ).fetchone()[0]
-    forged = TestStore(plan.output, forge_provenance(plan, settings))
+    forged = TestStore(plan.output, forge_provenance(plan, forge_settings))
 
     Forging = ForgeEnv
 
     ScriptedAgent.traced.clear()
     store.state.active_attempt = "forge"  # the scripted solver names its tries by the run it reads
-    await Forging(plan, settings, forged).run(None, agents)
+    await Forging(plan, forge_settings, forged).run(None, agents)
     assert [x[1] for x in seen if x[0] == "forge"] == [("r01-01", "r01-02"), ("r02-01", "r02-02")]
     chunks = {
         a: sorted(s[6] for s in seen if s[:3] == ("review", a, "task")) for a in ("round-01", "round-02")
@@ -4899,6 +4931,11 @@ async def check_author(root):
     assert chunks == {"round-01": [("r01-01",), ("r01-02",)], "round-02": [("r02-01",), ("r02-02",)]}, (
         "the judge reviews a round's candidates one chunk at a time"
     )
+    events = [json.loads(line) for line in (forged.root / "progress.jsonl").read_text().splitlines()]
+    roles = {path.name.split("-")[0] for path in (forged.root / "traces").glob("*.json")}
+    assert (
+        "proposer" in roles and "author" not in roles and any(e["event"] == "proposer_turn" for e in events)
+    ), "the forge's rounds are the proposer's, in a seat of its own"
     assert forged.state.phase == "done" and sorted(
         t for (t,) in forged.world.db.execute("SELECT id FROM tasks")
     ) == ["r01-01", "r02-01"], "the vague candidates are dropped"
@@ -4942,7 +4979,7 @@ async def check_author(root):
     # The forge's tries, as the forge keeps them. The witness tried the task the solver rarely answers, twice; an
     # unchanged task keeps its witness. The scripted solver counts these tries apart from the forge runs'.
     store.state.active_attempt = "check"
-    forge_env = Forging(plan, settings, forged)
+    forge_env = Forging(plan, forge_settings, forged)
     assert len(forged.state.witness["r02-01"]["results"]) == settings.author.witness_tries
     assert any(x[0] == "witnessed" and "r02-01" in x[2] and x[3] == 2 for x in seen), (
         "the judge reads the witness's tries"
@@ -5203,7 +5240,7 @@ async def check_author(root):
     # A place holds two tasks. A newcomer to a full one replaces a holder if GLM's tries are more mixed on it, or if
     # it brings a structure the place lacks while two holders share one; else it is dropped.
     weigher, actor = (
-        Forging(plan, settings, forged),
+        Forging(plan, forge_settings, forged),
         forged.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0],
     )
     newest = Task(
@@ -5283,7 +5320,7 @@ async def check_author(root):
     assert any(line.startswith("- lookup·structure: ") and " kept" in line for line in steering) and any(
         line.startswith("- search·when: ") for line in steering
     ), steering
-    pages_ = Forging(plan, settings, forged).pages()
+    pages_ = Forging(plan, forge_settings, forged).pages()
     assert (
         "## What this forge has measured" in pages_["memory/archive.md"]
         and steering[0] in pages_["memory/archive.md"]
@@ -5386,7 +5423,7 @@ async def check_author(root):
     ] == ["abstained", "overclaim", "trap", "saw_all"]
     forged.close()
     fails(
-        Store, plan.output, forge_provenance(plan.model_copy(update={"rounds": 3}), settings)
+        Store, plan.output, forge_provenance(plan.model_copy(update={"rounds": 3}), forge_settings)
     )  # its own config only
     # A forge stops early: at its goal (here, one task and no board), or after two rounds that place nothing. A goal
     # the archive's places cannot hold is refused.
@@ -5399,8 +5436,11 @@ async def check_author(root):
         ScriptedAgent.traced.clear()
         solved.clear(), finished.clear(), witnessed.clear()
         early = plan.model_copy(update={"output": root / name, "rounds": 4} | changes)
-        forging["vague"], early_store = vague, TestStore(early.output, forge_provenance(early, settings))
-        env_ = Forging(early, settings, early_store)
+        forging["vague"], early_store = (
+            vague,
+            TestStore(early.output, forge_provenance(early, forge_settings)),
+        )
+        env_ = Forging(early, forge_settings, early_store)
         env_.adopt()
         early_store.world.db.execute("DELETE FROM board")
         await env_.run(None, agents)
@@ -5437,10 +5477,10 @@ async def check_author(root):
         update={"world": source, "output": root / "measured", "rounds": 0, "measure": True, "target": 30}
     )
     measured, turns = (
-        TestStore(measuring.output, forge_provenance(measuring, settings)),
+        TestStore(measuring.output, forge_provenance(measuring, forge_settings)),
         len([x for x in seen if x[0] == "forge"]),
     )
-    await Forging(measuring, settings, measured).run(None, agents)
+    await Forging(measuring, forge_settings, measured).run(None, agents)
     assert (
         "extra-l2" in source_ids
         and sorted(measured.state.forged) == source_ids
@@ -5910,16 +5950,16 @@ async def check_chapter(root, parent, settings):
     forge = ForgeConfig(
         base=Path("worldgen.toml"), world=run.output, output=root / "forge", rounds=1, candidates=1, tasks=1
     )
-    forging = TestStore(forge.output, forge_provenance(forge, cfg))
-    on_chapter = ForgeEnv(forge, cfg, forging)
+    forging = TestStore(forge.output, forge_provenance(forge, seated(cfg)))
+    on_chapter = ForgeEnv(forge, seated(cfg), forging)
     on_chapter.adopt()
     assert on_chapter.covered()[1] == ["semantic-l3-v2-1"], on_chapter.covered()
     # One round on it, whose task review notes a message of the frozen past: thawed, the note is set apart, and the
     # candidate is kept.
     forging.close()
     with episodes(SimpleNamespace(**forge_seats(note_on=old))):
-        summary = await run_forge(forge, cfg)
-    forging = TestStore(forge.output, forge_provenance(forge, cfg))
+        summary = await run_forge(forge, seated(cfg))
+    forging = TestStore(forge.output, forge_provenance(forge, seated(cfg)))
     assert summary["status"] == "complete" and forging.state.forged["r01-01"]["verdict"].startswith("kept"), (
         forging.state.forged
     )

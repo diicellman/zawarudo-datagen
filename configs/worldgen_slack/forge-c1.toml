@@ -19,3 +19,11 @@ model = "deepseek/deepseek-v4.1-flash"
 
 [settings.tasks]
 max_answer_rows = 12      # exhaustive sets: a set of n is right about p^n of the time (WideSearch)
+
+# The proposer's seat, stated whole: the author's model, its prompt cached for an hour, as a round keeps it waiting
+# while the solver tries the candidates.
+[settings.env.proposer]
+model = "anthropic/claude-opus-5.5"
+
+[settings.env.proposer.sampling]
+cache_control = { type = "ephemeral", ttl = "1h" }
