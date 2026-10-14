@@ -2,24 +2,18 @@
 conversations); the judge reviews it mid-run and at the end. It writes no tasks: the forge writes them on the finished
 world.
 
-The rules live in the world's modules (ledger, writing, clock, board), the author's tools in `agents/world`; the world
-itself is one SQLite file, written only through `Workspace.trial()`."""
+The rules live in the world's modules (ledger, writing, clock, board), the author's task, tools and memory in
+`author/`; the world itself is one SQLite file, written only through `Workspace.trial()`."""
 
 import contextlib
 import json
 
 from verifiers.v1.errors import SandboxError
 
-from ..agents import synthesizer
 from ..judge.task import review, review_payload
-from ..agents.synthesizer import SynthesizerTask
-from ..agents.world import (
-    WorldAuthorTask,
-    day_prompt,
-    fix_prompt,
-    ledger_digest,
-    plan_prompt,
-)
+from .author.memory import ledger_digest
+from .author.setup import SetupTask, organization_context, parse_premise, premise_context
+from .author.task import AuthorTask, day_prompt, fix_prompt, plan_prompt
 from .clock import bounds, daily, present, start_clock, today
 from .ledger import unplanned
 from .writing import agenda_budget, close_day, posted
@@ -63,16 +57,14 @@ class WorldEnv(SessionEnv):
         super().__init__(settings, store)
         self.used = used_names(settings.corpus, store.root)
 
-    def provision_task(self) -> SynthesizerTask:
+    def provision_task(self) -> SetupTask:
         """The setup author's task: the premise and the organization are written in the VM's first block."""
-        return SynthesizerTask.create(
-            synthesizer.premise_context(self.settings, self.used), "setup", self.world.path
-        )
+        return SetupTask.create(premise_context(self.settings, self.used), "setup", self.world.path)
 
     # ------------------------------------------------------------------ authors
-    async def author_turn(self, interaction, runtime, task_cls, context, attempt, first):
+    async def author_turn(self, interaction, runtime, context, attempt, first):
         self.store.event("author_started", attempt=attempt, phase_document=context["phase"])
-        for name, text in task_cls.files(context).items():
+        for name, text in SetupTask.files(context).items():
             await runtime.write("/task/" + name, text.encode())
         await runtime.write("/task/world.sqlite", self.world.path.read_bytes())
         segment = await interaction.turn(
@@ -92,11 +84,11 @@ class WorldEnv(SessionEnv):
         self.store.trace(interaction.trace)
         return raw
 
-    async def author(self, interaction, runtime, task_cls, context, attempt, first, parse):
+    async def author(self, interaction, runtime, context, attempt, first, parse):
         """Code's rejections go back to the author twice within the attempt before the attempt is rejected."""
         errors = []
         for _ in range(3):
-            raw = await self.author_turn(interaction, runtime, task_cls, context, attempt, first)
+            raw = await self.author_turn(interaction, runtime, context, attempt, first)
             first = False
             try:
                 if not raw.strip():
@@ -133,11 +125,10 @@ class WorldEnv(SessionEnv):
                 state.premise = await self.author(
                     interaction,
                     runtime,
-                    SynthesizerTask,
-                    synthesizer.premise_context(cfg, self.used),
+                    premise_context(cfg, self.used),
                     "premise",
                     True,
-                    lambda raw: synthesizer.parse_premise(raw, cfg, self.used),
+                    lambda raw: parse_premise(raw, cfg, self.used),
                 )
             except ValueError as error:
                 raise ReviewLimit(f"the author proposed no valid premise: {error}") from None
@@ -151,8 +142,7 @@ class WorldEnv(SessionEnv):
                 await self.author(
                     interaction,
                     runtime,
-                    SynthesizerTask,
-                    synthesizer.organization_context(cfg, state, self.used),
+                    organization_context(cfg, state, self.used),
                     "organization",
                     first,
                     self.apply(
@@ -227,7 +217,7 @@ class WorldEnv(SessionEnv):
             await self.bring_notes(runtime, state.restore_point)
         imported = await self.note(runtime, "plan.md") if state.restore_point else None
         attempt = self.store.reserve("plan", cfg.author.plan_attempts)
-        task = WorldAuthorTask.create("plan", 0, self.world.path, self.author_context(), attempt)
+        task = AuthorTask.create("plan", 0, self.world.path, self.author_context(), attempt)
         async with agents.author.interaction(task, runtime=runtime) as interaction:
             prompt, errors = plan_prompt(self.world, cfg, state.feedback), []
             for _ in range(3):
@@ -265,7 +255,7 @@ class WorldEnv(SessionEnv):
         issues = [i.model_dump(mode="json") for i in state.issues]
         if issues:
             self.store.event("issues_delivered", attempt=attempt, issues=len(issues))
-        task = WorldAuthorTask.create("day", day, self.world.path, self.author_context(), attempt)
+        task = AuthorTask.create("day", day, self.world.path, self.author_context(), attempt)
         async with agents.author.interaction(task, runtime=runtime) as interaction:
             prompt, errors = day_prompt(self.world, day, issues, state.feedback), []
             for _ in range(3):
@@ -331,7 +321,7 @@ class WorldEnv(SessionEnv):
                 issues = [i.model_dump(mode="json") for i in verdict.issues]
                 if interaction is None:
                     await self.bring_notes(runtime, state.restore_point)
-                    task = WorldAuthorTask.create("fix", 0, self.world.path, self.author_context(), attempt)
+                    task = AuthorTask.create("fix", 0, self.world.path, self.author_context(), attempt)
                     interaction = await stack.enter_async_context(
                         agents.author.interaction(task, runtime=runtime)
                     )

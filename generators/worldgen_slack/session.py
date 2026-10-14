@@ -1,20 +1,34 @@
 """An agent's session in a VM: files uploaded in one archive, the VM kept awake while only the env works, the
-network notice its requests carry, and how a session that ended early is told from the agent's own limits."""
+network notice its requests carry, and how a session that ended early is told from the agent's own limits; and the
+world tools both agents in a VM (the world author and the proposer) share."""
 
 import asyncio
 import contextlib
+import functools
+import inspect
 import io
+import json
 import tarfile
 import time
+import typing
+from pathlib import Path
+from typing import Literal
 
 import verifiers.v1 as vf
+from pydantic import JsonValue, TypeAdapter, ValidationError
 from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
+from verifiers.v1.utils.decorators import discover_decorated
 from verifiers.v1.utils.interrupt import cleaning_up
+from worldgen_slack import slack
+from worldgen_slack.world import file_hash
 
-from .agents.world import context_of, files
 from .config import Config, PipelineConfig
 from .store import ReviewLimit, SessionLost, Store
+from .workspace import Workspace
+from .world.author.memory import files, now_page, view
+from .world.cast import cards, selves
+from .world.organization import channel_id
 
 ARCHIVE = "/tmp/task-files.tgz"
 # What verifiers tells every agent on a restricted network, on the first user message of each request: by default,
@@ -144,7 +158,7 @@ class SessionEnv(vf.Env[PipelineConfig]):
         """One author turn: code's memory of the world, rendered fresh (with `extra` memory files, such as the solver's
         tries), then the turn; the author works through its tools, and the world file is code's again when the turn
         ends."""
-        memory = files(self.world, self.settings, self.author_context(), mode) | (extra or {})
+        memory = files(self.world, self.settings, self.author_context()) | (extra or {})
         await upload(runtime, memory, "/task/memory")
         self.store.event(f"{self.seat}_turn", attempt=attempt, mode=mode, day=self.store.state.day)
         segment = await interaction.turn(prompt)
@@ -203,3 +217,221 @@ class SessionEnv(vf.Env[PipelineConfig]):
 
     async def blocks(self, agents, runtime, setup) -> None:
         raise NotImplementedError
+
+
+# ---------------------------------------------------------------------- the world tools both agents in a VM share
+
+
+class AuthoringToolsConfig(vf.ToolsetConfig):
+    """An agent's world tools for one turn: the turn (mode) and its day, the world file and its hash, and the context
+    code renders the memory from."""
+
+    mode: Literal["plan", "day", "fix", "forge"] = "plan"
+    day: int = 0
+    db_path: str = ""
+    db_hash: str = ""
+    # settings, task slots, typing cards, the day's drawn conversations, routines, the call log
+    context: str = "{}"
+
+
+def tools_config(mode: str, day: int, world: Path, context: dict) -> AuthoringToolsConfig:
+    """An agent's world tools for one turn, served host-side, where the world file is and code writes it."""
+    tools = AuthoringToolsConfig(
+        mode=mode, day=day, db_path=str(world), db_hash=file_hash(world), context=json.dumps(context)
+    )
+    if tools.colocated or tools.runtime.type != "subprocess" or tools.url is not None:
+        raise ValueError("the world file requires a host-side tool server")
+    return tools
+
+
+def context_of(settings, state, store_root: Path, organization: dict | None) -> dict:
+    """What an agent's world tools are configured with: the settings, a chapter's brief, each person's typing card and
+    seeded self, the conversations code drew per day, the channels' routines, and the call log."""
+    routines = {}
+    if organization:
+        for c in organization["channels"]:
+            if c.get("routines"):
+                routines[channel_id(c["type"], c.get("name"), c["members"])] = c["routines"]
+    agenda = {
+        day: [
+            {k: s[k] for k in ("channel_id", "part", "situation", "participants", "length")} for s in scenes
+        ]
+        for day, scenes in (state.plans.get("agenda") or {}).items()
+    }
+    return {
+        "settings": json.loads(settings.model_dump_json()),
+        "slots": [s.model_dump(mode="json") for s in state.quota],
+        # the ids the proposer's turn may write, read per call
+        "writable_file": str(store_root / "writable.json"),
+        "cards": cards(state.cast),
+        "selves": selves(state.cast),
+        "agenda": agenda,
+        "routines": routines,
+        "log": str(store_root / "world-calls.jsonl"),
+    }
+
+
+TYPES = {"string": "str", "integer": "int", "number": "float", "boolean": "bool", "object": "object"}
+
+
+def shape(schema: dict, defs: dict) -> str:
+    """One JSON schema, compact: a document's fields with ? when optional, a list's bounds, a choice's values."""
+    if "$ref" in schema:
+        return shape(defs[schema["$ref"].rsplit("/", 1)[1]], defs)
+    if "anyOf" in schema:
+        return " | ".join(shape(s, defs) for s in schema["anyOf"] if s.get("type") != "null")
+    if "enum" in schema:
+        return "|".join(json.dumps(v) for v in schema["enum"])
+    if schema.get("type") == "array":
+        lo, hi = schema.get("minItems"), schema.get("maxItems")
+        bound = f"{lo or 0}-{hi} × " if hi else (f"{lo}+ × " if lo else "")
+        return f"[{bound}{shape(schema.get('items', {}), defs)}]"
+    if "properties" in schema:
+        required = set(schema.get("required", []))
+        return (
+            "{"
+            + ", ".join(
+                f"{k}{'' if k in required else '?'}: {shape(v, defs)}"
+                for k, v in schema["properties"].items()
+            )
+            + "}"
+        )
+    return TYPES.get(schema.get("type"), "any")
+
+
+def arguments(fn) -> str:
+    """A tool's arguments as the agent passes them, rendered from the types that check the call: the agent's
+    help() shows only a tool's description."""
+    hints, out = typing.get_type_hints(fn), []
+    for name, param in inspect.signature(fn).parameters.items():
+        schema = TypeAdapter(hints[name]).json_schema()
+        optional = "?" if param.default is not inspect.Parameter.empty else ""
+        out.append(f"{name}{optional}: {shape(schema, schema.get('$defs', {}))}")
+    return ", ".join(out) or "none"
+
+
+class WorldReads:
+    """What both agents in a VM read the world with (world_now, world_view, world_sql, world_read), and how every call
+    of their world tools runs: one at a time, refused with its reason outside its turns, logged with its arguments and
+    outcome to world-calls.jsonl, and a write applied to a trial of the world file. A plain mixin, put before
+    vf.Toolset; the tools keep no state of their own, so with the base state a call makes no state round trip through
+    the tunnel."""
+
+    settings_model: type[Config] = Config  # what the context's settings validate as
+
+    async def setup(self) -> None:
+        self._lock = asyncio.Lock()
+        if file_hash(self.config.db_path) != self.config.db_hash:
+            raise ValueError("world file hash mismatch")
+        self.context = json.loads(self.config.context)
+        self.settings = self.settings_model.model_validate(self.context["settings"])
+
+    def _with_state(self, fn):
+        synced = super()._with_state(fn)
+
+        @functools.wraps(synced)
+        async def serialized(*args, **kwargs):
+            # One call at a time: each write is applied to a trial of the world file and replaces it whole.
+            async with self._lock:
+                return await synced(*args, **kwargs)
+
+        return serialized
+
+    def register(self, mcp) -> None:
+        """Each tool's description ends with its arguments, so the agent reads what a call takes before making one.
+        Arguments the tools' schemas refuse never reach a tool: log them too, with a short reason."""
+        for fn in discover_decorated(self, "tool"):
+            doc = (fn.__doc__ or "").strip()
+            name = getattr(fn, "tool_name", None) or fn.__name__
+            mcp.add_tool(self._with_state(fn), name=name, description=f"{doc}\n\nArguments: {arguments(fn)}")
+        call = mcp.call_tool
+
+        async def call_tool(name, arguments, context=None):
+            try:
+                return await call(name, arguments, context)
+            except Exception as error:
+                if not isinstance(error.__cause__, ValidationError):
+                    raise
+                reason = "; ".join(
+                    f"{'.'.join(map(str, e['loc']))}: {e['msg']}"
+                    for e in error.__cause__.errors(include_url=False)
+                )
+                self._log(name, arguments, f"invalid arguments: {reason}")
+                raise ValueError(f"{name}: invalid arguments: {reason}") from None
+
+        mcp.call_tool = call_tool
+
+    def _log(self, tool: str, arguments: dict, error: str | None) -> None:
+        if log := self.context.get("log"):
+            entry = {"time": time.time(), "mode": self.config.mode, "day": self.config.day, "tool": tool}
+            with open(log, "a") as stream:
+                stream.write(
+                    json.dumps(entry | {"ok": error is None, "error": error, "args": arguments}) + "\n"
+                )
+
+    def _logged(self, tool: str, arguments: dict, act, *modes: str):
+        """Run one call, refused when it is not this turn's, and log it with its arguments and outcome."""
+        error = None
+        try:
+            if modes:
+                self._turn(tool, *modes)
+            return act()
+        except (ValueError, LookupError) as caught:
+            error = str(caught)
+            raise ValueError(error) from None
+        except Exception as caught:  # a fault, not a refusal: logged as failed, and raised as it is
+            error = f"{type(caught).__name__}: {caught}"
+            raise
+        finally:
+            self._log(tool, arguments, error)
+
+    def _world(self, writable: bool = False) -> Workspace:
+        return Workspace(self.config.db_path, writable=writable)
+
+    def _turn(self, tool: str, *modes: str) -> None:
+        if self.config.mode not in modes:
+            raise ValueError(
+                f"{tool} is for the {' or '.join(modes)} turn; this is the {self.config.mode} turn"
+            )
+
+    def _write(self, act):
+        world = self._world(writable=True)
+        try:
+            with world.trial() as copy:
+                return act(copy)
+        finally:
+            world.close()
+
+    @vf.tool
+    async def now(self) -> str:
+        """The one-pager: the present, today's quota and drawn conversations, each storyline's facts, events, open
+        promises, a chapter's brief and style drift."""
+        return self._logged("now", {}, lambda: now_page(self._world(), self.settings, self.context))
+
+    @vf.tool
+    async def view(self, ref: str) -> str:
+        """One page: a person (id, handle or name), a channel (id or #name), a storyline, an event, a fact, a task, a
+        conversation (dNN-NNN) or a message (m123), with its latest messages and links."""
+        return self._logged("view", {"ref": ref}, lambda: view(self._world(), ref, self.context))
+
+    @vf.tool
+    async def sql(self, sql: str, actor_id: str | None = None) -> dict:
+        """One read-only SELECT over the whole world file, or, with actor_id, over the world as that person sees it
+        (the way gold queries run). At most 200 rows."""
+
+        def act():
+            world = self._world()
+            return world.gold(actor_id, sql, max_rows=200) if actor_id else world.select(sql, max_rows=200)
+
+        return self._logged("sql", {"sql": sql, "actor_id": actor_id}, act)
+
+    @vf.tool
+    async def read(self, actor_id: str, tool: str, arguments: dict[str, JsonValue]) -> dict:
+        """A Slack read tool as any person, by the solver's own tool names without slack_: search_public,
+        search_public_and_private, search_channels, search_users, read_channel, read_thread, read_user_profile,
+        get_reactions, list_channel_members or list_user_channels. Returns what it showed, structured."""
+        return self._logged(
+            "read",
+            {"actor_id": actor_id, "tool": tool, "arguments": arguments},
+            lambda: slack.read(Workspace(self.config.db_path, actor=actor_id), tool, arguments),
+        )

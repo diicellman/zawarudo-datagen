@@ -1,9 +1,26 @@
-"""The setup documents the world author writes first: the premise (the company) and the organization (its people
-and conversations)."""
+"""The setup documents the world author writes first, in its VM's first block: the premise (the company) and the
+organization (its people and conversations). Each is written by the file protocol: the phase's inputs, the world and
+the phase's contract in, one document out."""
 
-from ..world.cast import Premises, census, pick_premise, user_id
-from ..world.organization import Organization
-from .author import AuthorTask
+import json
+from pathlib import Path
+from typing import ClassVar, Self
+
+import verifiers.v1 as vf
+from pydantic import BaseModel, Field
+from worldgen_slack.taskset import WorldTaskData
+from worldgen_slack.world import SCHEMA, file_hash
+
+from ..cast import Premises, census, pick_premise, user_id
+from ..organization import Organization
+
+FILE_GUIDE = """/task/input.json holds this phase's inputs; when it has feedback, that is what code or a reviewer
+rejected in your last document. /task/world.sqlite is a read-only SQLite copy of the workspace built so far, and
+/task/schema.sql is its schema. /task/schemas.json is the JSON schema of the document to write. Write the document
+to /task/<phase>.json, where <phase> is input.json's phase.
+
+"""
+
 
 PREMISE_GUIDE = """Phase premise: propose exactly premise_count companies in `sector`; the run seed picks one, and the
 rest of the run builds that company's Slack workspace. A premise has:
@@ -15,6 +32,7 @@ rest of the run builds that company's Slack workspace. A premise has:
   at most that occupation's count in `occupations`; code hires exactly these people.
 Write in `language`.
 """
+
 
 ORGANIZATION_GUIDE = """Phase organization: give the company's people their jobs, and choose its conversations.
 - people: every candidate in `candidates` once, by user_id. A person keeps the candidate's name and timezone. title and
@@ -33,14 +51,53 @@ ORGANIZATION_GUIDE = """Phase organization: give the company's people their jobs
   Code writes every bot post: routine ones on workdays, and an event the ledger says an app reports.
 """
 
+
 CARD = set(
     "name sex age education_level bachelors_field occupation city state timezone professional_persona".split()
 )
 
 
-class SynthesizerTask(AuthorTask):
-    outputs = {"premise": Premises, "organization": Organization}
-    guides = {"premise": PREMISE_GUIDE, "organization": ORGANIZATION_GUIDE}
+class SetupConfig(vf.TaskConfig):
+    files: dict[str, str] = Field(default_factory=dict, exclude=True, repr=False)
+    world: str = Field(default="", exclude=True, repr=False)
+
+
+class SetupTask(vf.Task[WorldTaskData, vf.State, SetupConfig]):
+    """The setup block: each phase's document (the premise, then the organization) written to /task/<phase>.json from
+    the phase's files."""
+
+    NEEDS_CONTAINER = True
+    outputs: ClassVar[dict[str, type[BaseModel]]] = {"premise": Premises, "organization": Organization}
+    guides: ClassVar[dict[str, str]] = {"premise": PREMISE_GUIDE, "organization": ORGANIZATION_GUIDE}
+
+    @classmethod
+    def create(cls, context: dict, attempt: str, world: Path) -> Self:
+        return cls(
+            WorldTaskData(
+                prompt="Read /task/guide.md and /task/input.json. Write the current phase's document to /task/<phase>.json.",
+                attempt=attempt,
+                world_hash=file_hash(world),
+                network_allow=[],
+                network_block=["*"],
+            ),
+            SetupConfig(files=cls.files(context), world=str(world)),
+        )
+
+    @classmethod
+    def files(cls, context: dict) -> dict[str, str]:
+        """What a phase's agent reads: its inputs, its contract, its output schema and the world's schema."""
+        phase = context["phase"]
+        return {
+            "input.json": json.dumps(context, ensure_ascii=False, indent=1),
+            "guide.md": FILE_GUIDE + cls.guides[phase],
+            "schemas.json": json.dumps(cls.outputs[phase].model_json_schema()),
+            "schema.sql": SCHEMA.read_text(),
+        }
+
+    async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
+        for name, text in self.config.files.items():
+            await runtime.write("/task/" + name, text.encode())
+        await runtime.write("/task/world.sqlite", Path(self.config.world).read_bytes())
 
 
 def premise_context(settings, used) -> dict:

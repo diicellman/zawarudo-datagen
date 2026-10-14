@@ -42,18 +42,10 @@ from worldgen_slack.world import SHADOWED, SHOWN, file_hash
 from .workspace import ANSWER_KEY, Workspace
 from .judge.tools import ReviewState
 from .judge.task import PHASE_GUIDES, JudgeTask, review_payload
-from .agents.synthesizer import parse_premise
-from .agents.world import (
-    AUTHOR_GUIDE,
-    CHAPTER_GUIDE,
-    CRAFT_GUIDE,
-    WorldAuthorTask,
-    context_of,
-    files,
-    forge_guide,
-    ledger_digest,
-    ledger_document,
-)
+from .world.author.setup import parse_premise
+from .forge.proposer.task import ProposerTask, forge_guide
+from .world.author.memory import files, ledger_digest, ledger_document
+from .world.author.task import AUTHOR_GUIDE, CHAPTER_GUIDE, CRAFT_GUIDE, AuthorTask
 from .forge.tasks import Annotation, forge_task
 from .world.clock import bounds, part_of, present, start_clock, today
 from .world.ledger import (
@@ -104,7 +96,7 @@ from .cli import failure, run_forge, run_label, run_world
 from .forge.tries import rates
 from .world.env import WorldEnv, provenance
 from .judge.verdict import read_one_way
-from .session import ended, keep_awake
+from .session import context_of, ended, keep_awake
 from .store import ReviewLimit, SessionLost, Store
 from .forge.release import miss_class, publish, release_rows, write_release
 from .forge.env import ForgeConfig, ForgeEnv, bucket, measured_level
@@ -2804,7 +2796,8 @@ def check_clock(root):
 
 
 def author_context(settings, cast, org, root, agenda=None):
-    """What WorldTools are configured with, as the driver builds it; `agenda` maps a day to its drawn scenes."""
+    """What the author's world tools are configured with, as the env builds it; `agenda` maps a day to its drawn
+    scenes."""
     state = SimpleNamespace(
         quota=[
             Slot(id=f"t{i}", category=c, level=n, concept="a concept", style="a style")
@@ -2882,7 +2875,7 @@ async def check_tools(root):
     )
 
     def tools_for(mode, day):
-        task = WorldAuthorTask.create(mode, day, world.path, context, f"{mode}-{day:02d}")
+        task = AuthorTask.create(mode, day, world.path, context, f"{mode}-{day:02d}")
         (tools,) = task.toolsets(task.config)
         return tools
 
@@ -2892,35 +2885,14 @@ async def check_tools(root):
     assert "ledger holds 2 storylines, 1 events and 2 facts" in await planner._with_state(planner.plan)(
         ledger=ledger
     )
-    for name, kwargs in (
-        (
-            "post",
-            {
-                "conversation": Conversation(
-                    channel_id=ops, about="x", lines=[PostLine(author_id=a, text="hi")]
-                )
-            },
-        ),
-        (
-            "add_task",
-            {
-                "task": Task(
-                    id="t",
-                    category="lookup",
-                    level=1,
-                    actor_id=a,
-                    question="q?",
-                    answer_type="text",
-                    gold_sql="SELECT 1 AS answer",
-                )
-            },
-        ),
-    ):
-        try:
-            await planner._with_state(getattr(planner, name))(**kwargs)
-            raise AssertionError(f"{name} ran in the plan turn")
-        except ValueError as error:
-            assert "turn" in str(error), error
+    try:
+        await planner._with_state(planner.post)(
+            conversation=Conversation(channel_id=ops, about="x", lines=[PostLine(author_id=a, text="hi")])
+        )
+        raise AssertionError("post ran in the plan turn")
+    except ValueError as error:
+        assert "post is for the day turn; this is the plan turn" in str(error), error
+    assert not hasattr(planner, "add_task"), "the author is not served the proposer's tools"
     day1 = tools_for("day", 1)
     await day1.setup()
     with_state(day1)
@@ -3014,36 +2986,32 @@ async def check_tools(root):
     served = tools_for("day", 2)  # a tool server checks the world file's hash when it starts
     with_state(served)
     described = await served_tools(served)
+    # Each agent is served its own tools, and the reads they share, described once.
+    reads = {"now", "view", "sql", "read"}
     assert (
-        set(described)
-        == {
-            "now",
-            "view",
-            "sql",
-            "read",
-            "plan",
-            "post",
-            "advance",
-            "revise",
-            "edit",
-            "add_task",
-            "profile",
-            "probe",
-            "annotate",
-        }
+        set(described) == reads | {"plan", "post", "advance", "revise", "edit"}
         and served.server_name == "world"
     )
-    # help() in the author's IPython shows a tool's description alone: it names every field of every document a
-    # call takes, nested ones too, with ? when optional.
-    for tool, models in {
-        "post": (Conversation, PostLine, Reaction, Commit, Close),
-        "plan": (Plan, PlanFact, Event, Storyline),
-        "add_task": (Task,),
-    }.items():
+    proposer = ProposerTask.create(world.path, context, "forge-check")
+    (proposing,) = proposer.toolsets(proposer.config)
+    with_state(proposing)
+    proposed = await served_tools(proposing)
+    assert (
+        set(proposed) == reads | {"add_task", "profile", "probe", "annotate"}
+        and proposing.server_name == "world"
+    )
+    assert {t: described[t] for t in reads} == {t: proposed[t] for t in reads}
+    # help() in an agent's IPython shows a tool's description alone: it names every field of every document a call
+    # takes, nested ones too, with ? when optional.
+    for tools, tool, models in (
+        (described, "post", (Conversation, PostLine, Reaction, Commit, Close)),
+        (described, "plan", (Plan, PlanFact, Event, Storyline)),
+        (proposed, "add_task", (Task,)),
+    ):
         for model in models:
             for field, info in model.model_fields.items():
                 marked = f"{field}{'' if info.is_required() else '?'}: "
-                assert marked in described[tool].split("Arguments: ", 1)[1], (tool, marked)
+                assert marked in tools[tool].split("Arguments: ", 1)[1], (tool, marked)
     assert "lines: [1-40 × {author_id: str" in described["post"] and described["now"].endswith(
         "Arguments: none"
     )
@@ -3071,7 +3039,7 @@ async def check_tools(root):
     assert invalid["tool"] == "post" and invalid["error"].startswith(
         "invalid arguments: conversation.lines.0.commits.0.due_day"
     ), invalid
-    bad = WorldAuthorTask.create("day", 2, world.path, context, "day-02-01")
+    bad = AuthorTask.create("day", 2, world.path, context, "day-02-01")
     world.db.execute("UPDATE storylines SET summary = 'changed' WHERE id = 's1'")
     try:
         await bad.toolsets(bad.config)[0].setup()
@@ -3131,14 +3099,14 @@ async def check_tools(root):
         <= share_band(settings, "mention_rate", t["messages"])[1]
         for t in days_
     ), days_
-    memory = files(world, settings, context, "tasks")
+    memory = files(world, settings, context)
     # A person's page says who they are beyond their title and how they type, in words; the guide says how Slack sounds.
     page = memory["memory/people/alicia.rao.md"]
     assert "## Who they are" in page and "calm" in page and "midwest" in page and "chess" in page, page
     assert "20% of their messages are short (4 words or fewer)" in page, page
     assert (
         "\nVoice\n- This is Slack"
-        in WorldAuthorTask.create("day", 1, world.path, context, "day-01-01").data.system_prompt
+        in AuthorTask.create("day", 1, world.path, context, "day-01-01").data.system_prompt
     )
     raw = re.compile(r"\b1\d{15}\b")
     assert not [p for p, text in memory.items() if raw.search(text)], "no raw microseconds reach the author"
@@ -3148,7 +3116,7 @@ async def check_tools(root):
     )
     assert not raw.search(json.dumps(ledger_digest(world))), "the judge's ledger is rendered too"
     print(
-        "PASS tools: ten served, scoped by turn and day, checked and logged; memory rendered, small, round-trips"
+        "PASS tools: each agent's own, scoped by turn and day, checked and logged; memory rendered, small, round-trips"
     )
 
 
@@ -3655,7 +3623,7 @@ class ScriptedAuthor(ScriptedAgent):
     @asynccontextmanager
     async def interaction(self, task, runtime):
         tools = None
-        if isinstance(task, WorldAuthorTask):
+        if isinstance(task, (AuthorTask, ProposerTask)):
             (tools,) = task.toolsets(task.config)
             await tools.setup()
             with_state(tools)
@@ -4538,11 +4506,9 @@ async def check_author(root):
                     and "dropped: the judge did not approve it" in archive
                     and "lookup: L1 0/2 · L2 1/2" in archive
                 ), archive
-            try:
-                await call("revise", message_id=1, text="rewritten")
-                raise AssertionError("the forge wrote the workspace")
-            except ValueError as error:
-                assert "forge turn" in str(error), error
+            assert not any(hasattr(tools, w) for w in ("plan", "post", "advance", "revise", "edit")), (
+                "the proposer is served no tool that writes the workspace"
+            )
             try:
                 await call(
                     "add_task",
@@ -5914,26 +5880,11 @@ async def check_chapter(root, parent, settings):
         and found["world"]["version"] == 2
         and found["material"]["groups_3_values"] >= 1
     ), owners
-    tools_task = WorldAuthorTask.create("fix", 0, world.path, env.author_context(), "check")
+    tools_task = AuthorTask.create("fix", 0, world.path, env.author_context(), "check")
     (tools,) = tools_task.toolsets(tools_task.config)
-    await tools.setup()
-    with_state(tools)
-    try:
-        await tools._with_state(tools.add_task)(
-            task=Task(
-                id=slots[0].id,
-                category="semantic",
-                level=3,
-                actor_id=a,
-                question="Who owns the audit now?",
-                answer_type="text",
-                gold_sql="SELECT value AS answer FROM facts WHERE id = 'g1'",
-                facts=["g1"],
-            )
-        )
-        raise AssertionError("a chapter wrote a task")
-    except ValueError as error:
-        assert "add_task is for the forge turn; this is the fix turn" in str(error), error
+    assert not any(hasattr(tools, t) for t in ("add_task", "probe", "annotate")), (
+        "a chapter's author writes no task"
+    )
     world.db.execute(
         "UPDATE messages SET text = text || ', edited' WHERE id = ?", (old,)
     )  # the past, changed behind code
@@ -6007,18 +5958,10 @@ def scripted_task(settings, slot, actor):
 PROMPT_SOURCES = [
     *(
         ROOT / "generators/worldgen_slack" / n
-        for n in (
-            "agents/world.py",
-            "judge/task.py",
-            "judge/tools.py",
-            "judge/verdict.py",
-            "agents/synthesizer.py",
-            "agents/author.py",
-            "session.py",
-        )
+        for n in ("judge/task.py", "judge/tools.py", "judge/verdict.py", "session.py")
     ),
-    *sorted((ROOT / "generators/worldgen_slack/world").glob("*.py")),
-    *sorted((ROOT / "generators/worldgen_slack/forge").glob("*.py")),
+    *sorted((ROOT / "generators/worldgen_slack/world").rglob("*.py")),
+    *sorted((ROOT / "generators/worldgen_slack/forge").rglob("*.py")),
     *(
         ROOT / "environments/worldgen_slack/worldgen_slack" / n
         for n in ("taskset.py", "judge.py", "toolset.py", "slack.py", "world.py")
@@ -6134,14 +6077,14 @@ def check_prompts(root):
     world = Workspace.create(root / "w.sqlite")
     context = {"settings": settings.model_dump(mode="json")}
     systems = {
-        name: WorldAuthorTask.create(mode, 1, world.path, context | extra, "x").data.system_prompt
+        name: AuthorTask.create(mode, 1, world.path, context | extra, "x").data.system_prompt
         for name, mode, extra in (
             ("plan", "plan", {}),
             ("day", "day", {}),
-            ("forge", "forge", {}),
             ("chapter", "day", {"chapter": {"first": 5}}),
         )
     }
+    systems["forge"] = ProposerTask.create(world.path, context, "x").data.system_prompt
     assert (
         all(
             "Nobody states the lesson" in systems[m] and "Stakes move" in systems[m]

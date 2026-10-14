@@ -2,8 +2,8 @@
 uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge.toml [--dry-run]
 
 A world run writes the workspace and its ledger (a chapter's brief plants its entries' facts on the board before its
-first day); the forge then writes tasks on that world, in rounds: a proposer in the author's seat writes candidates,
-the solver tries each, and code keeps what lands. The world is never written again, so no task goes stale under it."""
+first day); the forge then writes tasks on that world, in rounds: the proposer writes candidates, the solver tries
+each, and code keeps what lands. The world is never written again, so no task goes stale under it."""
 
 import json
 import shutil
@@ -15,16 +15,17 @@ from pydantic import Field, model_validator
 from worldgen_slack.release import atomic_json
 from worldgen_slack.world import file_hash
 
-from ..agents.world import WorldAuthorTask, forge_prompt
 from ..config import Config, ForgeSettings, Section, load_config, merged, pinned, rooted
 from ..judge.verdict import READING
 from ..session import SETUP_FILES, SessionEnv, keep_awake, require_session
 from ..store import Store
 from ..workspace import Workspace, reset_tasks
+from ..world.author.memory import task_page
 from ..world.board import brief
 from .difficulty import features
 from .tasks import INTENTS, Task, answer_of, forge_task
 from .release import miss_class, release_rows
+from .proposer.task import ProposerTask, forge_prompt
 from .tries import Tries, rates
 
 
@@ -128,9 +129,9 @@ class ForgeEnv(SessionEnv):
         and gold answer: its tools read them per call."""
         atomic_json(self.store.root / "writable.json", {"ids": list(ids), "rework": rework or {}})
 
-    def provision_task(self) -> WorldAuthorTask:
+    def provision_task(self) -> ProposerTask:
         """The proposer's own task: no persona file is read to provision its VM."""
-        return WorldAuthorTask.create("forge", 0, self.world.path, self.author_context(), "setup")
+        return ProposerTask.create(self.world.path, self.author_context(), "setup")
 
     async def run(self, task, agents):
         state = self.store.state
@@ -233,7 +234,7 @@ class ForgeEnv(SessionEnv):
             },
         )
         await self.bring_notes(runtime, state.restore_point)
-        task = WorldAuthorTask.create("forge", 0, self.world.path, self.author_context(), attempt)
+        task = ProposerTask.create(self.world.path, self.author_context(), attempt)
         async with agents.proposer.interaction(task, runtime=runtime) as interaction:
             for n in range(2):
                 if not (missing := [t for t in ids if t not in self.written(ids)]):
@@ -416,7 +417,8 @@ class ForgeEnv(SessionEnv):
         self.store.event("candidate_dropped", attempt=attempt, task_id=task_id, why=why)
 
     def pages(self) -> dict[str, str]:
-        """The forge's own memory pages, beside the world's: the taxonomy, the board the world was planned for, and the archive:
+        """The forge's own memory pages, beside the world's: the tasks written, the taxonomy, the board the world was
+        planned for, and the archive:
         what each category and level holds against its target, the board's open entries, each kept task, and every
         candidate of the last two rounds with its tries, its traps and how the solver went wrong (SENTINEL's failure-driven
         proposer, 2606.12908)."""
@@ -495,7 +497,9 @@ class ForgeEnv(SessionEnv):
             "",
         ]
         taxonomy += [f"- {k}: {v}" for k, v in INTENTS.items()]
+        tasks = [task_page(dict(t)) for t in self.world.db.execute("SELECT * FROM tasks ORDER BY id")]
         return {
+            "memory/tasks.md": "# Tasks\n" + "\n".join(tasks) + "\n",
             "memory/board.md": "\n".join(board) + "\n",
             "memory/archive.md": "\n".join(lines) + "\n",
             "memory/taxonomy.md": "\n".join(taxonomy) + "\n",

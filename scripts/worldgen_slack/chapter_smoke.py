@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from generators.worldgen_slack.agents.world import ledger_document
+from generators.worldgen_slack.world.author.memory import ledger_document
 from generators.worldgen_slack.world.chapter import adopt, brief_slots, load_chapter, provenance, version_of
 from generators.worldgen_slack.world.clock import part_of, present, spread, today
 from generators.worldgen_slack.world.ledger import Event, Plan, PlanFact, record_plan
