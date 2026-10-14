@@ -13,24 +13,13 @@ from pathlib import Path
 
 from generators.worldgen_slack.agents.world import ledger_document
 from generators.worldgen_slack.chapter import adopt, brief_slots, load_chapter, provenance, version_of
-from generators.worldgen_slack.chronicle import (
-    Conversation,
-    Event,
-    Plan,
-    PlanFact,
-    PostLine,
-    advance,
-    part_of,
-    post,
-    present,
-    quotas,
-    record_plan,
-    revise,
-    spread,
-    today,
-)
+from generators.worldgen_slack.world.clock import part_of, present, spread, today
+from generators.worldgen_slack.world.ledger import Event, Plan, PlanFact, record_plan
+from generators.worldgen_slack.world.writing import Conversation, PostLine, advance, post, quotas, revise
 from generators.worldgen_slack.config import ROOT
-from generators.worldgen_slack.contracts import PARTS, Gaps, answer_facts, frozen_digest, meta
+from generators.worldgen_slack.world.board import answer_facts
+from generators.worldgen_slack.world.cast import Gaps
+from generators.worldgen_slack.world.clock import PARTS, frozen_digest, meta
 from generators.worldgen_slack.store import Store
 from worldgen_slack.world import file_hash
 

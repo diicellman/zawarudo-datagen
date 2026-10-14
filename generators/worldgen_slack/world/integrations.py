@@ -13,7 +13,8 @@ import re
 
 from worldgen_slack.world import digest
 
-from .contracts import APP_KINDS, TIME_LITERAL, queue
+from .organization import APP_KINDS
+from .text import MENTION, TIME_LITERAL
 
 # What each kind of app posts: about one of its subjects (noise, drawn by the seed on workdays), and when a ledger
 # event it reports happens. {n} is a running number, {who} a member of its channel, {subject} or {title} the matter.
@@ -39,6 +40,63 @@ KINDS = {
 }
 FAILS = 0.15  # a build's chance to fail
 assert tuple(KINDS) == APP_KINDS
+
+
+def queue(
+    world, due_us: int, channel_id: str, user_id: str, text: str, origin: str, subtype: str | None
+) -> bool:
+    """Queue one of code's posts (an app's, a join or a leave) for its moment; a post of the same origin is queued
+    once. Returns whether it was queued."""
+    if world.db.execute("SELECT 1 FROM queue WHERE origin = ?", (origin,)).fetchone():
+        return False
+    world.insert(
+        "queue",
+        [
+            dict(
+                due_us=due_us,
+                channel_id=channel_id,
+                user_id=user_id,
+                text=text,
+                origin=origin,
+                subtype=subtype,
+            )
+        ],
+    )
+    return True
+
+
+def drain(world, until_us: int) -> list[int]:
+    """Write every queued post due before `until_us`, in time order: code's posts reach the workspace as the present
+    reaches them, so the world stays one written forward. One due at the very moment of a message in its channel waits
+    a microsecond."""
+    written = []
+    for row in world.db.execute(
+        "SELECT * FROM queue WHERE message_id IS NULL AND due_us < ? ORDER BY due_us, id", (until_us,)
+    ).fetchall():
+        at = row["due_us"]
+        while world.db.execute(
+            "SELECT 1 FROM messages WHERE channel_id = ? AND ts_us = ?", (row["channel_id"], at)
+        ).fetchone():
+            at += 1
+        (message,) = world.insert(
+            "messages",
+            [
+                dict(
+                    channel_id=row["channel_id"],
+                    ts_us=at,
+                    user_id=row["user_id"],
+                    text=row["text"],
+                    subtype=row["subtype"],
+                )
+            ],
+        )
+        world.insert(
+            "message_mentions",
+            [dict(message_id=message, user_id=u) for u in dict.fromkeys(MENTION.findall(row["text"]))],
+        )
+        world.db.execute("UPDATE queue SET message_id = ? WHERE id = ?", (message, row["id"]))
+        written.append(message)
+    return written
 
 
 def apps(world) -> list[dict]:

@@ -21,7 +21,7 @@ from worldgen_slack.world import digest, file_hash
 from .workspace import Workspace
 
 
-from .chronicle import spread, start_clock
+from .world.clock import spread, start_clock
 from .config import (
     ActivityConfig,
     AuthorSettings,
@@ -33,9 +33,10 @@ from .config import (
     pinned,
     rooted,
 )
-from .contracts import Slot, calendar_days, extend_calendar, frozen_digest, meta
+from .world.board import Slot
+from .world.clock import calendar_days, extend_calendar, frozen_digest, meta
 from .env import GenerationEnv
-from .forge import merged, reset_tasks
+from .forge.env import merged, reset_tasks
 from .store import RunState, Store
 
 

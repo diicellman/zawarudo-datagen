@@ -11,7 +11,9 @@ from worldgen_slack.toolset import Call, watch_parent
 from worldgen_slack.world import file_hash
 from ..workspace import Workspace
 
-from ..contracts import frozen_before, measures, style
+from ..forge.difficulty import measures
+from ..world.clock import frozen_before
+from ..world.style import style
 
 
 class ReviewToolsConfig(vf.ToolsetConfig):

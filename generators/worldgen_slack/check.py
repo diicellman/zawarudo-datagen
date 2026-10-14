@@ -54,43 +54,40 @@ from .agents.world import (
     ledger_digest,
     ledger_document,
 )
-from .chronicle import (
-    share_band,
-    Move,
+from .forge.tasks import Annotation, forge_task
+from .world.clock import bounds, part_of, present, start_clock, today
+from .world.ledger import (
     Artifact,
-    edit,
-    move_moment,
-    promises_made,
-    tally,
-    Annotation,
-    forge_task,
     BoardEntry,
+    Event,
+    Move,
+    Plan,
+    PlanFact,
+    front_loaded,
+    move_moment,
+    record_plan,
+    unplanned,
+)
+from .world.writing import (
     Close,
     Commit,
     Conversation,
-    Event,
-    Plan,
-    PlanFact,
     PostLine,
     advance,
     agenda_budget,
     band,
-    bounds,
     close_day,
-    front_loaded,
+    edit,
     opening,
-    part_of,
     post,
     posted,
-    present,
+    promises_made,
     quotas,
-    record_plan,
     revise,
     room,
-    start_clock,
-    today,
+    share_band,
+    tally,
     today_line,
-    unplanned,
 )
 from .chapter import (
     ChapterConfig,
@@ -108,61 +105,49 @@ from .env import GenerationEnv, provenance, rates
 from .judge.verdict import read_one_way
 from .session import ended, keep_awake
 from .store import ReviewLimit, SessionLost, Store, write_release
-from .forge import ForgeConfig, ForgeEnv, bucket, measured_level
-from .forge import measured as forge_measured
-from .profile import profile
-from .forge import provenance as forge_provenance
+from .forge.env import ForgeConfig, ForgeEnv, bucket, measured_level
+from .forge.env import measured as forge_measured
+from .forge.profile import profile
+from .forge.env import provenance as forge_provenance
 from .config import ROOT, Category, Config, Needs
-from .contracts import (
+from .forge.difficulty import IDENTIFIER, failure_cases, features, measures, panel
+from .forge.tasks import Task, check_task, record_task
+from .forge.tries import miss_class
+from .world.board import Slot, needs_text
+from .world.cast import Gaps, Premise, Premises, SeedPersona, Typing, cards, pick_cast, user_id
+from .world.clock import (
     DAY,
     HABITS,
-    IDENTIFIER,
     PARTS,
-    TIME_LITERAL,
-    Channel,
-    Gaps,
-    Integration,
     Moment,
-    Organization,
-    Person,
-    Premise,
-    Premises,
-    Reaction,
-    Routine,
-    SeedPersona,
-    Slot,
-    Storyline,
-    Task,
-    Typing,
-    UserGroup,
     at,
-    background_plan,
-    bot_id,
-    cards,
-    channel_id,
     chapter_start,
-    check_task,
-    direct_messages,
-    failure_cases,
-    features,
     frozen_before,
     frozen_digest,
     habit,
-    measures,
     meta,
-    miss_class,
-    needs_text,
-    organize,
-    panel,
-    pick_cast,
-    record_task,
     render,
     reread,
-    style,
-    user_id,
     window,
     world_meta,
 )
+from .world.ledger import Storyline
+from .world.organization import (
+    Channel,
+    Integration,
+    Organization,
+    Person,
+    Routine,
+    UserGroup,
+    background_plan,
+    bot_id,
+    channel_id,
+    direct_messages,
+    organize,
+)
+from .world.style import style
+from .world.text import TIME_LITERAL
+from .world.writing import Reaction
 from .judge.verdict import (
     PHASE_CRITERIA,
     READING,
@@ -5983,13 +5968,12 @@ PROMPT_SOURCES = [
             "agents/synthesizer.py",
             "agents/author.py",
             "session.py",
-            "chronicle.py",
-            "contracts.py",
             "env.py",
-            "forge.py",
             "chapter.py",
         )
     ),
+    *sorted((ROOT / "generators/worldgen_slack/world").glob("*.py")),
+    *sorted((ROOT / "generators/worldgen_slack/forge").glob("*.py")),
     *(
         ROOT / "environments/worldgen_slack/worldgen_slack" / n
         for n in ("taskset.py", "judge.py", "toolset.py", "slack.py", "world.py")

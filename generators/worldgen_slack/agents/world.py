@@ -24,49 +24,19 @@ from worldgen_slack.toolset import watch_parent
 from worldgen_slack.world import digest, file_hash
 from ..workspace import Workspace
 
-from ..profile import profile
-from ..chronicle import (
-    edit,
-    Annotation,
-    Conversation,
-    Plan,
-    annotate,
-    advance,
-    bounds,
-    drift,
-    forge_task,
-    part_of,
-    post,
-    posted,
-    present,
-    quotas,
-    record_plan,
-    revise,
-    today,
-    today_line,
-)
+from ..forge.profile import profile
+from ..forge.tasks import Annotation, annotate, forge_task
+from ..world.clock import bounds, part_of, present, today
+from ..world.ledger import Plan, record_plan
+from ..world.writing import Conversation, advance, drift, edit, post, posted, quotas, revise, today_line
 from ..config import Config, Needs
-from ..contracts import (
-    failure_cases,
-    LONG,
-    PARTS,
-    SHORT,
-    Gaps,
-    Part,
-    Slot,
-    Task,
-    cards,
-    channel_id,
-    chapter_start,
-    clock,
-    frozen_before,
-    needs_text,
-    on_board,
-    slot_needs,
-    selves,
-    window,
-    world_meta,
-)
+from ..forge.difficulty import failure_cases
+from ..forge.tasks import Task
+from ..world.board import Slot, needs_text, on_board, slot_needs
+from ..world.cast import Gaps, cards, selves
+from ..world.clock import PARTS, Part, chapter_start, clock, frozen_before, window, world_meta
+from ..world.organization import channel_id
+from ..world.style import LONG, SHORT
 
 GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor sees it: channels, members, messages,
   message_mentions, reactions and thread_stats hold only what the actor can read; users, calendar, storylines, facts,

@@ -22,7 +22,7 @@ from pathlib import Path
 import verifiers.v1 as vf
 from worldgen_slack.judge import AnswerJudge
 
-from generators.worldgen_slack.contracts import failure_cases
+from generators.worldgen_slack.forge.difficulty import failure_cases
 from generators.worldgen_slack.workspace import Workspace
 
 # $ per million input, output and cached input tokens (list prices)

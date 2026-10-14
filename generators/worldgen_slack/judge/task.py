@@ -10,7 +10,7 @@ from worldgen_slack.taskset import WorldTaskData
 from worldgen_slack.world import SCHEMA, file_hash
 from ..workspace import Workspace
 
-from ..contracts import frozen_before
+from ..world.clock import frozen_before
 from ..session import require_trace
 from .tools import ReviewState, ReviewTools, ReviewToolsConfig
 from .verdict import PHASE_CRITERIA, Issue, Verdict, accepted, quality, validate_verdict, verdict_schema

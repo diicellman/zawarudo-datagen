@@ -19,7 +19,9 @@ from verifiers.v1.runtimes.prime import set_base_sandbox_labels
 from verifiers.v1.utils.interrupt import install_interrupt
 from worldgen_slack.release import atomic_json
 
-from . import chapter, forge, profile
+from . import chapter
+from .forge import env as forge
+from .forge import profile
 from .config import Config, load_config
 from .env import GenerationEnv, dry_run, provenance
 from .store import Store

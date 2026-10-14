@@ -1,7 +1,8 @@
 """The setup documents the world author writes first: the premise (the company) and the organization (its people
 and conversations)."""
 
-from ..contracts import Organization, Premises, census, pick_premise, user_id
+from ..world.cast import Premises, census, pick_premise, user_id
+from ..world.organization import Organization
 from .author import AuthorTask
 
 PREMISE_GUIDE = """Phase premise: propose exactly premise_count companies in `sector`; the run seed picks one, and the

@@ -27,7 +27,10 @@ from worldgen_slack.release import (
 from worldgen_slack.world import canonical, file_hash
 from .workspace import Workspace
 
-from .contracts import Premise, SeedPersona, Slot, measures, miss_class
+from .forge.difficulty import measures
+from .forge.tries import miss_class
+from .world.board import Slot
+from .world.cast import Premise, SeedPersona
 from .judge.verdict import Issue, Verdict
 
 

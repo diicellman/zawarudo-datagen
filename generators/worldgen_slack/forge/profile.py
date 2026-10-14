@@ -9,9 +9,10 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from .workspace import Workspace
+from ..workspace import Workspace
 
-from .contracts import answer_facts, meta, readable
+from ..world.board import answer_facts, readable
+from ..world.clock import meta
 
 
 def chains(world) -> dict[str, int]:
