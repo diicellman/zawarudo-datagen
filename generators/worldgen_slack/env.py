@@ -17,9 +17,10 @@ from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.utils.interrupt import cleaning_up
-from worldgen_slack.dataset import atomic_json
-from worldgen_slack.db import digest
-from worldgen_slack.taskset import AnswerJudge, SolverTask
+from worldgen_slack.judge import AnswerJudge
+from worldgen_slack.release import atomic_json
+from worldgen_slack.taskset import SolverTask
+from worldgen_slack.world import digest
 
 from .agents import synthesizer
 from .agents.judge import JudgeTask, review_payload
@@ -466,9 +467,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         )
 
     def answers(self, world):
-        from worldgen_slack.dataset import sha256
+        from worldgen_slack.world import file_hash
 
-        rows, answers = self.store.release_rows(sha256(world))
+        rows, answers = self.store.release_rows(file_hash(world))
         return rows, [answers[r.task_id] for r in rows]
 
     async def solve(self, agents, task, seat: str = "solver"):

@@ -102,7 +102,7 @@ test of 10 candidates took 21 minutes and about $7.
 | `generators/worldgen_slack/agents/judge.py` | The agentic judge: task and world reviews, with inspection tools |
 | `generators/worldgen_slack/contracts.py` | Cast, organization, agenda, task checks (T1-T7), the lazy-solver panel, failure cases, text rules, verdicts |
 | `generators/worldgen_slack/store.py` | The run directory: checkpoint, attempts, traces, summary, release |
-| `environments/worldgen_slack/worldgen_slack/db.py` | The world file: schema, rules checked on every write, actor-scoped reads |
+| `environments/worldgen_slack/worldgen_slack/world.py` | The world file: schema, rules checked on every write, actor-scoped reads |
 | `environments/worldgen_slack/worldgen_slack/taskset.py` | The released taskset: fresh solver sessions, `vf.Judge` grading and the +1 / 0 / -1 reward |
 
 `generate.py` starts the native Env from validated TOML. Verifiers owns model execution, harnesses, runtimes,

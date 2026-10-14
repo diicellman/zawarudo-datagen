@@ -14,7 +14,7 @@ import verifiers.v1 as vf
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from verifiers.v1.runtimes.prime import set_base_sandbox_labels
 from verifiers.v1.utils.interrupt import install_interrupt
-from worldgen_slack.dataset import atomic_json
+from worldgen_slack.release import atomic_json
 
 from .chronicle import daily
 from .config import ROOT, Config, load_config

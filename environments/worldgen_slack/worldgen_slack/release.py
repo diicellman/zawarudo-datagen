@@ -1,6 +1,5 @@
 """The release: one solver copy of the world, public questions, and private gold answers."""
 
-import hashlib
 import json
 import os
 import shutil
@@ -10,7 +9,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from .db import World, canonical
+from .world import World, canonical, file_hash
 
 
 class StrictModel(BaseModel):
@@ -45,11 +44,6 @@ def read_json(path: Path):
         return result
 
     return json.loads(path.read_bytes(), object_pairs_hook=unique)
-
-
-def sha256(path: Path) -> str:
-    with open(path, "rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 class PublicTask(StrictModel):
@@ -114,7 +108,7 @@ def load_release(root: Path) -> tuple[Path, list[PublicTask], dict[str, PrivateA
     if set(manifest.files) != FILES:
         raise ValueError("a release holds world.sqlite, tasks.json and answers.json")
     for name, expected in manifest.files.items():
-        if (root / name).is_symlink() or sha256(root / name) != expected:
+        if (root / name).is_symlink() or file_hash(root / name) != expected:
             raise ValueError(f"release file hash mismatch: {name}")
     rows = [PublicTask.model_validate(r) for r in read_json(root / "tasks.json")]
     answers = {k: PrivateAnswer.model_validate(v) for k, v in read_json(root / "answers.json").items()}
@@ -143,7 +137,7 @@ def write_release(root: Path, world: Path, rows: list[PublicTask], answers: dict
     """Publish atomically; an existing release must be the same one."""
     if root.exists():
         _, old_rows, old_answers = load_release(root)
-        if (old_rows, old_answers) != (rows, answers) or sha256(root / "world.sqlite") != sha256(world):
+        if (old_rows, old_answers) != (rows, answers) or file_hash(root / "world.sqlite") != file_hash(world):
             raise ValueError("refusing to overwrite a different release")
         return
     root.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +147,7 @@ def write_release(root: Path, world: Path, rows: list[PublicTask], answers: dict
         shutil.copyfile(world, stage / "world.sqlite")
         atomic_json(stage / "tasks.json", [r.model_dump(mode="json") for r in rows])
         atomic_json(stage / "answers.json", {k: v.model_dump(mode="json") for k, v in answers.items()})
-        files = {name: sha256(stage / name) for name in sorted(FILES)}
+        files = {name: file_hash(stage / name) for name in sorted(FILES)}
         atomic_json(
             stage / "manifest.json", Manifest(world_hash=files["world.sqlite"], files=files).model_dump()
         )

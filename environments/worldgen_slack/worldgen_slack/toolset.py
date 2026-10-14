@@ -2,7 +2,6 @@
 
 import asyncio
 import functools
-import hashlib
 import os
 import threading
 import time
@@ -12,16 +11,16 @@ from typing import Annotated, Literal
 import verifiers.v1 as vf
 from pydantic import Field, JsonValue
 
-from . import surface
-from .db import World
-from .dataset import StrictModel
+from . import slack
+from .release import StrictModel
+from .world import World, file_hash
 
 
 def described(kind, text: str, **checks):
     return Annotated[kind, Field(description=text, **checks)]
 
 
-# Parameters, as the real server describes them (tests/fixtures/slack-mcp/tools.json).
+# Parameters, as the real server describes them (capture/slack-mcp/tools.json).
 Keywords = described(
     list[str] | None,
     "Array of lexical search terms. Each element MUST be a single word (no spaces) OR an exact phrase in quotes. All elements are AND'd (every element must match). Use the author test: only include words the author would naturally write.",
@@ -166,23 +165,10 @@ class CallState(vf.State):
     calls: list[Call] = Field(default_factory=list, max_length=4096)
 
 
-class WorldTaskData(vf.TaskData):
-    """Which task and attempt a run belongs to, and which world file it was given."""
-
-    task_id: str = ""
-    attempt: str = ""
-    world_hash: str = ""
-
-
 class WorldToolsConfig(vf.ToolsetConfig):
     db_path: str = ""
     db_hash: str = ""
     actor_id: str
-
-
-def file_hash(path: Path | str) -> str:
-    with open(path, "rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def watch_parent() -> None:
@@ -207,7 +193,7 @@ def stage_world(config: WorldToolsConfig, path: Path | str) -> None:
     config.db_path, config.db_hash = str(Path(path).resolve()), file_hash(path)
 
 
-class SlackTools(vf.Toolset[WorldToolsConfig, CallState]):
+class SlackToolset(vf.Toolset[WorldToolsConfig, CallState]):
     TOOL_PREFIX = "slack"
 
     async def setup(self) -> None:
@@ -232,11 +218,11 @@ class SlackTools(vf.Toolset[WorldToolsConfig, CallState]):
         if len(self.state.calls) >= 4096:
             raise ValueError("call history exhausted")
         given = {k: v for k, v in arguments.items() if v is not None}
-        record = self.world.call(tool, given)
+        record = slack.read(self.world, tool, given)
         self.state.calls.append(Call(tool=tool, arguments=given, output=record))
-        return surface.render(self.world, tool, record)
+        return slack.render(self.world, tool, record)
 
-    # The tools of Slack's own MCP server, as captured on 2026-10-14 (tests/fixtures/slack-mcp): their names, parameters
+    # The tools of Slack's own MCP server, as captured on 2026-10-14 (capture/slack-mcp): their names, parameters
     # and descriptions. Left out on purpose: the caller's user id the real descriptions carry (the system prompt does),
     # the request for consent before the private search (asking is the request), and pointers to write tools.
     @vf.tool
@@ -450,4 +436,4 @@ def locals_of(scope: dict) -> dict:
 
 if __name__ == "__main__":
     watch_parent()
-    SlackTools.run()
+    SlackToolset.run()

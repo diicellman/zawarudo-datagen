@@ -6,8 +6,8 @@ from typing import ClassVar, Self
 
 import verifiers.v1 as vf
 from pydantic import BaseModel, Field
-from worldgen_slack.db import SCHEMA
-from worldgen_slack.tools import WorldTaskData, file_hash
+from worldgen_slack.taskset import WorldTaskData
+from worldgen_slack.world import SCHEMA, file_hash
 
 FILE_GUIDE = """/task/input.json holds this phase's inputs; when it has feedback, that is what code or a reviewer
 rejected in your last document. /task/world.sqlite is a read-only SQLite copy of the workspace built so far, and

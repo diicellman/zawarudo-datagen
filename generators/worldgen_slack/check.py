@@ -32,12 +32,13 @@ from mcp.client.streamable_http import streamable_http_client
 from verifiers.v1.dialects.base import append_user_notice
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.mcp.launch import serve
-from worldgen_slack.dataset import PrivateAnswer, PublicTask, load_release, sha256, write_release
-from worldgen_slack import surface
-from worldgen_slack.db import ANSWER_KEY, SHADOWED, SHOWN, World
-from worldgen_slack.surface import PAGE, briefing
-from worldgen_slack.taskset import EMPTY, AnswerGrade, AnswerJudge, SolverTask, compact, people_shown, shown
-from worldgen_slack.tools import SlackTools, WorldToolsConfig, file_hash, stage_world, watch_parent
+from worldgen_slack import slack
+from worldgen_slack.judge import EMPTY, AnswerGrade, AnswerJudge
+from worldgen_slack.release import PrivateAnswer, PublicTask, load_release, write_release
+from worldgen_slack.slack import PAGE, compact, people_shown, shown
+from worldgen_slack.taskset import SolverTask, system_prompt
+from worldgen_slack.toolset import SlackToolset, WorldToolsConfig, stage_world, watch_parent
+from worldgen_slack.world import ANSWER_KEY, SHADOWED, SHOWN, World, file_hash
 from .agents.inspection import ReviewState
 from .agents.judge import PHASE_GUIDES, JudgeTask, review_payload
 from .agents.synthesizer import parse_premise
@@ -503,7 +504,7 @@ async def check_world(root):
     assert not names & set(ANSWER_KEY) and {"messages", "messages_fts"} <= names
 
     def read(reader, tool, **arguments):
-        return surface.read(reader, tool, arguments)
+        return slack.read(reader, tool, arguments)
 
     def texts(reader, *keywords, filters="", **kwargs):
         found = read(reader, "search_public_and_private", keywords=list(keywords), filters=filters, **kwargs)
@@ -538,7 +539,7 @@ async def check_world(root):
     )
     # The client says whom the assistant acts as and when it is; the tools show every time on the user's own clock.
     assert (
-        briefing(solver)
+        system_prompt(solver)
         == "You are using Slack as the user with user_id U2. It is Thursday, June 18, 2026, 00:00 on your clock (America/Chicago)."
     )
     first = read(solver, "read_channel", channel_id="C1")["items"][-1]
@@ -546,7 +547,7 @@ async def check_world(root):
         float(first["ts"]), ZoneInfo("America/Chicago")
     ).strftime("%Y-%m-%d %H:%M:%S -05"), first
     fall = int(datetime(2026, 11, 1, 6, 30, tzinfo=ZoneInfo("UTC")).timestamp() * 1e6)  # 1:30 CDT, then CST
-    assert [surface.clock(solver, fall + h * 3_600_000_000)[-12:] for h in (0, 1)] == [
+    assert [slack.clock(solver, fall + h * 3_600_000_000)[-12:] for h in (0, 1)] == [
         "01:30:00 -05",
         "01:30:00 -06",
     ]
@@ -619,10 +620,10 @@ async def check_world(root):
         u1, "list_channel_members", channel_id="G1", response_format="ids_only"
     )["format"] == "ids_only"
     fails(read, solver, "list_channel_members", channel_id="D1")  # not a direct conversation
-    # What the solver reads is the real server's text (tests/fixtures/slack-mcp): its shapes, rendered from records.
-    fixture = Path(__file__).resolve().parents[2] / "environments/worldgen_slack/tests/fixtures/slack-mcp"
+    # What the solver reads is the real server's text (capture/slack-mcp): its shapes, rendered from records.
+    fixture = Path(__file__).resolve().parents[2] / "environments/worldgen_slack/capture/slack-mcp"
     served = {t["name"]: t for t in json.loads((fixture / "tools.json").read_text())["tools"]}
-    shown_ = surface.render(solver, "read_channel", read(solver, "read_channel", channel_id="C1"))
+    shown_ = slack.render(solver, "read_channel", read(solver, "read_channel", channel_id="C1"))
     assert (
         shown_["messages"].startswith(
             "Channel: #releases (C1)\n\n=== Message from Owen Sato <U2@example.com> (U2) at "
@@ -632,7 +633,7 @@ async def check_world(root):
         and "\nReactions: eyes (1)" in shown_["messages"]
     ), shown_
     assert shown_["pagination_info"] == "There are no more messages available.\n"
-    hit = surface.render(
+    hit = slack.render(
         solver, "search_public_and_private", read(solver, "search_public_and_private", keywords=["ack"])
     )
     assert (
@@ -642,11 +643,11 @@ async def check_world(root):
         and "\nContext before: \n- From: Alicia Rao" in hit["results"]
         and hit["pagination_info"] == "End of results - No more pages available.\\n"
     ), hit
-    assert surface.render(
+    assert slack.render(
         solver, "get_reactions", read(solver, "get_reactions", channel_id="C1", message_ts=root_ts)
     ) == {"result": "Reactions on message:\n\n:eyes: × 1 — Owen Sato (U2)"}
     assert (
-        surface.render(
+        slack.render(
             solver,
             "search_public_and_private",
             read(solver, "search_public_and_private", keywords=["nothinghere"]),
@@ -654,7 +655,7 @@ async def check_world(root):
         == json.loads((fixture / "responses.json").read_text())[16]["response"]
     ), "an empty search reads as the real one"
     assert texts(solver, "4.2", filters="on:2026-06-15") == texts(solver, "blocked"), "on: is one day"
-    assert surface.text_of(solver, "hi <@U1>, see <#C1>") == "hi <@U1|Alicia>, see <#C1|releases>", (
+    assert slack.text_of(solver, "hi <@U1>, see <#C1>") == "hi <@U1|Alicia>, see <#C1|releases>", (
         "names, as Slack's API gives them"
     )
     try:
@@ -694,7 +695,7 @@ async def check_world(root):
     fails(stage_world, WorldToolsConfig(actor_id="U2", colocated=True), root / "solver.sqlite")
     config = WorldToolsConfig(actor_id="U2")
     stage_world(config, root / "solver.sqlite")
-    toolset = SlackTools(config)
+    toolset = SlackToolset(config)
     await toolset.setup()
     stored = {"state": toolset._state_cls()}
 
@@ -720,7 +721,7 @@ async def check_world(root):
     ):
         await client.initialize()
         # The tool server adds its prefix as the solver's harness names a server's tools: slack_read_channel.
-        listed = {f"{SlackTools.TOOL_PREFIX}_{t.name}": t for t in (await client.list_tools()).tools}
+        listed = {f"{SlackToolset.TOOL_PREFIX}_{t.name}": t for t in (await client.list_tools()).tools}
         assert set(listed) == set(served), sorted(listed)
         for name, tool in listed.items():  # every parameter the real server takes, by its name and kind
             want = served[name]["input_schema"]["properties"]
@@ -733,7 +734,7 @@ async def check_world(root):
             ), name
     bad = WorldToolsConfig(actor_id="U2", db_path=config.db_path, db_hash="0" * 64)
     try:
-        await SlackTools(bad).setup()
+        await SlackToolset(bad).setup()
         raise AssertionError("a changed world file was served")
     except ValueError:
         pass
@@ -1793,14 +1794,14 @@ def check_apps(root):
     )
     reader = World(world.path, actor=c)
     assert (
-        not surface.read(reader, "search_public_and_private", {"keywords": ["production"]})["items"]
-        and surface.read(
+        not slack.read(reader, "search_public_and_private", {"keywords": ["production"]})["items"]
+        and slack.read(
             reader, "search_public_and_private", {"keywords": ["production"], "include_bots": True}
         )["items"]
     ), "a search leaves apps out unless asked"
     assert (
         "✅ production release: deployed to production"
-        in surface.render(reader, "read_channel", surface.read(reader, "read_channel", {"channel_id": ops}))[
+        in slack.render(reader, "read_channel", slack.read(reader, "read_channel", {"channel_id": ops}))[
             "messages"
         ]
     )
@@ -1942,9 +1943,9 @@ def check_churn(root):
         ),
     )
     reader = World(world.path, actor=a)
-    history = surface.render(
-        reader, "read_channel", surface.read(reader, "read_channel", {"channel_id": leads})
-    )["messages"]
+    history = slack.render(reader, "read_channel", slack.read(reader, "read_channel", {"channel_id": leads}))[
+        "messages"
+    ]
     assert (
         f"<@{c}|{world.db.execute('SELECT display_name FROM users WHERE id = ?', (c,)).fetchone()[0]}> has joined the channel"
         in history
@@ -2061,7 +2062,7 @@ def check_links(root):
     reader = World(world.path, actor=c)
     assert (
         "rollback decided (edited)"
-        in surface.render(reader, "read_channel", surface.read(reader, "read_channel", {"channel_id": ops}))[
+        in slack.render(reader, "read_channel", slack.read(reader, "read_channel", {"channel_id": ops}))[
             "messages"
         ]
     ), "an edit is marked"
@@ -3299,7 +3300,7 @@ async def check_reviews(root):
         category="search",
         level=1,
         answer_type="text",
-        world_hash=sha256(root / "solver.sqlite"),
+        world_hash=file_hash(root / "solver.sqlite"),
     )
     answer = PrivateAnswer(
         answer_type="text",
@@ -3313,7 +3314,7 @@ async def check_reviews(root):
         "the client says who and when"
     )
     assert "rollback" not in solve.data.model_dump_json() + solve.config.tools.model_dump_json()
-    assert solve.config.tools.db_hash == sha256(root / "solver.sqlite")
+    assert solve.config.tools.db_hash == file_hash(root / "solver.sqlite")
     # The answer judge grades the answer the response commits to and grounds the claims that make it; an unsupported
     # aside is counted, and costs nothing.
     asks = AnswerJudge(solve.config.judge).build_messages(
@@ -5145,7 +5146,7 @@ async def check_author(root):
         )
         for r in rows
     ), "each task's rates are published"
-    assert all((r.surface, r.turns, type(r.miss_classes)) == (surface.VERSION, 40, dict) for r in rows), (
+    assert all((r.surface, r.turns, type(r.miss_classes)) == (slack.VERSION, 40, dict) for r in rows), (
         "each task's surface, turns and misses"
     )
     assert {r.task_id: (r.witness, r.witness_right) for r in rows if r.witness} == {
@@ -5542,7 +5543,7 @@ async def check_chapter(root, parent, settings):
     slots, parent_quotas, parent_hash = (
         brief_slots(chapter, cfg, version_of(before) + 1),
         quotas(before, settings),
-        sha256(parent / "world.sqlite"),
+        file_hash(parent / "world.sqlite"),
     )
     board_rows = before.db.execute("SELECT COUNT(*) FROM board").fetchone()[0]
     before.close()
@@ -5857,7 +5858,7 @@ async def check_chapter(root, parent, settings):
     assert {d: q for d, q in quotas(world, cfg).items() if d < 5} == parent_quotas
     assert (
         world.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
-        and sha256(parent / "world.sqlite") == parent_hash
+        and file_hash(parent / "world.sqlite") == parent_hash
     )
     # Its profile: the group the brief planted, in the version it was planted in, its current value where few read it.
     found = profile(world)
@@ -5982,7 +5983,10 @@ PROMPT_SOURCES = [
             "chapter.py",
         )
     ),
-    *(ROOT / "environments/worldgen_slack/worldgen_slack" / n for n in ("taskset.py", "tools.py", "db.py")),
+    *(
+        ROOT / "environments/worldgen_slack/worldgen_slack" / n
+        for n in ("taskset.py", "judge.py", "toolset.py", "slack.py", "world.py")
+    ),
 ]
 
 

@@ -6,8 +6,8 @@ from typing import Self
 
 import verifiers.v1 as vf
 from pydantic import Field
-from worldgen_slack.db import SCHEMA, World
-from worldgen_slack.tools import WorldTaskData, file_hash
+from worldgen_slack.taskset import WorldTaskData
+from worldgen_slack.world import SCHEMA, World, file_hash
 
 from ..contracts import PHASE_CRITERIA, Verdict, quality, validate_verdict, verdict_schema
 from .inspection import ReviewState, ReviewTools, ReviewToolsConfig

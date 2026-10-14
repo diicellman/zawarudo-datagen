@@ -10,18 +10,17 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
-from worldgen_slack.dataset import (
+from worldgen_slack import slack
+from worldgen_slack.config import role
+from worldgen_slack.release import (
     PrivateAnswer,
     PublicTask,
     StrictModel,
     atomic_json,
     read_json,
-    sha256,
     write_release,
 )
-from worldgen_slack import surface
-from worldgen_slack.config import role
-from worldgen_slack.db import World, canonical
+from worldgen_slack.world import World, canonical, file_hash
 
 from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, measures, miss_class
 
@@ -383,7 +382,7 @@ class Store:
                     r for r in review.get("results", []) if not r.get("correct") and not r.get("crashed")
                 ]
                 measured |= {
-                    "surface": surface.VERSION,
+                    "surface": slack.VERSION,
                     "turns": env.get("solver", {}).get("max_turns") or role("", solver=True).max_turns,
                     "miss_classes": dict(Counter(miss_class(r, task["answer_type"]) for r in wrong)),
                 }
@@ -422,5 +421,5 @@ class Store:
         copy = self.root / "solver.sqlite"
         copy.unlink(missing_ok=True)
         self.world.solver_copy(copy)
-        rows, answers = self.release_rows(sha256(copy))
+        rows, answers = self.release_rows(file_hash(copy))
         write_release(self.root / "release", copy, rows, answers)

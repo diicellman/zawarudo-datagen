@@ -6,7 +6,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from worldgen_slack.db import digest
+from worldgen_slack.world import digest
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent

@@ -21,8 +21,8 @@ from pathlib import Path
 from pydantic import Field, model_validator
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from verifiers.v1.runtimes.prime import set_base_sandbox_labels
-from worldgen_slack.dataset import atomic_json, sha256
-from worldgen_slack.db import World, digest
+from worldgen_slack.release import atomic_json
+from worldgen_slack.world import World, digest, file_hash
 
 import verifiers.v1 as vf
 
@@ -251,7 +251,7 @@ def adopt(store: Store, chapter: ChapterConfig, settings: Config, slots: list[Sl
         lineage = {
             "segments": json.dumps(spans),
             "version": str(version),
-            "parent_hash": sha256(parent / "world.sqlite"),
+            "parent_hash": file_hash(parent / "world.sqlite"),
             "chapter_start_day": str(first),
             "brief": json.dumps({s.id: s.needs.model_dump() for s in slots}),
         }
@@ -312,7 +312,7 @@ def provenance(chapter: ChapterConfig, settings: Config) -> dict:
     return {
         "chapter": chapter.model_dump(mode="json"),
         "config": settings.model_dump(mode="json"),
-        "parent": {"path": str(chapter.world), "world_hash": sha256(chapter.world / "world.sqlite")},
+        "parent": {"path": str(chapter.world), "world_hash": file_hash(chapter.world / "world.sqlite")},
         "verifiers_revision": "ac2ec29",
         "lock_hash": hashlib.sha256((ROOT / "uv.lock").read_bytes()).hexdigest(),
     }
@@ -363,7 +363,7 @@ def dry_run(chapter: ChapterConfig, settings: Config) -> dict:
         version = version_of(world) + 1
         out = {
             "parent": str(chapter.world),
-            "parent_hash": sha256(chapter.world / "world.sqlite"),
+            "parent_hash": file_hash(chapter.world / "world.sqlite"),
             "parent_days": last,
             "messages_before": world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
             "version": version,

@@ -11,7 +11,7 @@ import json
 import random
 import re
 
-from worldgen_slack.db import digest
+from worldgen_slack.world import digest
 
 from .contracts import APP_KINDS, TIME_LITERAL, queue
 

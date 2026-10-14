@@ -17,8 +17,8 @@ from pathlib import Path
 from pydantic import Field, model_validator
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from verifiers.v1.runtimes.prime import set_base_sandbox_labels
-from worldgen_slack.dataset import atomic_json, sha256
-from worldgen_slack.db import SCHEMA, World
+from worldgen_slack.release import atomic_json
+from worldgen_slack.world import SCHEMA, World, file_hash
 
 import verifiers.v1 as vf
 
@@ -79,7 +79,7 @@ def provenance(forge: ForgeConfig, settings: Config) -> dict:
     return {
         "forge": forge.model_dump(mode="json"),
         "config": settings.model_dump(mode="json"),
-        "world_hash": sha256(forge.world / "world.sqlite"),
+        "world_hash": file_hash(forge.world / "world.sqlite"),
         "verifiers_revision": "ac2ec29",
         "lock_hash": hashlib.sha256((ROOT / "uv.lock").read_bytes()).hexdigest(),
     }
@@ -556,7 +556,7 @@ def dry_run(forge: ForgeConfig, settings: Config) -> dict:
     count = lambda table: world.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: E731
     return {
         "world": str(forge.world),
-        "world_hash": sha256(forge.world / "world.sqlite"),
+        "world_hash": file_hash(forge.world / "world.sqlite"),
         "messages": count("messages"),
         "facts": count("facts"),
         "board": dict(world.db.execute("SELECT slot, group_concat(fact_id, ', ') FROM board GROUP BY slot")),

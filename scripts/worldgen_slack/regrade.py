@@ -20,10 +20,10 @@ from collections import Counter
 from pathlib import Path
 
 import verifiers.v1 as vf
-from worldgen_slack.taskset import AnswerJudge
+from worldgen_slack.judge import AnswerJudge
 
 from generators.worldgen_slack.contracts import failure_cases
-from worldgen_slack.db import World
+from worldgen_slack.world import World
 
 # $ per million input, output and cached input tokens (list prices)
 PRICES = {"z-ai/glm-5.3": (1.4, 4.4, 0.26)}

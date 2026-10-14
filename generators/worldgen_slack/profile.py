@@ -9,7 +9,7 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from worldgen_slack.db import World
+from worldgen_slack.world import World
 
 from .contracts import answer_facts, meta, readable
 

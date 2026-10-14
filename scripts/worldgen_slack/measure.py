@@ -22,7 +22,7 @@ from generators.worldgen_slack.contracts import (
     style,
     user_id,
 )
-from worldgen_slack.db import World
+from worldgen_slack.world import World
 
 TYPING = {
     "median_words": "median_words",

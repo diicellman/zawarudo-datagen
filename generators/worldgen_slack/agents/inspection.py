@@ -6,8 +6,9 @@ import json
 
 import verifiers.v1 as vf
 from pydantic import Field, JsonValue
-from worldgen_slack.db import World
-from worldgen_slack.tools import Call, file_hash, watch_parent
+from worldgen_slack import slack
+from worldgen_slack.toolset import Call, watch_parent
+from worldgen_slack.world import World, file_hash
 
 from ..contracts import frozen_before, measures, style
 
@@ -77,7 +78,7 @@ class ReviewTools(vf.Toolset[ReviewToolsConfig, ReviewState]):
         """Call a Slack read tool as a task's actor, by the solver's tool names without slack_: search_public,
         search_public_and_private, search_channels, search_users, read_channel, read_thread, read_user_profile,
         get_reactions, list_channel_members or list_user_channels. Returns what it showed, structured."""
-        output = World(self.config.db_path, actor=self._actor(actor_id)).call(tool, arguments)
+        output = slack.read(World(self.config.db_path, actor=self._actor(actor_id)), tool, arguments)
         self.state.calls.append(Call(tool=tool, arguments=arguments | {"actor_id": actor_id}, output=output))
         return output
 

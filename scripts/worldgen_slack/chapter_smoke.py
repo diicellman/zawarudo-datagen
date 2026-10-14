@@ -32,7 +32,7 @@ from generators.worldgen_slack.chronicle import (
 from generators.worldgen_slack.config import ROOT
 from generators.worldgen_slack.contracts import PARTS, Gaps, answer_facts, frozen_digest, meta
 from generators.worldgen_slack.store import Store
-from worldgen_slack.dataset import sha256
+from worldgen_slack.world import file_hash
 
 
 def refused(expected: str, act) -> None:
@@ -68,7 +68,7 @@ def main(parent: Path) -> None:
             '[[material]]\ncategory = "semantic"\nlevel = 4\nneeds = { values = 6 }\n'
             "[settings.author]\ntolerance = 1.0\nshare_tolerance = 1.0\n"
         )
-        before = sha256(parent / "world.sqlite")
+        before = file_hash(parent / "world.sqlite")
         chapter, settings = load_chapter(config)
         store = Store(chapter.output, provenance(chapter, settings))
         world = store.world
@@ -254,7 +254,7 @@ def main(parent: Path) -> None:
         assert frozen_digest(world) == frozen, "nothing before the chapter changed"
         assert {d: q for d, q in quotas(world, settings).items() if d < first} == parent_quotas
         assert world.violations(complete=True) == [], world.violations(complete=True)
-        assert sha256(parent / "world.sqlite") == before, "the parent is read only"
+        assert file_hash(parent / "world.sqlite") == before, "the parent is read only"
         store.close()
     print(
         f"PASS chapter smoke on {parent}: version 2 from day {first}, the past unchanged, the brief planted"

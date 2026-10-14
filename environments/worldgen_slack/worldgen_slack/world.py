@@ -46,6 +46,11 @@ def digest(value) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def file_hash(path: Path | str) -> str:
+    with open(path, "rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 ANSWER_KEY = (
     "queue",
     "integrations",
@@ -470,9 +475,3 @@ class World:
             raise LookupError("user_not_found")
         self.db.executescript(SCOPE)
         self.db.execute("INSERT INTO temp.actor VALUES (?)", (actor,))
-
-    def call(self, tool: str, arguments: dict) -> dict:
-        """One Slack read tool's record, as the actor (`surface`: the tools of Slack's own MCP server)."""
-        from . import surface
-
-        return surface.read(self, tool, arguments)

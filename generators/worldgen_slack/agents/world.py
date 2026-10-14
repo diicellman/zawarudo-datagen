@@ -18,8 +18,10 @@ from zoneinfo import ZoneInfo
 import verifiers.v1 as vf
 from pydantic import JsonValue, TypeAdapter, ValidationError
 from verifiers.v1.utils.decorators import discover_decorated
-from worldgen_slack.db import World, digest
-from worldgen_slack.tools import WorldTaskData, file_hash, watch_parent
+from worldgen_slack import slack
+from worldgen_slack.taskset import WorldTaskData
+from worldgen_slack.toolset import watch_parent
+from worldgen_slack.world import World, digest, file_hash
 
 from ..profile import profile
 from ..chronicle import (
@@ -782,7 +784,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         return self._logged(
             "read",
             {"actor_id": actor_id, "tool": tool, "arguments": arguments},
-            lambda: World(self.config.db_path, actor=actor_id).call(tool, arguments),
+            lambda: slack.read(World(self.config.db_path, actor=actor_id), tool, arguments),
         )
 
     @vf.tool
