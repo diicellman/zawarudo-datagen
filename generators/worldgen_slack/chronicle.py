@@ -15,6 +15,7 @@ from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
 from worldgen_slack.world import digest
 
 from .integrations import app_id, event_errors, queue_day, queue_events
+from .config import Ids
 from .contracts import (
     LONG,
     SHORT,
@@ -23,7 +24,6 @@ from .contracts import (
     PLACEHOLDER,
     TIME_LITERAL,
     Clock,
-    Ids,
     Moment,
     Reaction,
     Storyline,

@@ -99,7 +99,7 @@ test of 10 candidates took 21 minutes and about $7.
 | `generators/worldgen_slack/chronicle.py` | The rules of a world written in time order: plan, post, advance, close a day, revise, add a task |
 | `generators/worldgen_slack/agents/world.py` | The author's memory (rendered by code), its world tools, its turns |
 | `generators/worldgen_slack/agents/synthesizer.py` | The setup documents: premise and organization |
-| `generators/worldgen_slack/agents/judge.py` | The agentic judge: task and world reviews, with inspection tools |
+| `generators/worldgen_slack/judge/` | The agentic judge both parts use: its task, its inspection tools, its verdict |
 | `generators/worldgen_slack/contracts.py` | Cast, organization, agenda, task checks (T1-T7), the lazy-solver panel, failure cases, text rules, verdicts |
 | `generators/worldgen_slack/store.py` | The run directory: checkpoint, attempts, traces, summary, release |
 | `environments/worldgen_slack/worldgen_slack/world.py` | The world file: schema, rules checked on every write, actor-scoped reads |

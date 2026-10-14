@@ -40,8 +40,8 @@ from worldgen_slack.taskset import SolverTask, system_prompt
 from worldgen_slack.toolset import SlackToolset, WorldToolsConfig, stage_world, watch_parent
 from worldgen_slack.world import SHADOWED, SHOWN, file_hash
 from .workspace import ANSWER_KEY, Workspace
-from .agents.inspection import ReviewState
-from .agents.judge import PHASE_GUIDES, JudgeTask, review_payload
+from .judge.tools import ReviewState
+from .judge.task import PHASE_GUIDES, JudgeTask, review_payload
 from .agents.synthesizer import parse_premise
 from .agents.world import (
     AUTHOR_GUIDE,
@@ -104,7 +104,9 @@ from .chapter import (
 )
 from .chapter import provenance as chapter_provenance
 from .cli import failure, run_forge, run_label, run_world
-from .env import GenerationEnv, ended, keep_awake, provenance, rates, read_one_way
+from .env import GenerationEnv, provenance, rates
+from .judge.verdict import read_one_way
+from .session import ended, keep_awake
 from .store import ReviewLimit, SessionLost, Store, write_release
 from .forge import ForgeConfig, ForgeEnv, bucket, measured_level
 from .forge import measured as forge_measured
@@ -112,62 +114,64 @@ from .profile import profile
 from .forge import provenance as forge_provenance
 from .config import ROOT, Category, Config, Needs
 from .contracts import (
-    READING,
-    Integration,
-    UserGroup,
-    bot_id,
-    miss_class,
-    needs_text,
     DAY,
-    PARTS,
-    PHASE_CRITERIA,
+    HABITS,
     IDENTIFIER,
+    PARTS,
     TIME_LITERAL,
     Channel,
     Gaps,
-    Issue,
+    Integration,
     Moment,
     Organization,
     Person,
-    Reaction,
-    Routine,
     Premise,
     Premises,
+    Reaction,
+    Routine,
     SeedPersona,
     Slot,
     Storyline,
     Task,
-    TaskReview,
     Typing,
-    Verdict,
-    accepted_task,
+    UserGroup,
     at,
-    chapter_start,
-    frozen_before,
-    frozen_digest,
-    meta,
-    style,
     background_plan,
-    failure_cases,
-    features,
-    panel,
+    bot_id,
+    cards,
     channel_id,
+    chapter_start,
     check_task,
     direct_messages,
+    failure_cases,
+    features,
+    frozen_before,
+    frozen_digest,
+    habit,
     measures,
+    meta,
+    miss_class,
+    needs_text,
     organize,
+    panel,
     pick_cast,
     record_task,
     render,
     reread,
-    cards,
-    habit,
-    HABITS,
+    style,
     user_id,
-    validate_verdict,
-    verdict_schema,
     window,
     world_meta,
+)
+from .judge.verdict import (
+    PHASE_CRITERIA,
+    READING,
+    Issue,
+    TaskReview,
+    Verdict,
+    accepted_task,
+    validate_verdict,
+    verdict_schema,
 )
 
 
@@ -5973,10 +5977,12 @@ PROMPT_SOURCES = [
         ROOT / "generators/worldgen_slack" / n
         for n in (
             "agents/world.py",
-            "agents/judge.py",
+            "judge/task.py",
+            "judge/tools.py",
+            "judge/verdict.py",
             "agents/synthesizer.py",
             "agents/author.py",
-            "agents/inspection.py",
+            "session.py",
             "chronicle.py",
             "contracts.py",
             "env.py",

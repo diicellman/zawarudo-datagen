@@ -1,14 +1,16 @@
 """Validated run settings; all role overrides use native Verifiers configs."""
 
 import hashlib
+import json
 import tomllib
 from pathlib import Path
 from typing import Annotated, Literal
 import verifiers.v1 as vf
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 from verifiers.v1.configs.retries import RetryConfig
 from verifiers.v1.harnesses.null.harness import NullHarnessConfig
 from worldgen_slack.config import role
+from worldgen_slack.release import SafeId
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -71,6 +73,18 @@ def rooted(path: Path) -> Path:
 
 RootedPath = Annotated[Path, AfterValidator(rooted)]
 Text = Annotated[str, Field(min_length=1)]
+
+
+def listed(value):
+    """Models often write null for an empty list, a bare string for a one-item list, or a list as a string."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return json.loads(value) if value.startswith("[") else [value]
+    return value
+
+
+Ids = Annotated[list[SafeId], BeforeValidator(listed)]
 
 
 class Section(BaseModel):

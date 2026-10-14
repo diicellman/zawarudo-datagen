@@ -10,8 +10,10 @@ from worldgen_slack.taskset import WorldTaskData
 from worldgen_slack.world import SCHEMA, file_hash
 from ..workspace import Workspace
 
-from ..contracts import PHASE_CRITERIA, Verdict, quality, validate_verdict, verdict_schema
-from .inspection import ReviewState, ReviewTools, ReviewToolsConfig
+from ..contracts import frozen_before
+from ..session import require_trace
+from .tools import ReviewState, ReviewTools, ReviewToolsConfig
+from .verdict import PHASE_CRITERIA, Issue, Verdict, accepted, quality, validate_verdict, verdict_schema
 
 REVIEW_PROMPT = """Review what /task/input.json names, as /task/review.md says. /task/world.sqlite is the workspace
 with its facts and tasks; /task/schema.sql is its schema. inspect_check runs code's checks and re-runs the reviewed
@@ -164,3 +166,73 @@ def review_payload(world: Workspace, phase: str, task_ids: list[str], taxonomy=N
             )
         )
     return {"phase": phase, "world_hash": file_hash(world.path), "tasks": tasks, **extra}
+
+
+def thaw(verdict: Verdict, world) -> tuple[Verdict, list[Issue]]:
+    """A verdict on a chapter's world, its earlier chapters read as written and frozen: an issue's messages from before
+    the chapter become its evidence, and an issue left with nothing of this chapter's to change (no message, and no
+    fact or task of its own) leaves the verdict, kept apart: nothing can act on it. A world written in one run has
+    nothing frozen. Returns the verdict and the issues it set apart."""
+    if not (start := frozen_before(world)):
+        return verdict, []
+    old = {r[0] for r in world.db.execute("SELECT id FROM messages WHERE ts_us < ?", (start,))}
+    parent = {
+        r[0]
+        for r in world.db.execute(
+            "SELECT f.id FROM facts f JOIN calendar c ON c.day = f.day WHERE c.start_us < ?", (start,)
+        )
+    }
+    kept, apart = [], []
+    for issue in verdict.issues:
+        live = [m for m in issue.message_ids if m not in old]
+        moved = issue.model_copy(
+            update={
+                "message_ids": live,
+                "evidence_message_ids": list(
+                    dict.fromkeys([*issue.evidence_message_ids, *(m for m in issue.message_ids if m in old)])
+                ),
+            }
+        )
+        frozen = (
+            (issue.message_ids or issue.fact_ids)
+            and not live
+            and set(issue.fact_ids) <= parent
+            and not issue.task_ids
+        )
+        (apart if frozen else kept).append(moved)
+    return verdict.model_copy(update={"issues": kept}), apart
+
+
+async def review(store, agents, payload: dict, attempt: str, max_rows: int, files=None, label="") -> Verdict:
+    """One review by the judge, kept with its attempt: its input, its verdict, and the issues a chapter's frozen past
+    sets apart. `files` maps /task file names to trace records the judge may investigate; `label` names one of an
+    attempt's several reviews. A malformed verdict is absorbed by one fresh rerun."""
+    suffix, files = ("-" + label if label else ""), files or {}
+    store.artifact(attempt, "review_input" + suffix, payload)
+    store.event("review_started", attempt=attempt, label=label, task_ids=[t["id"] for t in payload["tasks"]])
+    world = store.snapshot(attempt, f"review{suffix}.sqlite")
+    # One fresh rerun absorbs a malformed verdict; the review round is spent once.
+    for _ in range(2):
+        task = JudgeTask.create(
+            payload,
+            world,
+            attempt,
+            max_rows,
+            {n: json.dumps(r) for n, r in files.items()},
+        )
+        trace = await agents.judge.run(task)
+        store.trace(trace)
+        if trace.ok:
+            break
+    require_trace(trace)
+    verdict = Verdict.model_validate(trace.info["verdict"])
+    store.artifact(attempt, "verdict" + suffix, verdict.model_dump(mode="json"))
+    verdict, frozen = thaw(verdict, store.world)
+    if frozen:
+        store.artifact(attempt, "frozen_issues" + suffix, [i.model_dump(mode="json") for i in frozen])
+    verdict = verdict.model_copy(update={"approved": accepted(verdict)})
+    if payload["phase"] in PHASE_CRITERIA:
+        store.artifact(
+            attempt, "acceptance" + suffix, {"approved": verdict.approved, "quality": quality(verdict)}
+        )
+    return verdict

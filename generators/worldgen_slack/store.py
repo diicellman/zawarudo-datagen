@@ -27,7 +27,8 @@ from worldgen_slack.release import (
 from worldgen_slack.world import canonical, file_hash
 from .workspace import Workspace
 
-from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, measures, miss_class
+from .contracts import Premise, SeedPersona, Slot, measures, miss_class
+from .judge.verdict import Issue, Verdict
 
 
 def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:

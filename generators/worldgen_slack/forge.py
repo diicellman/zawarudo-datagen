@@ -20,8 +20,10 @@ from .workspace import Workspace
 from .agents.world import WorldAuthorTask, forge_prompt
 from .chronicle import answer_of, brief, forge_task
 from .config import Config, Section, load_config, pinned, rooted
-from .contracts import INTENTS, READING, Task, features, miss_class
-from .env import SETUP_FILES, GenerationEnv, keep_awake, rates, require_session
+from .contracts import INTENTS, Task, features, miss_class
+from .judge.verdict import READING
+from .env import SETUP_FILES, GenerationEnv, rates
+from .session import keep_awake, require_session
 from .store import Store
 
 

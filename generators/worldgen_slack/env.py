@@ -6,15 +6,11 @@ file, written only through `World.trial()`."""
 
 import asyncio
 import contextlib
-import io
 import json
 import math
-import tarfile
-import time
 
 import verifiers.v1 as vf
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
-from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.utils.interrupt import cleaning_up
 from worldgen_slack.judge import AnswerJudge
@@ -23,7 +19,7 @@ from worldgen_slack.taskset import SolverTask
 from worldgen_slack.world import digest
 
 from .agents import synthesizer
-from .agents.judge import JudgeTask, review_payload
+from .judge.task import review, review_payload
 from .agents.synthesizer import SynthesizerTask
 from .agents.world import (
     WorldAuthorTask,
@@ -37,13 +33,7 @@ from .agents.world import (
 from .chronicle import agenda_budget, bounds, close_day, daily, posted, present, start_clock, today, unplanned
 from .config import Config, PipelineConfig, pinned
 from .contracts import (
-    PHASE_CRITERIA,
-    READING,
     Organization,
-    Verdict,
-    Issue,
-    accepted,
-    accepted_task,
     background_plan,
     calendar,
     cards,
@@ -55,9 +45,17 @@ from .contracts import (
     meta,
     organize,
     pick_cast,
-    quality,
 )
+from .judge.verdict import Issue, Verdict, accepted_task, combined, read_one_way
 from .store import ReviewLimit, SessionLost, Store, used_names
+from .session import (
+    apply_network_notice,
+    ended,
+    keep_awake,
+    observable,
+    require_session,
+    upload,
+)
 
 NOTES = ("plan.md", "recap.md")  # the world author's own files in /task/notes
 SETUP_FILES = (
@@ -69,84 +67,6 @@ SETUP_FILES = (
     "premise.json",
     "organization.json",
 )
-
-
-ARCHIVE = "/tmp/task-files.tgz"
-# What verifiers tells every agent on a restricted network, on the first user message of each request: by default,
-# "do not retry the blocked provider-side operation", even when nothing was removed (to fix upstream: only when a
-# capability was). Our VMs block every host and reach their tools through a tunnel, where the true thing to say is
-# that a dropped call never arrived; the authors stopped their turns on the default instead of calling again.
-NETWORK_NOTICE = (
-    "This machine has no network. Its world_* and inspect_* functions reach the host through a tunnel; one that "
-    'raises "is unavailable" never arrived: call it again.'
-)
-
-
-async def upload(runtime, files: dict[str, str | bytes], clear: str) -> None:
-    """Files into /task in one archive: one upload and one command, not one upload per file. `clear` is emptied
-    first, so a file that is gone from the set is gone from the VM too."""
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for name, data in files.items():
-            data = data.encode() if isinstance(data, str) else data
-            info = tarfile.TarInfo(name)
-            info.size, info.mtime, info.mode = len(data), int(time.time()), 0o644
-            archive.addfile(info, io.BytesIO(data))
-    await runtime.write(ARCHIVE, buffer.getvalue())
-    script = f"rm -rf {clear} && mkdir -p /task && python3 -m tarfile -e {ARCHIVE} /task && rm -f {ARCHIVE}"
-    if (result := await runtime.run(["sh", "-c", script], {})).exit_code:
-        raise SandboxError(f"the author's files could not be unpacked: {result.stderr}")
-
-
-@contextlib.asynccontextmanager
-async def keep_awake(runtime, every: float):
-    """The author's VM kept from idling out while only the env works (the solver's tries, the judge's reviews): a
-    no-op command every `every` seconds. The pings end with the block, so a VM left behind still ends on its idle
-    timeout."""
-
-    async def ping():
-        while True:
-            await asyncio.sleep(every)
-            await runtime.run(["true"], {})
-
-    pinger = asyncio.create_task(ping())
-    try:
-        yield
-    finally:
-        pinger.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await pinger
-
-
-def require_trace(trace):
-    if not trace.ok:
-        raise RuntimeError("agent execution failed: " + "; ".join(e.message for e in trace.errors))
-
-
-def ended(trace) -> RuntimeError:
-    """Why an author's session ended before its work did: its own limits (the turn cap, the token budget), or an
-    error of its sandbox, tunnel or provider, which is none of the author's (S3's three stops: Prime's process stream
-    dropped, and each was reported as the author's limits)."""
-    errors = "; ".join(f"{e.type}: {e.message}" for e in getattr(trace, "errors", None) or [])
-    if not errors or getattr(trace, "is_truncated", False) or "budget reached" in errors:
-        return ReviewLimit(
-            "the author exhausted its interaction's limits" + (f": {errors}" if errors else "")
-        )
-    return SessionLost("the author's session was lost: " + errors)
-
-
-def require_session(trace):
-    """An author's interaction that failed, for the reason `ended` gives."""
-    if not trace.ok:
-        raise ended(trace)
-
-
-def observable(record: dict) -> dict:
-    """A trace record without hidden reasoning or provider state, for another agent to investigate."""
-    for node in record["nodes"]:
-        node["message"].pop("reasoning_content", None)
-        node["message"].pop("provider_state", None)
-    return record
 
 
 def wilson(right: int, n: int, z: float = 1.645) -> list[float]:
@@ -178,79 +98,11 @@ def rates(results: list[dict]) -> dict:
     }
 
 
-def read_one_way(verdict: Verdict) -> Verdict:
-    """A second reading the judge found is code's issue too: it blocks its task, and sends it back to be reworded."""
-    return verdict.model_copy(
-        update={
-            "issues": verdict.issues
-            + [
-                Issue(
-                    artifact="tasks",
-                    task_ids=[r.task_id],
-                    defect=READING + r.misread,
-                    requested_change="word the question so it rules that reading out, for the same asker and gold answer",
-                    blocking=True,
-                )
-                for r in verdict.tasks
-                if r.misread
-            ]
-        }
-    )
-
-
-def merged(verdicts: list[Verdict]) -> Verdict:
-    """Several reviews as one verdict: approved when each is, with every task review and issue; a rejection's feedback
-    carries only the rejecting reviews' words."""
-    rejected = [v for v in verdicts if not v.approved]
-    return Verdict.model_construct(
-        approved=not rejected,
-        tasks=[r for v in verdicts for r in v.tasks],
-        issues=[i for v in verdicts for i in v.issues],
-        criteria={},
-        summary=" ".join(v.summary for v in rejected or verdicts),
-    )
-
-
 # The anchor messages of the decoys on a task's facts' subjects: the near-misses a task rests beside.
 DECOYS = """SELECT m.id, m.channel_id, m.ts, m.text FROM task_facts tf JOIN facts f ON f.id = tf.fact_id
 JOIN facts d ON d.is_decoy = 1 AND lower(trim(d.subject)) = lower(trim(f.subject))
 JOIN evidence e ON e.fact_id = d.id JOIN messages m ON m.id = e.message_id
 WHERE tf.task_id = ? GROUP BY m.id ORDER BY m.ts_us, m.id"""
-
-
-def thaw(verdict: Verdict, world) -> tuple[Verdict, list[Issue]]:
-    """A verdict on a chapter's world, its earlier chapters read as written and frozen: an issue's messages from before
-    the chapter become its evidence, and an issue left with nothing of this chapter's to change (no message, and no
-    fact or task of its own) leaves the verdict, kept apart: nothing can act on it. A world written in one run has
-    nothing frozen. Returns the verdict and the issues it set apart."""
-    if not (start := frozen_before(world)):
-        return verdict, []
-    old = {r[0] for r in world.db.execute("SELECT id FROM messages WHERE ts_us < ?", (start,))}
-    parent = {
-        r[0]
-        for r in world.db.execute(
-            "SELECT f.id FROM facts f JOIN calendar c ON c.day = f.day WHERE c.start_us < ?", (start,)
-        )
-    }
-    kept, apart = [], []
-    for issue in verdict.issues:
-        live = [m for m in issue.message_ids if m not in old]
-        moved = issue.model_copy(
-            update={
-                "message_ids": live,
-                "evidence_message_ids": list(
-                    dict.fromkeys([*issue.evidence_message_ids, *(m for m in issue.message_ids if m in old)])
-                ),
-            }
-        )
-        frozen = (
-            (issue.message_ids or issue.fact_ids)
-            and not live
-            and set(issue.fact_ids) <= parent
-            and not issue.task_ids
-        )
-        (apart if frozen else kept).append(moved)
-    return verdict.model_copy(update={"issues": kept}), apart
 
 
 def provenance(config: Config) -> dict:
@@ -276,7 +128,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         self.used = used_names(settings.corpus, store.root)
         # GLM has its own gate, under the episode's: judges and the witness are not held up behind its solves.
         self.glm = asyncio.Semaphore(settings.author.solvers)
-        dialects.CAPABILITY_NOTICE = NETWORK_NOTICE  # read by append_user_notice on every request
+        apply_network_notice()
         super().__init__(settings.env)
 
     @property
@@ -394,43 +246,6 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         self.store.finish_attempt(False)
 
     # ------------------------------------------------------------------ reviews
-    async def review(self, agents, payload, attempt, files=None, label=""):
-        """`files` maps /task file names to trace records the judge may investigate; `label` names one of an
-        attempt's several reviews."""
-        suffix, files = ("-" + label if label else ""), files or {}
-        self.store.artifact(attempt, "review_input" + suffix, payload)
-        self.store.event(
-            "review_started", attempt=attempt, label=label, task_ids=[t["id"] for t in payload["tasks"]]
-        )
-        world = self.store.snapshot(attempt, f"review{suffix}.sqlite")
-        # One fresh rerun absorbs a malformed verdict; the review round is spent once.
-        for _ in range(2):
-            task = JudgeTask.create(
-                payload,
-                world,
-                attempt,
-                self.settings.tasks.max_answer_rows,
-                {n: json.dumps(r) for n, r in files.items()},
-            )
-            trace = await agents.judge.run(task)
-            self.store.trace(trace)
-            if trace.ok:
-                break
-        require_trace(trace)
-        verdict = Verdict.model_validate(trace.info["verdict"])
-        self.store.artifact(attempt, "verdict" + suffix, verdict.model_dump(mode="json"))
-        verdict, frozen = thaw(verdict, self.world)
-        if frozen:
-            self.store.artifact(
-                attempt, "frozen_issues" + suffix, [i.model_dump(mode="json") for i in frozen]
-            )
-        verdict = verdict.model_copy(update={"approved": accepted(verdict)})
-        if payload["phase"] in PHASE_CRITERIA:
-            self.store.artifact(
-                attempt, "acceptance" + suffix, {"approved": verdict.approved, "quality": quality(verdict)}
-            )
-        return verdict
-
     def task_key(self, task_id: str) -> str:
         """What a task review depends on: the task, its gold rows, the text of the messages they rest on, and the text
         of the decoys on its facts' subjects; a revised decoy is a changed task."""
@@ -531,7 +346,13 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             **({"previous_issues": workspace} if workspace else {}),
             **self.written_from(),
         )
-        verdict = merged([await self.review(agents, payload, attempt, {}, "world")])
+        verdict = combined(
+            [
+                await review(
+                    self.store, agents, payload, attempt, self.settings.tasks.max_answer_rows, {}, "world"
+                )
+            ]
+        )
         self.store.artifact(attempt, "verdict", verdict.model_dump(mode="json"))
         self.store.artifact(attempt, "acceptance", {"approved": verdict.approved})
         return verdict
@@ -678,7 +499,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             ledger=ledger_digest(self.world),
             **self.written_from(),
         )
-        verdict = await self.review(agents, payload, attempt, {}, "world")
+        verdict = await review(
+            self.store, agents, payload, attempt, self.settings.tasks.max_answer_rows, {}, "world"
+        )
         # It rejects nothing, so every issue is a note for what is written next, blocking or not.
         state.issues = verdict.issues
         state.day, state.phase = state.day + 1, "day"
@@ -718,8 +541,14 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 for k, trace_id in enumerate(tried[t]["traces"], 1)
                 if (record := self.saved_trace(trace_id))
             }
-            return await self.review(
-                agents, payload, attempt, files, "tasks" if len(chunks) == 1 else f"tasks-{k}"
+            return await review(
+                self.store,
+                agents,
+                payload,
+                attempt,
+                self.settings.tasks.max_answer_rows,
+                files,
+                "tasks" if len(chunks) == 1 else f"tasks-{k}",
             )
 
         # A review of a few tasks at a time, the reviews side by side: each task passes on its own chunk's verdict,
@@ -774,7 +603,7 @@ class GenerationEnv(vf.Env[PipelineConfig]):
                 **rate,
                 learnability=4 * right * (1 - right),
             )
-        return runs, merged(verdicts)
+        return runs, combined(verdicts)
 
     async def grade(self, question: str, reference: dict, response: str):
         """The answer judge's grade of one response, with no observations: its `correct` is what a screen reads."""
