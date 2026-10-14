@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import verifiers.v1 as vf
 import verifiers.v1.utils.interrupt
 from verifiers.v1.dialects.base import append_user_notice
@@ -1075,14 +1076,12 @@ async def run_flows(root):
             assert not any(hasattr(tools, w) for w in ("plan", "post", "advance", "revise", "edit")), (
                 "the proposer is served no tool that writes the workspace"
             )
-            try:
+            # else a candidate outside the round's open ids was written
+            with pytest.raises(ValueError, match=re.escape("open ids")):
                 await call(
                     "add_task",
                     task=scripted_task(settings, {"id": "elsewhere", "category": "lookup", "level": 1}, a),
                 )
-                raise AssertionError("a candidate outside the round's open ids was written")
-            except ValueError as error:
-                assert "open ids" in str(error), error
             if ids[0] == "r01-01":
                 first = world.db.execute(
                     "SELECT id FROM messages WHERE text LIKE '%rollback%' ORDER BY ts_us LIMIT 1"
@@ -1107,7 +1106,8 @@ async def run_flows(root):
                         "which it supersedes, does not exist",
                     ),
                 ):
-                    try:
+                    # else an annotation was accepted: {bad}
+                    with pytest.raises(ValueError, match=re.escape(why)):
                         await call(
                             "annotate",
                             fact=Annotation(
@@ -1121,9 +1121,6 @@ async def run_flows(root):
                                 summary="s",
                             ).model_copy(update=bad),
                         )
-                        raise AssertionError(f"an annotation was accepted: {bad}")
-                    except ValueError as error:
-                        assert why in str(error), error
                 # A search for the question's own words reaches the answer first: level 1, whatever it is called.
                 notes = Task(
                     id=ids[0],
@@ -1136,11 +1133,9 @@ async def run_flows(root):
                     facts=["f2"],
                     intent="when",
                 )
-                try:
+                # else a shortcut was written above level 1
+                with pytest.raises(ValueError, match=re.escape("so it is a level-1 task")):
                     await call("add_task", task=notes)
-                    raise AssertionError("a shortcut was written above level 1")
-                except ValueError as error:
-                    assert "so it is a level-1 task" in str(error), error
                 assert (await call("add_task", task=notes.model_copy(update={"level": 1})))["panel"][
                     "shortcut"
                 ]
@@ -1158,11 +1153,9 @@ async def run_flows(root):
                     and "failure_cases" in probed
                     and not world.db.execute("SELECT 1 FROM tasks WHERE id = ?", (ids[1],)).fetchone()
                 ), "a probe writes nothing"
-                try:
+                # else a candidate with no intent was written
+                with pytest.raises(ValueError, match=re.escape("name its intent")):
                     await call("add_task", task=notes.model_copy(update={"level": 1, "intent": None}))
-                    raise AssertionError("a candidate with no intent was written")
-                except ValueError as error:
-                    assert "name its intent" in str(error), error
                 # A task on no facts above level 1 names the answer a hasty reader gives: another one.
                 newest = Task(
                     id=ids[0],
@@ -1175,11 +1168,9 @@ async def run_flows(root):
                     intent="structure",
                 )
                 for near, why in (([], "near_sql"), ([newest.gold_sql], "returns its gold answer")):
-                    try:
+                    # else a near-miss query was accepted: {near}
+                    with pytest.raises(ValueError, match=re.escape(why)):
                         await call("add_task", task=newest.model_copy(update={"near_sql": near}))
-                        raise AssertionError(f"a near-miss query was accepted: {near}")
-                    except ValueError as error:
-                        assert why in str(error), error
             for n, open_id in enumerate(ids):  # a candidate the judge approves, and a vague one it does not
                 question = f"Who is the newest person here, round {open_id}?" + (
                     " vague" if n or forging["vague"] else ""
@@ -1246,11 +1237,9 @@ async def run_flows(root):
         "a dropped tool call is called again, not given up"
     )
     for _ in range(2):  # the review after day 2 is cut off, then day 3
-        try:
+        # else the simulated crash did not happen
+        with pytest.raises(KeyboardInterrupt):
             await WorldEnv(settings, store).run(None, agents)
-            raise AssertionError("the simulated crash did not happen")
-        except KeyboardInterrupt:
-            pass
         if store.state.phase == "review":
             assert store.state.day == 2 and store.state.rounds["day-02"] == 1, (
                 "a cut-off review is redone, not its day"
@@ -1396,7 +1385,8 @@ async def run_flows(root):
     async def cut_off(prompt):
         return SimpleNamespace(terminated=True)
 
-    try:
+    # else a dropped session was reported as the author's limits
+    with pytest.raises(SessionLost):
         await env.author_step(
             SimpleNamespace(trace=FakeTrace("cut-off", "author", ok=False, errors=[rpc]), turn=cut_off),
             FakeRuntime(),
@@ -1404,9 +1394,6 @@ async def run_flows(root):
             "final-02",
             "fix",
         )
-        raise AssertionError("a dropped session was reported as the author's limits")
-    except SessionLost:
-        pass
     blocks = []
 
     class Dropping(WorldEnv):  # the run's blocks, of which the first `losses` lose their session
@@ -1557,11 +1544,9 @@ async def run_flows(root):
                 task=task,
             )
 
-    try:
+    # else a task whose every try crashed was kept
+    with pytest.raises(RuntimeError, match=re.escape("crashed twice")):
         await forge_env.tries.solves(SimpleNamespace(solver=Crashing()), ["r01-01"], "check", 2)
-        raise AssertionError("a task whose every try crashed was kept")
-    except RuntimeError as error:
-        assert "crashed twice" in str(error), error
     # Its summary: each task's rates, a try that crashed twice counted and left out of them, and its difficulty.
     summary = forged.summary("complete")
     assert (
@@ -1919,12 +1904,10 @@ async def run_flows(root):
             "keeps its gold answer",
         ),
     ):
-        try:
+        # else a rewording was accepted: {bad}
+        with pytest.raises(ValueError, match=re.escape(why)):
             with forged.world.trial() as copy:
                 forge_task(copy, bad, plan, ["r09-06"], rework=rework)
-            raise AssertionError(f"a rewording was accepted: {bad}")
-        except ValueError as error:
-            assert why in str(error), error
     with forged.world.trial() as copy:
         forge_task(copy, again, plan, ["r09-06"], rework=rework)
     # Code classes each wrong try: out of turns, evidence never shown, or all of it shown and answered otherwise.
@@ -2328,11 +2311,9 @@ async def chapter_flow(root, parent, settings):
             return
         day = tools.config.day
         assert f"day {day} of 6 (this chapter writes days 5-6)" in prompt, prompt
-        try:
+        # else a frozen message was revised
+        with pytest.raises(ValueError, match=re.escape("earlier chapter")):
             await call("revise", message_id=old, text="edited")
-            raise AssertionError("a frozen message was revised")
-        except ValueError as error:
-            assert "earlier chapter" in str(error), error
         if day == 5:
             await call(
                 "post",
@@ -2451,11 +2432,9 @@ async def chapter_flow(root, parent, settings):
     world.db.execute(
         "UPDATE messages SET text = text || ', edited' WHERE id = ?", (old,)
     )  # the past, changed behind code
-    try:
+    # else a changed past passed the final check
+    with pytest.raises(ValueError, match=re.escape("an earlier chapter's world changed")):
         await env.final_world(agents)
-        raise AssertionError("a changed past passed the final check")
-    except ValueError as error:
-        assert "an earlier chapter's world changed" in str(error), error
     store.close()
     fails(
         Store, run.output, chapter_provenance(run.model_copy(update={"days": 3}), cfg)

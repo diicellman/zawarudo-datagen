@@ -1,7 +1,6 @@
 """The world: cast, premise and organization; apps, churn and links; the clock and a day's writing; the author's tools
 and memory."""
 
-import asyncio
 import json
 import math
 import random
@@ -11,9 +10,7 @@ from collections import Counter
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
-from verifiers.v1.mcp.launch import serve
+import pytest
 from worldgen_slack import slack
 
 from ..config import Category, Needs
@@ -100,14 +97,15 @@ from .support import (
     fails,
     forge_of,
     ledger_plan,
+    mcp_client,
     needing,
-    needless,
     onward,
     organized,
     refused,
     seed_person,
     served_tools,
     with_state,
+    world_settings,
 )
 
 
@@ -201,12 +199,10 @@ def test_contracts(tmp_path):
         org(dm_routines=routines[:2]),
         org(channels=[Channel(type="im", members=[a, b, c])]),
     ):
-        try:
+        # else organization accepted
+        with pytest.raises(ValueError):
             with world.trial() as copy:
                 organize(copy, bad, cast, premise, settings)
-            raise AssertionError("organization accepted")
-        except ValueError:
-            pass
     assert world.db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0, (
         "a failed trial leaves the world untouched"
     )
@@ -289,11 +285,9 @@ def test_contracts(tmp_path):
         ),
     }
     for name, (task_, slot_) in rejected.items():
-        try:
+        # else task accepted: {name}
+        with pytest.raises(ValueError):
             recorded(task_, slot_)
-            raise AssertionError(f"task accepted: {name}")
-        except ValueError:
-            pass
     directory = task(
         category="lookup", sql=f"SELECT real_name AS answer FROM users WHERE id = '{d}'", facts=()
     )
@@ -724,15 +718,10 @@ def test_apps(tmp_path):
     """Apps post by code (2026-10-14): the organization lists them, each a bot that is a member of its channel; an
     event one reports is posted at its moment with a title that states no fact; routine posts come on workdays, from
     the queue, in time order with everyone's messages; no quota, share, scene or task counts a bot."""
-    base = contracts_settings(tmp_path)
-    settings = base.model_copy(
-        update={
-            "activity": base.activity.model_copy(update={"messages": 12, "bot_posts": 3}),
-            "author": base.author.model_copy(
-                update={"tolerance": 1.0, "share_tolerance": 1.0, "mention_tolerance": 1.0}
-            ),
-            "taxonomy": needless(base.taxonomy),
-        }
+    settings = world_settings(
+        tmp_path,
+        activity={"messages": 12, "bot_posts": 3},
+        author={"tolerance": 1.0, "share_tolerance": 1.0, "mention_tolerance": 1.0},
     )
     deploys = Integration(name="Deploy Bot", kind="deploys", channel="ops", subjects=["web", "api", "worker"])
     builds = Integration(name="CI", kind="ci", channel="ops", subjects=["main", "release", "hotfix"])
@@ -875,15 +864,10 @@ def test_churn(tmp_path):
     """People come and go (2026-10-14): a plan's moves join and leave channels (Slack's posts of them in time order),
     take someone out of the company, archive a channel; recorded moves stay; no one posts where they are not, or in an
     archived channel; a fact's author is in its channel all its day; a status names no time."""
-    base = contracts_settings(tmp_path)
-    settings = base.model_copy(
-        update={
-            "activity": base.activity.model_copy(update={"messages": 12}),
-            "author": base.author.model_copy(
-                update={"tolerance": 1.0, "share_tolerance": 1.0, "mention_tolerance": 1.0}
-            ),
-            "taxonomy": needless(base.taxonomy),
-        }
+    settings = world_settings(
+        tmp_path,
+        activity={"messages": 12},
+        author={"tolerance": 1.0, "share_tolerance": 1.0, "mention_tolerance": 1.0},
     )
     world, cast, org, (a, b, c, d) = organized(tmp_path / "world", settings)
     ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
@@ -1016,15 +1000,10 @@ def test_links(tmp_path):
     """Links, groups and edits are code's (2026-10-14): an artifact of the plan has its URL by code and is linked as
     {link:id} once it exists, a ticket app announces a ticket, a group is mentioned as {group:handle}; a raw URL is
     refused; a person edits their own message of today, and Slack marks it."""
-    base = contracts_settings(tmp_path)
-    settings = base.model_copy(
-        update={
-            "activity": base.activity.model_copy(update={"messages": 12}),
-            "author": base.author.model_copy(
-                update={"tolerance": 1.0, "share_tolerance": 1.0, "mention_tolerance": 1.0}
-            ),
-            "taxonomy": needless(base.taxonomy),
-        }
+    settings = world_settings(
+        tmp_path,
+        activity={"messages": 12},
+        author={"tolerance": 1.0, "share_tolerance": 1.0, "mention_tolerance": 1.0},
     )
     tickets = Integration(
         name="Tracker",
@@ -1132,13 +1111,8 @@ def test_clock(tmp_path):
     conversations posted only at the present, their statements tagged and first made where the plan says; promises
     opened and closed; days closed only when their quota, facts and promises are settled; fixes that change no task;
     tasks written once the calendar is closed."""
-    base = contracts_settings(tmp_path)
-    settings = base.model_copy(
-        update={
-            "activity": base.activity.model_copy(update={"messages": 12}),
-            "author": base.author.model_copy(update={"tolerance": 1.0, "share_tolerance": 1.0}),
-            "taxonomy": needless(base.taxonomy),
-        }
+    settings = world_settings(
+        tmp_path, activity={"messages": 12}, author={"tolerance": 1.0, "share_tolerance": 1.0}
     )
     gaps = Gaps(settings.personas.gaps)
     world, cast, org, (a, b, c, d) = organized(tmp_path, settings)
@@ -1511,14 +1485,12 @@ def test_clock(tmp_path):
         talk(dict(author_id=c, text="a"), dict(author_id=a, text="b", reply_to=0), thread=rows[0]["id"]),
     )
     refused("past midnight", posted_, talk(*[dict(author_id=a, text="still here", pause="hours")] * 20))
-    try:  # code's clock is the only way forward: a message dated before the present is refused
+    # else a message was written into the past
+    with pytest.raises(ValueError, match=re.escape("written_out_of_order")):
         with world.batch():
             world.insert(
                 "messages", [dict(channel_id=ops, ts_us=rows[0]["ts_us"] - 1, user_id=a, text="late")]
             )
-        raise AssertionError("a message was written into the past")
-    except ValueError as error:
-        assert "written_out_of_order" in str(error), error
 
     def advanced(**kwargs):
         with world.trial() as copy:
@@ -1840,18 +1812,15 @@ async def test_tools(tmp_path):
     """The author's tools (v7): ten, served host-side over the world file (annotate is the forge's); each turn's tools act only in their turn
     and on their day; writes are checked and logged, reads are live; the memory renders every time on the company
     clock, never as raw microseconds, and the one-pager stays small on a full world."""
-    base = contracts_settings(tmp_path)
     quick = tmp_path / "quick-gaps.json"  # most replies within ten minutes, as in real channels
     quick.write_text(
         json.dumps({"quantiles": [i * 0.6 for i in range(900)] + [600 + i * 138 for i in range(101)]}) + "\n"
     )
-    settings = base.model_copy(
-        update={
-            "activity": base.activity.model_copy(update={"messages": 400}),
-            "author": base.author.model_copy(update={"tolerance": 1.0, "share_tolerance": 1.0}),
-            "personas": base.personas.model_copy(update={"gaps": quick}),
-            "taxonomy": needless(base.taxonomy),
-        }
+    settings = world_settings(
+        tmp_path,
+        activity={"messages": 400},
+        author={"tolerance": 1.0, "share_tolerance": 1.0},
+        personas={"gaps": quick},
     )
     world, cast, org, (a, b, c, d) = organized(tmp_path, settings)
     ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
@@ -1907,13 +1876,11 @@ async def test_tools(tmp_path):
     assert "ledger holds 2 storylines, 1 events and 2 facts" in await planner._with_state(planner.plan)(
         ledger=ledger
     )
-    try:
+    # else post ran in the plan turn
+    with pytest.raises(ValueError, match=re.escape("post is for the day turn; this is the plan turn")):
         await planner._with_state(planner.post)(
             conversation=Conversation(channel_id=ops, about="x", lines=[PostLine(author_id=a, text="hi")])
         )
-        raise AssertionError("post ran in the plan turn")
-    except ValueError as error:
-        assert "post is for the day turn; this is the plan turn" in str(error), error
     assert not hasattr(planner, "add_task"), "the author is not served the proposer's tools"
     day1 = tools_for("day", 1)
     await day1.setup()
@@ -1941,7 +1908,8 @@ async def test_tools(tmp_path):
         "a retry after a lost response returns the post"
     )
     assert world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == count, "and posts nothing more"
-    try:
+    # else an untagged anchor was posted
+    with pytest.raises(ValueError, match=re.escape("conveys")):
         await call(
             day1,
             "post",
@@ -1949,9 +1917,6 @@ async def test_tools(tmp_path):
                 channel_id=ops, about="x", lines=[PostLine(author_id=c, text="rollback again")]
             ),
         )
-        raise AssertionError("an untagged anchor was posted")
-    except ValueError as error:
-        assert "conveys" in str(error), error
     for ref in (
         "#ops",
         a,
@@ -1963,38 +1928,30 @@ async def test_tools(tmp_path):
         out["conversation"],
     ):
         assert (await call(day1, "view", ref=ref)).strip(), ref
-    try:
+    # else an unknown page was shown
+    with pytest.raises(ValueError):
         await call(day1, "view", ref="nobody")
-        raise AssertionError("an unknown page was shown")
-    except ValueError:
-        pass
     assert (await call(day1, "sql", sql="SELECT COUNT(*) AS n FROM facts"))["rows"] == [{"n": 2}]
     assert (await call(day1, "sql", sql="SELECT COUNT(*) AS n FROM messages", actor_id=c))["rows"] == [
         {"n": 2}
     ]
     for bad in ({"sql": "DELETE FROM facts"}, {"sql": "SELECT * FROM tasks", "actor_id": c}):
-        try:
+        # else sql ran {bad}
+        with pytest.raises(ValueError):
             await call(day1, "sql", **bad)
-            raise AssertionError(f"sql ran {bad}")
-        except ValueError:
-            pass
     assert (await call(day1, "read", actor_id=c, tool="read_channel", arguments={"channel_id": ops}))["items"]
-    try:
+    # else a read with unknown arguments went through
+    with pytest.raises(TypeError):
         await call(day1, "read", actor_id=c, tool="read_channel", arguments={"nope": 1})
-        raise AssertionError("a read with unknown arguments went through")
-    except TypeError:
-        pass
     while today(world) == 1:
         await call(day1, "advance", to=onward(world))
-    try:
+    # else day 1's tools posted on day 2
+    with pytest.raises(ValueError, match=re.escape("day 1 is closed")):
         await call(
             day1,
             "post",
             conversation=Conversation(channel_id=ops, about="x", lines=[PostLine(author_id=a, text="hi")]),
         )
-        raise AssertionError("day 1's tools posted on day 2")
-    except ValueError as error:
-        assert "day 1 is closed" in str(error), error
     log = [json.loads(line) for line in (tmp_path / "world-calls.jsonl").read_text().splitlines()]
     assert {e["tool"] for e in log} >= {"plan", "post", "view", "sql", "read", "advance", "now"}
     assert any(not e["ok"] and "conveys" in e["error"] for e in log)
@@ -2040,13 +1997,8 @@ async def test_tools(tmp_path):
     assert "lines: [1-40 × {author_id: str" in described["post"] and described["now"].endswith(
         "Arguments: none"
     )
-    async with (
-        asyncio.timeout(30),
-        serve(served) as url,
-        streamable_http_client(url) as (reader, writer_),
-        ClientSession(reader, writer_) as client,
-    ):  # nested documents cross the wire as strict models, and a refused write carries its reason
-        await client.initialize()
+    # nested documents cross the wire as strict models, and a refused write carries its reason
+    async with mcp_client(served) as client:
         refused = await client.call_tool(
             "post",
             {
@@ -2066,11 +2018,9 @@ async def test_tools(tmp_path):
     ), invalid
     bad = AuthorTask.create("day", 2, world.path, context, "day-02-01")
     world.db.execute("UPDATE storylines SET summary = 'changed' WHERE id = 's1'")
-    try:
+    # else a changed world file was served
+    with pytest.raises(ValueError):
         await bad.toolsets(bad.config)[0].setup()
-        raise AssertionError("a changed world file was served")
-    except ValueError:
-        pass
     world.db.execute("UPDATE storylines SET summary = 'the 4.2 release' WHERE id = 's1'")
     rng, gaps, lines = random.Random(3), Gaps(settings.personas.gaps), 0
     while today(world) is not None:  # a full world: about 400 messages over ten days, written at the present

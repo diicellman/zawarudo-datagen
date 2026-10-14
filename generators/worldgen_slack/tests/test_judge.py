@@ -4,6 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from worldgen_slack.judge import EMPTY, AnswerGrade, AnswerJudge
 from worldgen_slack.release import PrivateAnswer, PublicTask, load_release
 from worldgen_slack.slack import compact, people_shown, shown
@@ -96,13 +97,11 @@ async def test_reviews(tmp_path):
             actor_id="U2", tool="read_channel", arguments={"channel_id": "C1"}
         )
     )["items"]
-    try:
+    # else a reviewer read as someone outside the review
+    with pytest.raises(ValueError):
         await tools._with_state(tools.read)(
             actor_id="U1", tool="read_channel", arguments={"channel_id": "G1"}
         )
-        raise AssertionError("a reviewer read as someone outside the review")
-    except ValueError:
-        pass
     assert (
         await tools._with_state(tools.sql)(
             actor_id="U2", sql="SELECT COUNT(*) AS n FROM messages WHERE channel_id = 'G1'"
@@ -112,11 +111,9 @@ async def test_reviews(tmp_path):
     files = {"/task/verdict.json": verdict().model_dump_json().encode()}
     runtime = SimpleNamespace(read=lambda path, max_bytes: asyncio.sleep(0, files[path]))
     unchecked = SimpleNamespace(state=ReviewState(), info={}, record_metric=lambda *a: None)
-    try:
+    # else a verdict without inspect_check was accepted
+    with pytest.raises(ValueError):
         await judge.finalize(unchecked, runtime)
-        raise AssertionError("a verdict without inspect_check was accepted")
-    except ValueError:
-        pass
     checked = SimpleNamespace(state=ReviewState(checked=True), info={}, record_metric=lambda *a: None)
     await judge.finalize(checked, runtime)
     assert checked.info["verdict"]["approved"]

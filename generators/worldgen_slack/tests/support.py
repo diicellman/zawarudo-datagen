@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -255,6 +256,14 @@ def needless(taxonomy):
     return {name: c.model_copy(update={"needs": None}) for name, c in taxonomy.items()}
 
 
+def world_settings(root, **sections: dict) -> WorldConfig:
+    """The checks' settings for writing a world: their taxonomy without needs, and each named section's fields
+    changed."""
+    base = contracts_settings(root)
+    changed = {name: getattr(base, name).model_copy(update=fields) for name, fields in sections.items()}
+    return base.model_copy(update=changed | {"taxonomy": needless(base.taxonomy)})
+
+
 def ledger_plan(ops, leads, a, b, **changes):
     """Two storylines on an organized world: a rollback decided on day 1 (f1), service back at e2 on day 2 (f2), and
     an audit's dry run and owner at e1 on day 3 (f3, f4)."""
@@ -374,14 +383,21 @@ def author_context(settings, cast, org, root, agenda=None):
     return context_of(settings, state, root, org.model_dump(mode="json"))
 
 
-async def served_tools(toolset):
+@asynccontextmanager
+async def mcp_client(toolset):
+    """A toolset served as verifiers launches one (python -m, in a process of its own), and an MCP session on it."""
     async with (
         asyncio.timeout(30),
         serve(toolset) as url,
-        streamable_http_client(url) as (reader, writer_),
-        ClientSession(reader, writer_) as client,
+        streamable_http_client(url) as (reader, writer),
+        ClientSession(reader, writer) as client,
     ):
         await client.initialize()
+        yield client
+
+
+async def served_tools(toolset) -> dict[str, str]:
+    async with mcp_client(toolset) as client:
         return {t.name: t.description for t in (await client.list_tools()).tools}
 
 

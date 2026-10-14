@@ -12,15 +12,13 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
-from verifiers.v1.mcp.launch import serve
+import pytest
 from worldgen_slack import slack
 from worldgen_slack.taskset import system_prompt
 from worldgen_slack.toolset import SlackToolset, WorldToolsConfig, stage_world, watch_parent
 
 from ..workspace import ANSWER_KEY, Workspace
-from .support import fails, world_fixture
+from .support import fails, mcp_client, world_fixture
 
 
 async def test_world(tmp_path):
@@ -42,12 +40,10 @@ async def test_world(tmp_path):
             raise LookupError("drop the trial")
     except LookupError:
         pass
-    try:
+    # else a level-0 task was inserted
+    with pytest.raises(sqlite3.IntegrityError):
         with world.trial() as copy:
             copy.insert("tasks", [row | {"level": 0}])
-        raise AssertionError("a level-0 task was inserted")
-    except sqlite3.IntegrityError:
-        pass
     tables = [
         "messages",
         "facts",
@@ -437,13 +433,7 @@ async def test_world(tmp_path):
         answers_[0]["results"].startswith("# Search Results for: ")
         and stored["state"].calls[0].output["items"]
     ), "the solver reads text; grading keeps the record"
-    async with (
-        asyncio.timeout(30),
-        serve(toolset) as url,
-        streamable_http_client(url) as (reader, writer_),
-        ClientSession(reader, writer_) as client,
-    ):
-        await client.initialize()
+    async with mcp_client(toolset) as client:
         # The tool server adds its prefix as the solver's harness names a server's tools: slack_read_channel.
         listed = {f"{SlackToolset.TOOL_PREFIX}_{t.name}": t for t in (await client.list_tools()).tools}
         assert set(listed) == set(served), sorted(listed)
@@ -457,11 +447,9 @@ async def test_world(tmp_path):
                 served[name]["input_schema"]["required"]
             ), name
     bad = WorldToolsConfig(actor_id="U2", db_path=config.db_path, db_hash="0" * 64)
-    try:
+    # else a changed world file was served
+    with pytest.raises(ValueError):
         await SlackToolset(bad).setup()
-        raise AssertionError("a changed world file was served")
-    except ValueError:
-        pass
     # A tool server exits with the process that started it: killed while the server watches, or gone before it could.
     watcher = "import os, threading, time\n" + inspect.getsource(watch_parent)
     for late, then in (
