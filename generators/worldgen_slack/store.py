@@ -194,8 +194,14 @@ class Store:
     def summary(self, status, reason=""):
         usage = {}
         # Each trace's own calls and its answer judge's; then the answer judge's grades of the failure cases.
-        books = [[(t["agent"]["name"], t.get("usage") or {}, False, t.get("ok"))] + [("answer_judge", u, True, None) for u in t.get("extra_usage", [])] for t in map(read_json, (self.root / "traces").glob("*.json"))]  # fmt: skip
-        books.append([("answer_judge", u, True, None) for s in self.state.screens.values() for u in s.get("usage", [])])  # fmt: skip
+        books = [
+            [(t["agent"]["name"], t.get("usage") or {}, False, t.get("ok"))]
+            + [("answer_judge", u, True, None) for u in t.get("extra_usage", [])]
+            for t in map(read_json, (self.root / "traces").glob("*.json"))
+        ]
+        books.append(
+            [("answer_judge", u, True, None) for s in self.state.screens.values() for u in s.get("usage", [])]
+        )
         for accounts in books:
             for name, account, is_judge, ok in accounts:
                 row = usage.setdefault(
@@ -225,7 +231,19 @@ class Store:
         levels = dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())
         rates = {}
         for task, review in self.state.task_reviews.items():
-            rates[task] = {k: review.get(k) for k in ("right_rate", "strict_rate", "coverage", "tries", "crashed", "unanswered", "witness_right", "level_fit")}  # fmt: skip
+            rates[task] = {
+                k: review.get(k)
+                for k in (
+                    "right_rate",
+                    "strict_rate",
+                    "coverage",
+                    "tries",
+                    "crashed",
+                    "unanswered",
+                    "witness_right",
+                    "level_fit",
+                )
+            }
             if task in levels:
                 rates[task]["level"] = levels[task]
         right = [r["right_rate"] for r in rates.values()]
@@ -301,26 +319,87 @@ class Store:
                     (task["id"],),
                 )
             }
-            stating = {m for _, m in anchors} | {r["message_id"] for r in gold if r.get("message_id") is not None}
+            stating = {m for _, m in anchors} | {
+                r["message_id"] for r in gold if r.get("message_id") is not None
+            }
             marks = ", ".join("?" * len(stating))
             reader = World(self.world.path, actor=task["actor_id"])
-            readable = {r[0] for r in reader.db.execute(f"SELECT id FROM messages WHERE id IN ({marks})", sorted(stating))}  # fmt: skip
+            readable = {
+                r[0]
+                for r in reader.db.execute(f"SELECT id FROM messages WHERE id IN ({marks})", sorted(stating))
+            }
             reader.close()
-            decoys = {f for (f,) in db.execute("SELECT f.id FROM task_facts tf JOIN facts f ON f.id = tf.fact_id WHERE tf.task_id = ? AND f.is_decoy = 1", (task["id"],))}  # fmt: skip
+            decoys = {
+                f
+                for (f,) in db.execute(
+                    "SELECT f.id FROM task_facts tf JOIN facts f ON f.id = tf.fact_id WHERE tf.task_id = ? AND f.is_decoy = 1",
+                    (task["id"],),
+                )
+            }
             seen = {f for f, m in anchors if m in readable} - decoys
-            stale = {d for s, d in db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind = 'supersedes'") if s in seen}  # fmt: skip
-            ids = {m for f, m in anchors if f in seen - stale} | {r["message_id"] for r in gold if r.get("message_id") is not None}  # fmt: skip
-            stated = db.execute(f"SELECT id, channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us", sorted(stating)).fetchall()  # fmt: skip
+            stale = {
+                d
+                for s, d in db.execute(
+                    "SELECT src_fact, dst_fact FROM fact_relations WHERE kind = 'supersedes'"
+                )
+                if s in seen
+            }
+            ids = {m for f, m in anchors if f in seen - stale} | {
+                r["message_id"] for r in gold if r.get("message_id") is not None
+            }
+            stated = db.execute(
+                f"SELECT id, channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us",
+                sorted(stating),
+            ).fetchall()
             messages = [[r["channel_id"], r["ts"]] for r in stated if r["id"] in readable and r["id"] in ids]
             unseen = [[r["channel_id"], r["ts"]] for r in stated if r["id"] not in readable]
             review, env = self.state.task_reviews.get(task["id"]), self.settings.get("env", {})
-            measured = {} if review is None else {k: review.get(k) for k in ("tries", "crashed", "unanswered", "right_rate", "right_interval", "strict_rate", "abstain_rate", "coverage", "witness_right")} | {"solver": env.get("solver", {}).get("model"), "witness": env.get("witness", {}).get("model") if review.get("witness_right") is not None else None}  # fmt: skip
+            measured = (
+                {}
+                if review is None
+                else {
+                    k: review.get(k)
+                    for k in (
+                        "tries",
+                        "crashed",
+                        "unanswered",
+                        "right_rate",
+                        "right_interval",
+                        "strict_rate",
+                        "abstain_rate",
+                        "coverage",
+                        "witness_right",
+                    )
+                }
+                | {
+                    "solver": env.get("solver", {}).get("model"),
+                    "witness": env.get("witness", {}).get("model")
+                    if review.get("witness_right") is not None
+                    else None,
+                }
+            )
             if review is not None:
-                wrong = [r for r in review.get("results", []) if not r.get("correct") and not r.get("crashed")]
-                measured |= {"surface": surface.VERSION, "turns": env.get("solver", {}).get("max_turns") or role("", solver=True).max_turns, "miss_classes": dict(Counter(miss_class(r, task["answer_type"]) for r in wrong))}  # fmt: skip
+                wrong = [
+                    r for r in review.get("results", []) if not r.get("correct") and not r.get("crashed")
+                ]
+                measured |= {
+                    "surface": surface.VERSION,
+                    "turns": env.get("solver", {}).get("max_turns") or role("", solver=True).max_turns,
+                    "miss_classes": dict(Counter(miss_class(r, task["answer_type"]) for r in wrong)),
+                }
             rows.append(
-                PublicTask(task_id=task["id"], question=task["question"], actor_id=task["actor_id"], category=task["category"], level=task["level"], answer_type=task["answer_type"], world_hash=world_hash, intent=task["intent"], **measured)
-            )  # fmt: skip
+                PublicTask(
+                    task_id=task["id"],
+                    question=task["question"],
+                    actor_id=task["actor_id"],
+                    category=task["category"],
+                    level=task["level"],
+                    answer_type=task["answer_type"],
+                    world_hash=world_hash,
+                    intent=task["intent"],
+                    **measured,
+                )
+            )
             answers[task["id"]] = PrivateAnswer(
                 answer_type=task["answer_type"],
                 rows=gold,

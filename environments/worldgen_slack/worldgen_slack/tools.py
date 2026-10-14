@@ -16,60 +16,144 @@ from . import surface
 from .db import World
 from .dataset import StrictModel
 
+
 def described(kind, text: str, **checks):
     return Annotated[kind, Field(description=text, **checks)]
 
 
 # Parameters, as the real server describes them (tests/fixtures/slack-mcp/tools.json).
-Keywords = described(list[str] | None, "Array of lexical search terms. Each element MUST be a single word (no spaces) OR an exact phrase in quotes. All elements are AND'd (every element must match). Use the author test: only include words the author would naturally write.")  # fmt: skip
-Filters = described(str | None, "Slack search modifiers (e.g., 'from:<@U123> in:<#C456> after:2025-01-01'). Use for people, channels, dates, and content type constraints.")  # fmt: skip
-Query = described(str | None, "The user's question restated in conversational tone. Used for semantic reranking. Do not include filter-like content (people, channels, dates) — those belong in filters. Pass an empty string when the query is purely structural (only filters, no semantic question).")  # fmt: skip
+Keywords = described(
+    list[str] | None,
+    "Array of lexical search terms. Each element MUST be a single word (no spaces) OR an exact phrase in quotes. All elements are AND'd (every element must match). Use the author test: only include words the author would naturally write.",
+)
+Filters = described(
+    str | None,
+    "Slack search modifiers (e.g., 'from:<@U123> in:<#C456> after:2025-01-01'). Use for people, channels, dates, and content type constraints.",
+)
+Query = described(
+    str | None,
+    "The user's question restated in conversational tone. Used for semantic reranking. Do not include filter-like content (people, channels, dates) — those belong in filters. Pass an empty string when the query is purely structural (only filters, no semantic question).",
+)
 After = described(str | None, "Only messages after this Unix timestamp (inclusive)")
 Before = described(str | None, "Only messages before this Unix timestamp (inclusive)")
-Sort = described(Literal["score", "timestamp"] | None, "Sort order: 'score' (relevance, default) or 'timestamp' (newest first unless sort_dir is 'asc').")  # fmt: skip
+Sort = described(
+    Literal["score", "timestamp"] | None,
+    "Sort order: 'score' (relevance, default) or 'timestamp' (newest first unless sort_dir is 'asc').",
+)
 SortDir = described(Literal["asc", "desc"] | None, "Sort direction (default: 'desc'). Options: 'asc', 'desc'")
-SearchLimit = described(int | None, "Number of results to return, up to a max of 20. Defaults to 20.", ge=1, le=20)
-Cursor = described(str | None, "The cursor returned by the API. Omit this parameter for the first request, and use this to get the next page of results")  # fmt: skip
-IncludeContext = described(bool | None, "Include surrounding context messages for each result (default: true). Set to false to reduce response size.")  # fmt: skip
+SearchLimit = described(
+    int | None, "Number of results to return, up to a max of 20. Defaults to 20.", ge=1, le=20
+)
+Cursor = described(
+    str | None,
+    "The cursor returned by the API. Omit this parameter for the first request, and use this to get the next page of results",
+)
+IncludeContext = described(
+    bool | None,
+    "Include surrounding context messages for each result (default: true). Set to false to reduce response size.",
+)
 IncludeBots = described(bool | None, "Include bot messages (default: false)")
-ChannelTypes = described(str | None, "Comma-separated list of channel types to include in the search. Defaults to 'public_channel,private_channel,mpim,im' (all channel types including private channels, group DMs, and DMs). Mix and match channel types by providing a comma-separated list of any combination of `public_channel`, `private_channel`, `mpim`, `im`")  # fmt: skip
-OnlyMine = described(bool | None, "Limit results to channels the user is a member of. Set to true when the user asks to search only their own or joined channels. Default: false.")  # fmt: skip
-ContentTypes = described(str | None, "Content types to include, a comma-separated list of any combination of messages, files.")  # fmt: skip
-ContextChannel = described(str | None, "Context channel ID to support boosting the search results for a channel when applicable")  # fmt: skip
-ContextLength = described(int | None, "Max character length for each context message. Longer messages are truncated.", ge=1)  # fmt: skip
-Format = described(Literal["detailed", "concise"] | None, "Level of detail (default: 'detailed'). Options: 'detailed', 'concise'")  # fmt: skip
-ChannelKinds = described(str | None, "Comma-separated list of channel types to include in the search. Defaults to public_channel. Mix and match channel types by providing a comma-separated list of any combination of public_channel, private_channel. Example: public_channel,private_channel; Second Example: public_channel")  # fmt: skip
+ChannelTypes = described(
+    str | None,
+    "Comma-separated list of channel types to include in the search. Defaults to 'public_channel,private_channel,mpim,im' (all channel types including private channels, group DMs, and DMs). Mix and match channel types by providing a comma-separated list of any combination of `public_channel`, `private_channel`, `mpim`, `im`",
+)
+OnlyMine = described(
+    bool | None,
+    "Limit results to channels the user is a member of. Set to true when the user asks to search only their own or joined channels. Default: false.",
+)
+ContentTypes = described(
+    str | None, "Content types to include, a comma-separated list of any combination of messages, files."
+)
+ContextChannel = described(
+    str | None, "Context channel ID to support boosting the search results for a channel when applicable"
+)
+ContextLength = described(
+    int | None, "Max character length for each context message. Longer messages are truncated.", ge=1
+)
+Format = described(
+    Literal["detailed", "concise"] | None,
+    "Level of detail (default: 'detailed'). Options: 'detailed', 'concise'",
+)
+ChannelKinds = described(
+    str | None,
+    "Comma-separated list of channel types to include in the search. Defaults to public_channel. Mix and match channel types by providing a comma-separated list of any combination of public_channel, private_channel. Example: public_channel,private_channel; Second Example: public_channel",
+)
 IncludeArchived = described(bool | None, "Include archived channels in the search results")
-ChannelId = described(str, "ID of the Channel, private group, or IM channel to fetch history for. Can also be a user_id to read DM history.")  # fmt: skip
+ChannelId = described(
+    str,
+    "ID of the Channel, private group, or IM channel to fetch history for. Can also be a user_id to read DM history.",
+)
 Oldest = described(str | None, "Start of time range of messages to include in results (timestamp)")
 Latest = described(str | None, "End of time range of messages to include in results (timestamp)")
-HistoryLimit = described(int | None, "Number of messages to return, between 1 and 100. Default value is 100.", ge=1, le=100)  # fmt: skip
-PageCursor = described(str | None, "Paginate through collections of data by setting the cursor parameter to a next_cursor attribute returned by a previous request")  # fmt: skip
-ReadFormat = described(Literal["detailed", "concise"] | None, "Level of detail: 'detailed' (default, includes reactions + thread info) or 'concise'.")  # fmt: skip
+HistoryLimit = described(
+    int | None, "Number of messages to return, between 1 and 100. Default value is 100.", ge=1, le=100
+)
+PageCursor = described(
+    str | None,
+    "Paginate through collections of data by setting the cursor parameter to a next_cursor attribute returned by a previous request",
+)
+ReadFormat = described(
+    Literal["detailed", "concise"] | None,
+    "Level of detail: 'detailed' (default, includes reactions + thread info) or 'concise'.",
+)
 ThreadChannel = described(str, "Channel, private group, or IM channel to fetch thread replies for")
-MessageTs = described(str, 'Timestamp of the parent message (e.g. "1234567890.123456"). Must be a string in Slack ts format with a decimal point.')  # fmt: skip
-ThreadOldest = described(str | None, 'Start of time range of messages to include in results. Slack ts format string (e.g. "1234567890.123456").')  # fmt: skip
-ThreadLatest = described(str | None, 'End of time range of messages to include in results. Slack ts format string (e.g. "1234567890.123456").')  # fmt: skip
-ThreadLimit = described(int | None, "Number of messages to return, between 1 and 1000. Default value is 100.", ge=1, le=1000)  # fmt: skip
-UserId = described(str | None, "Slack user ID to look up (e.g., 'U0ABC12345'). Defaults to current user if not provided")  # fmt: skip
+MessageTs = described(
+    str,
+    'Timestamp of the parent message (e.g. "1234567890.123456"). Must be a string in Slack ts format with a decimal point.',
+)
+ThreadOldest = described(
+    str | None,
+    'Start of time range of messages to include in results. Slack ts format string (e.g. "1234567890.123456").',
+)
+ThreadLatest = described(
+    str | None,
+    'End of time range of messages to include in results. Slack ts format string (e.g. "1234567890.123456").',
+)
+ThreadLimit = described(
+    int | None, "Number of messages to return, between 1 and 1000. Default value is 100.", ge=1, le=1000
+)
+UserId = described(
+    str | None, "Slack user ID to look up (e.g., 'U0ABC12345'). Defaults to current user if not provided"
+)
 Locale = described(bool | None, "Include user's locale information. Default: false")
-ProfileFormat = described(Literal["detailed", "concise"] | None, "Level of detail in response. 'detailed' includes all fields, 'concise' shows essential info. Default: detailed'")  # fmt: skip
+ProfileFormat = described(
+    Literal["detailed", "concise"] | None,
+    "Level of detail in response. 'detailed' includes all fields, 'concise' shows essential info. Default: detailed'",
+)
 ReactionChannel = described(str, "The ID of the channel containing the message")
 ReactionTs = described(str, "Timestamp of the message to get reactions for")
 MembersChannel = described(str, "ID of the channel to list members from")
 MembersCursor = described(str | None, "Pagination cursor from previous response")
-MembersLimit = described(int | None, "Number of members to return per page (default: 30, max: 30)", ge=1, le=30)
-MembersFormat = described(Literal["detailed", "concise", "ids_only"] | None, "Level of detail (default: 'detailed'). Options: 'detailed', 'concise', 'ids_only'")  # fmt: skip
+MembersLimit = described(
+    int | None, "Number of members to return per page (default: 30, max: 30)", ge=1, le=30
+)
+MembersFormat = described(
+    Literal["detailed", "concise", "ids_only"] | None,
+    "Level of detail (default: 'detailed'). Options: 'detailed', 'concise', 'ids_only'",
+)
 MembersBots = described(bool | None, "Include bots and apps in the member list (default: false)")
-MembersDeleted = described(bool | None, "Include deleted/deactivated users in the member list (default: false)")
-Types = described(str | None, 'Comma-separated list of channel types to include. Valid values: public_channel, private_channel, mpim, im. Default: "public_channel,private_channel" (DMs and Group DMs are excluded unless explicitly listed).')  # fmt: skip
-ListFormat = described(Literal["full", "ids_only", "names_only"] | None, "Output format: 'full' (default, all details), 'ids_only' (just channel IDs), or 'names_only' (just channel names)")  # fmt: skip
+MembersDeleted = described(
+    bool | None, "Include deleted/deactivated users in the member list (default: false)"
+)
+Types = described(
+    str | None,
+    'Comma-separated list of channel types to include. Valid values: public_channel, private_channel, mpim, im. Default: "public_channel,private_channel" (DMs and Group DMs are excluded unless explicitly listed).',
+)
+ListFormat = described(
+    Literal["full", "ids_only", "names_only"] | None,
+    "Output format: 'full' (default, all details), 'ids_only' (just channel IDs), or 'names_only' (just channel names)",
+)
 ListLimit = described(int | None, "Max channels to return (default: 50, max: 200)", ge=1, le=200)
-ListCursor = described(str | None, "Pagination cursor from previous response. Ignored when name_prefix is provided, because prefix filtering scans multiple internal pages and cannot resume from a single cursor.")  # fmt: skip
+ListCursor = described(
+    str | None,
+    "Pagination cursor from previous response. Ignored when name_prefix is provided, because prefix filtering scans multiple internal pages and cannot resume from a single cursor.",
+)
 NamePrefix = described(str | None, "Filter channels whose name starts with this string (case-insensitive)")
 ExcludeArchived = described(bool | None, "Exclude archived channels (default: false)")
-TeamId = described(str | None, 'Encoded workspace ID (e.g. "T012AB3C4") to list channels from. On a multi-workspace org, channel memberships are per-workspace; without this, results come from the user\'s default workspace only.')  # fmt: skip
-
+TeamId = described(
+    str | None,
+    'Encoded workspace ID (e.g. "T012AB3C4") to list channels from. On a multi-workspace org, channel memberships are per-workspace; without this, results come from the user\'s default workspace only.',
+)
 
 
 class Call(StrictModel):

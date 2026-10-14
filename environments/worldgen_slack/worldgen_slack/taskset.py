@@ -22,7 +22,13 @@ def _items(call: dict) -> list:
     """What a recorded call listed: its items, and a search hit's context (the messages around it it also showed)."""
     items = call["output"].get("items")
     items = items if isinstance(items, list) else []
-    around = [c for i in items if isinstance(i, dict) for side in ("before", "after") for c in (i.get("context") or {}).get(side, [])]  # fmt: skip
+    around = [
+        c
+        for i in items
+        if isinstance(i, dict)
+        for side in ("before", "after")
+        for c in (i.get("context") or {}).get(side, [])
+    ]
     return items + around
 
 
@@ -53,7 +59,9 @@ def compact(observations: list[dict]) -> dict:
     for call in observations:
         out, tool = call["output"], call["tool"]
         listed = out.get("items") if isinstance(out.get("items"), list) else []
-        calls.append({"tool": tool, "arguments": call["arguments"], "results": len(listed) if "items" in out else 1})  # fmt: skip
+        calls.append(
+            {"tool": tool, "arguments": call["arguments"], "results": len(listed) if "items" in out else 1}
+        )
         for item in _items(call):
             if isinstance(item, dict) and "ts" in item:
                 key = (item["channel"], item["ts"])
@@ -63,7 +71,9 @@ def compact(observations: list[dict]) -> dict:
             elif isinstance(item, dict) and "id" in item and "real_name" not in item:
                 channels.setdefault(item["id"], item)
         if tool == "list_channel_members":
-            members.setdefault(call["arguments"]["channel_id"], set()).update(i["id"] if isinstance(i, dict) else i for i in listed)  # fmt: skip
+            members.setdefault(call["arguments"]["channel_id"], set()).update(
+                i["id"] if isinstance(i, dict) else i for i in listed
+            )
         elif tool == "get_reactions":
             reactions[(out["channel"], out["ts"])] = out["reactions"]
         elif tool in PROFILES:
@@ -102,9 +112,15 @@ def empty_grade(reference: dict) -> AnswerGrade:
     """An empty response is wrong by rule, with no grader call: it lacks every reference row."""
     rows = [str(r["answer"]) for r in reference.get("rows", [])]
     return AnswerGrade(
-        correct=False, abstained=False, grounded=False, unsupported_asides=0, committed=[], missing=rows, extra=[],
+        correct=False,
+        abstained=False,
+        grounded=False,
+        unsupported_asides=0,
+        committed=[],
+        missing=rows,
+        extra=[],
         reason=EMPTY,
-    )  # fmt: skip
+    )
 
 
 class AnswerJudge(vf.Judge[AnswerGrade]):

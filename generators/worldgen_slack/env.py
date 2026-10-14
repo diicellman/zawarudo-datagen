@@ -57,7 +57,15 @@ from .contracts import (
 from .store import ReviewLimit, SessionLost, Store, used_names
 
 NOTES = ("plan.md", "recap.md")  # the world author's own files in /task/notes
-SETUP_FILES = ("input.json", "guide.md", "schemas.json", "schema.sql", "world.sqlite", "premise.json", "organization.json")  # fmt: skip
+SETUP_FILES = (
+    "input.json",
+    "guide.md",
+    "schemas.json",
+    "schema.sql",
+    "world.sqlite",
+    "premise.json",
+    "organization.json",
+)
 
 
 ARCHIVE = "/tmp/task-files.tgz"
@@ -169,7 +177,22 @@ def rates(results: list[dict]) -> dict:
 
 def read_one_way(verdict: Verdict) -> Verdict:
     """A second reading the judge found is code's issue too: it blocks its task, and sends it back to be reworded."""
-    return verdict.model_copy(update={"issues": verdict.issues + [Issue(artifact="tasks", task_ids=[r.task_id], defect=READING + r.misread, requested_change="word the question so it rules that reading out, for the same asker and gold answer", blocking=True) for r in verdict.tasks if r.misread]})  # fmt: skip
+    return verdict.model_copy(
+        update={
+            "issues": verdict.issues
+            + [
+                Issue(
+                    artifact="tasks",
+                    task_ids=[r.task_id],
+                    defect=READING + r.misread,
+                    requested_change="word the question so it rules that reading out, for the same asker and gold answer",
+                    blocking=True,
+                )
+                for r in verdict.tasks
+                if r.misread
+            ]
+        }
+    )
 
 
 def merged(verdicts: list[Verdict]) -> Verdict:
@@ -200,12 +223,29 @@ def thaw(verdict: Verdict, world) -> tuple[Verdict, list[Issue]]:
     if not (start := frozen_before(world)):
         return verdict, []
     old = {r[0] for r in world.db.execute("SELECT id FROM messages WHERE ts_us < ?", (start,))}
-    parent = {r[0] for r in world.db.execute("SELECT f.id FROM facts f JOIN calendar c ON c.day = f.day WHERE c.start_us < ?", (start,))}  # fmt: skip
+    parent = {
+        r[0]
+        for r in world.db.execute(
+            "SELECT f.id FROM facts f JOIN calendar c ON c.day = f.day WHERE c.start_us < ?", (start,)
+        )
+    }
     kept, apart = [], []
     for issue in verdict.issues:
         live = [m for m in issue.message_ids if m not in old]
-        moved = issue.model_copy(update={"message_ids": live, "evidence_message_ids": list(dict.fromkeys([*issue.evidence_message_ids, *(m for m in issue.message_ids if m in old)]))})  # fmt: skip
-        frozen = (issue.message_ids or issue.fact_ids) and not live and set(issue.fact_ids) <= parent and not issue.task_ids  # fmt: skip
+        moved = issue.model_copy(
+            update={
+                "message_ids": live,
+                "evidence_message_ids": list(
+                    dict.fromkeys([*issue.evidence_message_ids, *(m for m in issue.message_ids if m in old)])
+                ),
+            }
+        )
+        frozen = (
+            (issue.message_ids or issue.fact_ids)
+            and not live
+            and set(issue.fact_ids) <= parent
+            and not issue.task_ids
+        )
         (apart if frozen else kept).append(moved)
     return verdict.model_copy(update={"issues": kept}), apart
 
@@ -289,9 +329,14 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         if state.premise is None:
             try:
                 state.premise = await self.author(
-                    interaction, runtime, SynthesizerTask, synthesizer.premise_context(cfg, self.used), "premise", True,
+                    interaction,
+                    runtime,
+                    SynthesizerTask,
+                    synthesizer.premise_context(cfg, self.used),
+                    "premise",
+                    True,
                     lambda raw: synthesizer.parse_premise(raw, cfg, self.used),
-                )  # fmt: skip
+                )
             except ValueError as error:
                 raise ReviewLimit(f"the author proposed no valid premise: {error}") from None
             first = False
@@ -302,10 +347,18 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         if state.phase == "organization":
             try:
                 await self.author(
-                    interaction, runtime, SynthesizerTask, synthesizer.organization_context(cfg, state, self.used),
-                    "organization", first,
-                    self.apply(lambda w, d: organize(w, d, state.cast, state.premise, cfg), Organization, "organization"),
-                )  # fmt: skip
+                    interaction,
+                    runtime,
+                    SynthesizerTask,
+                    synthesizer.organization_context(cfg, state, self.used),
+                    "organization",
+                    first,
+                    self.apply(
+                        lambda w, d: organize(w, d, state.cast, state.premise, cfg),
+                        Organization,
+                        "organization",
+                    ),
+                )
             except ValueError as error:
                 raise ReviewLimit(f"the author built no valid organization: {error}") from None
             first = False
@@ -348,7 +401,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         self.store.artifact(attempt, "verdict" + suffix, verdict.model_dump(mode="json"))
         verdict, frozen = thaw(verdict, self.world)
         if frozen:
-            self.store.artifact(attempt, "frozen_issues" + suffix, [i.model_dump(mode="json") for i in frozen])
+            self.store.artifact(
+                attempt, "frozen_issues" + suffix, [i.model_dump(mode="json") for i in frozen]
+            )
         verdict = verdict.model_copy(update={"approved": accepted(verdict)})
         if payload["phase"] in PHASE_CRITERIA:
             self.store.artifact(
@@ -360,7 +415,12 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         """What a task review depends on: the task, its gold rows, the text of the messages they rest on, and the text
         of the decoys on its facts' subjects; a revised decoy is a changed task."""
         db = self.world.db
-        task = dict(db.execute("SELECT id, actor_id, question, answer_type, gold_sql, gold_json FROM tasks WHERE id = ?", (task_id,)).fetchone())  # fmt: skip
+        task = dict(
+            db.execute(
+                "SELECT id, actor_id, question, answer_type, gold_sql, gold_json FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        )
         texts = [
             r[0]
             for r in db.execute(
@@ -384,8 +444,19 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         (SPADE's privileged hint: a task the solver misses even so is hard to reason, or broken, not hard to find)."""
         row, answer = next((r, a) for r, a in zip(*self.answers(world)) if r.task_id == task_id)
         if hint:
-            texts = [self.world.db.execute("SELECT text FROM messages WHERE channel_id = ? AND ts = ?", (c, ts)).fetchone()[0] for c, ts in answer.messages]  # fmt: skip
-            row = row.model_copy(update={"question": row.question + "\n\nThese messages bear on it:\n" + "\n".join(f"- {t}" for t in texts)})  # fmt: skip
+            texts = [
+                self.world.db.execute(
+                    "SELECT text FROM messages WHERE channel_id = ? AND ts = ?", (c, ts)
+                ).fetchone()[0]
+                for c, ts in answer.messages
+            ]
+            row = row.model_copy(
+                update={
+                    "question": row.question
+                    + "\n\nThese messages bear on it:\n"
+                    + "\n".join(f"- {t}" for t in texts)
+                }
+            )
         return SolverTask.create(
             row,
             world,
@@ -416,7 +487,12 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         copy = self.store.path(attempt, f"{seat}.sqlite")
         copy.unlink(missing_ok=True)
         self.world.solver_copy(copy)
-        runs = await asyncio.gather(*(asyncio.gather(*(self.solve(agents, self.solver_task(t, copy, hint), seat) for _ in range(n))) for t in task_ids))  # fmt: skip
+        runs = await asyncio.gather(
+            *(
+                asyncio.gather(*(self.solve(agents, self.solver_task(t, copy, hint), seat) for _ in range(n)))
+                for t in task_ids
+            )
+        )
         if dead := [t for t, tries in zip(task_ids, runs) if all(o["crashed"] for o, _ in tries)]:
             raise RuntimeError(f"every try of {dead} crashed twice: the solver or its grading is failing")
         return dict(zip(task_ids, runs))
@@ -426,7 +502,15 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         state = self.store.state
         previous = list(state.last_verdict.issues) if state.last_verdict else []
         workspace = [i.model_dump(mode="json") for i in previous if i.artifact == "workspace"]
-        payload = review_payload(self.world, "world", [], people=cards(state.cast), ledger=ledger_digest(self.world), **({"previous_issues": workspace} if workspace else {}), **self.written_from())  # fmt: skip
+        payload = review_payload(
+            self.world,
+            "world",
+            [],
+            people=cards(state.cast),
+            ledger=ledger_digest(self.world),
+            **({"previous_issues": workspace} if workspace else {}),
+            **self.written_from(),
+        )
         verdict = merged([await self.review(agents, payload, attempt, {}, "world")])
         self.store.artifact(attempt, "verdict", verdict.model_dump(mode="json"))
         self.store.artifact(attempt, "acceptance", {"approved": verdict.approved})
@@ -598,12 +682,22 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         async def judged(k: int, chunk: list[str]) -> Verdict:
             witness = [result for t in chunk for result in witnessed.get(t, {}).get("results", [])]
             payload = review_payload(
-                self.world, "task", chunk, self.settings.taxonomy,
+                self.world,
+                "task",
+                chunk,
+                self.settings.taxonomy,
                 solves=[result for t in chunk for result in runs[t]["results"]],
                 previous_issues=[i.model_dump(mode="json") for i in previous if set(i.task_ids) & set(chunk)],
                 **({"witness": witness} if witness else {}),
-            )  # fmt: skip
-            files = {f"{seat}_{t}_{k}.json": record for seat, tried in (("solver", runs), ("witness", witnessed)) for t in chunk if t in tried for k, trace_id in enumerate(tried[t]["traces"], 1) if (record := self.saved_trace(trace_id))}  # fmt: skip
+            )
+            files = {
+                f"{seat}_{t}_{k}.json": record
+                for seat, tried in (("solver", runs), ("witness", witnessed))
+                for t in chunk
+                if t in tried
+                for k, trace_id in enumerate(tried[t]["traces"], 1)
+                if (record := self.saved_trace(trace_id))
+            }
             return await self.review(
                 agents, payload, attempt, files, "tasks" if len(chunks) == 1 else f"tasks-{k}"
             )
@@ -611,11 +705,31 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         # A review of a few tasks at a time, the reviews side by side: each task passes on its own chunk's verdict,
         # and on its failure cases: a task whose grade accepts a wrong answer is ambiguous as asked.
         verdicts = await asyncio.gather(*(judged(k, chunk) for k, chunk in enumerate(chunks, 1)))
-        issues = {t: Issue(artifact="tasks", task_ids=[t], defect="the answer judge accepts a wrong answer to it: " + "; ".join(failed), requested_change="ask it so that its gold, and only its gold, is the right answer: tell it apart from what the judge accepted", blocking=True) for t, failed in loose.items() if failed}  # fmt: skip
-        verdicts = [v.model_copy(update={"issues": v.issues + [issues[t] for t in chunk if t in issues], "approved": v.approved and not any(t in issues for t in chunk)}) for chunk, v in zip(chunks, verdicts)]  # fmt: skip
+        issues = {
+            t: Issue(
+                artifact="tasks",
+                task_ids=[t],
+                defect="the answer judge accepts a wrong answer to it: " + "; ".join(failed),
+                requested_change="ask it so that its gold, and only its gold, is the right answer: tell it apart from what the judge accepted",
+                blocking=True,
+            )
+            for t, failed in loose.items()
+            if failed
+        }
+        verdicts = [
+            v.model_copy(
+                update={
+                    "issues": v.issues + [issues[t] for t in chunk if t in issues],
+                    "approved": v.approved and not any(t in issues for t in chunk),
+                }
+            )
+            for chunk, v in zip(chunks, verdicts)
+        ]
         verdicts = [read_one_way(v) for v in verdicts]
         verdict_of = {t: v for chunk, v in zip(chunks, verdicts) for t in chunk}
-        for task_id in due:  # the issues each task's latest review raised: why a candidate is dropped or sent back
+        for (
+            task_id
+        ) in due:  # the issues each task's latest review raised: why a candidate is dropped or sent back
             state.task_issues[task_id] = [i for i in verdict_of[task_id].issues if task_id in i.task_ids]
         for task_id in due:
             results = runs[task_id]["results"]
@@ -624,16 +738,31 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             fit = next(r.level_fit for r in verdict_of[task_id].tasks if r.task_id == task_id)
             seen = rates(witnessed[task_id]["results"])["right_rate"] if task_id in witnessed else None
             if approved:
-                state.task_reviews[task_id] = {"key": keys[task_id], **rate, "witness_right": seen, "level_fit": fit, "results": results}  # fmt: skip
+                state.task_reviews[task_id] = {
+                    "key": keys[task_id],
+                    **rate,
+                    "witness_right": seen,
+                    "level_fit": fit,
+                    "results": results,
+                }
             right = rate["right_rate"]
-            self.store.event("task_reviewed", attempt=attempt, task_id=task_id, approved=approved, **rate, learnability=4 * right * (1 - right))  # fmt: skip
+            self.store.event(
+                "task_reviewed",
+                attempt=attempt,
+                task_id=task_id,
+                approved=approved,
+                **rate,
+                learnability=4 * right * (1 - right),
+            )
         return runs, merged(verdicts)
 
     async def grade(self, question: str, reference: dict, response: str):
         """The answer judge's grade of one response, with no observations: its `correct` is what a screen reads."""
         for again in (True, False):
             try:
-                return await AnswerJudge(self.settings.answer_judge).evaluate(question=question, reference=reference, response=response, observations=[])  # fmt: skip
+                return await AnswerJudge(self.settings.answer_judge).evaluate(
+                    question=question, reference=reference, response=response, observations=[]
+                )
             except Exception:
                 if not again:
                     raise
@@ -643,12 +772,18 @@ class GenerationEnv(vf.Env[PipelineConfig]):
         those it accepted, and its gold if it rejected that. Kept with the task's key, so a task is screened once."""
         state = self.store.state
         for t in [t for t in due if state.screens.get(t, {}).get("key") != keys[t]]:
-            row = self.world.db.execute("SELECT question, answer_type, gold_json FROM tasks WHERE id = ?", (t,)).fetchone()  # fmt: skip
+            row = self.world.db.execute(
+                "SELECT question, answer_type, gold_json FROM tasks WHERE id = ?", (t,)
+            ).fetchone()
             rows = json.loads(row["gold_json"])
             gold, cases = failure_cases(self.world, t, rows)
             reference = {"answer_type": row["answer_type"], "rows": rows}
-            graded = await asyncio.gather(*(self.grade(row["question"], reference, r) for r in [gold, *(r for _, r in cases)]))  # fmt: skip
-            failed = (["its gold answer, judged wrong"] if not graded[0].parsed.correct else []) + [f"{name} ({response!r})" for (name, response), g in zip(cases, graded[1:]) if g.parsed.correct]  # fmt: skip
+            graded = await asyncio.gather(
+                *(self.grade(row["question"], reference, r) for r in [gold, *(r for _, r in cases)])
+            )
+            failed = (["its gold answer, judged wrong"] if not graded[0].parsed.correct else []) + [
+                f"{name} ({response!r})" for (name, response), g in zip(cases, graded[1:]) if g.parsed.correct
+            ]
             usage = [g.usage.model_dump(mode="json") for g in graded if getattr(g, "usage", None) is not None]
             state.screens[t] = {"key": keys[t], "failed": failed, "cases": len(cases), "usage": usage}
             self.store.event("task_screened", attempt=attempt, task_id=t, cases=len(cases), failed=failed)
@@ -665,7 +800,9 @@ class GenerationEnv(vf.Env[PipelineConfig]):
             floor = cfg.tasks.bands[level[t] - 1][0]
             return floor == 0 or rates(state.solves[t]["results"])["right_rate"] < floor
 
-        if cfg.author.witness_tries and (fresh := [t for t in due if low(t) and state.witness.get(t, {}).get("key") != keys[t]]):  # fmt: skip
+        if cfg.author.witness_tries and (
+            fresh := [t for t in due if low(t) and state.witness.get(t, {}).get("key") != keys[t]]
+        ):
             for t, runs in (
                 await self.solves(agents, fresh, attempt, cfg.author.witness_tries, "witness")
             ).items():
@@ -678,7 +815,11 @@ class GenerationEnv(vf.Env[PipelineConfig]):
 
     def keep_solves(self, task_id: str, key: str, runs: list) -> None:
         """A task's solver runs, kept with what the task was when they ran."""
-        self.store.state.solves[task_id] = {"key": key, "results": [r for r, _ in runs], "traces": [t.id for _, t in runs]}  # fmt: skip
+        self.store.state.solves[task_id] = {
+            "key": key,
+            "results": [r for r, _ in runs],
+            "traces": [t.id for _, t in runs],
+        }
 
     def saved_trace(self, trace_id: str) -> dict | None:
         """A saved solver trace, as the judge may read it."""

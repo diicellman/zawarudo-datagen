@@ -18,10 +18,23 @@ from .contracts import APP_KINDS, TIME_LITERAL, queue
 # What each kind of app posts: about one of its subjects (noise, drawn by the seed on workdays), and when a ledger
 # event it reports happens. {n} is a running number, {who} a member of its channel, {subject} or {title} the matter.
 KINDS = {
-    "deploys": {"noise": "Deployed {subject} to staging · build #{n}", "event": "✅ {title}: deployed to production"},
-    "alerts": {"noise": "🔴 Triggered: {subject}", "resolved": "✅ Resolved: {subject}", "event": "🔴 Triggered: {title}"},  # fmt: skip
-    "tickets": {"noise": "{prefix}-{n} created: {subject} · assigned to <@{who}>", "event": "{prefix}-{n} created: {title} · assigned to <@{who}>"},  # fmt: skip
-    "ci": {"noise": "Build #{n} on main {outcome} · {minutes} min", "event": "Build #{n} for {title} passed ✅ · {minutes} min"},  # fmt: skip
+    "deploys": {
+        "noise": "Deployed {subject} to staging · build #{n}",
+        "event": "✅ {title}: deployed to production",
+    },
+    "alerts": {
+        "noise": "🔴 Triggered: {subject}",
+        "resolved": "✅ Resolved: {subject}",
+        "event": "🔴 Triggered: {title}",
+    },
+    "tickets": {
+        "noise": "{prefix}-{n} created: {subject} · assigned to <@{who}>",
+        "event": "{prefix}-{n} created: {title} · assigned to <@{who}>",
+    },
+    "ci": {
+        "noise": "Build #{n} on main {outcome} · {minutes} min",
+        "event": "Build #{n} for {title} passed ✅ · {minutes} min",
+    },
     "reminders": {"noise": "Reminder: {subject}", "event": "Reminder: {title}"},
 }
 FAILS = 0.15  # a build's chance to fail
@@ -55,7 +68,13 @@ def number(world, app: dict, start: int = 1000) -> int:
 
 def member(world, channel_id: str, rng, at_us: int) -> str:
     """A person in the channel at that moment."""
-    people = [r[0] for r in world.db.execute("SELECT m.user_id FROM members m JOIN users u ON u.id = m.user_id WHERE m.channel_id = ? AND m.joined_us <= ? AND (m.left_us IS NULL OR m.left_us > ?) AND u.is_bot = 0 ORDER BY m.user_id", (channel_id, at_us, at_us))]  # fmt: skip
+    people = [
+        r[0]
+        for r in world.db.execute(
+            "SELECT m.user_id FROM members m JOIN users u ON u.id = m.user_id WHERE m.channel_id = ? AND m.joined_us <= ? AND (m.left_us IS NULL OR m.left_us > ?) AND u.is_bot = 0 ORDER BY m.user_id",
+            (channel_id, at_us, at_us),
+        )
+    ]
     return rng.choice(people)
 
 
@@ -78,7 +97,9 @@ def queue_day(world, settings, day: int) -> int:
     """A workday's routine posts of each app, drawn by the seed: `bot_posts` of them, about its subjects, in the
     working hours; an alert resolves itself within the hour; reminders keep their morning. Weekends are quiet."""
     rate = settings.activity.bot_posts
-    date, start, end = world.db.execute("SELECT date, start_us, end_us FROM calendar WHERE day = ?", (day,)).fetchone()  # fmt: skip
+    date, start, end = world.db.execute(
+        "SELECT date, start_us, end_us FROM calendar WHERE day = ?", (day,)
+    ).fetchone()
     if rate <= 0 or dt.date.fromisoformat(date).weekday() >= 5:
         return 0
     queued = 0
@@ -93,12 +114,28 @@ def queue_day(world, settings, day: int) -> int:
             if not open_at(world, app["channel_id"], due):
                 continue
             post = text(world, app, KINDS[app["kind"]]["noise"], rng, due, subject=subject)
-            if queue(world, due, app["channel_id"], app["user_id"], post, f"noise:{app['user_id']}:{day}:{k}", "bot_message"):  # fmt: skip
+            if queue(
+                world,
+                due,
+                app["channel_id"],
+                app["user_id"],
+                post,
+                f"noise:{app['user_id']}:{day}:{k}",
+                "bot_message",
+            ):
                 queued += 1
             if app["kind"] == "alerts":
                 later = due + rng.randint(5, 55) * 60_000_000
                 if later < end:
-                    queue(world, later, app["channel_id"], app["user_id"], KINDS["alerts"]["resolved"].format(subject=subject), f"noise:{app['user_id']}:{day}:{k}:resolved", "bot_message")  # fmt: skip
+                    queue(
+                        world,
+                        later,
+                        app["channel_id"],
+                        app["user_id"],
+                        KINDS["alerts"]["resolved"].format(subject=subject),
+                        f"noise:{app['user_id']}:{day}:{k}:resolved",
+                        "bot_message",
+                    )
     return queued
 
 
@@ -106,13 +143,23 @@ def queue_events(world, settings, after_us: int) -> int:
     """Each ledger event an app reports, posted at its moment by that app: the events after `after_us` (the present,
     or a chapter's first day), whose moments are still to come."""
     queued = 0
-    for event in world.db.execute("SELECT * FROM events WHERE post_by IS NOT NULL AND moment_us >= ? ORDER BY moment_us", (after_us,)).fetchall():  # fmt: skip
+    for event in world.db.execute(
+        "SELECT * FROM events WHERE post_by IS NOT NULL AND moment_us >= ? ORDER BY moment_us", (after_us,)
+    ).fetchall():
         app = next(a for a in apps(world) if a["user_id"] == event["post_by"])
         rng = random.Random(digest([settings.seed, "event", event["id"]]))
         if not open_at(world, app["channel_id"], event["moment_us"]):
             continue
         post = text(world, app, KINDS[app["kind"]]["event"], rng, event["moment_us"], title=event["title"])
-        queued += queue(world, event["moment_us"], app["channel_id"], app["user_id"], post, f"event:{event['id']}", "bot_message")  # fmt: skip
+        queued += queue(
+            world,
+            event["moment_us"],
+            app["channel_id"],
+            app["user_id"],
+            post,
+            f"event:{event['id']}",
+            "bot_message",
+        )
     return queued
 
 
@@ -128,11 +175,15 @@ def event_errors(world, events, anchors: list[str]) -> list[str]:
             errors.append(f"event {e.id}: post_by names an app of the workspace, one of {sorted(names)}")
         found = [a for a in anchors if re.search(rf"(?<!\w){re.escape(a)}(?!\w)", e.title, re.IGNORECASE)]
         if TIME_LITERAL.search(e.title) or found:
-            errors.append(f"event {e.id}: an app posts its title, which states no fact or time: {found or 'a time'}")  # fmt: skip
+            errors.append(
+                f"event {e.id}: an app posts its title, which states no fact or time: {found or 'a time'}"
+            )
     return errors
 
 
 def app_id(world, name: str) -> str | None:
     """A bot's user id, by its app's name."""
-    row = world.db.execute("SELECT i.user_id FROM integrations i JOIN users u ON u.id = i.user_id WHERE u.real_name = ?", (name,)).fetchone()  # fmt: skip
+    row = world.db.execute(
+        "SELECT i.user_id FROM integrations i JOIN users u ON u.id = i.user_id WHERE u.real_name = ?", (name,)
+    ).fetchone()
     return row[0] if row else None

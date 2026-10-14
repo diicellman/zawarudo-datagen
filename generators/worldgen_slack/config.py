@@ -39,7 +39,12 @@ class PipelineConfig(vf.EnvConfig):
     # A stronger solver with the same tools, for the tasks GLM rarely answers: hard, or broken?
     # It thinks hard (FC1's took 2-5 calls and lost tasks the solver answered): it shows a task can be answered.
     witness: vf.AgentConfig = role("openai/gpt-6-sol", solver=True).model_copy(
-        update={"runtime": vf.SubprocessConfig(), "sampling": role("openai/gpt-6-sol", solver=True).sampling.model_copy(update={"reasoning_effort": "high"})}  # fmt: skip
+        update={
+            "runtime": vf.SubprocessConfig(),
+            "sampling": role("openai/gpt-6-sol", solver=True).sampling.model_copy(
+                update={"reasoning_effort": "high"}
+            ),
+        }
     )
     retries: RetryConfig = RetryConfig(max_retries=0)
     # The episode's agents at once. GLM, whose account allows 8 concurrent requests, is gated on its own by
@@ -140,7 +145,9 @@ class Needs(Section):
 
     def facts(self) -> bool:
         """Whether a level needs anything of its facts, so its slots are planned on the board before day 1."""
-        return bool(self.channels or self.relations or self.decoys or self.hidden or self.values or self.fresh)
+        return bool(
+            self.channels or self.relations or self.decoys or self.hidden or self.values or self.fresh
+        )
 
 
 class Category(Section):
@@ -178,7 +185,9 @@ class AuthorSettings(Section):
     share_tolerance: float = Field(
         default=0.1, ge=0, le=1
     )  # reply, reaction and DM shares, checked at the end
-    mention_tolerance: float = Field(default=0.05, ge=0, le=1)  # the share of messages mentioning someone, per day
+    mention_tolerance: float = Field(
+        default=0.05, ge=0, le=1
+    )  # the share of messages mentioning someone, per day
     review_days: list[int] = Field(
         default_factory=lambda: [5]
     )  # the judge reviews the world after these days

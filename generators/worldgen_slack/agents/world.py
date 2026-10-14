@@ -82,7 +82,10 @@ GOLD_SQL = """- gold_sql is one SELECT over world.sqlite as the task's actor see
 - near_sql, optional: up to NEAR_SQL queries, the gold with one condition relaxed, each answering otherwise (the answer
   a hasty reader gives).
 - question is what actor_id asks, in `language`; it does not contain its answer.
-""".replace("NEAR_SQL", str(next(m.max_length for m in Task.model_fields["near_sql"].metadata if hasattr(m, "max_length"))))
+""".replace(
+    "NEAR_SQL",
+    str(next(m.max_length for m in Task.model_fields["near_sql"].metadata if hasattr(m, "max_length"))),
+)
 
 AUTHOR_GUIDE = """You write one company's Slack workspace, as its people live it, in time order: first the company and its
 people, then the ledger of what will be stated, then each day's conversations.
@@ -163,7 +166,9 @@ Voice
 Reviews
 - An independent judge reviews the world after some days and at the end. Its issues come back to you: message_ids
   are the messages to change (world_revise rewrites one where it stands), evidence_message_ids show the defect.
-""".replace("PARTS_OF_THE_DAY", ", ".join(f"{part} {start:02d}-{end:02d}" for part, (start, end) in PARTS.items()))
+""".replace(
+    "PARTS_OF_THE_DAY", ", ".join(f"{part} {start:02d}-{end:02d}" for part, (start, end) in PARTS.items())
+)
 
 
 # ---------------------------------------------------------------------- memory: rendered from the world
@@ -239,7 +244,11 @@ def now_page(world, settings, context: dict) -> str:
     who, total = people(world), world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0]
     day, now, first = today(world), present(world), chapter_start(world)
     out = []
-    span = f" (this chapter writes days {first}-{total}; days 1-{first - 1} are written and frozen)" if first > 1 else ""  # fmt: skip
+    span = (
+        f" (this chapter writes days {first}-{total}; days 1-{first - 1} are written and frozen)"
+        if first > 1
+        else ""
+    )
     if day is None:
         out.append(f"# Now: the calendar is closed; its {total} days ended {clock(world, now)}.")
     else:
@@ -294,7 +303,10 @@ def now_page(world, settings, context: dict) -> str:
             for c in promises
         ]
     if context.get("slots"):
-        out += ["", "## Brief: what this chapter plants, each entry on the board (a later forge writes its tasks)"]
+        out += [
+            "",
+            "## Brief: what this chapter plants, each entry on the board (a later forge writes its tasks)",
+        ]
     board = {}
     for slot, fact in world.db.execute("SELECT slot, fact_id FROM board ORDER BY fact_id"):
         board.setdefault(slot, []).append(f"[[{fact}]]")
@@ -332,7 +344,13 @@ def person_page(world, user_id: str, context: dict) -> str:
     if typing := context.get("cards", {}).get(user_id):
         out.append(f"- how they type: {card(typing)}")
     now = int(world.db.execute("SELECT value FROM world_meta WHERE key = 'now_us'").fetchone()[0])
-    channels = [r[0] for r in world.db.execute("SELECT channel_id FROM members WHERE user_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us > ?)", (user_id, now, now))]  # fmt: skip
+    channels = [
+        r[0]
+        for r in world.db.execute(
+            "SELECT channel_id FROM members WHERE user_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us > ?)",
+            (user_id, now, now),
+        )
+    ]
     out.append("- conversations: " + ", ".join(f"{label(world, c)} [[{c}]]" for c in channels))
     lines = world.db.execute(
         "SELECT * FROM messages WHERE user_id = ? ORDER BY ts_us DESC LIMIT 8", (user_id,)
@@ -366,7 +384,13 @@ def channel_page(world, channel_id: str, context: dict) -> str:
     if channel["topic"] or channel["purpose"]:
         out.append(f"- topic: {channel['topic']}; purpose: {channel['purpose']}")
     now = int(world.db.execute("SELECT value FROM world_meta WHERE key = 'now_us'").fetchone()[0])
-    members = [r[0] for r in world.db.execute("SELECT user_id FROM members WHERE channel_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us > ?)", (channel_id, now, now))]  # fmt: skip
+    members = [
+        r[0]
+        for r in world.db.execute(
+            "SELECT user_id FROM members WHERE channel_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us > ?)",
+            (channel_id, now, now),
+        )
+    ]
     out.append("- members: " + ", ".join(f"{who[m]['real_name']} [[{m}]]" for m in members))
     if routines := context.get("routines", {}).get(channel_id):
         out.append(
@@ -384,7 +408,10 @@ def storyline_page(world, storyline: str) -> str:
     who = people(world)
     row = world.db.execute("SELECT * FROM storylines WHERE id = ?", (storyline,)).fetchone()
     out = [frontmatter(storyline, "storyline", []), f"# {row['summary']}"]
-    out += [fact_line(world, dict(f), who) for f in world.db.execute("SELECT * FROM facts WHERE storyline = ? ORDER BY day, id", (storyline,))]  # fmt: skip
+    out += [
+        fact_line(world, dict(f), who)
+        for f in world.db.execute("SELECT * FROM facts WHERE storyline = ? ORDER BY day, id", (storyline,))
+    ]
     out += [
         f"- event [[{e['id']}]] {e['title']}: {clock(world, e['moment_us'])}"
         for e in world.db.execute("SELECT * FROM events WHERE storyline = ? ORDER BY moment_us", (storyline,))
@@ -397,7 +424,10 @@ def event_page(world, event: str) -> str:
     row = world.db.execute("SELECT * FROM events WHERE id = ?", (event,)).fetchone()
     out = [frontmatter(event, "event", [row["title"]]), f"# {row['title']}: {clock(world, row['moment_us'])}"]
     out.append(f"- storyline [[{row['storyline']}]]")
-    out += [fact_line(world, dict(f), who) for f in world.db.execute("SELECT * FROM facts WHERE event_id = ?", (event,))]  # fmt: skip
+    out += [
+        fact_line(world, dict(f), who)
+        for f in world.db.execute("SELECT * FROM facts WHERE event_id = ?", (event,))
+    ]
     return "\n".join(out) + "\n"
 
 
@@ -541,7 +571,13 @@ def files(world, settings, context: dict, mode: str) -> dict[str, str]:
     """The memory code writes to /task/memory before a turn."""
     out = {
         "memory/now.md": now_page(world, settings, context),
-        "memory/ledger.json": json.dumps(ledger_document(world, {x["id"] for x in context.get("slots", [])} if context.get("chapter") else None), ensure_ascii=False, indent=1),  # fmt: skip
+        "memory/ledger.json": json.dumps(
+            ledger_document(
+                world, {x["id"] for x in context.get("slots", [])} if context.get("chapter") else None
+            ),
+            ensure_ascii=False,
+            indent=1,
+        ),
     }
     for user in people(world).values():
         out[f"memory/people/{user['handle']}.md"] = person_page(world, user["id"], context)
@@ -587,7 +623,14 @@ def shape(schema: dict, defs: dict) -> str:
         return f"[{bound}{shape(schema.get('items', {}), defs)}]"
     if "properties" in schema:
         required = set(schema.get("required", []))
-        return "{" + ", ".join(f"{k}{'' if k in required else '?'}: {shape(v, defs)}" for k, v in schema["properties"].items()) + "}"  # fmt: skip
+        return (
+            "{"
+            + ", ".join(
+                f"{k}{'' if k in required else '?'}: {shape(v, defs)}"
+                for k, v in schema["properties"].items()
+            )
+            + "}"
+        )
     return TYPES.get(schema.get("type"), "any")
 
 
@@ -826,9 +869,13 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         gold rows and code's measures returned."""
 
         def act(copy):
-            return forge_task(copy, task, self.settings, self.allowed().get("ids", []), rework=self.allowed().get("rework"))  # fmt: skip
+            return forge_task(
+                copy, task, self.settings, self.allowed().get("ids", []), rework=self.allowed().get("rework")
+            )
 
-        return self._logged("add_task", {"task": task.model_dump(mode="json")}, lambda: self._write(act), "forge")
+        return self._logged(
+            "add_task", {"task": task.model_dump(mode="json")}, lambda: self._write(act), "forge"
+        )
 
     @vf.tool
     async def profile(self) -> dict:
@@ -846,7 +893,13 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
             world, out = self._world(), {}
             try:
                 with world.trial() as copy:
-                    result = forge_task(copy, task, self.settings, self.allowed().get("ids", []), rework=self.allowed().get("rework"))  # fmt: skip
+                    result = forge_task(
+                        copy,
+                        task,
+                        self.settings,
+                        self.allowed().get("ids", []),
+                        rework=self.allowed().get("rework"),
+                    )
                     _, cases = failure_cases(copy, task.id, result["gold"])
                     out = result | {"failure_cases": [name for name, _ in cases]}
                     raise LookupError("a probe writes nothing")
@@ -896,7 +949,9 @@ class WorldAuthorTask(vf.Task[WorldTaskData, vf.State, WorldAuthorConfig]):
             raise ValueError("the world file requires a host-side tool server")
         data = WorldTaskData(
             prompt=None,
-            system_prompt=forge_guide(context["settings"]) if mode == "forge" else AUTHOR_GUIDE + CRAFT_GUIDE + (CHAPTER_GUIDE if context.get("chapter") else ""),
+            system_prompt=forge_guide(context["settings"])
+            if mode == "forge"
+            else AUTHOR_GUIDE + CRAFT_GUIDE + (CHAPTER_GUIDE if context.get("chapter") else ""),
             attempt=attempt,
             world_hash=tools.db_hash,
             network_allow=[],
@@ -1100,7 +1155,9 @@ def context_of(settings, state, store_root: Path, organization: dict | None) -> 
     return {
         "settings": json.loads(settings.model_dump_json()),
         "slots": [s.model_dump(mode="json") for s in state.quota],
-        "writable_file": str(store_root / "writable.json"),  # the ids the proposer's turn may write, read per call
+        "writable_file": str(
+            store_root / "writable.json"
+        ),  # the ids the proposer's turn may write, read per call
         "cards": cards(state.cast),
         "selves": selves(state.cast),
         "agenda": agenda,

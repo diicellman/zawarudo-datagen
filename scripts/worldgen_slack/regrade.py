@@ -63,23 +63,35 @@ def recorded_view(observations: list[dict]) -> dict:
     def items(call: dict) -> list:
         listed = call["output"].get("items")
         listed = listed if isinstance(listed, list) else []
-        return listed + [c for i in listed if isinstance(i, dict) for side in ("before", "after") for c in (i.get("context") or {}).get(side, [])]  # fmt: skip
+        return listed + [
+            c
+            for i in listed
+            if isinstance(i, dict)
+            for side in ("before", "after")
+            for c in (i.get("context") or {}).get(side, [])
+        ]
 
     messages, people, channels, members, reactions, calls = {}, {}, {}, {}, {}, []
     for call in observations:
         out, tool = call["output"], call["tool"]
         listed = out.get("items") if isinstance(out.get("items"), list) else []
-        calls.append({"tool": tool, "arguments": call["arguments"], "results": len(listed) if "items" in out else 1})
+        calls.append(
+            {"tool": tool, "arguments": call["arguments"], "results": len(listed) if "items" in out else 1}
+        )
         for item in items(call):
             if isinstance(item, dict) and "ts" in item:
                 key = (item["channel"], item["ts"])
-                messages[key] = messages.get(key, {}) | {k: v for k, v in item.items() if k not in ("time_utc", "context")}  # fmt: skip
+                messages[key] = messages.get(key, {}) | {
+                    k: v for k, v in item.items() if k not in ("time_utc", "context")
+                }
             elif isinstance(item, dict) and "real_name" in item and tool != "list_channel_members":
                 people.setdefault(item["id"], item)
             elif isinstance(item, dict) and "id" in item and "real_name" not in item:
                 channels.setdefault(item["id"], item)
         if tool == "list_channel_members":
-            members.setdefault(call["arguments"]["channel_id"], set()).update(i["id"] if isinstance(i, dict) else i for i in listed)  # fmt: skip
+            members.setdefault(call["arguments"]["channel_id"], set()).update(
+                i["id"] if isinstance(i, dict) else i for i in listed
+            )
         elif tool == "get_reactions":
             reactions[(out["channel"], out["ts"])] = out["reactions"]
         elif tool in PROFILES:
@@ -104,7 +116,16 @@ def tries(run: Path) -> list[dict]:
         grade = info.get("evaluation")
         if trace["agent"]["name"] != "solver" or not grade or not grade.get("execution_ok"):
             continue
-        found.append(dict(trace=path.stem, task=data["task_id"], question=data["prompt"], response=grade.get("response") or "", observations=info.get("observations", []), recorded=grade))  # fmt: skip
+        found.append(
+            dict(
+                trace=path.stem,
+                task=data["task_id"],
+                question=data["prompt"],
+                response=grade.get("response") or "",
+                observations=info.get("observations", []),
+                recorded=grade,
+            )
+        )
     return found
 
 
@@ -152,7 +173,9 @@ async def main() -> None:
         len(json.dumps(recorded_view(t["observations"]) if args.view == "compact" else t["observations"]))
         for t in work
     ]
-    print(f"{len(work)} tries ({sum(not t['recorded']['correct'] for t in work)} graded wrong) and {len(cases)} screen cases for {args.model}, {args.view} view: {sum(views) / max(len(views), 1):,.0f} characters of observations a try")  # fmt: skip
+    print(
+        f"{len(work)} tries ({sum(not t['recorded']['correct'] for t in work)} graded wrong) and {len(cases)} screen cases for {args.model}, {args.view} view: {sum(views) / max(len(views), 1):,.0f} characters of observations a try"
+    )
     if args.dry_run:
         return
 
@@ -164,7 +187,9 @@ async def main() -> None:
             failures = 0
             for wait in (2, 4, 8, 16, 32, 60, 60, 60):
                 try:
-                    result = await judge.evaluate(question=question, reference=ref, response=response, observations=observations)  # fmt: skip
+                    result = await judge.evaluate(
+                        question=question, reference=ref, response=response, observations=observations
+                    )
                     usage = result.usage.model_dump(mode="json") if getattr(result, "usage", None) else {}
                     return result.parsed.model_dump(mode="json"), usage
                 except Exception as error:
@@ -202,11 +227,15 @@ async def main() -> None:
     print(
         f"\ngraded {len(done)} of {len(graded)} tries ({len(graded) - len(done) - len(failed)} empty, {len(failed)} failed)"
     )
-    print(f"agreement {sum(a == b for a, b in pairs) / len(pairs):.1%}, on the recorded wrong {sum(a == b for a, b in wrong) / max(len(wrong), 1):.1%} ({len(wrong)}), kappa {kappa(pairs):.3f}")  # fmt: skip
+    print(
+        f"agreement {sum(a == b for a, b in pairs) / len(pairs):.1%}, on the recorded wrong {sum(a == b for a, b in wrong) / max(len(wrong), 1):.1%} ({len(wrong)}), kappa {kappa(pairs):.3f}"
+    )
     print("recorded → new:", dict(Counter(f"{a}→{b}" for a, b in pairs if a != b)))
     for g in done:
         if outcome(g["recorded"]) != outcome(g["new"]):
-            print(f"  {g['task']} {g['trace'][:8]} {outcome(g['recorded'])}→{outcome(g['new'])}: {g['new']['reason'][:220]}")  # fmt: skip
+            print(
+                f"  {g['task']} {g['trace'][:8]} {outcome(g['recorded'])}→{outcome(g['new'])}: {g['new']['reason'][:220]}"
+            )
     if screened:
         lost = [s for s in screened if "error" in s["new"]]
         flips = [s for s in screened if "error" not in s["new"] and s["new"]["correct"] != s["expect"]]

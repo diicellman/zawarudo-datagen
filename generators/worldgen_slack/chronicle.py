@@ -123,8 +123,12 @@ class Move(StrictModel):
 
     @model_validator(mode="after")
     def named(self) -> Self:
-        if (self.kind != "archive") != (self.user_id is not None) or (self.kind != "depart") != (self.channel_id is not None):  # fmt: skip
-            raise ValueError("a join or a leave names a person and a channel; a departure a person; an archive a channel")  # fmt: skip
+        if (self.kind != "archive") != (self.user_id is not None) or (self.kind != "depart") != (
+            self.channel_id is not None
+        ):
+            raise ValueError(
+                "a join or a leave names a person and a channel; a departure a person; an archive a channel"
+            )
         return self
 
 
@@ -155,7 +159,12 @@ def artifact_url(world, artifact: Artifact) -> str:
     """Where it lives, on the company's own hosts."""
     company = world_meta(world, "company")
     domain = re.sub(r"[^a-z0-9]+", "", company.lower()) + ".example"
-    path = {"ticket": f"browse/{artifact.id}", "pull_request": f"app/pull/{re.sub(r'[^0-9]', '', artifact.id) or artifact.id}", "doc": "d/" + re.sub(r"[^a-z0-9]+", "-", artifact.title.lower()).strip("-"), "incident": f"incidents/{artifact.id}"}[artifact.kind]  # fmt: skip
+    path = {
+        "ticket": f"browse/{artifact.id}",
+        "pull_request": f"app/pull/{re.sub(r'[^0-9]', '', artifact.id) or artifact.id}",
+        "doc": "d/" + re.sub(r"[^a-z0-9]+", "-", artifact.title.lower()).strip("-"),
+        "incident": f"incidents/{artifact.id}",
+    }[artifact.kind]
     return f"https://{HOSTS[artifact.kind]}.{domain}/{path}"
 
 
@@ -178,25 +187,60 @@ def apply_artifacts(world, artifacts: list[Artifact], anchors: list[str], first:
         found = [x for x in anchors if re.search(rf"(?<!\w){re.escape(x)}(?!\w)", a.title, re.IGNORECASE)]
         if TIME_LITERAL.search(a.title) or found:
             raise ValueError(f"artifact {a.id}: its title states no fact or time: {found or 'a time'}")
-        world.insert("artifacts", [dict(id=a.id, kind=a.kind, title=a.title, url=artifact_url(world, a), owner_id=a.owner_id, created_us=at)])  # fmt: skip
-        if a.kind == "ticket" and (app := world.db.execute("SELECT user_id, channel_id FROM integrations WHERE kind = 'tickets' ORDER BY user_id").fetchone()):  # fmt: skip
-            queue(world, at, app[1], app[0], f"<{artifact_url(world, a)}|{a.id}> created: {a.title} · assigned to <@{a.owner_id}>", f"artifact:{a.id}", "bot_message")  # fmt: skip
+        world.insert(
+            "artifacts",
+            [
+                dict(
+                    id=a.id,
+                    kind=a.kind,
+                    title=a.title,
+                    url=artifact_url(world, a),
+                    owner_id=a.owner_id,
+                    created_us=at,
+                )
+            ],
+        )
+        if a.kind == "ticket" and (
+            app := world.db.execute(
+                "SELECT user_id, channel_id FROM integrations WHERE kind = 'tickets' ORDER BY user_id"
+            ).fetchone()
+        ):
+            queue(
+                world,
+                at,
+                app[1],
+                app[0],
+                f"<{artifact_url(world, a)}|{a.id}> created: {a.title} · assigned to <@{a.owner_id}>",
+                f"artifact:{a.id}",
+                "bot_message",
+            )
 
 
 def move_moment(world, move: Move) -> int:
     """When a move happens: in its day's morning, at a minute the move itself draws."""
-    return window(world, move.day, "morning")[0] + int(digest(move.model_dump())[:6], 16) % 120 * 60_000_000 + 7
+    return (
+        window(world, move.day, "morning")[0] + int(digest(move.model_dump())[:6], 16) % 120 * 60_000_000 + 7
+    )
 
 
 def member_through(world, channel_id: str, user_id: str, start_us: int, end_us: int) -> bool:
     """Whether someone is a member of a channel from `start_us` to `end_us`."""
-    return bool(world.db.execute("SELECT 1 FROM members WHERE channel_id = ? AND user_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us >= ?)", (channel_id, user_id, start_us, end_us)).fetchone())  # fmt: skip
+    return bool(
+        world.db.execute(
+            "SELECT 1 FROM members WHERE channel_id = ? AND user_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us >= ?)",
+            (channel_id, user_id, start_us, end_us),
+        ).fetchone()
+    )
 
 
 def apply_moves(world, moves: list[Move], first: int, day: int) -> None:
     """Record the plan's moves, once each: earlier ones stay as they were; new ones are checked at their moment and
     written as members' joins and leaves, departures and archives, with Slack's own posts queued for joins and leaves."""
-    done = json.loads(world_meta(world, "moves") or "[]") if world.db.execute("SELECT 1 FROM world_meta WHERE key = 'moves'").fetchone() else []  # fmt: skip
+    done = (
+        json.loads(world_meta(world, "moves") or "[]")
+        if world.db.execute("SELECT 1 FROM world_meta WHERE key = 'moves'").fetchone()
+        else []
+    )
     planned = [m.model_dump() for m in moves]
     if gone := [m for m in done if m not in planned]:
         raise ValueError(f"recorded moves stay in the plan: {gone}")
@@ -204,10 +248,14 @@ def apply_moves(world, moves: list[Move], first: int, day: int) -> None:
     for move in (Move(**m) for m in planned if m not in done):
         at, who, where = move_moment(world, move), move.user_id, move.channel_id
         if move.day < max(day, first) or at <= present(world):
-            raise ValueError(f"a move is planned for a later moment than the present: {move.model_dump(exclude_none=True)}")  # fmt: skip
+            raise ValueError(
+                f"a move is planned for a later moment than the present: {move.model_dump(exclude_none=True)}"
+            )
         if who is not None and who not in people:
             raise ValueError(f"{move.kind}: {who} is no person of the company")
-        channel = world.db.execute("SELECT * FROM channels WHERE id = ?", (where,)).fetchone() if where else None
+        channel = (
+            world.db.execute("SELECT * FROM channels WHERE id = ?", (where,)).fetchone() if where else None
+        )
         if where and (channel is None or channel["name"] is None):
             raise ValueError(f"{move.kind}: {where} is a named channel of the company")
         if channel is not None and channel["archived_us"] is not None and channel["archived_us"] <= at:
@@ -217,18 +265,42 @@ def apply_moves(world, moves: list[Move], first: int, day: int) -> None:
             if inside:
                 raise ValueError(f"join: {who} is a member of {where} already")
             world.insert("members", [dict(channel_id=where, user_id=who, joined_us=at)])
-            queue(world, at, where, who, f"<@{who}> has joined the channel", f"move:join:{where}:{who}:{move.day}", "channel_join")  # fmt: skip
+            queue(
+                world,
+                at,
+                where,
+                who,
+                f"<@{who}> has joined the channel",
+                f"move:join:{where}:{who}:{move.day}",
+                "channel_join",
+            )
         elif move.kind == "leave":
             if not inside:
                 raise ValueError(f"leave: {who} is no member of {where} then")
-            queue(world, at - 1, where, who, f"<@{who}> has left the channel", f"move:leave:{where}:{who}:{move.day}", "channel_leave")  # fmt: skip
-            world.db.execute("UPDATE members SET left_us = ? WHERE channel_id = ? AND user_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us > ?)", (at, where, who, at, at))  # fmt: skip
+            queue(
+                world,
+                at - 1,
+                where,
+                who,
+                f"<@{who}> has left the channel",
+                f"move:leave:{where}:{who}:{move.day}",
+                "channel_leave",
+            )
+            world.db.execute(
+                "UPDATE members SET left_us = ? WHERE channel_id = ? AND user_id = ? AND joined_us <= ? AND (left_us IS NULL OR left_us > ?)",
+                (at, where, who, at, at),
+            )
         elif move.kind == "depart":
-            world.db.execute("UPDATE members SET left_us = ? WHERE user_id = ? AND joined_us < ? AND (left_us IS NULL OR left_us > ?)", (at, who, at, at))  # fmt: skip
+            world.db.execute(
+                "UPDATE members SET left_us = ? WHERE user_id = ? AND joined_us < ? AND (left_us IS NULL OR left_us > ?)",
+                (at, who, at, at),
+            )
             world.db.execute("UPDATE users SET deactivated_us = ?, is_deleted = 1 WHERE id = ?", (at, who))
         else:
             world.db.execute("UPDATE channels SET archived_us = ?, is_archived = 1 WHERE id = ?", (at, where))
-    world.db.execute("INSERT OR REPLACE INTO world_meta (key, value) VALUES ('moves', ?)", (json.dumps(planned),))
+    world.db.execute(
+        "INSERT OR REPLACE INTO world_meta (key, value) VALUES ('moves', ?)", (json.dumps(planned),)
+    )
 
 
 class Commit(StrictModel):
@@ -334,7 +406,9 @@ def daily(dates: list[str], settings, busy=()) -> list[dict]:
     """Code's share of the world per calendar date and part: `[activity].messages` over the dates, a weekend day
     weighing `[author].weekend` of a workday unless it is `busy` (a day number with a planned event), and each day
     split by the parts' rhythm."""
-    return spread(dates, 1, settings.activity.messages, settings.author.weekend, settings.activity.parts, busy)
+    return spread(
+        dates, 1, settings.activity.messages, settings.author.weekend, settings.activity.parts, busy
+    )
 
 
 def segments(world, settings) -> list[dict]:
@@ -345,7 +419,16 @@ def segments(world, settings) -> list[dict]:
         return json.loads(stored)
     first, last = world.db.execute("SELECT MIN(day), MAX(day) FROM calendar").fetchone()
     busy = meta(world, "busy_days")
-    return [dict(first=first, last=last, messages=settings.activity.messages, busy=json.loads(busy) if busy else None, weekend=settings.author.weekend, parts=settings.activity.parts)]  # fmt: skip
+    return [
+        dict(
+            first=first,
+            last=last,
+            messages=settings.activity.messages,
+            busy=json.loads(busy) if busy else None,
+            weekend=settings.author.weekend,
+            parts=settings.activity.parts,
+        )
+    ]
 
 
 def segment_of(world, settings, day: int) -> dict:
@@ -360,7 +443,19 @@ def quotas(world, settings) -> dict[int, dict]:
     out = {}
     for s in segments(world, settings):
         days = range(s["first"], s["last"] + 1)
-        out |= dict(zip(days, spread([dates[d] for d in days], s["first"], s["messages"], s["weekend"], s["parts"], s["busy"] or ())))  # fmt: skip
+        out |= dict(
+            zip(
+                days,
+                spread(
+                    [dates[d] for d in days],
+                    s["first"],
+                    s["messages"],
+                    s["weekend"],
+                    s["parts"],
+                    s["busy"] or (),
+                ),
+            )
+        )
     return out
 
 
@@ -381,7 +476,12 @@ def keep_busy(world, events: list) -> None:
 
 
 # A day's shares, each checked on that day's own messages at its close, and named as the author reads them.
-SHARES = {"reply_share": "thread replies", "reaction_rate": "reacted to", "dm_share": "in DMs", "mention_rate": "mention someone"}  # fmt: skip
+SHARES = {
+    "reply_share": "thread replies",
+    "reaction_rate": "reacted to",
+    "dm_share": "in DMs",
+    "mention_rate": "mention someone",
+}
 
 
 def share_band(settings, share: str, n: int) -> tuple[int, int]:
@@ -470,10 +570,14 @@ def today_line(world, settings, day: int) -> str:
     minutes = max(end - max(present(world), start), 0) // 60_000_000
     left = f"{minutes // 60} h {minutes % 60} min left today"
     if ways is None:
-        return f"{have['messages']} messages today ({shares}); today can no longer close within its quota and shares; {left}"  # fmt: skip
+        return f"{have['messages']} messages today ({shares}); today can no longer close within its quota and shares; {left}"
     lo, hi = ways["closes"]
     needs = ", ".join(f"{a}-{b} {SHARES[s]}" for s, (a, b) in ways["more"].items())
-    promised = f"; promises made {promises_made(world, day)}, at least {math.floor(settings.activity.promise_rate * ways['at'])}" if settings.activity.promise_rate else ""  # fmt: skip
+    promised = (
+        f"; promises made {promises_made(world, day)}, at least {math.floor(settings.activity.promise_rate * ways['at'])}"
+        if settings.activity.promise_rate
+        else ""
+    )
     return (
         f"{have['messages']} messages today ({shares}); it closes with {lo}-{hi} messages. At {ways['at']}: "
         f"{ways['at'] - have['messages']} more lines, of them {needs}{promised}; {left}"
@@ -621,9 +725,13 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
         raise ValueError(f"storyline, event and fact ids are distinct; repeated {repeated}")
     kept = [r[0] for r in world.db.execute("SELECT id FROM storylines ORDER BY position")]
     if kept and kept != [s.id for s in plan.storylines[: len(kept)]]:
-        raise ValueError(f"the storylines are planned: keep {kept} in this order, first (summaries may change)")
+        raise ValueError(
+            f"the storylines are planned: keep {kept} in this order, first (summaries may change)"
+        )
     check_facts(plan.facts, {s.id for s in plan.storylines})
-    anchors = [f.anchor for f in plan.facts if f.anchor] + [r[0] for r in world.db.execute("SELECT anchor FROM facts WHERE anchor IS NOT NULL")]  # fmt: skip
+    anchors = [f.anchor for f in plan.facts if f.anchor] + [
+        r[0] for r in world.db.execute("SELECT anchor FROM facts WHERE anchor IS NOT NULL")
+    ]
     if errors := event_errors(world, plan.events, anchors):
         raise ValueError("; ".join(errors))
     day, zone = today(world), world_meta(world, "zone")
@@ -639,7 +747,9 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
             raise ValueError(f"{e.id}: a title has no time or date in it; day and time say when")
         moment[e.id] = at(world, Moment(day=e.day, time=e.time, zone=e.zone or zone))
         if e.id not in old_ids and moment[e.id] < frozen:
-            raise ValueError(f"{e.id}: an earlier chapter's days are written and frozen; a new event is in this one (day {first} or later)")  # fmt: skip
+            raise ValueError(
+                f"{e.id}: an earlier chapter's days are written and frozen; a new event is in this one (day {first} or later)"
+            )
         if e.id in old and (old[e.id]["moment_us"], old[e.id]["zone"], old[e.id]["title"]) != (
             moment[e.id],
             e.zone or zone,
@@ -651,7 +761,9 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
             )
     if gone := sorted(old.keys() - events.keys()):
         raise ValueError(f"planned events stay in the ledger: {gone}")
-    apply_moves(world, plan.moves, first, day)  # a plan is recorded on a trial copy: a refusal later drops these
+    apply_moves(
+        world, plan.moves, first, day
+    )  # a plan is recorded on a trial copy: a refusal later drops these
     apply_artifacts(world, plan.artifacts, anchors, first, day)
     stated = {r[0] for r in world.db.execute("SELECT DISTINCT fact_id FROM evidence")}
     current = {r["id"]: dict(r) for r in world.db.execute("SELECT * FROM facts")}
@@ -687,11 +799,23 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
             } or mine != {r for r in relations if r[0] == f.id}:
                 raise ValueError(f"{f.id} is stated: only its summary may change")
             if current[f.id]["day"] < first and f.summary != current[f.id]["summary"]:
-                raise ValueError(f"{f.id} is an earlier chapter's, written and frozen: it stays as it is, its summary too")  # fmt: skip
+                raise ValueError(
+                    f"{f.id} is an earlier chapter's, written and frozen: it stays as it is, its summary too"
+                )
             continue
         if not member_through(world, f.channel_id, f.author_id, *bounds(world, f.day)):
-            raise ValueError(f"{f.id}: its author {f.author_id} is a member of {f.channel_id} all of day {f.day}")
-        if (gone := world.db.execute("SELECT archived_us FROM channels WHERE id = ?", (f.channel_id,)).fetchone()) and gone[0] is not None and gone[0] < bounds(world, f.day)[1]:  # fmt: skip
+            raise ValueError(
+                f"{f.id}: its author {f.author_id} is a member of {f.channel_id} all of day {f.day}"
+            )
+        if (
+            (
+                gone := world.db.execute(
+                    "SELECT archived_us FROM channels WHERE id = ?", (f.channel_id,)
+                ).fetchone()
+            )
+            and gone[0] is not None
+            and gone[0] < bounds(world, f.day)[1]
+        ):
             raise ValueError(f"{f.id}: {f.channel_id} is archived by day {f.day}")
         if f.day < day:
             raise ValueError(f"{f.id}: an unstated fact is planned for today (day {day}) or later")
@@ -706,7 +830,11 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
             raise ValueError(f"{f.id} comes after {later}, which are first stated on a later day")
     with world.batch():
         # The plan's board is whole, as its facts are; in a chapter, an earlier chapter's entries (on stated facts) stay.
-        scope = list(backward) if first > 1 else [r[0] for r in world.db.execute("SELECT DISTINCT slot FROM board")]  # fmt: skip
+        scope = (
+            list(backward)
+            if first > 1
+            else [r[0] for r in world.db.execute("SELECT DISTINCT slot FROM board")]
+        )
         world.db.execute(f"DELETE FROM board WHERE slot IN ({', '.join('?' * len(scope))})", scope)
         for s in plan.storylines[: len(kept)]:
             world.db.execute("UPDATE storylines SET summary = ? WHERE id = ?", (s.summary, s.id))
@@ -794,7 +922,9 @@ def opening(world, settings, rng, now: int, day: int) -> int:
     pace = started * (end - now) / (now - start) if now > start else 0.0
     conversations = max(1.0, left / settings.activity.conversation_lines, pace)
     wait = int(rng.random() * 2 * max(end - now, 0) / (conversations + 1))
-    if (ways := room(world, settings, day)) is not None and (need := ways["closes"][0] - tally(world, day)["messages"]) > 0:  # fmt: skip
+    if (ways := room(world, settings, day)) is not None and (
+        need := ways["closes"][0] - tally(world, day)["messages"]
+    ) > 0:
         still = math.ceil(need / settings.activity.conversation_lines)
         wait = min(wait, max(bounds(world, day)[1] - now, 0) // (still + 1))
     return wait + rng.randrange(1_000_000, 60_000_000)
@@ -815,12 +945,17 @@ def hidden_answers(world) -> dict[str, list[tuple[str, int | None]]]:
     """The answer facts of the brief's entries that need their answer out of easy sight, by fact: each entry, with
     the last day a near-miss of it is first stated (None when it has none)."""
     needs, out = brief(world), {}
-    for slot, ids in world.db.execute("SELECT slot, group_concat(fact_id) FROM board GROUP BY slot").fetchall():
+    for slot, ids in world.db.execute(
+        "SELECT slot, group_concat(fact_id) FROM board GROUP BY slot"
+    ).fetchall():
         if not needs.get(slot, {}).get("hidden"):
             continue
         answers = answer_facts(world, ids.split(","))
         misses = near_misses(world, answers)
-        last = max((world.db.execute("SELECT day FROM facts WHERE id = ?", (m,)).fetchone()[0] for m in misses), default=None)  # fmt: skip
+        last = max(
+            (world.db.execute("SELECT day FROM facts WHERE id = ?", (m,)).fetchone()[0] for m in misses),
+            default=None,
+        )
         for answer in answers:
             out.setdefault(answer, []).append((slot, last))
     return out
@@ -836,7 +971,9 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
         raise ValueError("the calendar is closed; nothing more is posted")
     start, end = bounds(world, day)
     lines, channel = conversation.lines, conversation.channel_id
-    if (row := world.db.execute("SELECT archived_us FROM channels WHERE id = ?", (channel,)).fetchone()) is None:
+    if (
+        row := world.db.execute("SELECT archived_us FROM channels WHERE id = ?", (channel,)).fetchone()
+    ) is None:
         raise ValueError(f"no channel {channel}")
     if row[0] is not None and row[0] <= end:
         raise ValueError(f"{channel} is archived today: no one posts in it from then on")
@@ -853,10 +990,14 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
     errors += text_errors(world, lines, set(facts), set(moment))
     anchored = {r[0] for r in world.db.execute("SELECT fact_id FROM evidence WHERE role = 'anchor'")}
     follows = {}
-    for src, dst in world.db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind IN ('after', 'supersedes')"):  # fmt: skip
+    for src, dst in world.db.execute(
+        "SELECT src_fact, dst_fact FROM fact_relations WHERE kind IN ('after', 'supersedes')"
+    ):
         follows.setdefault(src, {})[dst] = None  # a fact may both follow and supersede another
     first, hide = set(), hidden_answers(world)
-    direct = world.db.execute("SELECT type IN ('im', 'mpim') FROM channels WHERE id = ?", (channel,)).fetchone()
+    direct = world.db.execute(
+        "SELECT type IN ('im', 'mpim') FROM channels WHERE id = ?", (channel,)
+    ).fetchone()
     for i, line in enumerate(lines):
         for f in line.conveys:
             if f in facts and f not in anchored and f not in first:
@@ -866,7 +1007,11 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
                         f"line {i}: {f} is first stated by {x['author_id']} in {x['channel_id']} on day {x['day']}"
                     )
                 reply = line.reply_to is not None or conversation.thread is not None
-                if f in hide and not (reply or (direct and direct[0])) and [s for s, last in hide[f] if last is None or day <= last]:  # fmt: skip
+                if (
+                    f in hide
+                    and not (reply or (direct and direct[0]))
+                    and [s for s, last in hide[f] if last is None or day <= last]
+                ):
                     errors.append(
                         f"line {i}: {f} answers the brief's {[s for s, _ in hide[f]]}, which needs its answer stated where "
                         "it is harder to see than its near-misses: in a thread reply, in a DM, or on a later day than "
@@ -903,7 +1048,11 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
     for stamp, line in zip(stamps, lines):
         for f in line.conveys:
             told.setdefault(f, stamp)
-    if late := [f for f, moment_us in owed_moments(world, day) if moment_us <= stamps[-1] and not told.get(f, moment_us) < moment_us]:  # fmt: skip
+    if late := [
+        f
+        for f, moment_us in owed_moments(world, day)
+        if moment_us <= stamps[-1] and not told.get(f, moment_us) < moment_us
+    ]:
         raise ValueError(
             f"this conversation would run to {clock(world, stamps[-1])}, past the moment of {late}, which are "
             "scheduled and still to be told before it: tell them first, or post less now"
@@ -945,7 +1094,12 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
                 f"after this conversation today could not close: {today_line(world, settings, day)}. Before it, "
                 f"{before}"
             )
-    texts = {r[0]: r[1] for r in world.db.execute(f"SELECT id, text FROM messages WHERE id IN ({', '.join('?' * len(ids))})", ids)}  # fmt: skip
+    texts = {
+        r[0]: r[1]
+        for r in world.db.execute(
+            f"SELECT id, text FROM messages WHERE id IN ({', '.join('?' * len(ids))})", ids
+        )
+    }
     return {
         "conversation": scene["id"],
         "messages": [
@@ -1040,7 +1194,9 @@ def advance(world, settings, to: str) -> dict:
 
 def drift(world, cards: dict[str, dict], since_us: int = 0) -> dict[str, str]:
     """Each person's messages since `since_us` beside the typing card they were given: what is far from it, by person."""
-    rows = world.db.execute("SELECT user_id, text FROM messages WHERE ts_us >= ? AND is_deleted = 0", (since_us,)).fetchall()  # fmt: skip
+    rows = world.db.execute(
+        "SELECT user_id, text FROM messages WHERE ts_us >= ? AND is_deleted = 0", (since_us,)
+    ).fetchall()
     by = {}
     for user, text in rows:
         by.setdefault(user, []).append(text.strip())
@@ -1092,7 +1248,13 @@ def revise(world, message_id: int, text: str) -> dict:
         raise ValueError("; ".join(errors))
     zones, habits, home = writing(world)
     moment, who = moments(world), row["user_id"]
-    rendered = linked(world, PLACEHOLDER.sub(lambda m: render(moment[m[1]], zones[who], row["ts_us"], habits.get(who), home), text), row["ts_us"])  # fmt: skip
+    rendered = linked(
+        world,
+        PLACEHOLDER.sub(
+            lambda m: render(moment[m[1]], zones[who], row["ts_us"], habits.get(who), home), text
+        ),
+        row["ts_us"],
+    )
     with world.batch():
         world.db.execute("UPDATE messages SET text = ? WHERE id = ?", (rendered, message_id))
         world.db.execute("DELETE FROM message_mentions WHERE message_id = ?", (message_id,))
@@ -1106,7 +1268,10 @@ def revise(world, message_id: int, text: str) -> dict:
 def edit(world, message_id: int, text: str) -> dict:
     """A person's edit of their own message of today, at the present: as a revision (same statements, no task's answer
     changed), and Slack marks it edited. What it said before is gone, as in Slack."""
-    row = world.db.execute("SELECT m.ts_us, m.subtype, u.is_bot FROM messages m JOIN users u ON u.id = m.user_id WHERE m.id = ?", (message_id,)).fetchone()  # fmt: skip
+    row = world.db.execute(
+        "SELECT m.ts_us, m.subtype, u.is_bot FROM messages m JOIN users u ON u.id = m.user_id WHERE m.id = ?",
+        (message_id,),
+    ).fetchone()
     if row is None:
         raise ValueError(f"no message {message_id}")
     day, now = today(world), present(world)
@@ -1130,7 +1295,9 @@ def answer_of(world, task_id: str) -> list:
 # ---------------------------------------------------------------------- the forge: tasks on a frozen world
 
 
-def forge_task(world, task: Task, settings, open_ids: list[str], gates: bool = True, rework: dict | None = None) -> dict:  # fmt: skip
+def forge_task(
+    world, task: Task, settings, open_ids: list[str], gates: bool = True, rework: dict | None = None
+) -> dict:
     """One candidate task on a finished, frozen world, for one of the round's open ids. Its category and level are the
     proposer's own, and its tries re-level it; it is checked as every task is (T1-T7, readable facts, the columns the
     tools show), with no planned level's needs: the forge measures difficulty instead of planning it. Without `gates`
@@ -1143,7 +1310,9 @@ def forge_task(world, task: Task, settings, open_ids: list[str], gates: bool = T
     was = None
     if task.rewords is not None:
         if (was := (rework or {}).get(task.rewords)) is None:
-            raise ValueError(f"rewords names a task the last round sent back for another reading: {sorted(rework or {})}")  # fmt: skip
+            raise ValueError(
+                f"rewords names a task the last round sent back for another reading: {sorted(rework or {})}"
+            )
         if task.actor_id != was["actor"]:
             raise ValueError(f"{task.id} rewords {task.rewords}: the same asker, {was['actor']}")
     spec = settings.taxonomy.get(task.category)
@@ -1206,16 +1375,50 @@ def annotate(world, fact: Annotation) -> dict:
     ):
         raise ValueError(f"fact {fact.supersedes}, which it supersedes, does not exist")
     marks = ", ".join("?" * len(fact.message_ids))
-    stated = world.db.execute(f"SELECT id, channel_id, user_id, ts_us FROM messages WHERE id IN ({marks}) AND is_deleted = 0 ORDER BY ts_us", fact.message_ids).fetchall()  # fmt: skip
+    stated = world.db.execute(
+        f"SELECT id, channel_id, user_id, ts_us FROM messages WHERE id IN ({marks}) AND is_deleted = 0 ORDER BY ts_us",
+        fact.message_ids,
+    ).fetchall()
     if len(stated) != len(set(fact.message_ids)):
         raise ValueError(f"messages {sorted(set(fact.message_ids) - {r['id'] for r in stated})} do not exist")
     first = stated[0]
-    (day,) = world.db.execute("SELECT day FROM calendar WHERE ? >= start_us AND ? < end_us", (first["ts_us"], first["ts_us"])).fetchone()  # fmt: skip
+    (day,) = world.db.execute(
+        "SELECT day FROM calendar WHERE ? >= start_us AND ? < end_us", (first["ts_us"], first["ts_us"])
+    ).fetchone()
     with world.batch():
-        world.insert("facts", [dict(id=fact.id, storyline=fact.storyline, subject=fact.subject, attribute=fact.attribute, value=fact.value, anchor=fact.anchor, channel_id=first["channel_id"], author_id=first["user_id"], day=day, is_decoy=int(fact.decoy), summary=fact.summary)])  # fmt: skip
-        world.insert("evidence", [dict(fact_id=fact.id, message_id=r["id"], role="anchor", anchor_token=fact.anchor) for r in stated])  # fmt: skip
+        world.insert(
+            "facts",
+            [
+                dict(
+                    id=fact.id,
+                    storyline=fact.storyline,
+                    subject=fact.subject,
+                    attribute=fact.attribute,
+                    value=fact.value,
+                    anchor=fact.anchor,
+                    channel_id=first["channel_id"],
+                    author_id=first["user_id"],
+                    day=day,
+                    is_decoy=int(fact.decoy),
+                    summary=fact.summary,
+                )
+            ],
+        )
+        world.insert(
+            "evidence",
+            [
+                dict(fact_id=fact.id, message_id=r["id"], role="anchor", anchor_token=fact.anchor)
+                for r in stated
+            ],
+        )
         if fact.supersedes:
             world.insert(
                 "fact_relations", [dict(src_fact=fact.id, dst_fact=fact.supersedes, kind="supersedes")]
             )
-    return {"fact": fact.id, "channel_id": first["channel_id"], "author_id": first["user_id"], "day": day, "messages": len(stated)}  # fmt: skip
+    return {
+        "fact": fact.id,
+        "channel_id": first["channel_id"],
+        "author_id": first["user_id"],
+        "day": day,
+        "messages": len(stated),
+    }

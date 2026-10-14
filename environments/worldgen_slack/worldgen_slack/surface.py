@@ -30,7 +30,26 @@ KINDS = {"public_channel": "public", "private_channel": "private", "mpim": "mpim
 NAMES = {v: k for k, v in KINDS.items()}
 TITLES = {"public": "Public Channel", "private": "Private Channel", "mpim": "Group DM", "im": "DM"}
 FILTER = re.compile(r"(?<!\S)(in|from|with|has|is|before|after|on|during|creator):(\S+)", re.IGNORECASE)
-MONTHS = {m: i for i, m in enumerate(("january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"), 1)}  # fmt: skip
+MONTHS = {
+    m: i
+    for i, m in enumerate(
+        (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ),
+        1,
+    )
+}
 MENTION, CHANNEL_REF = re.compile(r"<@(U[A-Z0-9]+)>"), re.compile(r"<#(C[A-Z0-9]+|G[A-Z0-9]+)>")
 CONTEXT = 3  # messages of context on each side of a search hit
 PAGE = 100  # read_channel's default page: how deep a message sits is counted in these
@@ -49,7 +68,9 @@ def words(text: str) -> list[str]:
     return tokens(text)
 
 
-def _page(world, items: list, scope: list, cursor: str | None, limit: int, top: int) -> tuple[list, str | None]:
+def _page(
+    world, items: list, scope: list, cursor: str | None, limit: int, top: int
+) -> tuple[list, str | None]:
     """A page of items; the cursor is opaque, bound to the actor and the request, as the real server's are."""
     from .db import canonical, digest
 
@@ -109,7 +130,13 @@ def channel_name(world, row) -> str:
     """How a conversation is named: `#name`, or for a direct one the other people's names (reconstructed)."""
     if row["name"]:
         return "#" + row["name"]
-    others = [label(u) for u in world.db.execute("SELECT u.* FROM members m JOIN users u ON u.id = m.user_id WHERE m.channel_id = ? AND m.user_id <> ? AND m.left_us IS NULL ORDER BY u.real_name", (row["id"], world.actor["id"]))]  # fmt: skip
+    others = [
+        label(u)
+        for u in world.db.execute(
+            "SELECT u.* FROM members m JOIN users u ON u.id = m.user_id WHERE m.channel_id = ? AND m.user_id <> ? AND m.left_us IS NULL ORDER BY u.real_name",
+            (row["id"], world.actor["id"]),
+        )
+    ]
     return "DM: " + ", ".join(others) if row["type"] == "im" else "Group DM: " + ", ".join(others)
 
 
@@ -154,7 +181,11 @@ def message(world, row) -> dict:
     if row["parent_ts"]:
         out["thread_ts"] = row["parent_ts"]
     elif row["reply_count"]:
-        out |= {"thread_ts": row["ts"], "reply_count": row["reply_count"], "latest_reply": clock(world, row["latest_reply_us"])}  # fmt: skip
+        out |= {
+            "thread_ts": row["ts"],
+            "reply_count": row["reply_count"],
+            "latest_reply": clock(world, row["latest_reply_us"]),
+        }
     counts = world.db.execute(
         "SELECT emoji, COUNT(*) FROM reactions WHERE message_id = ? GROUP BY emoji ORDER BY MIN(created_us)",
         (row["id"],),
@@ -183,7 +214,11 @@ def briefing(world) -> str:
     caller's id into its tools' descriptions), and the date and time (the client's own)."""
     row = world.db.execute("SELECT value FROM world_meta WHERE key = 'now_us'").fetchone()
     now = datetime.fromtimestamp(int(row[0]) / 1e6, ZoneInfo(world.actor["tz"])) if row else None
-    when = f" It is {now:%A, %B} {now.day}, {now:%Y}, {now:%H:%M} on your clock ({world.actor['tz']})." if now else ""
+    when = (
+        f" It is {now:%A, %B} {now.day}, {now:%Y}, {now:%H:%M} on your clock ({world.actor['tz']})."
+        if now
+        else ""
+    )
     return f"You are using Slack as the user with user_id {world.actor['id']}." + when
 
 
@@ -252,10 +287,20 @@ def search(
         raise Failed("invalid_arguments: give keywords or filters")
     if sort not in ("score", "timestamp") or sort_dir not in ("asc", "desc"):
         raise Failed("invalid_arguments: sort is score or timestamp, sort_dir asc or desc")
-    kinds = ["public"] if not private else [KINDS[t.strip()] for t in (channel_types or "public_channel,private_channel,mpim,im").split(",") if t.strip() in KINDS]  # fmt: skip
+    kinds = (
+        ["public"]
+        if not private
+        else [
+            KINDS[t.strip()]
+            for t in (channel_types or "public_channel,private_channel,mpim,im").split(",")
+            if t.strip() in KINDS
+        ]
+    )
     where, args = [f"c.type IN ({', '.join('?' * len(kinds))})"], list(kinds)
     if only_my_channels:
-        where.append("EXISTS (SELECT 1 FROM members x WHERE x.channel_id = m.channel_id AND x.user_id = ? AND x.left_us IS NULL)")  # fmt: skip
+        where.append(
+            "EXISTS (SELECT 1 FROM members x WHERE x.channel_id = m.channel_id AND x.user_id = ? AND x.left_us IS NULL)"
+        )
         args.append(world.actor["id"])
     if not include_bots:
         where.append("u.is_bot = 0")
@@ -284,12 +329,38 @@ def search(
     if wanted:
         where.append("m.id IN (SELECT docid FROM main.messages_fts WHERE messages_fts MATCH ?)")
         args.append(" ".join(wanted))
-        score = "(SELECT bm25(matchinfo(messages_fts, 'pcnalx')) FROM main.messages_fts WHERE messages_fts MATCH ? AND docid = m.id)"  # fmt: skip
+        score = "(SELECT bm25(matchinfo(messages_fts, 'pcnalx')) FROM main.messages_fts WHERE messages_fts MATCH ? AND docid = m.id)"
     direction = "ASC" if sort_dir == "asc" else "DESC"
-    order = f"m.ts_us {direction}, m.id" if sort == "timestamp" or not wanted else "score DESC, m.ts_us DESC, m.id"
-    sql = MESSAGE.replace("SELECT m.id,", f"SELECT {score} AS score, m.id,") + f" WHERE {' AND '.join(where)} ORDER BY {order}"  # fmt: skip
+    order = (
+        f"m.ts_us {direction}, m.id"
+        if sort == "timestamp" or not wanted
+        else "score DESC, m.ts_us DESC, m.id"
+    )
+    sql = (
+        MESSAGE.replace("SELECT m.id,", f"SELECT {score} AS score, m.id,")
+        + f" WHERE {' AND '.join(where)} ORDER BY {order}"
+    )
     rows = world.db.execute(sql, ([" ".join(wanted)] if wanted else []) + args).fetchall()
-    shown, more = _page(world, rows, ["search", private, keywords, filters, after, before, sort, sort_dir, channel_types, only_my_channels, include_bots], cursor, limit, 20)  # fmt: skip
+    shown, more = _page(
+        world,
+        rows,
+        [
+            "search",
+            private,
+            keywords,
+            filters,
+            after,
+            before,
+            sort,
+            sort_dir,
+            channel_types,
+            only_my_channels,
+            include_bots,
+        ],
+        cursor,
+        limit,
+        20,
+    )
     items = []
     for row in shown:
         hit = message(world, row)
@@ -305,33 +376,48 @@ def modifier(world, name: str, value: str) -> tuple[str, list]:
     if name == "in":
         if bare.startswith("@") or bare.startswith("U"):
             who = user_ref(world, bare)
-            return "(c.type = 'im' AND EXISTS (SELECT 1 FROM members x WHERE x.channel_id = c.id AND x.user_id = ?))", [who]  # fmt: skip
+            return (
+                "(c.type = 'im' AND EXISTS (SELECT 1 FROM members x WHERE x.channel_id = c.id AND x.user_id = ?))",
+                [who],
+            )
         return "(c.id = ? OR c.name = ?)", [bare.lstrip("#"), bare.lstrip("#")]
     if name == "from":
         return "m.user_id = ?", [user_ref(world, bare)]
     if name == "with":  # a thread or a direct conversation the person is in
         who = user_ref(world, bare)
-        return """(EXISTS (SELECT 1 FROM messages t WHERE t.user_id = ? AND (t.id = COALESCE(m.parent_id, m.id)
+        return (
+            """(EXISTS (SELECT 1 FROM messages t WHERE t.user_id = ? AND (t.id = COALESCE(m.parent_id, m.id)
             OR t.parent_id = COALESCE(m.parent_id, m.id))) OR (c.type IN ('im', 'mpim') AND EXISTS (SELECT 1 FROM
-            members x WHERE x.channel_id = c.id AND x.user_id = ?)))""", [who, who]
+            members x WHERE x.channel_id = c.id AND x.user_id = ?)))""",
+            [who, who],
+        )
     if name == "has":
         if value.lower() == "link":
             return "(m.text LIKE '%http://%' OR m.text LIKE '%https://%')", []
         if value.lower() == "reaction":
             return "EXISTS (SELECT 1 FROM reactions r WHERE r.message_id = m.id)", []
         if value.startswith(":") and value.endswith(":") and len(value) > 2:
-            return "EXISTS (SELECT 1 FROM reactions r WHERE r.message_id = m.id AND r.emoji = ?)", [value.strip(":")]
+            return "EXISTS (SELECT 1 FROM reactions r WHERE r.message_id = m.id AND r.emoji = ?)", [
+                value.strip(":")
+            ]
         return "0", []  # pins, files and saved items: the world has none
     if name == "is":
         if value.lower() == "thread":
-            return "(m.parent_id IS NOT NULL OR EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = m.id))", []
+            return (
+                "(m.parent_id IS NOT NULL OR EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = m.id))",
+                [],
+            )
         if value.lower() == "dm":
             return "c.type IN ('im', 'mpim')", []
         return "0", []
     if name in ("before", "after", "on"):
         if name == "on":
             return "(m.ts_us >= ? AND m.ts_us < ?)", [day_us(world, value), day_us(world, value, 1)]
-        return ("m.ts_us < ?", [day_us(world, value)]) if name == "before" else ("m.ts_us >= ?", [day_us(world, value, 1)])  # fmt: skip
+        return (
+            ("m.ts_us < ?", [day_us(world, value)])
+            if name == "before"
+            else ("m.ts_us >= ?", [day_us(world, value, 1)])
+        )
     if name == "during":
         start, end = during(world, value)
         return "(m.ts_us >= ? AND m.ts_us < ?)", [start, end]
@@ -350,22 +436,37 @@ def context(world, row, length: int | None) -> dict:
     replies after it; a top-level message's channel around it."""
     root = row["parent_id"]
     if root:
-        before = messages(world, "(m.id = ? OR m.parent_id = ?) AND m.ts_us < ?", [root, root, row["ts_us"]], "m.ts_us DESC")[:CONTEXT][::-1]  # fmt: skip
+        before = messages(
+            world, "(m.id = ? OR m.parent_id = ?) AND m.ts_us < ?", [root, root, row["ts_us"]], "m.ts_us DESC"
+        )[:CONTEXT][::-1]
         after = messages(world, "m.parent_id = ? AND m.ts_us > ?", [root, row["ts_us"]], "m.ts_us")[:CONTEXT]
     elif row["reply_count"]:
         before, after = [], messages(world, "m.parent_id = ?", [row["id"]], "m.ts_us")[:CONTEXT]
     else:
         near = "m.channel_id = ? AND m.parent_id IS NULL AND m.ts_us {} ?"
-        before = messages(world, near.format("<"), [row["channel_id"], row["ts_us"]], "m.ts_us DESC")[:2][::-1]
+        before = messages(world, near.format("<"), [row["channel_id"], row["ts_us"]], "m.ts_us DESC")[:2][
+            ::-1
+        ]
         after = messages(world, near.format(">"), [row["channel_id"], row["ts_us"]], "m.ts_us")[:2]
     cut = lambda m: m | {"text": m["text"][:length]} if length else m  # noqa: E731
-    return {"before": [cut(message(world, r)) for r in before], "after": [cut(message(world, r)) for r in after]}
+    return {
+        "before": [cut(message(world, r)) for r in before],
+        "after": [cut(message(world, r)) for r in after],
+    }
 
 
 # ---------------------------------------------------------------------- reads
 
 
-def read_channel(world, channel_id: str, oldest: str | None = None, latest: str | None = None, limit: int = PAGE, cursor: str | None = None, response_format: str = "detailed") -> dict:  # fmt: skip
+def read_channel(
+    world,
+    channel_id: str,
+    oldest: str | None = None,
+    latest: str | None = None,
+    limit: int = PAGE,
+    cursor: str | None = None,
+    response_format: str = "detailed",
+) -> dict:
     """A conversation's top-level messages, newest first, between `oldest` and `latest`."""
     row = channel(world, channel_id)
     where, args = ["m.channel_id = ?", "m.parent_id IS NULL"], [row["id"]]
@@ -375,10 +476,25 @@ def read_channel(world, channel_id: str, oldest: str | None = None, latest: str 
             args.append(us)
     rows = messages(world, " AND ".join(where), args, "m.ts_us DESC, m.id DESC")
     shown, more = _page(world, rows, ["history", row["id"], oldest, latest], cursor, limit, 100)
-    return {"channel": row["id"], "channel_name": channel_name(world, row), "items": [message(world, r) for r in shown], "next_cursor": more, "format": response_format}  # fmt: skip
+    return {
+        "channel": row["id"],
+        "channel_name": channel_name(world, row),
+        "items": [message(world, r) for r in shown],
+        "next_cursor": more,
+        "format": response_format,
+    }
 
 
-def read_thread(world, channel_id: str, message_ts: str, oldest: str | None = None, latest: str | None = None, limit: int = 100, cursor: str | None = None, response_format: str = "detailed") -> dict:  # fmt: skip
+def read_thread(
+    world,
+    channel_id: str,
+    message_ts: str,
+    oldest: str | None = None,
+    latest: str | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+    response_format: str = "detailed",
+) -> dict:
     """A thread: its parent message, then its replies oldest first."""
     row = channel(world, channel_id)
     parent = messages(world, "m.channel_id = ? AND m.ts = ?", [row["id"], message_ts], "m.id")
@@ -392,9 +508,18 @@ def read_thread(world, channel_id: str, message_ts: str, oldest: str | None = No
             where.append(f"m.ts_us {op} ?")
             args.append(us)
     replies = messages(world, " AND ".join(where), args, "m.ts_us, m.id")
-    shown, more = _page(world, replies, ["thread", row["id"], message_ts, oldest, latest], cursor, limit, 1000)
+    shown, more = _page(
+        world, replies, ["thread", row["id"], message_ts, oldest, latest], cursor, limit, 1000
+    )
     items = [message(world, parent[0])] + [message(world, r) for r in shown]
-    return {"channel": row["id"], "parent": parent[0]["ts"], "replies": len(replies), "items": items, "next_cursor": more, "format": response_format}  # fmt: skip
+    return {
+        "channel": row["id"],
+        "parent": parent[0]["ts"],
+        "replies": len(replies),
+        "items": items,
+        "next_cursor": more,
+        "format": response_format,
+    }
 
 
 def profile(row) -> dict:
@@ -415,7 +540,9 @@ def profile(row) -> dict:
     }
 
 
-def read_user_profile(world, user_id: str | None = None, include_locale: bool = False, response_format: str = "detailed") -> dict:  # fmt: skip
+def read_user_profile(
+    world, user_id: str | None = None, include_locale: bool = False, response_format: str = "detailed"
+) -> dict:
     """A person's profile; with no user_id, the caller's own."""
     row = person(world, user_id or world.actor["id"])
     company = world.db.execute("SELECT value FROM world_meta WHERE key = 'company'").fetchone()
@@ -425,7 +552,9 @@ def read_user_profile(world, user_id: str | None = None, include_locale: bool = 
 def get_reactions(world, channel_id: str, message_ts: str) -> dict:
     """Each reaction on a message, with who added it."""
     row = channel(world, channel_id)
-    found = world.db.execute("SELECT id FROM messages WHERE channel_id = ? AND ts = ?", (row["id"], message_ts)).fetchone()  # fmt: skip
+    found = world.db.execute(
+        "SELECT id FROM messages WHERE channel_id = ? AND ts = ?", (row["id"], message_ts)
+    ).fetchone()
     if found is None:
         raise Failed("message_not_found")
     rows = world.db.execute(
@@ -442,7 +571,15 @@ def get_reactions(world, channel_id: str, message_ts: str) -> dict:
     return {"channel": row["id"], "ts": message_ts, "reactions": list(reactions.values())}
 
 
-def list_channel_members(world, channel_id: str, cursor: str | None = None, limit: int = 30, response_format: str = "detailed", include_bots: bool = False, include_deleted: bool = False) -> dict:  # fmt: skip
+def list_channel_members(
+    world,
+    channel_id: str,
+    cursor: str | None = None,
+    limit: int = 30,
+    response_format: str = "detailed",
+    include_bots: bool = False,
+    include_deleted: bool = False,
+) -> dict:
     """A conversation's current members (not a direct one's): profiles, or ids only, which are not filtered."""
     row = channel(world, channel_id)
     if row["type"] == "im":
@@ -457,27 +594,69 @@ def list_channel_members(world, channel_id: str, cursor: str | None = None, limi
         + " ORDER BY u.id",
         (row["id"],),
     ).fetchall()
-    shown, more = _page(world, rows, ["members", row["id"], response_format, include_bots, include_deleted], cursor, limit, 30)  # fmt: skip
-    return {"channel": row["id"], "total": len(rows), "items": [profile(r) for r in shown], "next_cursor": more, "format": response_format}  # fmt: skip
+    shown, more = _page(
+        world, rows, ["members", row["id"], response_format, include_bots, include_deleted], cursor, limit, 30
+    )
+    return {
+        "channel": row["id"],
+        "total": len(rows),
+        "items": [profile(r) for r in shown],
+        "next_cursor": more,
+        "format": response_format,
+    }
 
 
-def list_user_channels(world, types: str = "public_channel,private_channel", format: str = "full", limit: int = 50, cursor: str | None = None, name_prefix: str | None = None, exclude_archived: bool = False, team_id: str | None = None) -> dict:  # fmt: skip
+def list_user_channels(
+    world,
+    types: str = "public_channel,private_channel",
+    format: str = "full",
+    limit: int = 50,
+    cursor: str | None = None,
+    name_prefix: str | None = None,
+    exclude_archived: bool = False,
+    team_id: str | None = None,
+) -> dict:
     """The conversations the caller is a member of, archived ones included unless excluded."""
     kinds = [KINDS.get(t.strip()) for t in types.split(",") if t.strip()]
     if not kinds or None in kinds:
-        raise Failed("invalid_arguments: types is a comma-separated subset of public_channel, private_channel, mpim, im")  # fmt: skip
+        raise Failed(
+            "invalid_arguments: types is a comma-separated subset of public_channel, private_channel, mpim, im"
+        )
     rows = world.db.execute(
         f"""SELECT c.* FROM channels c JOIN members mine ON mine.channel_id = c.id AND mine.user_id = ?
-        AND mine.left_us IS NULL WHERE c.type IN ({", ".join("?" * len(kinds))})""" + (" AND c.is_archived = 0" if exclude_archived else "") + " ORDER BY CASE c.type WHEN 'public' THEN 0 WHEN 'private' THEN 1 WHEN 'mpim' THEN 2 ELSE 3 END, c.name, c.id",  # fmt: skip
+        AND mine.left_us IS NULL WHERE c.type IN ({", ".join("?" * len(kinds))})"""
+        + (" AND c.is_archived = 0" if exclude_archived else "")
+        + " ORDER BY CASE c.type WHEN 'public' THEN 0 WHEN 'private' THEN 1 WHEN 'mpim' THEN 2 ELSE 3 END, c.name, c.id",
         (world.actor["id"], *kinds),
     ).fetchall()
     if name_prefix:
         rows = [r for r in rows if (r["name"] or "").lower().startswith(name_prefix.lower())]
-    shown, more = _page(world, rows, ["mine", types, name_prefix, exclude_archived], None if name_prefix else cursor, limit, 200)  # fmt: skip
+    shown, more = _page(
+        world,
+        rows,
+        ["mine", types, name_prefix, exclude_archived],
+        None if name_prefix else cursor,
+        limit,
+        200,
+    )
     items = []
     for r in shown:
-        people = [u for (u,) in world.db.execute("SELECT user_id FROM members WHERE channel_id = ? AND left_us IS NULL ORDER BY user_id", (r["id"],))]  # fmt: skip
-        items.append({"id": r["id"], "name": channel_name(world, r), "type": r["type"], "is_archived": bool(r["is_archived"])} | ({"users": people} if r["name"] is None else {}))  # fmt: skip
+        people = [
+            u
+            for (u,) in world.db.execute(
+                "SELECT user_id FROM members WHERE channel_id = ? AND left_us IS NULL ORDER BY user_id",
+                (r["id"],),
+            )
+        ]
+        items.append(
+            {
+                "id": r["id"],
+                "name": channel_name(world, r),
+                "type": r["type"],
+                "is_archived": bool(r["is_archived"]),
+            }
+            | ({"users": people} if r["name"] is None else {})
+        )
     return {"total": len(rows), "items": items, "next_cursor": more, "format": format}
 
 
@@ -490,22 +669,56 @@ def matches(texts: list[str], keywords: list[str]) -> bool:
         parts = words(keyword.strip("-").strip('"'))
         if not parts:
             continue
-        hit = any(all(bag[i + j].startswith(w) for j, w in enumerate(parts)) for i in range(len(bag) - len(parts) + 1))  # fmt: skip
+        hit = any(
+            all(bag[i + j].startswith(w) for j, w in enumerate(parts))
+            for i in range(len(bag) - len(parts) + 1)
+        )
         if hit == negative:
             return False
     return True
 
 
-def search_users(world, keywords: list[str] | None = None, natural_language_query: str = "", limit: int = 20, cursor: str | None = None, response_format: str = "detailed") -> dict:  # fmt: skip
+def search_users(
+    world,
+    keywords: list[str] | None = None,
+    natural_language_query: str = "",
+    limit: int = 20,
+    cursor: str | None = None,
+    response_format: str = "detailed",
+) -> dict:
     """People whose name, handle, email, title or profile fields have every keyword."""
     if not keywords:
         raise Failed("invalid_arguments: give keywords")
-    rows = [r for r in world.db.execute("SELECT * FROM users WHERE is_deleted = 0 ORDER BY real_name, id") if matches([r["real_name"], r["display_name"], r["handle"], r["email"], r["title"] or "", r["id"], *map(str, json.loads(r["profile_json"]).values())], keywords)]  # fmt: skip
+    rows = [
+        r
+        for r in world.db.execute("SELECT * FROM users WHERE is_deleted = 0 ORDER BY real_name, id")
+        if matches(
+            [
+                r["real_name"],
+                r["display_name"],
+                r["handle"],
+                r["email"],
+                r["title"] or "",
+                r["id"],
+                *map(str, json.loads(r["profile_json"]).values()),
+            ],
+            keywords,
+        )
+    ]
     shown, more = _page(world, rows, ["users", keywords], cursor, limit, 20)
     return {"items": [profile(r) for r in shown], "next_cursor": more, "format": response_format}
 
 
-def search_channels(world, keywords: list[str] | None = None, natural_language_query: str = "", channel_types: str = "public_channel", include_archived: bool = False, limit: int = 20, cursor: str | None = None, response_format: str = "detailed") -> dict:  # fmt: skip
+def search_channels(
+    world,
+    keywords: list[str] | None = None,
+    natural_language_query: str = "",
+    channel_types: str = "public_channel",
+    include_archived: bool = False,
+    limit: int = 20,
+    cursor: str | None = None,
+    response_format: str = "detailed",
+) -> dict:
     """Named channels the caller can see whose name, topic or purpose has every keyword."""
     if not keywords:
         raise Failed("invalid_arguments: give keywords")
@@ -514,12 +727,29 @@ def search_channels(world, keywords: list[str] | None = None, natural_language_q
         raise Failed("invalid_arguments: channel_types is public_channel, private_channel or both")
     rows = world.db.execute(
         f"""SELECT c.*, u.real_name AS creator_name FROM channels c LEFT JOIN users u ON u.id = c.creator_id
-        WHERE c.name IS NOT NULL AND c.type IN ({", ".join("?" * len(kinds))})""" + ("" if include_archived else " AND c.is_archived = 0") + " ORDER BY c.name",  # fmt: skip
+        WHERE c.name IS NOT NULL AND c.type IN ({", ".join("?" * len(kinds))})"""
+        + ("" if include_archived else " AND c.is_archived = 0")
+        + " ORDER BY c.name",
         kinds,
     ).fetchall()
     rows = [r for r in rows if matches([r["name"].replace("-", " "), r["topic"], r["purpose"]], keywords)]
-    shown, more = _page(world, rows, ["channels", keywords, channel_types, include_archived], cursor, limit, 20)
-    items = [{"id": r["id"], "name": r["name"], "type": r["type"], "topic": r["topic"], "purpose": r["purpose"], "is_archived": bool(r["is_archived"]), "creator": r["creator_id"], "creator_name": r["creator_name"], "created": clock(world, r["created_us"])} for r in shown]  # fmt: skip
+    shown, more = _page(
+        world, rows, ["channels", keywords, channel_types, include_archived], cursor, limit, 20
+    )
+    items = [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "type": r["type"],
+            "topic": r["topic"],
+            "purpose": r["purpose"],
+            "is_archived": bool(r["is_archived"]),
+            "creator": r["creator_id"],
+            "creator_name": r["creator_name"],
+            "created": clock(world, r["created_us"]),
+        }
+        for r in shown
+    ]
     return {"items": items, "next_cursor": more, "format": response_format}
 
 
@@ -563,57 +793,130 @@ def render(world, tool: str, record: dict) -> dict:
         if concise:
             body = "\n\n".join(f"{who(m)}: {m['text']} [{m['time_local']}]" for m in record["items"])
         else:
-            body = "\n\n".join(f"=== Message from {who(m)} ({m['user']}) at {m['time_local']} === \nMessage TS: {m['ts']}\n{m['text']}{tail(m)}" for m in record["items"])  # fmt: skip
-        more = f"There are more messages available. To view the next page, use cursor: `{record['next_cursor']}`\n" if record["next_cursor"] else "There are no more messages available.\n"  # fmt: skip
+            body = "\n\n".join(
+                f"=== Message from {who(m)} ({m['user']}) at {m['time_local']} === \nMessage TS: {m['ts']}\n{m['text']}{tail(m)}"
+                for m in record["items"]
+            )
+        more = (
+            f"There are more messages available. To view the next page, use cursor: `{record['next_cursor']}`\n"
+            if record["next_cursor"]
+            else "There are no more messages available.\n"
+        )
         return {"messages": head + body, "pagination_info": more}
     if tool == "read_thread":
         parent, replies = record["items"][0], record["items"][1:]
-        more = f"There are more messages in this thread. To view the next page, use cursor: `{record['next_cursor']}`\n" if record["next_cursor"] else "There are no more messages in this thread.\n"  # fmt: skip  # reconstructed
+        more = (
+            f"There are more messages in this thread. To view the next page, use cursor: `{record['next_cursor']}`\n"
+            if record["next_cursor"]
+            else "There are no more messages in this thread.\n"
+        )  # reconstructed
         if concise:
-            text = f"THREAD: {parent['text']} [{who(parent)}]\n\n" + "".join(f"> {who(m)}: {m['text']}\n" for m in replies)  # fmt: skip
+            text = f"THREAD: {parent['text']} [{who(parent)}]\n\n" + "".join(
+                f"> {who(m)}: {m['text']}\n" for m in replies
+            )
             return {"messages": text, "pagination_info": more}
-        text = f"=== THREAD PARENT MESSAGE ===\nFrom: {who(parent)} ({parent['user']})\nTime: {parent['time_local']}\nMessage TS: {parent['ts']}\n{parent['text']}" + ("\nReactions: " + ", ".join(f"{r['name']} ({r['count']})" for r in parent["reactions"]) if parent.get("reactions") else "") + "\n\n"  # fmt: skip
+        text = (
+            f"=== THREAD PARENT MESSAGE ===\nFrom: {who(parent)} ({parent['user']})\nTime: {parent['time_local']}\nMessage TS: {parent['ts']}\n{parent['text']}"
+            + (
+                "\nReactions: " + ", ".join(f"{r['name']} ({r['count']})" for r in parent["reactions"])
+                if parent.get("reactions")
+                else ""
+            )
+            + "\n\n"
+        )
         if not replies:
             return {"messages": text + "No thread messsages\n", "pagination_info": more}
         text += f"=== THREAD REPLIES ({record['replies']} total) ===\n\n"
-        text += "\n".join(f"--- Reply {k} of {record['replies']} ---\nFrom: {who(m)} ({m['user']})\nTime: {m['time_local']}\nMessage TS: {m['ts']}\n{m['text']}" + ("\nReactions: " + ", ".join(f"{r['name']} ({r['count']})" for r in m["reactions"]) if m.get("reactions") else "") + "\n" for k, m in enumerate(replies, 1))  # fmt: skip
+        text += "\n".join(
+            f"--- Reply {k} of {record['replies']} ---\nFrom: {who(m)} ({m['user']})\nTime: {m['time_local']}\nMessage TS: {m['ts']}\n{m['text']}"
+            + (
+                "\nReactions: " + ", ".join(f"{r['name']} ({r['count']})" for r in m["reactions"])
+                if m.get("reactions")
+                else ""
+            )
+            + "\n"
+            for k, m in enumerate(replies, 1)
+        )
         return {"messages": text, "pagination_info": more}
     if tool in ("search_public", "search_public_and_private"):
         items = record["items"]
-        more = f"For the next page of results use cursor `{record['next_cursor']}`\n" if record["next_cursor"] else "End of results - No more pages available.\\n"  # fmt: skip
+        more = (
+            f"For the next page of results use cursor `{record['next_cursor']}`\n"
+            if record["next_cursor"]
+            else "End of results - No more pages available.\\n"
+        )
         if not items:
             return {"results": "# Search Results for: \n\nNo results found.\n", "pagination_info": more}
         if concise:
-            lines = "".join(f"{k}. {('#' + m['channel_name']) if m['channel_name'] else 'DM'} - {m['user_name']}: {m['text']} {m['time_local']}\n" for k, m in enumerate(items, 1))  # fmt: skip
-            return {"results": f"# Search Results for: \n\n## Messages ({len(items)} results)\n({len(items)} results)\n{lines}", "pagination_info": more}  # fmt: skip
+            lines = "".join(
+                f"{k}. {('#' + m['channel_name']) if m['channel_name'] else 'DM'} - {m['user_name']}: {m['text']} {m['time_local']}\n"
+                for k, m in enumerate(items, 1)
+            )
+            return {
+                "results": f"# Search Results for: \n\n## Messages ({len(items)} results)\n({len(items)} results)\n{lines}",
+                "pagination_info": more,
+            }
         out = f"# Search Results for: \n\n## Messages ({len(items)} results)\n"
         for k, m in enumerate(items, 1):
-            where = f"#{m['channel_name']}" if m["channel_name"] else "DM"  # reconstructed for direct conversations
-            out += f"### Result {k} of {len(items)}\nChannel: {where} (ID: {m['channel']})\nFrom: {who(m)} (ID: {m['user']}) \nTime: {m['time_local']}\nMessage_ts: {m['ts']}\n"  # fmt: skip
-            out += (f"Reply count: {m['reply_count']}\n" if m.get("reply_count") else "") + f"Permalink: [link]({permalink(world, m)})\nText: \n{m['text']}\n"  # fmt: skip
+            where = (
+                f"#{m['channel_name']}" if m["channel_name"] else "DM"
+            )  # reconstructed for direct conversations
+            out += f"### Result {k} of {len(items)}\nChannel: {where} (ID: {m['channel']})\nFrom: {who(m)} (ID: {m['user']}) \nTime: {m['time_local']}\nMessage_ts: {m['ts']}\n"
+            out += (
+                f"Reply count: {m['reply_count']}\n" if m.get("reply_count") else ""
+            ) + f"Permalink: [link]({permalink(world, m)})\nText: \n{m['text']}\n"
             for side in ("before", "after"):
                 if near := m.get("context", {}).get(side):
-                    out += f"Context {side}: \n" + "".join(f"- From: {'' if c.get('subtype') in ('channel_join', 'channel_leave') else who(c)} (ID: {'U00' if c.get('subtype') in ('channel_join', 'channel_leave') else c['user']}) \n  Message_ts: {c['ts']}\n  {c['text']}\n" for c in near)  # fmt: skip  # a join's author shows as the capture does
+                    out += f"Context {side}: \n" + "".join(
+                        f"- From: {'' if c.get('subtype') in ('channel_join', 'channel_leave') else who(c)} (ID: {'U00' if c.get('subtype') in ('channel_join', 'channel_leave') else c['user']}) \n  Message_ts: {c['ts']}\n  {c['text']}\n"
+                        for c in near
+                    )  # a join's author shows as the capture does
             out += "\n---\n\n"
         return {"results": out, "pagination_info": more}
     if tool == "get_reactions":
         if not record["reactions"]:
             return {"result": "No reactions found on this message."}
-        return {"result": "Reactions on message:\n\n" + "\n".join(f":{r['name']}: × {r['count']} — " + ", ".join(f"{n} ({u})" for n, u in zip(r["names"], r["users"])) for r in record["reactions"])}  # fmt: skip
+        return {
+            "result": "Reactions on message:\n\n"
+            + "\n".join(
+                f":{r['name']}: × {r['count']} — "
+                + ", ".join(f"{n} ({u})" for n, u in zip(r["names"], r["users"]))
+                for r in record["reactions"]
+            )
+        }
     if tool == "read_user_profile":
         p = record
         if concise:
-            return {"result": f"{p['handle']} ({p['display_name']})\n{p['organization']}\n{p['title']}\n{p['email']}\nStatus: {p['status_emoji']} {p['status_text']}\n"}  # fmt: skip
-        fields = "".join(f"{k}: {v}\n" for k, v in p["fields"].items())  # reconstructed: custom profile fields
-        return {"result": f"User ID: {p['id']}\nUsername: {p['handle']}\nDisplay Name: {p['display_name']}\nReal Name: {p['real_name']}\nPronouns: \nTitle: {p['title']}\nEmail: {p['email']}\nOrganization Name: {p['organization']}\nPhone: \nStatus: {p['status_emoji']} {p['status_text']}\nTimezone: {p['tz']}\n{fields}Admin: {'Yes' if p['is_admin'] else 'No'}\nOwner: No\nBot: {'Yes' if p['is_bot'] else 'No'}\nRestricted: No\n"}  # fmt: skip
+            return {
+                "result": f"{p['handle']} ({p['display_name']})\n{p['organization']}\n{p['title']}\n{p['email']}\nStatus: {p['status_emoji']} {p['status_text']}\n"
+            }
+        fields = "".join(
+            f"{k}: {v}\n" for k, v in p["fields"].items()
+        )  # reconstructed: custom profile fields
+        return {
+            "result": f"User ID: {p['id']}\nUsername: {p['handle']}\nDisplay Name: {p['display_name']}\nReal Name: {p['real_name']}\nPronouns: \nTitle: {p['title']}\nEmail: {p['email']}\nOrganization Name: {p['organization']}\nPhone: \nStatus: {p['status_emoji']} {p['status_text']}\nTimezone: {p['tz']}\n{fields}Admin: {'Yes' if p['is_admin'] else 'No'}\nOwner: No\nBot: {'Yes' if p['is_bot'] else 'No'}\nRestricted: No\n"
+        }
     if tool == "list_channel_members":
-        more = f"More members available. Use cursor: `{record['next_cursor']}`\n" if record["next_cursor"] else "No more members available.\n"  # fmt: skip  # reconstructed
+        more = (
+            f"More members available. Use cursor: `{record['next_cursor']}`\n"
+            if record["next_cursor"]
+            else "No more members available.\n"
+        )  # reconstructed
         head = f"# Channel Members ({record['total']})\n\n"
         if record["format"] == "ids_only":
-            return {"members": head + "".join(f"{p['id']}\n" for p in record["items"]), "pagination_info": more}
+            return {
+                "members": head + "".join(f"{p['id']}\n" for p in record["items"]),
+                "pagination_info": more,
+            }
         if record["format"] == "concise":
-            return {"members": head + "".join(f"@{p['handle']} ({p['display_name']})\n" for p in record["items"]), "pagination_info": more}  # fmt: skip
-        body = "".join(f"## Member {k}\nUser ID: {p['id']}\nUsername: @{p['handle']}\nDisplay Name: {p['display_name']}\nReal Name: {p['real_name']}\nEmail: {p['email']}\n\n" for k, p in enumerate(record["items"], 1))  # fmt: skip
+            return {
+                "members": head + "".join(f"@{p['handle']} ({p['display_name']})\n" for p in record["items"]),
+                "pagination_info": more,
+            }
+        body = "".join(
+            f"## Member {k}\nUser ID: {p['id']}\nUsername: @{p['handle']}\nDisplay Name: {p['display_name']}\nReal Name: {p['real_name']}\nEmail: {p['email']}\n\n"
+            for k, p in enumerate(record["items"], 1)
+        )
         return {"members": head + body, "pagination_info": more}
     if tool == "list_user_channels":
         if not record["items"]:
@@ -624,24 +927,52 @@ def render(world, tool: str, record: dict) -> dict:
         elif record["format"] == "names_only":
             body = "".join(f"{c['name']}\n" for c in record["items"])
         else:
-            body = "".join(f"### {c['name']}\n- **ID:** {c['id']}\n- **Type:** {TITLES[c['type']]}\n- **Archived:** {'Yes' if c['is_archived'] else 'No'}\n\n" for c in record["items"])  # fmt: skip
-        more = f"\nMore channels available. Use cursor: `{record['next_cursor']}`\n" if record["next_cursor"] else ""  # reconstructed
+            body = "".join(
+                f"### {c['name']}\n- **ID:** {c['id']}\n- **Type:** {TITLES[c['type']]}\n- **Archived:** {'Yes' if c['is_archived'] else 'No'}\n\n"
+                for c in record["items"]
+            )
+        more = (
+            f"\nMore channels available. Use cursor: `{record['next_cursor']}`\n"
+            if record["next_cursor"]
+            else ""
+        )  # reconstructed
         return {"result": head + body + more}
     if tool == "search_users":
-        items, more = record["items"], f"For the next page of results use cursor `{record['next_cursor']}`\n" if record["next_cursor"] else "End of results - No more pages available.\\n"  # fmt: skip
+        items, more = (
+            record["items"],
+            f"For the next page of results use cursor `{record['next_cursor']}`\n"
+            if record["next_cursor"]
+            else "End of results - No more pages available.\\n",
+        )
         if not items:
             return {"results": "# Search Results for: \n\nNo results found.\n", "pagination_info": more}
-        body = "".join(f"### Result {k} of {len(items)}\nName: {p['real_name']}\nUser ID: {p['id']}\nTitle: {p['title']}\nEmail: {p['email']}\nTimezone: {p['tz']}\nPermalink: [link](https://{domain(world)}/team/{p['id']})\n\n---\n\n" for k, p in enumerate(items, 1))  # fmt: skip
-        return {"results": f"# Search Results for: \n\n## Users ({len(items)} results)\n" + body, "pagination_info": more}  # fmt: skip
+        body = "".join(
+            f"### Result {k} of {len(items)}\nName: {p['real_name']}\nUser ID: {p['id']}\nTitle: {p['title']}\nEmail: {p['email']}\nTimezone: {p['tz']}\nPermalink: [link](https://{domain(world)}/team/{p['id']})\n\n---\n\n"
+            for k, p in enumerate(items, 1)
+        )
+        return {
+            "results": f"# Search Results for: \n\n## Users ({len(items)} results)\n" + body,
+            "pagination_info": more,
+        }
     if tool == "search_channels":
-        items, more = record["items"], f"For the next page of results use cursor `{record['next_cursor']}`\n" if record["next_cursor"] else "End of results - No more pages available.\\n"  # fmt: skip
+        items, more = (
+            record["items"],
+            f"For the next page of results use cursor `{record['next_cursor']}`\n"
+            if record["next_cursor"]
+            else "End of results - No more pages available.\\n",
+        )
         if not items:
             return {"results": "# Search Results for: \n\nNo results found.\n", "pagination_info": more}
         body = ""
         for k, c in enumerate(items, 1):
             body += f"### Result {k} of {len(items)}\nName: #{c['name']}\n"
-            body += f"Topic: {c['topic']}\n" if c["topic"] else ""  # reconstructed: the captured channel had none
+            body += (
+                f"Topic: {c['topic']}\n" if c["topic"] else ""
+            )  # reconstructed: the captured channel had none
             body += f"Purpose: {c['purpose']}\n" if c["purpose"] else ""
-            body += f"Creator: {c['creator_name']} (<@{c['creator']})\nCreated: {c['created']}\nPermalink: [link](https://{domain(world)}/archives/{c['id']})\nIs Archived: {'true' if c['is_archived'] else 'false'}\nChannel Type: {NAMES[c['type']]}\n\n---\n\n"  # fmt: skip
-        return {"results": f"# Search Results for: \n\n## Channels ({len(items)} results)\n" + body, "pagination_info": more}  # fmt: skip
+            body += f"Creator: {c['creator_name']} (<@{c['creator']})\nCreated: {c['created']}\nPermalink: [link](https://{domain(world)}/archives/{c['id']})\nIs Archived: {'true' if c['is_archived'] else 'false'}\nChannel Type: {NAMES[c['type']]}\n\n---\n\n"
+        return {
+            "results": f"# Search Results for: \n\n## Channels ({len(items)} results)\n" + body,
+            "pagination_info": more,
+        }
     raise ValueError(f"unknown tool {tool!r}")

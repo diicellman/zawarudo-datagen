@@ -14,7 +14,14 @@ from types import SimpleNamespace
 
 from generators.worldgen_slack.chronicle import bounds, posted, quotas
 from generators.worldgen_slack.config import ROOT, ActivityConfig, AuthorSettings
-from generators.worldgen_slack.contracts import SeedPersona, activity, frozen_before, normalized, style, user_id
+from generators.worldgen_slack.contracts import (
+    SeedPersona,
+    activity,
+    frozen_before,
+    normalized,
+    style,
+    user_id,
+)
 from worldgen_slack.db import World
 
 TYPING = {
@@ -57,7 +64,11 @@ def author(run: Path, world: World, settings) -> dict | None:
     message."""
     one = lambda sql, *args: world.db.execute(sql, args).fetchone()[0]  # noqa: E731
     events = [json.loads(line) for line in (run / "progress.jsonl").read_text().splitlines()]
-    calls = [json.loads(line) for line in (run / "world-calls.jsonl").read_text().splitlines()] if (run / "world-calls.jsonl").exists() else []  # fmt: skip
+    calls = (
+        [json.loads(line) for line in (run / "world-calls.jsonl").read_text().splitlines()]
+        if (run / "world-calls.jsonl").exists()
+        else []
+    )
     quota = quotas(world, settings)
     days = {
         day: {"messages": posted(world, *bounds(world, day)), "quota": q["messages"]}
@@ -74,11 +85,24 @@ def author(run: Path, world: World, settings) -> dict | None:
     texts = [normalized(t) for (t,) in world.db.execute("SELECT text FROM messages")]
     shortcuts = {}
     for (task,) in world.db.execute("SELECT id FROM tasks WHERE gold_source = 'ledger'"):
-        values = [normalized(v) for (v,) in world.db.execute("SELECT f.value FROM task_facts tf JOIN facts f ON f.id = tf.fact_id WHERE tf.task_id = ?", (task,))]  # fmt: skip
+        values = [
+            normalized(v)
+            for (v,) in world.db.execute(
+                "SELECT f.value FROM task_facts tf JOIN facts f ON f.id = tf.fact_id WHERE tf.task_id = ?",
+                (task,),
+            )
+        ]
         if len(values) > 1:
             shortcuts[task] = sum(all(f" {v} " in f" {text} " for v in values) for text in texts)
-    terms = [t for (t,) in world.db.execute("SELECT anchor FROM facts WHERE anchor IS NOT NULL UNION SELECT subject FROM facts")]  # fmt: skip
-    everyday = world.db.execute("SELECT s.id, group_concat(m.text, ' ') FROM scenes s JOIN scene_messages sm ON sm.scene_id = s.id JOIN messages m ON m.id = sm.message_id WHERE s.storyline IS NULL GROUP BY s.id").fetchall()  # fmt: skip
+    terms = [
+        t
+        for (t,) in world.db.execute(
+            "SELECT anchor FROM facts WHERE anchor IS NOT NULL UNION SELECT subject FROM facts"
+        )
+    ]
+    everyday = world.db.execute(
+        "SELECT s.id, group_concat(m.text, ' ') FROM scenes s JOIN scene_messages sm ON sm.scene_id = s.id JOIN messages m ON m.id = sm.message_id WHERE s.storyline IS NULL GROUP BY s.id"
+    ).fetchall()
     return {
         "days": days,
         "ledger": {
@@ -86,7 +110,7 @@ def author(run: Path, world: World, settings) -> dict | None:
             "events": one("SELECT COUNT(*) FROM events"),
             "events_shared_by_facts": one(
                 "SELECT COUNT(*) FROM (SELECT event_id FROM facts WHERE event_id IS NOT NULL GROUP BY event_id HAVING COUNT(*) > 1)"
-            ),  # fmt: skip
+            ),
             "facts": one("SELECT COUNT(*) FROM facts"),
             "decoys": one("SELECT COUNT(*) FROM facts WHERE is_decoy = 1"),
             "supersedes": one("SELECT COUNT(*) FROM fact_relations WHERE kind = 'supersedes'"),
@@ -115,7 +139,9 @@ def author(run: Path, world: World, settings) -> dict | None:
 def measure(run: Path) -> dict:
     state = json.loads((run / "state.json").read_text())
     summary = json.loads((run / "summary.json").read_text()) if (run / "summary.json").exists() else {}
-    with tempfile.TemporaryDirectory() as directory:  # a world of an older schema, read as today's code reads it
+    with (
+        tempfile.TemporaryDirectory() as directory
+    ):  # a world of an older schema, read as today's code reads it
         shutil.copy(run / "world.sqlite", Path(directory) / "world.sqlite")
         world = World(Path(directory) / "world.sqlite", writable=True)
         world.migrate()
@@ -128,11 +154,12 @@ def read(run: Path, world: World, state: dict, summary: dict) -> dict:
     stats = style(world, frozen_before(world))  # a chapter: its own messages
     cast = {user_id(p["uuid"]): SeedPersona.model_validate(p) for p in state["cast"]}
     authors = {
-        author: {k: values[k] for k in TYPING} | {"messages": values["messages"]}
+        author: {k: values[k] for k in TYPING}
+        | {"messages": values["messages"]}
         | {"target": {ours: getattr(cast[author].typing, theirs) for ours, theirs in TYPING.items()}}
         for author, values in stats.get("authors", {}).items()
         if author in cast
-    }  # fmt: skip
+    }
     config = json.loads((run / "run.json").read_text())["config"]
     targets = known(ActivityConfig, config.get("activity", {}))
     settings = SimpleNamespace(activity=targets, author=known(AuthorSettings, config.get("author", {})))

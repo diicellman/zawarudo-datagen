@@ -25,7 +25,11 @@ COLUMNS = {
     2: [
         ("users", "deactivated_us", "ALTER TABLE users ADD COLUMN deactivated_us INTEGER"),
         ("channels", "archived_us", "ALTER TABLE channels ADD COLUMN archived_us INTEGER"),
-        ("messages", "subtype", "ALTER TABLE messages ADD COLUMN subtype TEXT CHECK (subtype IS NULL OR subtype IN ('bot_message', 'channel_join', 'channel_leave'))"),  # fmt: skip
+        (
+            "messages",
+            "subtype",
+            "ALTER TABLE messages ADD COLUMN subtype TEXT CHECK (subtype IS NULL OR subtype IN ('bot_message', 'channel_join', 'channel_leave'))",
+        ),
         ("events", "post_by", "ALTER TABLE events ADD COLUMN post_by TEXT REFERENCES users(id)"),
         ("tasks", "intent", "ALTER TABLE tasks ADD COLUMN intent TEXT"),
     ],
@@ -78,7 +82,17 @@ CREATE TEMP VIEW thread_stats AS SELECT p.id AS root_id, COUNT(r.id) AS reply_co
 """
 # What a gold query may read: the world as its actor sees it, the directory, the calendar, the fact ledger and the
 # promises people made (what was promised, by whom, and how it ended: kept, changed or dropped).
-GOLD_READS = {*SHADOWED, "users", "calendar", "storylines", "facts", "fact_relations", "evidence", "commitments", "artifacts"}  # fmt: skip
+GOLD_READS = {
+    *SHADOWED,
+    "users",
+    "calendar",
+    "storylines",
+    "facts",
+    "fact_relations",
+    "evidence",
+    "commitments",
+    "artifacts",
+}
 # Of the workspace, the columns the tools below show, or let the solver work out (a mention is <@U..> in a message's
 # text; a thread's latest reply is the last one it reads; a channel's members are those who have not left): a gold
 # query filters on and returns these alone. S3's gold read reactions.created_us, when the tools say who reacted but
@@ -98,7 +112,7 @@ SHOWN = {
         "is_admin",
         "is_deleted",
         "profile_json",
-    },  # fmt: skip
+    },
     "channels": {"id", "name", "type", "topic", "purpose", "is_archived"},
     "members": {"channel_id", "user_id", "left_us"},
     "messages": {"id", "channel_id", "ts_us", "ts", "user_id", "parent_id", "text", "is_deleted", "subtype"},
@@ -202,7 +216,6 @@ COMPLETION = {
 }
 
 
-
 def bm25(info: bytes, k1: float = 1.2, b: float = 0.75) -> float:
     """Okapi BM25 of one row from FTS4 matchinfo(..., 'pcnalx')."""
     values = struct.unpack(f"={len(info) // 4}I", info)
@@ -257,7 +270,9 @@ class World:
         was = int(row[0]) if row else 1
         fresh = sqlite3.connect(":memory:")
         fresh.executescript(SCHEMA.read_text())
-        objects = fresh.execute("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid").fetchall()  # fmt: skip
+        objects = fresh.execute(
+            "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid"
+        ).fetchall()
         fresh.close()
         have = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master")}
         with self.batch():
@@ -268,7 +283,10 @@ class World:
             for kind, name, sql in objects:
                 if name not in have and not name.startswith("messages_fts_"):
                     self.db.execute(sql)
-            self.db.execute("INSERT OR REPLACE INTO world_meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))  # fmt: skip
+            self.db.execute(
+                "INSERT OR REPLACE INTO world_meta (key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
         return was
 
     # ------------------------------------------------------------------ writes (generation code only)

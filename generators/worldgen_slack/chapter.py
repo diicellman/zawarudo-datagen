@@ -42,7 +42,9 @@ class Material(Section):
     category: Text
     level: int = Field(ge=1)
     count: int = Field(default=1, ge=1, le=20)
-    concept: Text | None = None  # what the entries are about; the seed draws one of the level's concepts when unset
+    concept: Text | None = (
+        None  # what the entries are about; the seed draws one of the level's concepts when unset
+    )
     needs: dict = Field(default_factory=dict)
 
 
@@ -88,7 +90,9 @@ def chapter_settings(chapter: ChapterConfig, base: Config) -> Config:
     world that breaks none of the world's rules, and each material is a cell of the taxonomy."""
     state = json.loads((chapter.world / "state.json").read_text())
     if state.get("phase") != "done":
-        raise ValueError(f"{chapter.world} is not finished (phase {state.get('phase')}): a chapter continues a finished world")  # fmt: skip
+        raise ValueError(
+            f"{chapter.world} is not finished (phase {state.get('phase')}): a chapter continues a finished world"
+        )
     world = parent_world(chapter.world)
     try:
         last = world.db.execute("SELECT MAX(day) FROM calendar").fetchone()[0]
@@ -97,8 +101,18 @@ def chapter_settings(chapter: ChapterConfig, base: Config) -> Config:
             raise ValueError(f"{chapter.world} breaks the world's rules: " + "; ".join(broken))
     finally:
         world.close()
-    changes = merged(chapter.settings, {"author": {"review_days": [last + d for d in chapter.review_days]}, "activity": {"messages": chapter.messages}})  # fmt: skip
-    fixed = {"output": str(chapter.output), "seed": chapter.seed, "storylines": storylines + chapter.storylines}
+    changes = merged(
+        chapter.settings,
+        {
+            "author": {"review_days": [last + d for d in chapter.review_days]},
+            "activity": {"messages": chapter.messages},
+        },
+    )
+    fixed = {
+        "output": str(chapter.output),
+        "seed": chapter.seed,
+        "storylines": storylines + chapter.storylines,
+    }
     settings = Config.model_validate(merged(base.model_dump(mode="json"), changes) | fixed)
     for m in chapter.material:
         spec = settings.taxonomy.get(m.category)
@@ -119,12 +133,27 @@ def brief_slots(chapter: ChapterConfig, settings: Config, version: int) -> list[
     rng, slots, seen, drawn = random.Random(digest([chapter.seed, "brief"])), [], {}, {}
     for m in chapter.material:
         spec = settings.taxonomy[m.category]
-        needs = Needs.model_validate((spec.needs[m.level - 1].model_dump() if spec.needs else {}) | m.needs | {"fresh": True})  # fmt: skip
-        pool = drawn.setdefault((m.category, m.level), rng.sample(spec.concepts[m.level - 1], len(spec.concepts[m.level - 1])))  # fmt: skip
+        needs = Needs.model_validate(
+            (spec.needs[m.level - 1].model_dump() if spec.needs else {}) | m.needs | {"fresh": True}
+        )
+        pool = drawn.setdefault(
+            (m.category, m.level), rng.sample(spec.concepts[m.level - 1], len(spec.concepts[m.level - 1]))
+        )
         for _ in range(m.count):
             seen[(m.category, m.level)] = n = seen.get((m.category, m.level), 0) + 1
-            concept = m.concept or pool[(n - 1) % len(pool)]  # a cell's entries walk its concepts, as a world's slots do
-            slots.append(Slot(id=f"{m.category}-l{m.level}-v{version}-{n}", category=m.category, level=m.level, concept=concept, style=rng.choice(settings.tasks.styles), needs=needs))  # fmt: skip
+            concept = (
+                m.concept or pool[(n - 1) % len(pool)]
+            )  # a cell's entries walk its concepts, as a world's slots do
+            slots.append(
+                Slot(
+                    id=f"{m.category}-l{m.level}-v{version}-{n}",
+                    category=m.category,
+                    level=m.level,
+                    concept=concept,
+                    style=rng.choice(settings.tasks.styles),
+                    needs=needs,
+                )
+            )
     return slots
 
 
@@ -138,7 +167,16 @@ def parent_segments(path: Path, world) -> list[dict]:
     activity, author = config.get("activity", {}), config.get("author", {})
     first, last = world.db.execute("SELECT MIN(day), MAX(day) FROM calendar").fetchone()
     busy = meta(world, "busy_days")
-    return [dict(first=first, last=last, messages=activity.get("messages", ActivityConfig().messages), busy=json.loads(busy) if busy else None, weekend=author.get("weekend", AuthorSettings().weekend), parts=activity.get("parts", ActivityConfig().parts))]  # fmt: skip
+    return [
+        dict(
+            first=first,
+            last=last,
+            messages=activity.get("messages", ActivityConfig().messages),
+            busy=json.loads(busy) if busy else None,
+            weekend=author.get("weekend", AuthorSettings().weekend),
+            parts=activity.get("parts", ActivityConfig().parts),
+        )
+    ]
 
 
 def same_schema(world) -> list[str]:
@@ -147,9 +185,13 @@ def same_schema(world) -> list[str]:
     its text differs), anything else by its text, comments and spacing aside."""
 
     def defined(db) -> dict:
-        rows = db.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
+        rows = db.execute(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchall()
         return {
-            name: sorted(tuple(c)[1:] for c in db.execute(f"PRAGMA table_info({name})")) if kind == "table" and not (sql or "").startswith("CREATE VIRTUAL") else " ".join(re.sub(r"--[^\n]*", "", sql or "").split())  # fmt: skip
+            name: sorted(tuple(c)[1:] for c in db.execute(f"PRAGMA table_info({name})"))
+            if kind == "table" and not (sql or "").startswith("CREATE VIRTUAL")
+            else " ".join(re.sub(r"--[^\n]*", "", sql or "").split())
             for kind, name, sql in rows
         }
 
@@ -158,12 +200,20 @@ def same_schema(world) -> list[str]:
         want = defined(fresh.db)
         fresh.close()
     have = defined(world.db)
-    return sorted(n for n in want.keys() | have.keys() if want.get(n) != have.get(n) and n not in ("tasks", "task_facts"))  # fmt: skip
+    return sorted(
+        n
+        for n in want.keys() | have.keys()
+        if want.get(n) != have.get(n) and n not in ("tasks", "task_facts")
+    )
 
 
 def last_day_attempt(path: Path) -> str:
     """The attempt the parent's last closed day was kept in: its notes are where the world left off."""
-    closed = [json.loads(line) for line in (path / "progress.jsonl").read_text().splitlines() if '"day_closed"' in line]  # fmt: skip
+    closed = [
+        json.loads(line)
+        for line in (path / "progress.jsonl").read_text().splitlines()
+        if '"day_closed"' in line
+    ]
     if not closed:
         raise ValueError(f"{path} closed no day")
     return closed[-1]["attempt"]
@@ -180,19 +230,45 @@ def adopt(store: Store, chapter: ChapterConfig, settings: Config, slots: list[Sl
     source.close()
     world.migrate()  # a world of an older schema comes forward before anything is measured on it
     if drift := same_schema(world):
-        raise ValueError(f"{parent}'s world has another schema in {drift}: a chapter continues a world of this one")
+        raise ValueError(
+            f"{parent}'s world has another schema in {drift}: a chapter continues a world of this one"
+        )
     reset_tasks(world)
     spans = parent_segments(parent, world)
     version = version_of(world) + 1
     with world.batch():
         first = extend_calendar(world, chapter.days)
-        spans.append(dict(first=first, last=first + chapter.days - 1, messages=chapter.messages, busy=None, weekend=settings.author.weekend, parts=settings.activity.parts))  # fmt: skip
-        lineage = {"segments": json.dumps(spans), "version": str(version), "parent_hash": sha256(parent / "world.sqlite"), "chapter_start_day": str(first), "brief": json.dumps({s.id: s.needs.model_dump() for s in slots})}  # fmt: skip
+        spans.append(
+            dict(
+                first=first,
+                last=first + chapter.days - 1,
+                messages=chapter.messages,
+                busy=None,
+                weekend=settings.author.weekend,
+                parts=settings.activity.parts,
+            )
+        )
+        lineage = {
+            "segments": json.dumps(spans),
+            "version": str(version),
+            "parent_hash": sha256(parent / "world.sqlite"),
+            "chapter_start_day": str(first),
+            "brief": json.dumps({s.id: s.needs.model_dump() for s in slots}),
+        }
         for key, value in lineage.items():
             world.db.execute("INSERT OR REPLACE INTO world_meta (key, value) VALUES (?, ?)", (key, value))
         start_clock(world, first)
-        world.db.execute("INSERT OR REPLACE INTO world_meta (key, value) VALUES ('frozen_digest', ?)", (frozen_digest(world),))  # fmt: skip
-    was = RunState.model_validate({k: v for k, v in json.loads((parent / "state.json").read_text()).items() if k in ("premise", "cast", "organization", "drafts", "plans")})  # fmt: skip
+        world.db.execute(
+            "INSERT OR REPLACE INTO world_meta (key, value) VALUES ('frozen_digest', ?)",
+            (frozen_digest(world),),
+        )
+    was = RunState.model_validate(
+        {
+            k: v
+            for k, v in json.loads((parent / "state.json").read_text()).items()
+            if k in ("premise", "cast", "organization", "drafts", "plans")
+        }
+    )
     state = store.state
     state.premise, state.cast, state.organization = was.premise, was.cast, was.organization
     state.drafts = {"organization": was.drafts["organization"]}
@@ -201,7 +277,14 @@ def adopt(store: Store, chapter: ChapterConfig, settings: Config, slots: list[Sl
     shutil.copytree(notes, store.path("source", "notes"), dirs_exist_ok=True)
     store.snapshot("source")
     state.quota, state.phase, state.day, state.restore_point = slots, "plan", first, "source"
-    store.event("chapter_adopted", world=str(parent), version=version, first=first, days=chapter.days, brief=[s.id for s in slots])  # fmt: skip
+    store.event(
+        "chapter_adopted",
+        world=str(parent),
+        version=version,
+        first=first,
+        days=chapter.days,
+        brief=[s.id for s in slots],
+    )
     store.save()
 
 
@@ -259,7 +342,9 @@ async def run(chapter: ChapterConfig, settings: Config) -> dict:
                 )
         return store.summary("complete")
     except asyncio.CancelledError:
-        store.summary("interrupted", "chapter interrupted; committed progress and available traces are preserved")
+        store.summary(
+            "interrupted", "chapter interrupted; committed progress and available traces are preserved"
+        )
         raise
     finally:
         store.close()
@@ -284,8 +369,13 @@ def dry_run(chapter: ChapterConfig, settings: Config) -> dict:
             "version": version,
             "days": {f"{d['day']} {d['date']}": q["messages"] for d, q in zip(days, shares)},
             "review_days": settings.author.review_days,
-            "storylines": {"earlier": [r[0] for r in world.db.execute("SELECT id FROM storylines ORDER BY position")], "in_all": settings.storylines},  # fmt: skip
-            "brief": [s.model_dump(mode="json", exclude_none=True) for s in brief_slots(chapter, settings, version)],
+            "storylines": {
+                "earlier": [r[0] for r in world.db.execute("SELECT id FROM storylines ORDER BY position")],
+                "in_all": settings.storylines,
+            },
+            "brief": [
+                s.model_dump(mode="json", exclude_none=True) for s in brief_slots(chapter, settings, version)
+            ],
             "author": settings.env.author.model,
             "judge": settings.env.judge.model,
             "seed": settings.seed,
@@ -293,4 +383,3 @@ def dry_run(chapter: ChapterConfig, settings: Config) -> dict:
     finally:
         world.close()
     return out
-

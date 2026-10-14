@@ -45,19 +45,40 @@ def snapshot(path: Path) -> dict:
     world = {
         "zone": zone[0] if zone else None,
         "users": [
-            {"id": r["id"], "name": r["real_name"], "display_name": r["display_name"], "team": json.loads(r["profile_json"]).get("Team")}
+            {
+                "id": r["id"],
+                "name": r["real_name"],
+                "display_name": r["display_name"],
+                "team": json.loads(r["profile_json"]).get("Team"),
+            }
             for r in db.execute("SELECT * FROM users ORDER BY id")
         ],
         "conversations": [
-            {"id": r["id"], "name": r["name"], "kind": KIND[r["type"]], "topic": r["topic"], "purpose": r["purpose"], "member_ids": members.get(r["id"], [])}
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "kind": KIND[r["type"]],
+                "topic": r["topic"],
+                "purpose": r["purpose"],
+                "member_ids": members.get(r["id"], []),
+            }
             for r in db.execute("SELECT * FROM channels ORDER BY id")
         ],
         "messages": [
-            {"id": str(r["id"]), "conversation_id": r["channel_id"], "author_id": r["user_id"], "text": r["text"], "timestamp": iso(r["ts_us"]), "thread_root_id": str(r["parent_id"]) if r["parent_id"] else None, "deleted": bool(r["is_deleted"]), "edited": r["edited_us"] is not None,
-             "reactions": [{"emoji": e, "user_ids": us} for e, us in reactions.get(r["id"], {}).items()]}
+            {
+                "id": str(r["id"]),
+                "conversation_id": r["channel_id"],
+                "author_id": r["user_id"],
+                "text": r["text"],
+                "timestamp": iso(r["ts_us"]),
+                "thread_root_id": str(r["parent_id"]) if r["parent_id"] else None,
+                "deleted": bool(r["is_deleted"]),
+                "edited": r["edited_us"] is not None,
+                "reactions": [{"emoji": e, "user_ids": us} for e, us in reactions.get(r["id"], {}).items()],
+            }
             for r in db.execute("SELECT * FROM messages ORDER BY ts_us")
         ],
-    }  # fmt: skip
+    }
     db.close()
     return world
 
@@ -110,40 +131,113 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
         gold = json.loads(t["gold_json"])
         fact_ids = [r[0] for r in db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (t["id"],))]
         evidence = {str(r["message_id"]) for r in gold if r.get("message_id") is not None}
-        evidence |= {str(r[0]) for r in db.execute("SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id WHERE tf.task_id = ? AND e.role = 'anchor'", (t["id"],))}  # fmt: skip
-        claims = [str(r.get("answer")) + (" (not settled)" if t["answer_type"] == "status" else "") for r in gold] or ["(refusal: nothing to find)"]  # fmt: skip
+        evidence |= {
+            str(r[0])
+            for r in db.execute(
+                "SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id WHERE tf.task_id = ? AND e.role = 'anchor'",
+                (t["id"],),
+            )
+        }
+        claims = [
+            str(r.get("answer")) + (" (not settled)" if t["answer_type"] == "status" else "") for r in gold
+        ] or ["(refusal: nothing to find)"]
         tasks.append(
-            {"id": t["id"], "group_id": next((storyline_of[f] for f in fact_ids), "tasks"), "question": t["question"], "actor_id": t["actor_id"], "fact_ids": fact_ids, "reasoning": f"{t['category']} · level {t['level']} · {t['answer_type']}", "gold_sql": t["gold_sql"], "category": t["category"], "level": t["level"], "answer": {"canonical_answer": "; ".join(claims), "required_claims": claims}}
-        )  # fmt: skip
-        bindings[t["id"]] = {"claims": [{"claim_index": k, "message_ids": sorted(evidence), "user_ids": []} for k in range(len(claims))]}  # fmt: skip
+            {
+                "id": t["id"],
+                "group_id": next((storyline_of[f] for f in fact_ids), "tasks"),
+                "question": t["question"],
+                "actor_id": t["actor_id"],
+                "fact_ids": fact_ids,
+                "reasoning": f"{t['category']} · level {t['level']} · {t['answer_type']}",
+                "gold_sql": t["gold_sql"],
+                "category": t["category"],
+                "level": t["level"],
+                "answer": {"canonical_answer": "; ".join(claims), "required_claims": claims},
+            }
+        )
+        bindings[t["id"]] = {
+            "claims": [
+                {"claim_index": k, "message_ids": sorted(evidence), "user_ids": []}
+                for k in range(len(claims))
+            ]
+        }
     catalog = {
         "company": (db.execute("SELECT value FROM world_meta WHERE key = 'company'").fetchone() or [None])[0],
-        "people": [{"id": u["id"], "name": u["real_name"], "display_name": u["display_name"], "team": json.loads(u["profile_json"]).get("Team")} for u in users],
-        "personas": [{"id": u["id"], "role": u["title"], "seniority": "", "timezone": u["tz"], "voice": "", "profile": from_seed.get(u["id"])} for u in users],
-        "groups": [{"id": r["id"], "description": r["summary"]} for r in db.execute("SELECT * FROM storylines ORDER BY position")],
+        "people": [
+            {
+                "id": u["id"],
+                "name": u["real_name"],
+                "display_name": u["display_name"],
+                "team": json.loads(u["profile_json"]).get("Team"),
+            }
+            for u in users
+        ],
+        "personas": [
+            {
+                "id": u["id"],
+                "role": u["title"],
+                "seniority": "",
+                "timezone": u["tz"],
+                "voice": "",
+                "profile": from_seed.get(u["id"]),
+            }
+            for u in users
+        ],
+        "groups": [
+            {"id": r["id"], "description": r["summary"]}
+            for r in db.execute("SELECT * FROM storylines ORDER BY position")
+        ],
         "facts": [
-            {"id": f["id"], "group_id": f["storyline"], "subject": f["subject"], "predicate": f["attribute"], "value": f["value"], "valid_from": f"day {f['day']}" + (f" · {f['moment_kind']} {iso(f['moment_us'])}" if f["moment_us"] else ""), "valid_until": None, "description": f["summary"]}
+            {
+                "id": f["id"],
+                "group_id": f["storyline"],
+                "subject": f["subject"],
+                "predicate": f["attribute"],
+                "value": f["value"],
+                "valid_from": f"day {f['day']}"
+                + (f" · {f['moment_kind']} {iso(f['moment_us'])}" if f["moment_us"] else ""),
+                "valid_until": None,
+                "description": f["summary"],
+            }
             for f in facts
         ],
         "tasks": tasks,
-    }  # fmt: skip
+    }
     scenes, owner = [], {}
     for s in db.execute("SELECT * FROM scenes ORDER BY slot_start_us").fetchall():
         plan = json.loads(s["plan_json"])
-        ids = [str(r[0]) for r in db.execute("SELECT sm.message_id FROM scene_messages sm JOIN messages m ON m.id = sm.message_id WHERE sm.scene_id = ? ORDER BY m.ts_us", (s["id"],))]  # fmt: skip
+        ids = [
+            str(r[0])
+            for r in db.execute(
+                "SELECT sm.message_id FROM scene_messages sm JOIN messages m ON m.id = sm.message_id WHERE sm.scene_id = ? ORDER BY m.ts_us",
+                (s["id"],),
+            )
+        ]
         owner.update(dict.fromkeys(ids, s["id"]))
         # A conversation keeps its lines: their authors, the facts they state and the promises they make.
         lines = plan.get("lines", [])
         participants = list(dict.fromkeys(line["author_id"] for line in lines))
-        beats = [{"fact_id": f, "author_id": line["author_id"]} for line in lines for f in line.get("conveys", [])]
+        beats = [
+            {"fact_id": f, "author_id": line["author_id"]} for line in lines for f in line.get("conveys", [])
+        ]
         promises = [c["text"] for line in lines for c in line.get("commits", [])]
         scenes.append(
-            {"id": s["id"], "conversation_id": s["channel_id"], "participant_ids": participants, "start": iso(s["slot_start_us"]), "end": iso(s["slot_end_us"]), "situation": s["situation"], "beats": beats, "messages": ids, "promises": promises}
-        )  # fmt: skip
+            {
+                "id": s["id"],
+                "conversation_id": s["channel_id"],
+                "participant_ids": participants,
+                "start": iso(s["slot_start_us"]),
+                "end": iso(s["slot_end_us"]),
+                "situation": s["situation"],
+                "beats": beats,
+                "messages": ids,
+                "promises": promises,
+            }
+        )
     marks = {}
     for message, fact, role, decoy in db.execute(
         "SELECT e.message_id, e.fact_id, e.role, f.is_decoy FROM evidence e JOIN facts f ON f.id = e.fact_id ORDER BY e.message_id, e.fact_id"
-    ):  # fmt: skip
+    ):
         marks.setdefault(str(message), []).append({"fact": fact, "role": role, "decoy": bool(decoy)})
     db.close()
     return catalog, bindings, scenes, owner, marks
@@ -157,7 +251,9 @@ def chapter_of(db, state: dict, board: dict) -> dict | None:
     if "chapter_start_day" not in meta:
         return None
     first = int(meta["chapter_start_day"])
-    start, last = db.execute("SELECT (SELECT start_us FROM calendar WHERE day = ?), MAX(day) FROM calendar", (first,)).fetchone()  # fmt: skip
+    start, last = db.execute(
+        "SELECT (SELECT start_us FROM calendar WHERE day = ?), MAX(day) FROM calendar", (first,)
+    ).fetchone()
     brief = json.loads(meta.get("brief", "{}"))
     slots = {q["id"]: q for q in state.get("quota", [])}
     return {
@@ -167,10 +263,17 @@ def chapter_of(db, state: dict, board: dict) -> dict | None:
         "start": iso(start),
         "parent_hash": meta.get("parent_hash"),
         "brief": [
-            {"slot": slot, "category": slots.get(slot, {}).get("category"), "level": slots.get(slot, {}).get("level"), "concept": slots.get(slot, {}).get("concept"), "needs": needs, "facts": board.get(slot, [])}
+            {
+                "slot": slot,
+                "category": slots.get(slot, {}).get("category"),
+                "level": slots.get(slot, {}).get("level"),
+                "concept": slots.get(slot, {}).get("concept"),
+                "needs": needs,
+                "facts": board.get(slot, []),
+            }
             for slot, needs in brief.items()
         ],
-    }  # fmt: skip
+    }
 
 
 def load_run(path, full=False):
@@ -191,7 +294,10 @@ def load_run(path, full=False):
     chapter = chapter_of(db, state, board)
     db.close()
     snapshots, attempts = {}, []
-    folders = sorted((p for p in (run / "attempts").iterdir() if p.is_dir()), key=lambda p: (order.get(p.name, -1 if p.name in ("premise", "organization") else 1e9), p.name))  # fmt: skip
+    folders = sorted(
+        (p for p in (run / "attempts").iterdir() if p.is_dir()),
+        key=lambda p: (order.get(p.name, -1 if p.name in ("premise", "organization") else 1e9), p.name),
+    )
     for folder in folders:
         files = {p.stem: read_json(p) for p in folder.glob("*.json")}
         key = None
@@ -204,7 +310,8 @@ def load_run(path, full=False):
             {
                 "id": folder.name,
                 "snapshot": key,
-                "verdict": files.get("verdict") or (files.get(f"verdict-{labels[0]}") if len(labels) == 1 else None),
+                "verdict": files.get("verdict")
+                or (files.get(f"verdict-{labels[0]}") if len(labels) == 1 else None),
                 "acceptance": files.get("acceptance"),
                 "validation": {k: validation.get(k) for k in ("ok", "errors")} if validation else None,
                 "corrections": files.get("corrections"),
@@ -216,7 +323,7 @@ def load_run(path, full=False):
                     for label in labels
                 },
             }
-        )  # fmt: skip
+        )
     return {
         "name": f"{run.parent.name}/{run.name}",
         "summary": read_json(run / "summary.json"),

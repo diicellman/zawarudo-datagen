@@ -12,7 +12,9 @@ from generators.worldgen_slack.check import check_author
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(check_author(Path(tmp) / "author"))
-        world, forge, chapter = (load_run(Path(tmp) / "author" / name) for name in ("run", "forge", "chapter/run"))
+        world, forge, chapter = (
+            load_run(Path(tmp) / "author" / name) for name in ("run", "forge", "chapter/run")
+        )
         db = sqlite3.connect(Path(tmp) / "author" / "run" / "world.sqlite")
         stated = {
             (str(m), f, role) for m, f, role in db.execute("SELECT message_id, fact_id, role FROM evidence")
@@ -28,7 +30,9 @@ def main():
     ), steps
     assert steps.index("day-04-01") < steps.index("final-01") < steps.index("final-02"), steps
     assert all(
-        world["snapshots"][a["snapshot"]]["messages"] for a in world["attempts"] if a["id"].startswith("final")
+        world["snapshots"][a["snapshot"]]["messages"]
+        for a in world["attempts"]
+        if a["id"].startswith("final")
     ), "each attempt shows the world it ended with"
     assert set(world["scene_of"]) == {m["id"] for m in world["world"]["messages"]}, (
         "every message maps to its conversation"
@@ -37,7 +41,9 @@ def main():
     assert any(s["promises"] for s in world["scenes"]), "a conversation shows the promises its lines make"
     assert all(p["profile"] for p in world["catalog"]["personas"]), "the cast shows seeded profiles"
     assert world["world"]["zone"], "times are drawn on the world's clock"
-    assert world["chapter"] is None and not world["catalog"]["tasks"], "a world written in one run, with no tasks"
+    assert world["chapter"] is None and not world["catalog"]["tasks"], (
+        "a world written in one run, with no tasks"
+    )
     # A message shows its reactions and whom it mentions, as Slack does, and the facts it states.
     people = {u["id"] for u in world["world"]["users"]}
     reacted = [m for m in world["world"]["messages"] if m["reactions"]]
@@ -63,19 +69,23 @@ def main():
     assert set(rates) <= {e["task_id"] for e in forge["events"] if e["event"] == "task_reviewed"}, (
         "every task's probes"
     )
-    assert any(t["role"] == "witness" and t["evaluation"] and t["task_id"] in rates for t in forge["traces"]), (
-        "the witness"
-    )
+    assert any(
+        t["role"] == "witness" and t["evaluation"] and t["task_id"] in rates for t in forge["traces"]
+    ), "the witness"
     # A chapter: the version it writes, from its first day, and its brief, each entry with the facts the board plants.
     brief = chapter["chapter"]["brief"]
-    assert chapter["chapter"]["first_day"] == 5 and brief and all(b["facts"] for b in brief), chapter["chapter"]
+    assert chapter["chapter"]["first_day"] == 5 and brief and all(b["facts"] for b in brief), chapter[
+        "chapter"
+    ]
     assert {b["slot"] for b in brief} <= set(chapter["board"]) and all(chapter["board"].values()), (
         "the board per slot"
     )
     attack = "</script><script>alert('artifact')</script>&"
     html = render({"runs": [], "probe": attack})
     assert attack not in html and "__VIEWER_DATA__" not in html and "\\u003c/script\\u003e" in html
-    print("Viewer checks passed: attempt order, snapshots, conversations, cast, reactions, mentions, facts, gold queries, rates, probes, witness, chapter, board, escaping.")  # fmt: skip
+    print(
+        "Viewer checks passed: attempt order, snapshots, conversations, cast, reactions, mentions, facts, gold queries, rates, probes, witness, chapter, board, escaping."
+    )
 
 
 if __name__ == "__main__":

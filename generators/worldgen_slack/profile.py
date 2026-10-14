@@ -16,7 +16,9 @@ from .contracts import answer_facts, meta, readable
 
 def chains(world) -> dict[str, int]:
     """Each fact's depth in its supersedes chain: 1 for a fact that supersedes nothing."""
-    supersedes = dict(world.db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind = 'supersedes'").fetchall())  # fmt: skip
+    supersedes = dict(
+        world.db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind = 'supersedes'").fetchall()
+    )
     depth = {}
 
     def of(fact: str) -> int:
@@ -45,7 +47,9 @@ def groups(world) -> list[dict]:
     depth, versions = chains(world), version_of_day(world)
     people = [u for (u,) in world.db.execute("SELECT id FROM users WHERE is_bot = 0")]
     by = defaultdict(list)
-    for row in world.db.execute("SELECT f.*, c.type, c.name FROM facts f JOIN channels c ON c.id = f.channel_id ORDER BY f.day, f.id"):  # fmt: skip
+    for row in world.db.execute(
+        "SELECT f.*, c.type, c.name FROM facts f JOIN channels c ON c.id = f.channel_id ORDER BY f.day, f.id"
+    ):
         by[(row["subject"].strip().lower(), row["attribute"].strip().lower())].append(dict(row))
     tasks = Counter(f for (f,) in world.db.execute("SELECT fact_id FROM task_facts"))
     board = defaultdict(set)
@@ -60,7 +64,9 @@ def groups(world) -> list[dict]:
             JOIN channels c ON c.id = m.channel_id WHERE e.role = 'anchor' AND e.fact_id IN ({", ".join("?" * len(current))})""",
             current,
         ).fetchall()
-        readers = sum(any(readable(world, u, a["channel_id"]) for a in anchors) for u in people) if anchors else 0
+        readers = (
+            sum(any(readable(world, u, a["channel_id"]) for a in anchors) for u in people) if anchors else 0
+        )
         out.append(
             {
                 "subject": facts[0]["subject"],
@@ -72,8 +78,11 @@ def groups(world) -> list[dict]:
                 "depth": max(depth[f] for f in ids),
                 "channels": len({f["channel_id"] for f in facts}),
                 "days": [facts[0]["day"], max(f["day"] for f in facts)],
-                "current_where": sorted({("thread reply in " if a["parent_id"] else "") + a["type"] for a in anchors}),
-                "current_private": bool(anchors) and all(a["type"] in ("im", "mpim", "private") for a in anchors),
+                "current_where": sorted(
+                    {("thread reply in " if a["parent_id"] else "") + a["type"] for a in anchors}
+                ),
+                "current_private": bool(anchors)
+                and all(a["type"] in ("im", "mpim", "private") for a in anchors),
                 "readers": [readers, len(people)],
                 "version": max(versions[f["day"]] for f in facts),
                 "tasks": sum(tasks[f] for f in ids),
@@ -88,7 +97,12 @@ def profile(world) -> dict:
     and people, and what tasks and the board rest on."""
     count = lambda sql: world.db.execute(sql).fetchone()[0]  # noqa: E731
     found = groups(world)
-    replies = [n for (n,) in world.db.execute("SELECT COUNT(*) FROM messages WHERE parent_id IS NOT NULL GROUP BY parent_id")]  # fmt: skip
+    replies = [
+        n
+        for (n,) in world.db.execute(
+            "SELECT COUNT(*) FROM messages WHERE parent_id IS NOT NULL GROUP BY parent_id"
+        )
+    ]
     kinds = Counter(s for (s,) in world.db.execute("SELECT situation FROM scenes"))
     posts = dict(world.db.execute("SELECT user_id, COUNT(*) FROM messages GROUP BY user_id").fetchall())
     names = dict(world.db.execute("SELECT id, real_name FROM users").fetchall())
@@ -100,7 +114,9 @@ def profile(world) -> dict:
             "version": int(meta(world, "version", 1)),
             "days": count("SELECT COUNT(*) FROM calendar"),
             "messages": count("SELECT COUNT(*) FROM messages"),
-            "channels": dict(world.db.execute("SELECT type, COUNT(*) FROM channels GROUP BY type").fetchall()),
+            "channels": dict(
+                world.db.execute("SELECT type, COUNT(*) FROM channels GROUP BY type").fetchall()
+            ),
             "people": count("SELECT COUNT(*) FROM users"),
             "facts": count("SELECT COUNT(*) FROM facts"),
             "tasks": count("SELECT COUNT(*) FROM tasks"),
@@ -151,7 +167,8 @@ def page(found: dict) -> str:
             f"- {g['subject']} / {g['attribute']}: {g['values']} values, depth {g['depth']}, decoys {len(g['decoys'])}, "
             f"{g['channels']} channels, days {g['days'][0]}-{g['days'][1]}, current {g['current']} in "
             f"{', '.join(g['current_where']) or 'nothing stated'} (readable by {g['readers'][0]}/{g['readers'][1]}), "
-            f"version {g['version']}, tasks {g['tasks']}" + (f", board {', '.join(g['board'])}" if g["board"] else "")
+            f"version {g['version']}, tasks {g['tasks']}"
+            + (f", board {', '.join(g['board'])}" if g["board"] else "")
         )
     t = found["threads"]
     out += [

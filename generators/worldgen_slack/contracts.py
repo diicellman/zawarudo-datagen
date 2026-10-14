@@ -152,12 +152,20 @@ def on_board(settings, slot: Slot) -> bool:
     one whose level needs something of its facts (robustness level 4: a near-miss in sight, the truth out of it), and
     every entry of a chapter's brief."""
     needs = slot_needs(settings, slot)
-    return slot.needs is not None or settings.taxonomy[slot.category].gold in ("ledger", "hybrid") or bool(needs and needs.facts())  # fmt: skip
+    return (
+        slot.needs is not None
+        or settings.taxonomy[slot.category].gold in ("ledger", "hybrid")
+        or bool(needs and needs.facts())
+    )
 
 
 def cards(cast: list) -> dict[str, dict]:
     """Each person's typing card, by user id: how they write, as the author and the judge read it."""
-    return {user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) | {"timezone": p.timezone} for p in cast if p.typing}  # fmt: skip
+    return {
+        user_id(p.uuid): p.typing.model_dump(exclude={"id", "messages"}) | {"timezone": p.timezone}
+        for p in cast
+        if p.typing
+    }
 
 
 def selves(cast: list) -> dict[str, dict]:
@@ -165,11 +173,15 @@ def selves(cast: list) -> dict[str, dict]:
     seed's own job was drawn for another occupation, so its professional persona is left out."""
     return {
         user_id(p.uuid): {
-            "age": p.age, "home": f"{p.city}, {p.state}", "education": p.education_level.replace("_", " "),
-            "persona": p.persona, "background": p.cultural_background, "hobbies": p.hobbies[:6],
+            "age": p.age,
+            "home": f"{p.city}, {p.state}",
+            "education": p.education_level.replace("_", " "),
+            "persona": p.persona,
+            "background": p.cultural_background,
+            "hobbies": p.hobbies[:6],
         }
         for p in cast
-    }  # fmt: skip
+    }
 
 
 def user_id(seed_uuid: str) -> str:
@@ -214,7 +226,9 @@ class Person(StrictModel):
     user_id: SafeId
     title: NonEmptyText
     team: NonEmptyText
-    status_emoji: str | None = Field(default=None, pattern=r"^:[a-z0-9_+-]+:$")  # their Slack status, if they set one
+    status_emoji: str | None = Field(
+        default=None, pattern=r"^:[a-z0-9_+-]+:$"
+    )  # their Slack status, if they set one
     status_text: str | None = Field(default=None, max_length=100)
 
 
@@ -376,7 +390,10 @@ def calendar(seed: int, settings, place: str) -> list[dict]:
 def extend_calendar(world, count: int) -> int:
     """`count` more days after the calendar's last, the dates running on (a chapter's days); returns the first."""
     last, on = world.db.execute("SELECT day, date FROM calendar ORDER BY day DESC LIMIT 1").fetchone()
-    world.insert("calendar", calendar_days(date.fromisoformat(on) + timedelta(days=1), count, world_meta(world, "zone"), last + 1))  # fmt: skip
+    world.insert(
+        "calendar",
+        calendar_days(date.fromisoformat(on) + timedelta(days=1), count, world_meta(world, "zone"), last + 1),
+    )
     return last + 1
 
 
@@ -444,7 +461,7 @@ FROZEN = {
     "scenes": "SELECT * FROM scenes WHERE slot_start_us < :t",
     "scene_messages": "SELECT x.* FROM scene_messages x JOIN messages m ON m.id = x.message_id WHERE m.ts_us < :t",
     "facts": "SELECT f.* FROM facts f JOIN calendar c ON c.day = f.day WHERE c.start_us < :t",
-    "fact_relations": "SELECT r.* FROM fact_relations r JOIN facts f ON f.id = r.src_fact JOIN calendar c ON c.day = f.day WHERE c.start_us < :t",  # fmt: skip
+    "fact_relations": "SELECT r.* FROM fact_relations r JOIN facts f ON f.id = r.src_fact JOIN calendar c ON c.day = f.day WHERE c.start_us < :t",
     "events": "SELECT * FROM events WHERE moment_us < :t",
     "commitments": "SELECT x.* FROM commitments x JOIN messages m ON m.id = x.message_id WHERE m.ts_us < :t",
 }
@@ -453,7 +470,12 @@ FROZEN = {
 def frozen_digest(world) -> str:
     """A digest of everything before the chapter's first day: a chapter changes none of it."""
     t = frozen_before(world)
-    return digest({name: sorted((list(r) for r in world.db.execute(sql, {"t": t})), key=repr) for name, sql in FROZEN.items()})  # fmt: skip
+    return digest(
+        {
+            name: sorted((list(r) for r in world.db.execute(sql, {"t": t})), key=repr)
+            for name, sql in FROZEN.items()
+        }
+    )
 
 
 # How a person writes a time, drawn once per person: "5pm", "5 PM" or "17:00". A world written before 2026-10-14 has
@@ -490,14 +512,26 @@ def render(moment_us: int, place: str, said_us: int, way: str | None = None, hom
     tz = ZoneInfo(place)
     when, said = datetime.fromtimestamp(moment_us / 1e6, tz), datetime.fromtimestamp(said_us / 1e6, tz)
     if way is None:
-        return f"{when:%H:%M %Z}" if when.date() == said.date() else f"{when:%a %b} {when.day} {when:%H:%M %Z}"
+        return (
+            f"{when:%H:%M %Z}" if when.date() == said.date() else f"{when:%a %b} {when.day} {when:%H:%M %Z}"
+        )
     if way == "24h":
         hour = f"{when:%H:%M}"
     else:  # "12pm", not "noon": a word people also write freely, which code could not tell from its own
         h, m = when.hour % 12 or 12, f":{when.minute:02d}" if when.minute else ""
-        hour = f"{h}{m}{' ' if way == '12h spaced' else ''}{('pm' if when.hour >= 12 else 'am') if way == '12h' else ('PM' if when.hour >= 12 else 'AM')}"  # fmt: skip
+        hour = f"{h}{m}{' ' if way == '12h spaced' else ''}{('pm' if when.hour >= 12 else 'am') if way == '12h' else ('PM' if when.hour >= 12 else 'AM')}"
     gap = (when.date() - said.date()).days
-    day = "" if gap == 0 else "tomorrow " if gap == 1 else "yesterday " if gap == -1 else f"{when:%a} " if 1 < gap < 7 else f"{when:%b} {when.day} "  # fmt: skip
+    day = (
+        ""
+        if gap == 0
+        else "tomorrow "
+        if gap == 1
+        else "yesterday "
+        if gap == -1
+        else f"{when:%a} "
+        if 1 < gap < 7
+        else f"{when:%b} {when.day} "
+    )
     return day + hour + ("" if home is None or place == home else f" {when:%Z}")
 
 
@@ -521,7 +555,9 @@ def reread(text: str, place: str, said_us: int) -> int:
     if g["rel"]:
         day += timedelta(days=1 if g["rel"] == "tomorrow" else -1)
     elif g["wd"]:
-        day += timedelta(days=next(k for k in range(2, 7) if (said.date() + timedelta(days=k)).strftime("%a") == g["wd"]))  # fmt: skip
+        day += timedelta(
+            days=next(k for k in range(2, 7) if (said.date() + timedelta(days=k)).strftime("%a") == g["wd"])
+        )
     elif g["mon"]:
         day = datetime.strptime(f"{g['mon']} {g['md']} {said.year}", "%b %d %Y").date()
     return us(datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz))
@@ -546,7 +582,13 @@ class Gaps:
 
 # ---------------------------------------------------------------------- documents → rows, checked
 
-LEDGER_TABLES = {"facts", "fact_relations", "evidence", "commitments", "artifacts"}  # promises and the registry too
+LEDGER_TABLES = {
+    "facts",
+    "fact_relations",
+    "evidence",
+    "commitments",
+    "artifacts",
+}  # promises and the registry too
 STRUCTURE = {"channels", "members", "messages", "message_mentions", "reactions", "thread_stats"}
 
 
@@ -612,10 +654,14 @@ def organize(world, org: Organization, cast: list[SeedPersona], premise: Premise
             raise ValueError(f"{person.user_id}: a status names no time: {person.status_text!r}")
     named = {ch.name for ch in org.channels if ch.name}
     if settings.activity.bot_posts > 0 and not 2 <= len(org.integrations) <= 5:
-        raise ValueError("integrations lists 2 to 5 apps the company runs, each posting in one of its channels")
+        raise ValueError(
+            "integrations lists 2 to 5 apps the company runs, each posting in one of its channels"
+        )
     for app in org.integrations:
         if app.channel not in named:
-            raise ValueError(f"integration {app.name}: channel is one of the organization's channels, not {app.channel!r}")  # fmt: skip
+            raise ValueError(
+                f"integration {app.name}: channel is one of the organization's channels, not {app.channel!r}"
+            )
         if spoken := [x for x in app.subjects if TIME_LITERAL.search(x)]:
             raise ValueError(f"integration {app.name}: a subject names no time: {spoken}")
     if len({a.name for a in org.integrations}) != len(org.integrations):
@@ -625,7 +671,11 @@ def organize(world, org: Organization, cast: list[SeedPersona], premise: Premise
         users.append(
             dict(id=bot_id(app.name), handle=handle, real_name=app.name, display_name=app.name, is_bot=1)
             | dict(email=f"{handle}@bots.{domain}", title="App", tz=place, created_us=start - 30 * DAY)
-            | dict(profile_json=json.dumps({"subjects": app.subjects} | ({"prefix": app.prefix} if app.prefix else {})))  # fmt: skip
+            | dict(
+                profile_json=json.dumps(
+                    {"subjects": app.subjects} | ({"prefix": app.prefix} if app.prefix else {})
+                )
+            )
         )
     meta = {
         "schema_version": str(SCHEMA_VERSION),
@@ -643,16 +693,43 @@ def organize(world, org: Organization, cast: list[SeedPersona], premise: Premise
         world.insert("channels", rows)
         world.insert("members", members)
         by_name = {r["name"]: r["id"] for r in rows if r["name"]}
-        world.insert("members", [dict(channel_id=by_name[a.channel], user_id=bot_id(a.name), joined_us=start - 30 * DAY) for a in org.integrations])  # fmt: skip
-        world.insert("integrations", [dict(user_id=bot_id(a.name), kind=a.kind, channel_id=by_name[a.channel]) for a in org.integrations])  # fmt: skip
+        world.insert(
+            "members",
+            [
+                dict(channel_id=by_name[a.channel], user_id=bot_id(a.name), joined_us=start - 30 * DAY)
+                for a in org.integrations
+            ],
+        )
+        world.insert(
+            "integrations",
+            [
+                dict(user_id=bot_id(a.name), kind=a.kind, channel_id=by_name[a.channel])
+                for a in org.integrations
+            ],
+        )
         if len({g.handle for g in org.usergroups}) != len(org.usergroups):
             raise ValueError("each usergroup has a handle of its own")
         for g in org.usergroups:
             if strangers := set(g.members) - set(chosen):
-                raise ValueError(f"usergroup @{g.handle}: members are people of the company, not {sorted(strangers)}")  # fmt: skip
+                raise ValueError(
+                    f"usergroup @{g.handle}: members are people of the company, not {sorted(strangers)}"
+                )
             group = "S" + digest(["group", g.handle])[:10].upper()
-            world.insert("usergroups", [dict(id=group, handle=g.handle, name=g.name, description=g.description, created_us=start - 30 * DAY)])  # fmt: skip
-            world.insert("usergroup_members", [dict(usergroup_id=group, user_id=m) for m in dict.fromkeys(g.members)])  # fmt: skip
+            world.insert(
+                "usergroups",
+                [
+                    dict(
+                        id=group,
+                        handle=g.handle,
+                        name=g.name,
+                        description=g.description,
+                        created_us=start - 30 * DAY,
+                    )
+                ],
+            )
+            world.insert(
+                "usergroup_members", [dict(usergroup_id=group, user_id=m) for m in dict.fromkeys(g.members)]
+            )
 
 
 def linked(world, text: str, at_us: int) -> str:
@@ -675,12 +752,26 @@ def bot_id(name: str) -> str:
     return "U" + digest(["bot", name])[:10].upper()
 
 
-def queue(world, due_us: int, channel_id: str, user_id: str, text: str, origin: str, subtype: str | None) -> bool:
+def queue(
+    world, due_us: int, channel_id: str, user_id: str, text: str, origin: str, subtype: str | None
+) -> bool:
     """Queue one of code's posts (an app's, a join or a leave) for its moment; a post of the same origin is queued
     once. Returns whether it was queued."""
     if world.db.execute("SELECT 1 FROM queue WHERE origin = ?", (origin,)).fetchone():
         return False
-    world.insert("queue", [dict(due_us=due_us, channel_id=channel_id, user_id=user_id, text=text, origin=origin, subtype=subtype)])  # fmt: skip
+    world.insert(
+        "queue",
+        [
+            dict(
+                due_us=due_us,
+                channel_id=channel_id,
+                user_id=user_id,
+                text=text,
+                origin=origin,
+                subtype=subtype,
+            )
+        ],
+    )
     return True
 
 
@@ -689,12 +780,30 @@ def drain(world, until_us: int) -> list[int]:
     reaches them, so the world stays one written forward. One due at the very moment of a message in its channel waits
     a microsecond."""
     written = []
-    for row in world.db.execute("SELECT * FROM queue WHERE message_id IS NULL AND due_us < ? ORDER BY due_us, id", (until_us,)).fetchall():  # fmt: skip
+    for row in world.db.execute(
+        "SELECT * FROM queue WHERE message_id IS NULL AND due_us < ? ORDER BY due_us, id", (until_us,)
+    ).fetchall():
         at = row["due_us"]
-        while world.db.execute("SELECT 1 FROM messages WHERE channel_id = ? AND ts_us = ?", (row["channel_id"], at)).fetchone():  # fmt: skip
+        while world.db.execute(
+            "SELECT 1 FROM messages WHERE channel_id = ? AND ts_us = ?", (row["channel_id"], at)
+        ).fetchone():
             at += 1
-        (message,) = world.insert("messages", [dict(channel_id=row["channel_id"], ts_us=at, user_id=row["user_id"], text=row["text"], subtype=row["subtype"])])  # fmt: skip
-        world.insert("message_mentions", [dict(message_id=message, user_id=u) for u in dict.fromkeys(MENTION.findall(row["text"]))])  # fmt: skip
+        (message,) = world.insert(
+            "messages",
+            [
+                dict(
+                    channel_id=row["channel_id"],
+                    ts_us=at,
+                    user_id=row["user_id"],
+                    text=row["text"],
+                    subtype=row["subtype"],
+                )
+            ],
+        )
+        world.insert(
+            "message_mentions",
+            [dict(message_id=message, user_id=u) for u in dict.fromkeys(MENTION.findall(row["text"]))],
+        )
         world.db.execute("UPDATE queue SET message_id = ? WHERE id = ?", (message, row["id"]))
         written.append(message)
     return written
@@ -726,8 +835,17 @@ def background_plan(world, org: Organization, activity, seed: int, day: int, bud
     rng = random.Random(digest([seed, "agenda", day]))
     span = world.db.execute("SELECT start_us, end_us FROM calendar WHERE day = ?", (day,)).fetchone()[:]
     # Conversations happen in channels open all day (not archived by its end), among people there all day.
-    archived = {r[0] for r in world.db.execute("SELECT id FROM channels WHERE archived_us IS NOT NULL AND archived_us < ?", (span[1],))}  # fmt: skip
-    routines = {i: c.routines for c in org.channels if c.routines and (i := channel_id(c.type, c.name, c.members)) not in archived}  # fmt: skip
+    archived = {
+        r[0]
+        for r in world.db.execute(
+            "SELECT id FROM channels WHERE archived_us IS NOT NULL AND archived_us < ?", (span[1],)
+        )
+    }
+    routines = {
+        i: c.routines
+        for c in org.channels
+        if c.routines and (i := channel_id(c.type, c.name, c.members)) not in archived
+    }
     named = sorted(
         routines,
         key=lambda c: (
@@ -794,7 +912,9 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
         )
     asker = world.db.execute("SELECT is_bot, is_deleted FROM users WHERE id = ?", (task.actor_id,)).fetchone()
     if asker is not None and (asker["is_bot"] or asker["is_deleted"]):
-        raise ValueError(f"{task.id}: actor_id {task.actor_id} is a bot or no longer at the company; a person asks")
+        raise ValueError(
+            f"{task.id}: actor_id {task.actor_id} is a bot or no longer at the company; a person asks"
+        )
     try:
         out = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)
     except LookupError:
@@ -887,11 +1007,15 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
     with world.renumbered() as renumbered:
         gold = check_task(world, task, settings, renumbered)
     # A question no other task asks, but for a perspective twin: another asker, for whom its answer differs.
-    for question, actor, rows in world.db.execute("SELECT question, actor_id, gold_json FROM tasks WHERE id != ?", (task.id,)):  # fmt: skip
+    for question, actor, rows in world.db.execute(
+        "SELECT question, actor_id, gold_json FROM tasks WHERE id != ?", (task.id,)
+    ):
         if normalized(question) == normalized(task.question) and (
             actor == task.actor_id or json.loads(rows) == gold
         ):
-            raise ValueError(f"{task.id}: a task asks a question no other task asks, unless another person asks it and its answer differs for them")  # fmt: skip
+            raise ValueError(
+                f"{task.id}: a task asks a question no other task asks, unless another person asks it and its answer differs for them"
+            )
     with world.batch():
         world.insert("tasks", [task_row(task, settings) | {"concept": slot.concept}])
         world.insert("task_facts", [dict(task_id=task.id, fact_id=f) for f in dict.fromkeys(task.facts)])
@@ -905,15 +1029,25 @@ def unmet(needs, measured: dict) -> list[str]:
     hidden is checked when it is posted."""
     out = []
     if measured["channels"] < needs.channels:
-        out.append(f"its facts first stated in at least {needs.channels} channels (they are in {measured['channels']})")  # fmt: skip
+        out.append(
+            f"its facts first stated in at least {needs.channels} channels (they are in {measured['channels']})"
+        )
     if measured["relations"] < needs.relations:
-        out.append(f"at least {needs.relations} supersedes or after relations among its facts (it has {measured['relations']})")  # fmt: skip
+        out.append(
+            f"at least {needs.relations} supersedes or after relations among its facts (it has {measured['relations']})"
+        )
     if measured["decoys"] < needs.decoys:
-        out.append(f"at least {needs.decoys} near-misses: decoys, or values whose change its actor cannot see, on its answer's subject and attribute, that its actor can read and no change it can see retracts (it has {measured['decoys']})")  # fmt: skip
+        out.append(
+            f"at least {needs.decoys} near-misses: decoys, or values whose change its actor cannot see, on its answer's subject and attribute, that its actor can read and no change it can see retracts (it has {measured['decoys']})"
+        )
     if measured.get("values", needs.values) < needs.values:
-        out.append(f"its answer's subject and attribute taking at least {needs.values} values, its answer among them (it takes {measured['values']})")  # fmt: skip
+        out.append(
+            f"its answer's subject and attribute taking at least {needs.values} values, its answer among them (it takes {measured['values']})"
+        )
     if needs.fresh and measured.get("fresh") is False:
-        out.append("its answer first stated in this chapter, on its first day or later: what it plants is new")
+        out.append(
+            "its answer first stated in this chapter, on its first day or later: what it plants is new"
+        )
     return out
 
 
@@ -926,13 +1060,21 @@ def needs_text(needs) -> str:
     if needs.relations:
         out.append(f"{many(needs.relations, 'relation')} among its facts")
     if needs.decoys:
-        out.append(f"{many(needs.decoys, 'near-miss')} on its answer's subject and attribute that its actor can read, unretracted in its sight")  # fmt: skip
+        out.append(
+            f"{many(needs.decoys, 'near-miss')} on its answer's subject and attribute that its actor can read, unretracted in its sight"
+        )
     if needs.hidden:
         out.append("its answer in a thread reply, a DM, or later than its near-misses")
     if needs.named is not None:
-        out.append("a question that names none of its evidence's channels and identifiers" if needs.named == 0 else f"a question naming at most {needs.named} of its evidence's channels and identifiers")  # fmt: skip
+        out.append(
+            "a question that names none of its evidence's channels and identifiers"
+            if needs.named == 0
+            else f"a question naming at most {needs.named} of its evidence's channels and identifiers"
+        )
     if needs.values:
-        out.append(f"its answer's subject and attribute taking {needs.values} or more values, its answer among them")
+        out.append(
+            f"its answer's subject and attribute taking {needs.values} or more values, its answer among them"
+        )
     if needs.fresh:
         out.append("its answer first stated in this chapter")
     return "; ".join(out)
@@ -946,7 +1088,10 @@ IDENTIFIER = re.compile(
 def named(world, question: str, evidence: list[int]) -> int:
     """How many of the evidence's channel names and identifiers the question names."""
     marks = ", ".join("?" * len(evidence))
-    rows = world.db.execute(f"SELECT m.text, c.name FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id IN ({marks})", evidence).fetchall()  # fmt: skip
+    rows = world.db.execute(
+        f"SELECT m.text, c.name FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id IN ({marks})",
+        evidence,
+    ).fetchall()
     terms = {n.casefold() for _, n in rows if n} | {
         t.casefold() for text, _ in rows for t in IDENTIFIER.findall(text)
     }
@@ -961,10 +1106,20 @@ def fact_measures(world, ids: list[str], actor: str | None = None, gold=None, re
     chain. Planned before any actor is chosen, a near-miss counts wherever it is stated, and a change counts as seen
     when it is public."""
     marks = ", ".join("?" * len(ids))
-    channels = world.db.execute(f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", ids).fetchone()[0]  # fmt: skip
-    relations = world.db.execute(f"SELECT COUNT(*) FROM fact_relations WHERE src_fact IN ({marks}) AND dst_fact IN ({marks})", [*ids, *ids]).fetchone()[0]  # fmt: skip
+    channels = world.db.execute(
+        f"SELECT COUNT(DISTINCT channel_id) FROM facts WHERE id IN ({marks})", ids
+    ).fetchone()[0]
+    relations = world.db.execute(
+        f"SELECT COUNT(*) FROM fact_relations WHERE src_fact IN ({marks}) AND dst_fact IN ({marks})",
+        [*ids, *ids],
+    ).fetchone()[0]
     answers = answer_facts(world, ids, actor, gold, refusal)
-    return {"channels": channels, "relations": relations, "decoys": len(near_misses(world, answers, actor)), "values": values(world, answers, actor)}  # fmt: skip
+    return {
+        "channels": channels,
+        "relations": relations,
+        "decoys": len(near_misses(world, answers, actor)),
+        "values": values(world, answers, actor),
+    }
 
 
 def values(world, answers: list[str], actor: str | None = None) -> int:
@@ -972,9 +1127,18 @@ def values(world, answers: list[str], actor: str | None = None) -> int:
     one, before any actor is chosen): the most of any answer fact's."""
     most = 0
     for answer in answers:
-        subject, attribute = world.db.execute("SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (answer,)).fetchone()  # fmt: skip
-        rows = world.db.execute("SELECT id, lower(trim(value)) FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ?", (subject, attribute)).fetchall()  # fmt: skip
-        seen = {v for f, v in rows if f == answer or not actor or any(readable(world, actor, c) for c in places(world, f))}  # fmt: skip
+        subject, attribute = world.db.execute(
+            "SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (answer,)
+        ).fetchone()
+        rows = world.db.execute(
+            "SELECT id, lower(trim(value)) FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ?",
+            (subject, attribute),
+        ).fetchall()
+        seen = {
+            v
+            for f, v in rows
+            if f == answer or not actor or any(readable(world, actor, c) for c in places(world, f))
+        }
         most = max(most, len(seen))
     return most
 
@@ -988,16 +1152,28 @@ def board_measures(world, ids: list[str]) -> dict:
     if not answers:
         return {"hidden": None, "fresh": None}
     marks = ", ".join("?" * len(answers))
-    rows = world.db.execute(f"SELECT f.day, c.type FROM facts f JOIN channels c ON c.id = f.channel_id WHERE f.id IN ({marks})", answers).fetchall()  # fmt: skip
+    rows = world.db.execute(
+        f"SELECT f.day, c.type FROM facts f JOIN channels c ON c.id = f.channel_id WHERE f.id IN ({marks})",
+        answers,
+    ).fetchall()
     misses = near_misses(world, answers)
-    last = max((world.db.execute("SELECT day FROM facts WHERE id = ?", (f,)).fetchone()[0] for f in misses), default=None)  # fmt: skip
+    last = max(
+        (world.db.execute("SELECT day FROM facts WHERE id = ?", (f,)).fetchone()[0] for f in misses),
+        default=None,
+    )
     hidden = any(t in ("im", "mpim") or (last is not None and d > last) for d, t in rows)
     return {"hidden": True if hidden else None, "fresh": any(d >= chapter_start(world) for d, _ in rows)}
 
 
 def places(world, fact: str) -> set[str]:
     """Where a fact is stated, or, before it is, the channel it is planned to be first stated in."""
-    stated = {r[0] for r in world.db.execute("SELECT DISTINCT m.channel_id FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?", (fact,))}  # fmt: skip
+    stated = {
+        r[0]
+        for r in world.db.execute(
+            "SELECT DISTINCT m.channel_id FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = ?",
+            (fact,),
+        )
+    }
     return stated or {world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()[0]}
 
 
@@ -1012,8 +1188,12 @@ def answer_facts(
     if refusal and actor:
         found = [f for f in ids if not any(readable(world, actor, c) for c in places(world, f))]
     else:
-        found = [f for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", ids) if v.strip().casefold() in values]  # fmt: skip
-    current = f"SELECT id FROM facts WHERE id IN ({marks}) AND is_decoy = 0 AND id NOT IN (SELECT dst_fact FROM fact_relations WHERE kind = 'supersedes')"  # fmt: skip
+        found = [
+            f
+            for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", ids)
+            if v.strip().casefold() in values
+        ]
+    current = f"SELECT id FROM facts WHERE id IN ({marks}) AND is_decoy = 0 AND id NOT IN (SELECT dst_fact FROM fact_relations WHERE kind = 'supersedes')"
     earlier = f"SELECT id FROM facts WHERE id IN ({marks}) AND is_decoy = 0"
     return (
         found
@@ -1035,14 +1215,21 @@ def near_misses(world, answers: list[str], actor: str | None = None) -> list[str
 
     out = []
     for answer in answers:
-        subject, attribute = world.db.execute("SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (answer,)).fetchone()  # fmt: skip
+        subject, attribute = world.db.execute(
+            "SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (answer,)
+        ).fetchone()
         for (fact,) in world.db.execute(
             "SELECT id FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ? ORDER BY id",
             (subject, attribute),
         ):
             if fact in answers or fact in out or not any(map(reads, places(world, fact))):
                 continue
-            changes = [r[0] for r in world.db.execute("SELECT src_fact FROM fact_relations WHERE kind = 'supersedes' AND dst_fact = ?", (fact,))]  # fmt: skip
+            changes = [
+                r[0]
+                for r in world.db.execute(
+                    "SELECT src_fact FROM fact_relations WHERE kind = 'supersedes' AND dst_fact = ?", (fact,)
+                )
+            ]
             if not any(sees(c) for change in changes for c in places(world, change)):
                 out.append(fact)
     return out
@@ -1063,8 +1250,14 @@ def hidden(world, ids: list[str], actor: str, gold=None) -> bool | None:
     ).fetchall()
     if not anchors:
         return None
-    last = max((world.db.execute("SELECT day FROM facts WHERE id = ?", (f,)).fetchone()[0] for f in misses), default=None)  # fmt: skip
-    return any(a["parent_id"] is not None or a["type"] in ("im", "mpim") or (last is not None and a["day"] > last) for a in anchors)  # fmt: skip
+    last = max(
+        (world.db.execute("SELECT day FROM facts WHERE id = ?", (f,)).fetchone()[0] for f in misses),
+        default=None,
+    )
+    return any(
+        a["parent_id"] is not None or a["type"] in ("im", "mpim") or (last is not None and a["day"] > last)
+        for a in anchors
+    )
 
 
 def measures(world, task_id: str, rows: list[dict], tables) -> dict:
@@ -1111,7 +1304,9 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
         for message_id in seen
     ]
     facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
-    (busiest,) = reader.db.execute("SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM messages WHERE parent_id IS NULL GROUP BY channel_id)").fetchone()  # fmt: skip
+    (busiest,) = reader.db.execute(
+        "SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM messages WHERE parent_id IS NULL GROUP BY channel_id)"
+    ).fetchone()
     return (
         {
             "evidence_pages": max(pages, default=None),
@@ -1158,7 +1353,12 @@ def panel(world, task_id: str, rows: list[dict]) -> dict:
     stated = stated_values(world, facts, task["actor_id"]) if facts else {}
     if not stated:
         return {"guesses": {}, "traps": [], "shortcut": False}
-    when = {v: world.db.execute(f"SELECT MIN(ts_us), MAX(ts_us) FROM messages WHERE id IN ({', '.join('?' * len(ms))})", ms).fetchone() for v, ms in stated.items()}  # fmt: skip
+    when = {
+        v: world.db.execute(
+            f"SELECT MIN(ts_us), MAX(ts_us) FROM messages WHERE id IN ({', '.join('?' * len(ms))})", ms
+        ).fetchone()
+        for v, ms in stated.items()
+    }
     reader = World(world.path, actor=task["actor_id"])
     ranks = {v: reader.rank(task["question"], ms) for v, ms in stated.items()}
     reader.close()
@@ -1172,7 +1372,11 @@ def panel(world, task_id: str, rows: list[dict]) -> dict:
     # The value the task rests on: its answer facts' (a hybrid task answers about the message that states it).
     marks = ", ".join("?" * len(facts))
     answered = answer_facts(world, facts, task["actor_id"], [r.get("answer") for r in rows])
-    gold = {v.strip().casefold() for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", facts) if f in answered}  # fmt: skip
+    gold = {
+        v.strip().casefold()
+        for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", facts)
+        if f in answered
+    }
     if task["answer_type"] == "refusal":  # nothing is the answer: any value given is wrong
         return {
             "guesses": guesses,
@@ -1180,7 +1384,11 @@ def panel(world, task_id: str, rows: list[dict]) -> dict:
             "shortcut": False,
         }
     traps = [k for k, v in guesses.items() if v is not None and v not in gold]
-    return {"guesses": guesses, "traps": traps, "shortcut": task["answer_type"] != "status" and guesses["top"] in gold}  # fmt: skip
+    return {
+        "guesses": guesses,
+        "traps": traps,
+        "shortcut": task["answer_type"] != "status" and guesses["top"] in gold,
+    }
 
 
 def features(world, task_id: str, rows: list[dict]) -> dict:
@@ -1198,21 +1406,51 @@ def features(world, task_id: str, rows: list[dict]) -> dict:
     # Where its answer is stated: its answer facts' values, as the panel reads them (a hybrid or a person answer is
     # about the message that states a fact).
     answered = answer_facts(world, facts, task["actor_id"], answers) if facts else []
-    values = [v.strip().casefold() for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({', '.join('?' * len(answered))})", answered)] if answered else []  # fmt: skip
+    values = (
+        [
+            v.strip().casefold()
+            for f, v in world.db.execute(
+                f"SELECT id, value FROM facts WHERE id IN ({', '.join('?' * len(answered))})", answered
+            )
+        ]
+        if answered
+        else []
+    )
     golden = [stated[v] for v in values if v in stated]
     if golden:
-        message = world.db.execute("SELECT m.parent_id, c.type, m.ts_us FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?", (golden[0][0],)).fetchone()  # fmt: skip
-        link = "thread" if message["parent_id"] else {"im": "dm", "mpim": "dm", "private": "private"}.get(message["type"], "channel")  # fmt: skip
-        first = min(world.db.execute(f"SELECT MIN(ts_us) FROM messages WHERE id IN ({', '.join('?' * len(ms))})", ms).fetchone()[0] for ms in stated.values())  # fmt: skip
+        message = world.db.execute(
+            "SELECT m.parent_id, c.type, m.ts_us FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = ?",
+            (golden[0][0],),
+        ).fetchone()
+        link = (
+            "thread"
+            if message["parent_id"]
+            else {"im": "dm", "mpim": "dm", "private": "private"}.get(message["type"], "channel")
+        )
+        first = min(
+            world.db.execute(
+                f"SELECT MIN(ts_us) FROM messages WHERE id IN ({', '.join('?' * len(ms))})", ms
+            ).fetchone()[0]
+            for ms in stated.values()
+        )
         link += "·later" if message["ts_us"] > first and len(stated) > 1 else ""
     others = []
-    for (user,) in world.db.execute("SELECT id FROM users WHERE id != ? AND is_bot = 0 ORDER BY id", (task["actor_id"],)):
+    for (user,) in world.db.execute(
+        "SELECT id FROM users WHERE id != ? AND is_bot = 0 ORDER BY id", (task["actor_id"],)
+    ):
         try:
-            others.append(sorted(str(r.get("answer")) for r in world.gold(user, task["gold_sql"], max_rows=50)["rows"]))  # fmt: skip
+            others.append(
+                sorted(str(r.get("answer")) for r in world.gold(user, task["gold_sql"], max_rows=50)["rows"])
+            )
         except ValueError:
             continue  # the query returns what that person cannot read
     readable = World(world.path, actor=task["actor_id"])
-    verbatim = all(readable.db.execute("SELECT 1 FROM messages WHERE instr(lower(text), lower(?)) LIMIT 1", (a,)).fetchone() for a in answers)  # fmt: skip
+    verbatim = all(
+        readable.db.execute(
+            "SELECT 1 FROM messages WHERE instr(lower(text), lower(?)) LIMIT 1", (a,)
+        ).fetchone()
+        for a in answers
+    )
     named = all(world.db.execute("SELECT 1 FROM users WHERE real_name = ?", (a,)).fetchone() for a in answers)
     readable.close()
     return {
@@ -1240,14 +1478,25 @@ def failure_cases(world, task_id: str, rows: list[dict]) -> tuple[str, list[tupl
     if facts and kind != "refusal":
         golden = {a.strip().casefold() for a in answers}
         for fact in answer_facts(world, facts, task["actor_id"], answers):
-            subject, attribute = world.db.execute("SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (fact,)).fetchone()  # fmt: skip
-            for other, value in world.db.execute("SELECT id, value FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ? ORDER BY day, id", (subject, attribute)):  # fmt: skip
+            subject, attribute = world.db.execute(
+                "SELECT lower(trim(subject)), lower(trim(attribute)) FROM facts WHERE id = ?", (fact,)
+            ).fetchone()
+            for other, value in world.db.execute(
+                "SELECT id, value FROM facts WHERE lower(trim(subject)) = ? AND lower(trim(attribute)) = ? ORDER BY day, id",
+                (subject, attribute),
+            ):
                 sight = any(readable(world, task["actor_id"], c) for c in places(world, other))
                 if sight and value.strip().casefold() not in golden and value not in misses:
                     misses.append(value)
     elif facts:  # a refusal: any value its actor can see, given as the answer
         marks = ", ".join("?" * len(facts))
-        misses = [v for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks}) ORDER BY day, id", facts) if any(readable(world, task["actor_id"], c) for c in places(world, f))]  # fmt: skip
+        misses = [
+            v
+            for f, v in world.db.execute(
+                f"SELECT id, value FROM facts WHERE id IN ({marks}) ORDER BY day, id", facts
+            )
+            if any(readable(world, task["actor_id"], c) for c in places(world, f))
+        ]
     gold = ", ".join(answers)
     cases = [(f"the near-miss {value!r}", f"{value}.") for value in misses[:3]]
     for near in json.loads(
@@ -1286,24 +1535,35 @@ def unsettled(world, task: Task, rows: list[dict]) -> None:
     values = {str(r.get("answer")).strip().casefold() for r in rows}
     seen = lambda f: any(readable(world, task.actor_id, c) for c in places(world, f))  # noqa: E731
     marks = ", ".join("?" * len(task.facts))
-    given = [f for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", task.facts) if v.strip().casefold() in values and seen(f)]  # fmt: skip
+    given = [
+        f
+        for f, v in world.db.execute(f"SELECT id, value FROM facts WHERE id IN ({marks})", task.facts)
+        if v.strip().casefold() in values and seen(f)
+    ]
     if not given:
         raise ValueError(
             f"{task.id}: a status answer's gold gives the value of one of its facts its actor can read"
         )
     # The values that replace it: later facts on its subject and attribute down its supersedes chain.
-    later = [r[0] for r in world.db.execute(
-        f"""WITH RECURSIVE chain(id) AS (SELECT src_fact FROM fact_relations WHERE kind = 'supersedes'
+    later = [
+        r[0]
+        for r in world.db.execute(
+            f"""WITH RECURSIVE chain(id) AS (SELECT src_fact FROM fact_relations WHERE kind = 'supersedes'
         AND dst_fact IN ({", ".join("?" * len(given))}) UNION SELECT r.src_fact FROM chain c JOIN fact_relations r
         ON r.dst_fact = c.id AND r.kind = 'supersedes')
         SELECT f.id FROM chain JOIN facts f ON f.id = chain.id JOIN facts g ON g.id = ?
         WHERE lower(trim(f.subject)) = lower(trim(g.subject)) AND lower(trim(f.attribute)) = lower(trim(g.attribute))""",
-        [*given, given[0]],
-    )]  # fmt: skip
+            [*given, given[0]],
+        )
+    ]
     if in_sight := [f for f in later if seen(f)]:
-        raise ValueError(f"{task.id}: its actor can read {in_sight}, which supersede the value it gives: that is its answer, not a status")  # fmt: skip
+        raise ValueError(
+            f"{task.id}: its actor can read {in_sight}, which supersede the value it gives: that is its answer, not a status"
+        )
     if not [f for f in task.facts if f in later]:
-        raise ValueError(f"{task.id}: a status answer rests on a fact, out of its actor's sight, that supersedes the value it gives")  # fmt: skip
+        raise ValueError(
+            f"{task.id}: a status answer rests on a fact, out of its actor's sight, that supersedes the value it gives"
+        )
 
 
 def task_row(task: Task, settings) -> dict:
@@ -1340,7 +1600,9 @@ def text_errors(world, lines, conveyable: set[str], moments: set[str]) -> list[s
             )
         if unknown := set(PLACEHOLDER.findall(line.text)) - moments:
             errors.append(f"line {i}: {{at:...}} names a moment; not {sorted(unknown)}")
-        if named_twice := [m.group(1) for m in PLACEHOLDER.finditer(line.text) if DAY_WORD.search(line.text[: m.start()])]:  # fmt: skip
+        if named_twice := [
+            m.group(1) for m in PLACEHOLDER.finditer(line.text) if DAY_WORD.search(line.text[: m.start()])
+        ]:
             errors.append(f"line {i}: {{at:...}} names its own day; drop the day word before {named_twice}")
         if literal := TIME_LITERAL.findall(PLACEHOLDER.sub(" ", line.text)):
             errors.append(f"line {i}: write times and dates only as {{at:id}}; found {literal}")
@@ -1373,7 +1635,14 @@ def insert_lines(
     ids = [None] * len(lines)
     for i, (line, ts) in enumerate(zip(lines, stamps)):
         drain(world, ts)  # code's posts due before this line come first
-        text = linked(world, PLACEHOLDER.sub(lambda m: render(moments[m[1]], zones[line.author_id], ts, habits.get(line.author_id), home), line.text), ts)  # fmt: skip
+        text = linked(
+            world,
+            PLACEHOLDER.sub(
+                lambda m: render(moments[m[1]], zones[line.author_id], ts, habits.get(line.author_id), home),
+                line.text,
+            ),
+            ts,
+        )
         root = i
         while lines[root].reply_to is not None:
             root = lines[root].reply_to
@@ -1529,7 +1798,9 @@ class TaskReview(StrictModel):
     @model_validator(mode="after")
     def read_one_way(self) -> Self:
         if self.misread and self.valid:
-            raise ValueError("a task whose wrong answer another reading of its question makes right is not valid")
+            raise ValueError(
+                "a task whose wrong answer another reading of its question makes right is not valid"
+            )
         return self
 
 
