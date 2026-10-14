@@ -5,8 +5,6 @@ A world run writes the workspace and its ledger (backward generation: the board 
 day 1); the forge then writes tasks on that world, in rounds: a proposer in the author's seat writes candidates, the
 solver tries each, and code keeps what lands. The world is never written again, so no task goes stale under it."""
 
-import asyncio
-import hashlib
 import json
 import re
 import shutil
@@ -15,20 +13,15 @@ from collections import Counter
 from pathlib import Path
 
 from pydantic import Field, model_validator
-from verifiers.v1.clients import EvalClientConfig, ModelContext
-from verifiers.v1.runtimes.prime import set_base_sandbox_labels
-from worldgen_slack.release import atomic_json
 from worldgen_slack.world import SCHEMA, file_hash
 from .workspace import Workspace
 
-import verifiers.v1 as vf
 
 from .agents.world import WorldAuthorTask, forge_prompt
 from .chronicle import answer_of, brief, forge_task
-from .config import ROOT, Config, Section, load_config
+from .config import Config, Section, load_config, pinned, rooted
 from .contracts import INTENTS, READING, Task, features, miss_class
 from .env import SETUP_FILES, GenerationEnv, keep_awake, rates, require_session
-from .generate import failure, run_label
 from .store import Store
 
 
@@ -66,9 +59,7 @@ def merged(base: dict, changes: dict) -> dict:
 def load_forge(path: Path) -> tuple[ForgeConfig, Config]:
     """The forge's configuration, and the run settings it works under: the base's, with its changes and output."""
     forge = ForgeConfig.model_validate(tomllib.loads(path.read_text()))
-    for field in ("base", "world", "output"):
-        if not getattr(forge, field).is_absolute():
-            setattr(forge, field, (ROOT / getattr(forge, field)).resolve())
+    forge.base, forge.world, forge.output = rooted(forge.base), rooted(forge.world), rooted(forge.output)
     base = load_config(forge.base).model_dump(mode="json")
     settings = Config.model_validate(merged(base, forge.settings) | {"output": str(forge.output)})
     return forge, settings
@@ -81,9 +72,7 @@ def provenance(forge: ForgeConfig, settings: Config) -> dict:
         "forge": forge.model_dump(mode="json"),
         "config": settings.model_dump(mode="json"),
         "world_hash": file_hash(forge.world / "world.sqlite"),
-        "verifiers_revision": "ac2ec29",
-        "lock_hash": hashlib.sha256((ROOT / "uv.lock").read_bytes()).hexdigest(),
-    }
+    } | pinned()
 
 
 TASK_TABLES = ("task_facts", "tasks")
@@ -515,40 +504,6 @@ class ForgeEnv(GenerationEnv):
             "memory/archive.md": "\n".join(lines) + "\n",
             "memory/taxonomy.md": "\n".join(taxonomy) + "\n",
         }
-
-
-async def run(forge: ForgeConfig, settings: Config) -> dict:
-    set_base_sandbox_labels([run_label(forge.output)])
-    store = Store(forge.output, provenance(forge, settings))
-    try:
-        if store.state.phase != "done":
-            env = ForgeEnv(forge, settings, store)
-            context = ModelContext(
-                model=settings.env.solver.model, client=EvalClientConfig(), sampling=vf.Sampling()
-            )
-            seed = vf.Task(vf.TaskData(idx=settings.seed, prompt="Forge tasks on the finished workspace."))
-            async with env.serving():
-                episode = await env.run_episode(seed, context)
-            for trace in episode.traces:
-                store.trace(trace)
-            atomic_json(store.root / f"episode-{episode.id}.json", episode.to_record())
-            if (reason := failure(store.state.phase, episode)) is not None:
-                return store.summary(
-                    "incomplete" if "ReviewLimit" in reason else "infrastructure_error", reason
-                )
-        summary = store.summary("complete")
-        if store.world.db.execute(
-            "SELECT 1 FROM tasks"
-        ).fetchone():  # an archive that kept nothing has no release
-            store.publish()
-        return summary
-    except asyncio.CancelledError:
-        store.summary(
-            "interrupted", "forge interrupted; committed progress and available traces are preserved"
-        )
-        raise
-    finally:
-        store.close()
 
 
 def dry_run(forge: ForgeConfig, settings: Config) -> dict:

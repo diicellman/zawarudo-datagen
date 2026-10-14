@@ -34,8 +34,8 @@ from .agents.world import (
     ledger_digest,
     plan_prompt,
 )
-from .chronicle import agenda_budget, bounds, close_day, posted, present, start_clock, today, unplanned
-from .config import Config, PipelineConfig
+from .chronicle import agenda_budget, bounds, close_day, daily, posted, present, start_clock, today, unplanned
+from .config import Config, PipelineConfig, pinned
 from .contracts import (
     PHASE_CRITERIA,
     READING,
@@ -45,7 +45,9 @@ from .contracts import (
     accepted,
     accepted_task,
     background_plan,
+    calendar,
     cards,
+    census,
     clock,
     failure_cases,
     frozen_before,
@@ -249,6 +251,23 @@ def thaw(verdict: Verdict, world) -> tuple[Verdict, list[Issue]]:
         )
         (apart if frozen else kept).append(moved)
     return verdict.model_copy(update={"issues": kept}), apart
+
+
+def provenance(config: Config) -> dict:
+    """Everything a resumed world run must share with its start: its configuration (taxonomy included), and what every
+    run pins."""
+    return {"config": config.model_dump(mode="json")} | pinned()
+
+
+def dry_run(config: Config) -> dict:
+    """What a world run would start from, spending nothing: its configuration, the cast drawn, and each date's messages
+    and their parts."""
+    (occupation, _), *_ = census(config.personas)[1].most_common(1)
+    pick_cast(config.personas, config.seed, [], {occupation: config.personas.pool})
+    plan = {"config": config.model_dump(mode="json")}
+    dates = [d["date"] for d in calendar(config.seed, config.calendar, "UTC")]
+    plan["daily"] = dict(zip(dates, daily(dates, config)))  # each date's messages and their parts
+    return plan
 
 
 class GenerationEnv(vf.Env[PipelineConfig]):

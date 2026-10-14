@@ -1,5 +1,6 @@
 """Validated run settings; all role overrides use native Verifiers configs."""
 
+import hashlib
 import tomllib
 from pathlib import Path
 from typing import Annotated, Literal
@@ -10,6 +11,18 @@ from verifiers.v1.harnesses.null.harness import NullHarnessConfig
 from worldgen_slack.config import role
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def pinned() -> dict:
+    """What every run's provenance pins beside its own settings: the verifiers revision pyproject.toml installs, and
+    the lock file."""
+    revision = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["uv"]["sources"]["verifiers"][
+        "rev"
+    ]
+    return {
+        "verifiers_revision": revision,
+        "lock_hash": hashlib.sha256((ROOT / "uv.lock").read_bytes()).hexdigest(),
+    }
 
 
 def world_author(model: str) -> vf.AgentConfig:
@@ -257,7 +270,5 @@ class Config(Section):
 
 def load_config(path: Path) -> Config:
     config = Config.model_validate(tomllib.loads(path.read_text()))
-    for field in ("output", "corpus"):
-        if not getattr(config, field).is_absolute():
-            setattr(config, field, (ROOT / getattr(config, field)).resolve())
+    config.output, config.corpus = rooted(config.output), rooted(config.corpus)
     return config

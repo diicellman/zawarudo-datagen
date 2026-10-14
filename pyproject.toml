@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-worldgen-slack = "generators.worldgen_slack.generate:main"
+worldgen-slack = "generators.worldgen_slack.cli:main"
 
 [build-system]
 requires = ["hatchling"]

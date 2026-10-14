@@ -103,15 +103,13 @@ from .chapter import (
     version_of,
 )
 from .chapter import provenance as chapter_provenance
-from .env import GenerationEnv, ended, keep_awake, rates, read_one_way
-from .generate import failure, provenance, run_label
-from .generate import run as generate_run
+from .cli import failure, run_forge, run_label, run_world
+from .env import GenerationEnv, ended, keep_awake, provenance, rates, read_one_way
 from .store import ReviewLimit, SessionLost, Store, write_release
 from .forge import ForgeConfig, ForgeEnv, bucket, measured_level
 from .forge import measured as forge_measured
 from .profile import profile
 from .forge import provenance as forge_provenance
-from .forge import run as forge_run
 from .config import ROOT, Category, Config, Needs
 from .contracts import (
     READING,
@@ -4076,7 +4074,7 @@ async def world_run(root, settings, agents_of):
     author, judge, fixed, reviewed = world_seats()
 
     with episodes(agents_of(judge=judge, author=author)):
-        summary = await generate_run(settings)
+        summary = await run_world(settings)
     assert summary["status"] == "complete" and not (settings.output / "release").exists(), (
         "a world run publishes nothing"
     )
@@ -5924,7 +5922,7 @@ async def check_chapter(root, parent, settings):
     # candidate is kept.
     forging.close()
     with episodes(SimpleNamespace(**forge_seats(note_on=old))):
-        summary = await forge_run(forge, cfg)
+        summary = await run_forge(forge, cfg)
     forging = TestStore(forge.output, forge_provenance(forge, cfg))
     assert summary["status"] == "complete" and forging.state.forged["r01-01"]["verdict"].startswith("kept"), (
         forging.state.forged

@@ -7,8 +7,6 @@ checked by code on the board), and the same author writes them in time order, as
 before the chapter's first day is written again. The chapter writes no tasks: the forge writes them on the version it
 leaves, and tasks forged on an earlier version stay with that version."""
 
-import asyncio
-import hashlib
 import json
 import random
 import re
@@ -19,20 +17,25 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from pydantic import Field, model_validator
-from verifiers.v1.clients import EvalClientConfig, ModelContext
-from verifiers.v1.runtimes.prime import set_base_sandbox_labels
-from worldgen_slack.release import atomic_json
 from worldgen_slack.world import digest, file_hash
 from .workspace import Workspace
 
-import verifiers.v1 as vf
 
 from .chronicle import spread, start_clock
-from .config import ROOT, ActivityConfig, AuthorSettings, Config, Needs, Section, Text, load_config
+from .config import (
+    ActivityConfig,
+    AuthorSettings,
+    Config,
+    Needs,
+    Section,
+    Text,
+    load_config,
+    pinned,
+    rooted,
+)
 from .contracts import Slot, calendar_days, extend_calendar, frozen_digest, meta
 from .env import GenerationEnv
 from .forge import merged, reset_tasks
-from .generate import failure, run_label
 from .store import RunState, Store
 
 
@@ -79,9 +82,11 @@ def parent_world(path: Path) -> Workspace:
 def load_chapter(path: Path) -> tuple[ChapterConfig, Config]:
     """The chapter's configuration, and the settings it runs under (`chapter_settings`)."""
     chapter = ChapterConfig.model_validate(tomllib.loads(path.read_text()))
-    for field in ("base", "world", "output"):
-        if not getattr(chapter, field).is_absolute():
-            setattr(chapter, field, (ROOT / getattr(chapter, field)).resolve())
+    chapter.base, chapter.world, chapter.output = (
+        rooted(chapter.base),
+        rooted(chapter.world),
+        rooted(chapter.output),
+    )
     return chapter, chapter_settings(chapter, load_config(chapter.base))
 
 
@@ -314,41 +319,7 @@ def provenance(chapter: ChapterConfig, settings: Config) -> dict:
         "chapter": chapter.model_dump(mode="json"),
         "config": settings.model_dump(mode="json"),
         "parent": {"path": str(chapter.world), "world_hash": file_hash(chapter.world / "world.sqlite")},
-        "verifiers_revision": "ac2ec29",
-        "lock_hash": hashlib.sha256((ROOT / "uv.lock").read_bytes()).hexdigest(),
-    }
-
-
-async def run(chapter: ChapterConfig, settings: Config) -> dict:
-    set_base_sandbox_labels([run_label(chapter.output)])
-    store = Store(chapter.output, provenance(chapter, settings))
-    try:
-        if store.state.phase != "done":
-            world = parent_world(chapter.world)
-            slots = brief_slots(chapter, settings, version_of(world) + 1)
-            world.close()
-            env = ChapterEnv(chapter, settings, store, slots)
-            context = ModelContext(
-                model=settings.env.solver.model, client=EvalClientConfig(), sampling=vf.Sampling()
-            )
-            seed = vf.Task(vf.TaskData(idx=settings.seed, prompt="Continue the shared Slack workspace."))
-            async with env.serving():
-                episode = await env.run_episode(seed, context)
-            for trace in episode.traces:
-                store.trace(trace)
-            atomic_json(store.root / f"episode-{episode.id}.json", episode.to_record())
-            if (reason := failure(store.state.phase, episode)) is not None:
-                return store.summary(
-                    "incomplete" if "ReviewLimit" in reason else "infrastructure_error", reason
-                )
-        return store.summary("complete")
-    except asyncio.CancelledError:
-        store.summary(
-            "interrupted", "chapter interrupted; committed progress and available traces are preserved"
-        )
-        raise
-    finally:
-        store.close()
+    } | pinned()
 
 
 def dry_run(chapter: ChapterConfig, settings: Config) -> dict:
