@@ -15,7 +15,7 @@ import sys
 import tarfile
 import time
 from collections import Counter
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 import random
 import re
@@ -85,11 +85,13 @@ from .chapter import ChapterConfig, ChapterEnv, Material, adopt, brief_slots, ch
 from .chapter import provenance as chapter_provenance
 from .env import GenerationEnv, ended, keep_awake, rates, read_one_way, try_digest
 from .generate import failure, provenance, run_label
+from .generate import run as generate_run
 from .store import ReviewLimit, SessionLost, Store
 from .forge import ForgeConfig, ForgeEnv, bucket, measured_level
 from .forge import measured as forge_measured
 from .profile import profile
 from .forge import provenance as forge_provenance
+from .forge import run as forge_run
 from .config import ROOT, Acceptance, Category, Config, Needs
 from .contracts import (
     READING,
@@ -2392,12 +2394,11 @@ async def scripted_complete(self, messages, *, trace=None, schema=None, parse=No
 vf.Judge.complete = scripted_complete  # a judge left unscripted fails here, before it reaches the gateway
 
 
-async def world_run(root, settings, agents_of):
-    """A world written with no tasks of its own, as W1 is: setup, the plan, four days with a review after day 2 whose
-    note opens day 3, and a final review that rejects once and is fixed in the same session. It ends at the final
-    review. The forge, the measure and the chapter below start from it. Returns its run directory and settings."""
-    settings = settings.model_copy(update={"output": root / "world", "tasks": settings.tasks.model_copy(update={"in_world": False})})  # fmt: skip
-    fixed = []
+def world_seats():
+    """The seats of a world with no tasks of its own: an author that sets up, plans, writes four days (revising what a
+    review names) and fixes what the final review rejects; a judge with a note after day 2 that rejects the final
+    review once. Returns the author, the judge, the messages fixed and the reviews made."""
+    fixed, reviewed = [], []
 
     async def script(prompt, tools, runtime):
         if tools is None:
@@ -2448,8 +2449,6 @@ async def world_run(root, settings, agents_of):
                     fixed.append(message)
         world.close()
 
-    reviewed = []
-
     class Judge(ScriptedAgent):  # a note after day 2; the final review rejects once, then approves
         async def run(self, task):
             payload, attempt = json.loads(task.config.payload), task.data.attempt
@@ -2463,33 +2462,17 @@ async def world_run(root, settings, agents_of):
             verdict = Verdict(approved=not any(i.blocking for i in issues), tasks=[], issues=issues, criteria=dict.fromkeys(PHASE_CRITERIA[payload["phase"]], 1.0), summary="s")  # fmt: skip
             return await judged(task, verdict)
 
-    store = TestStore(settings.output, provenance(settings))
-    env = GenerationEnv(settings, store)
-    agents = agents_of(judge=Judge(), author=ScriptedAuthor(script))
-    await env.setup(agents)
-    await env.run(None, agents)
-    state = store.state
-    assert state.phase == "done" and env.after_days == "final", (state.phase, state.rounds)
-    assert reviewed == ["review-02-01", "final-01", "final-02"] and len(fixed) == 1, (reviewed, fixed)
-    assert store.world.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0 and not state.quota, "no tasks"
-    assert [e["day"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines()) if e["event"] == "day_closed"] == [1, 2, 3, 4]  # fmt: skip
-    assert store.world.violations(complete=True) == []
-    store.close()
-    return settings.output, settings
+    return ScriptedAuthor(script), Judge(), fixed, reviewed
 
 
-async def check_author(root):
-    """One world written by a scripted author through the v7 driver: setup, the plan, days that close only when done,
-    a review after day 2 whose issues open day 3, a crash in that review and in day 3 with resumes from day 2's world
-    and notes, tasks, probes and hardening toward each level's band, a final rejection fixed in the same session,
-    publish."""
-    root.mkdir(parents=True)
+def flow_run_settings(root):
+    """The flows' settings: a 4-day world of 16 messages, 4 tasks in 2 batches, a review after day 2."""
     base = flow_settings(root, 3)
     cut = {
         "robustness": 2
     }  # S1's 17 cells, without needs: the flow's scripted tasks are not built to taxonomy v2
     flow = {n: c.model_copy(update={"levels": c.levels[: cut.get(n, 3)], "concepts": c.concepts[: cut.get(n, 3)], "needs": None}) for n, c in base.taxonomy.items()}  # fmt: skip
-    settings = base.model_copy(
+    return base.model_copy(
         update={
             "taxonomy": flow,
             "calendar": base.calendar.model_copy(update={"days": 4}),
@@ -2512,6 +2495,93 @@ async def check_author(root):
             ),
         }
     )
+
+
+@contextmanager
+def episodes(agents):
+    """The CLI's run functions on scripted seats: an episode sets its env up and runs it, with no model, and records a
+    failure as verifiers' episodes do."""
+
+    async def run_episode(self, task, context):
+        await self.setup(agents)
+        errors = []
+        try:
+            await self.run(task, agents)
+        except Exception as error:
+            errors.append(SimpleNamespace(type=type(error).__name__, message=str(error)))
+        return SimpleNamespace(id="episode", traces=[], errors=errors, to_record=lambda: {"id": "episode", "errors": [vars(e) for e in errors]})  # fmt: skip
+
+    @asynccontextmanager
+    async def serving(self):
+        yield
+
+    saved = vf.Env.run_episode, vf.Env.serving
+    vf.Env.run_episode, vf.Env.serving = run_episode, serving
+    try:
+        yield
+    finally:
+        vf.Env.run_episode, vf.Env.serving = saved
+
+
+def forge_seats(note_on=None) -> dict:
+    """The seats of a plain forge: a proposer that writes one lookup task for each open id, a judge that approves every
+    task (with a note on message `note_on`, when given), and a solver and a witness that answer right."""
+
+    async def propose(prompt, tools, runtime):
+        call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
+        world = World(tools.config.db_path)
+        (actor,) = world.db.execute("SELECT id FROM users WHERE is_bot = 0 ORDER BY id LIMIT 1").fetchone()
+        world.close()
+        for open_id in re.findall(r"r\d\d-\d\d", prompt):
+            await call("add_task", task=Task(id=open_id, category="lookup", level=1, actor_id=actor, question="Who is the newest person here?", answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1", intent="structure"))  # fmt: skip
+
+    class TaskJudge(ScriptedAgent):
+        async def run(self, task):
+            payload = json.loads(task.config.payload)
+            notes = [Issue(artifact="workspace", message_ids=[note_on], defect="a stiff old line", requested_change="loosen it", blocking=False)] if note_on else []  # fmt: skip
+            reviews = [TaskReview(task_id=t["id"], valid=True, reason="r", level_fit=3) for t in payload["tasks"]]
+            verdict = Verdict(approved=True, tasks=reviews, issues=notes, criteria=dict.fromkeys(PHASE_CRITERIA[payload["phase"]], 1.0), summary="s")  # fmt: skip
+            return await judged(task, verdict)
+
+    class RightSolver(ScriptedAgent):
+        async def run(self, task):
+            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r", "response": "an answer"}  # fmt: skip
+            return FakeTrace(self.trace("solver").id, "solver", info={"evaluation": evaluation}, task=task)
+
+    return dict(judge=TaskJudge(), solver=RightSolver(), witness=RightSolver(), author=ScriptedAuthor(propose))
+
+
+async def world_run(root, settings, agents_of):
+    """A world written with no tasks of its own, as W1 is: setup, the plan, four days with a review after day 2 whose
+    note opens day 3, and a final review that rejects once and is fixed in the same session. It ends at the final
+    review. The forge, the measure and the chapter below start from it. Returns its run directory and settings."""
+    settings = settings.model_copy(update={"output": root / "world", "tasks": settings.tasks.model_copy(update={"in_world": False})})  # fmt: skip
+    author, judge, fixed, reviewed = world_seats()
+
+    with episodes(agents_of(judge=judge, author=author)):
+        try:
+            await generate_run(settings)
+            raise AssertionError("a world with no tasks published a release")
+        except ValueError as error:  # it publishes after its final review all the same, an empty release
+            assert "public tasks and private answers must match exactly" in str(error), error
+    store = TestStore(settings.output, provenance(settings))
+    state = store.state
+    assert state.phase == "done" and GenerationEnv(settings, store).after_days == "final", (state.phase, state.rounds)
+    assert reviewed == ["review-02-01", "final-01", "final-02"] and len(fixed) == 1, (reviewed, fixed)
+    assert store.world.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0 and not state.quota, "no tasks"
+    assert [e["day"] for e in map(json.loads, (store.root / "progress.jsonl").read_text().splitlines()) if e["event"] == "day_closed"] == [1, 2, 3, 4]  # fmt: skip
+    assert store.world.violations(complete=True) == []
+    store.close()
+    return settings.output, settings
+
+
+async def check_author(root):
+    """One world written by a scripted author through the v7 driver: setup, the plan, days that close only when done,
+    a review after day 2 whose issues open day 3, a crash in that review and in day 3 with resumes from day 2's world
+    and notes, tasks, probes and hardening toward each level's band, a final rejection fixed in the same session,
+    publish."""
+    root.mkdir(parents=True)
+    settings = flow_run_settings(root)
     seen, crash, solved, finished = [], {"armed": True, "review": True, "plans": 0, "tasks": True}, Counter(), Counter()  # fmt: skip
     GRADER.update(on=True, loose=False, blind=False)
     t0, t1, t2, t3 = [
@@ -3557,27 +3627,13 @@ async def check_chapter(root, parent, settings):
     assert on_chapter.covered()[1] == ["semantic-l3-v2-1"], on_chapter.covered()
     # One round on it, whose task review notes a message of the frozen past: thawed, the note is set apart, and the
     # candidate is kept.
-    async def propose(prompt, tools, runtime):
-        call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
-        (open_id,) = re.findall(r"r\d\d-\d\d", prompt)
-        await call("add_task", task=Task(id=open_id, category="lookup", level=1, actor_id=a, question="Who is the newest person here?", answer_type="text", gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1", intent="structure"))  # fmt: skip
-
-    class TaskJudge(ScriptedAgent):
-        async def run(self, task):
-            payload = json.loads(task.config.payload)
-            frozen_issue = Issue(artifact="workspace", message_ids=[old], defect="a stiff old line", requested_change="loosen it", blocking=False)  # fmt: skip
-            reviews = [TaskReview(task_id=t["id"], valid=True, reason="r", level_fit=3) for t in payload["tasks"]]
-            verdict = Verdict(approved=True, tasks=reviews, issues=[frozen_issue], criteria=dict.fromkeys(PHASE_CRITERIA["task"], 1.0), summary="s")  # fmt: skip
-            return await judged(task, verdict)
-
-    class RightSolver(ScriptedAgent):
-        async def run(self, task):
-            evaluation = {"task_id": task.data.task_id, "execution_ok": True, "semantic_correctness": 1.0, "correct": True, "grounded": True, "calls": 1, "reason": "r", "response": "an answer"}  # fmt: skip
-            return FakeTrace(self.trace("solver").id, "solver", info={"evaluation": evaluation}, task=task)
-
-    await ForgeEnv(forge, cfg, forging).run(None, SimpleNamespace(judge=TaskJudge(), solver=RightSolver(), witness=RightSolver(), author=ScriptedAuthor(propose)))  # fmt: skip
-    assert forging.state.forged["r01-01"]["verdict"].startswith("kept"), forging.state.forged
+    forging.close()
+    with episodes(SimpleNamespace(**forge_seats(note_on=old))):
+        summary = await forge_run(forge, cfg)
+    forging = TestStore(forge.output, forge_provenance(forge, cfg))
+    assert summary["status"] == "complete" and forging.state.forged["r01-01"]["verdict"].startswith("kept"), forging.state.forged  # fmt: skip
     assert (forging.root / "attempts/round-01/frozen_issues-tasks.json").exists(), "the frozen issue is set apart"
+    assert [r.task_id for r in load_release(forge.output / "release")[1]] == ["r01-01"], "the forge publishes"
     forging.close()
     print("PASS chapter: adopted frozen, plan and brief checked, the past never written, reviews thawed, forged on")
 
