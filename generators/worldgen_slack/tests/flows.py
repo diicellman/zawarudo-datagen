@@ -1387,7 +1387,7 @@ async def run_flows(root):
 
     # else a dropped session was reported as the author's limits
     with pytest.raises(SessionLost):
-        await env.author_step(
+        await env.take_turn(
             SimpleNamespace(trace=FakeTrace("cut-off", "author", ok=False, errors=[rpc]), turn=cut_off),
             FakeRuntime(),
             "write",
@@ -1410,17 +1410,17 @@ async def run_flows(root):
     stopping = verifiers.v1.utils.interrupt
     stopping._cleaning_up = True  # a stop cancels the session's streams: it is not retried
     try:
-        await Dropping("stop", 1).author_world(agents)
+        await Dropping("stop", 1).work_in_vm(agents)
         raise AssertionError("a stopped run was taken up again")
     except SessionLost:
         assert blocks == ["stop-01"] and "stop" not in store.state.lost, blocks
     finally:
         stopping._cleaning_up = False
     blocks.clear()
-    await Dropping("block", 1).author_world(agents)
+    await Dropping("block", 1).work_in_vm(agents)
     assert blocks == ["block-01", "block-02"] and store.state.lost == {"block": 1}, (blocks, store.state.lost)
     try:
-        await Dropping("gone", 2).author_world(agents)
+        await Dropping("gone", 2).work_in_vm(agents)
         raise AssertionError("a block that lost its session twice went on")
     except SessionLost:
         assert blocks[2:] == ["gone-01", "gone-02"] and store.state.lost["gone"] == 2, blocks
@@ -2424,7 +2424,7 @@ async def chapter_flow(root, parent, settings):
         and found["world"]["version"] == 2
         and found["material"]["groups_3_values"] >= 1
     ), owners
-    tools_task = AuthorTask.create("fix", 0, world.path, env.author_context(), "check")
+    tools_task = AuthorTask.create("fix", 0, world.path, env.tools_context(), "check")
     (tools,) = tools_task.toolsets(tools_task.config)
     assert not any(hasattr(tools, t) for t in ("add_task", "probe", "annotate")), (
         "a chapter's author writes no task"

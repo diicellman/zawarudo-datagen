@@ -10,6 +10,7 @@ from typing import Annotated
 from pydantic import AfterValidator, Field
 from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
 from worldgen_slack.world import digest
+
 from .clock import zone
 from .text import normalized
 

@@ -9,6 +9,8 @@ from typing import Annotated, Literal
 
 from pydantic import Field
 from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
+
+from ..config import Ids
 from .board import hidden_answers
 from .clock import (
     PARTS,
@@ -29,7 +31,6 @@ from .clock import (
 from .integrations import drain, queue_day
 from .style import LONG, SHORT
 from .text import DAY_WORD, GROUP, LINK, MENTION, PEOPLE, PLACEHOLDER, RAW_URL, TIME_LITERAL, normalized
-from ..config import Ids
 
 
 class Reaction(StrictModel):

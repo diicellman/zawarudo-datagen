@@ -7,6 +7,8 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
 from worldgen_slack.world import digest
+
+from ..config import Ids
 from .board import board_measures, fact_measures, on_board, slot_needs, unmet
 from .clock import (
     Clock,
@@ -26,7 +28,6 @@ from .clock import (
 from .integrations import app_id, event_errors, queue, queue_day, queue_events
 from .text import TIME_LITERAL, normalized
 from .writing import keep_busy, quotas, room, today_line
-from ..config import Ids
 
 
 class Storyline(StrictModel):

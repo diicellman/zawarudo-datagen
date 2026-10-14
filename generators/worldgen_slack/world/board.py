@@ -5,8 +5,9 @@ import json
 
 from pydantic import Field
 from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
-from .clock import chapter_start, meta
+
 from ..config import Needs
+from .clock import chapter_start, meta
 
 
 class Slot(StrictModel):

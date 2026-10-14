@@ -7,7 +7,6 @@ from zoneinfo import ZoneInfo
 
 from .text import EMOJI, PEOPLE
 
-
 # Words: a short line has at most SHORT, a long one more than LONG, as the typing profiles measure.
 SHORT, LONG = 4, 20
 

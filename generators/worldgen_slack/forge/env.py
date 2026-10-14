@@ -21,9 +21,9 @@ from ..world.author.memory import task_page
 from ..world.board import brief
 from .config import ForgeConfig
 from .difficulty import features
-from .tasks import INTENTS, Task, answer_of, forge_task
-from .release import miss_class, release_rows
 from .proposer.task import ProposerTask, forge_prompt
+from .release import miss_class, release_rows
+from .tasks import INTENTS, Task, answer_of, forge_task
 from .tries import Tries, rates
 
 
@@ -94,7 +94,7 @@ class ForgeEnv(SessionEnv):
 
     def provision_task(self) -> ProposerTask:
         """The proposer's own task: no persona file is read to provision its VM."""
-        return ProposerTask.create(self.world.path, self.author_context(), "setup")
+        return ProposerTask.create(self.world.path, self.tools_context(), "setup")
 
     async def run(self, task, agents):
         state = self.store.state
@@ -103,7 +103,7 @@ class ForgeEnv(SessionEnv):
         if self.settings.measure and not state.plans.get("forge", {}).get("measured"):
             await self.measure(agents)
         if state.phase == "tasks":  # a forge that only measures needs no proposer, and no VM
-            await self.author_world(agents)
+            await self.work_in_vm(agents)
 
     async def measure(self, agents) -> None:
         """Round 0: the finished run's own tasks, under their own ids, checked for validity only (T1-T7, the columns
@@ -197,7 +197,7 @@ class ForgeEnv(SessionEnv):
             },
         )
         await self.bring_notes(runtime, state.restore_point)
-        task = ProposerTask.create(self.world.path, self.author_context(), attempt)
+        task = ProposerTask.create(self.world.path, self.tools_context(), attempt)
         async with agents.proposer.interaction(task, runtime=runtime) as interaction:
             for n in range(2):
                 if not (missing := [t for t in ids if t not in self.written(ids)]):
@@ -210,7 +210,7 @@ class ForgeEnv(SessionEnv):
                     if n == 0
                     else f"These open ids have no candidate yet: {missing}. Write them with world_add_task, then end your turn."
                 )
-                await self.author_step(interaction, runtime, prompt, attempt, "forge", self.pages())
+                await self.take_turn(interaction, runtime, prompt, attempt, "forge", self.pages())
         self.store.trace(interaction.trace)
         require_session(interaction.trace)
         await self.keep_notes(runtime, attempt)

@@ -8,11 +8,12 @@ from typing import Literal
 from pydantic import Field
 from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
 from worldgen_slack.world import SHOWN, canonical
-from ..evidence import measures
-from .difficulty import features, panel
+
 from ..config import Ids
+from ..evidence import measures
 from ..world.board import Slot, places, readable
 from ..world.text import normalized
+from .difficulty import features, panel
 
 
 def _meaningful_tokens(value: str) -> set[str]:

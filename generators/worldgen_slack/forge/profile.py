@@ -10,7 +10,6 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from ..workspace import Workspace
-
 from ..world.board import answer_facts, readable
 from ..world.clock import meta
 

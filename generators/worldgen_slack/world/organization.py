@@ -11,11 +11,12 @@ from typing import Literal
 from pydantic import Field
 from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
 from worldgen_slack.world import digest, words
+
+from ..config import Ids
+from ..workspace import SCHEMA_VERSION
 from .cast import Premise, SeedPersona, company_zone, user_id
 from .clock import DAY, Part, calendar
 from .text import TIME_LITERAL
-from ..config import Ids
-from ..workspace import SCHEMA_VERSION
 
 
 def channel_id(kind: str, name: str | None, members: list[str]) -> str:

@@ -18,16 +18,14 @@ from pathlib import Path
 
 from pydantic import Field, model_validator
 from worldgen_slack.world import digest, file_hash
-from ..workspace import Workspace, reset_tasks
 
-
-from .clock import spread, start_clock
 from ..config import Needs, Section, Text, load_taxonomy, merged, pinned, rooted
+from ..store import RunState, Store
+from ..workspace import Workspace, reset_tasks
 from .board import Slot
-from .clock import calendar_days, extend_calendar, frozen_digest, meta
+from .clock import calendar_days, extend_calendar, frozen_digest, meta, spread, start_clock
 from .config import ActivityConfig, AuthorSettings, WorldConfig, load_world
 from .env import WorldEnv
-from ..store import RunState, Store
 
 
 class Material(Section):
@@ -294,14 +292,14 @@ class ChapterEnv(WorldEnv):
         self.chapter, self.slots = chapter, slots
         super().__init__(settings, store)
 
-    def author_context(self) -> dict:
+    def tools_context(self) -> dict:
         first = int(meta(self.world, "chapter_start_day", 1))
-        return super().author_context() | {"chapter": {"first": first, "version": version_of(self.world)}}
+        return super().tools_context() | {"chapter": {"first": first, "version": version_of(self.world)}}
 
     async def run(self, task, agents):
         if self.store.state.phase == "premise":
             adopt(self.store, self.chapter, self.settings, self.slots)
-        return await self.author_world(agents)
+        return await self.work_in_vm(agents)
 
 
 def provenance(chapter: ChapterConfig, settings: WorldConfig) -> dict:

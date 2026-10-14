@@ -15,12 +15,12 @@ from worldgen_slack.release import (
     read_json,
 )
 from worldgen_slack.world import canonical
-from .evidence import measures
-from .workspace import Workspace
 
+from .evidence import measures
+from .judge.verdict import Issue, Verdict
+from .workspace import Workspace
 from .world.board import Slot
 from .world.cast import Premise, SeedPersona
-from .judge.verdict import Issue, Verdict
 
 
 def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:

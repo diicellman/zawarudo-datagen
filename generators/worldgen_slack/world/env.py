@@ -10,20 +10,9 @@ import json
 
 from verifiers.v1.errors import SandboxError
 
-from ..judge.task import review, review_payload
-from .author.memory import ledger_digest
-from .author.setup import SetupTask, organization_context, parse_premise, premise_context
-from .author.task import AuthorTask, day_prompt, fix_prompt, plan_prompt
-from .clock import bounds, daily, present, start_clock, today
-from .ledger import unplanned
-from .writing import agenda_budget, close_day, posted
 from ..config import pinned
-from .cast import cards, census, pick_cast
-from .clock import calendar, clock, frozen_before, frozen_digest, meta
-from .config import WorldConfig
-from .organization import Organization, background_plan, organize
+from ..judge.task import review, review_payload
 from ..judge.verdict import Verdict, combined
-from ..store import ReviewLimit, Store, used_names
 from ..session import (
     SETUP_FILES,
     SessionEnv,
@@ -31,6 +20,27 @@ from ..session import (
     keep_awake,
     require_session,
 )
+from ..store import ReviewLimit, Store, used_names
+from .author.memory import ledger_digest
+from .author.setup import SetupTask, organization_context, parse_premise, premise_context
+from .author.task import AuthorTask, day_prompt, fix_prompt, plan_prompt
+from .cast import cards, census, pick_cast
+from .clock import (
+    bounds,
+    calendar,
+    clock,
+    daily,
+    frozen_before,
+    frozen_digest,
+    meta,
+    present,
+    start_clock,
+    today,
+)
+from .config import WorldConfig
+from .ledger import unplanned
+from .organization import Organization, background_plan, organize
+from .writing import agenda_budget, close_day, posted
 
 
 def provenance(config: WorldConfig) -> dict:
@@ -211,11 +221,11 @@ class WorldEnv(SessionEnv):
             await self.bring_notes(runtime, state.restore_point)
         imported = await self.note(runtime, "plan.md") if state.restore_point else None
         attempt = self.store.reserve("plan", cfg.author.plan_attempts)
-        task = AuthorTask.create("plan", 0, self.world.path, self.author_context(), attempt)
+        task = AuthorTask.create("plan", 0, self.world.path, self.tools_context(), attempt)
         async with agents.author.interaction(task, runtime=runtime) as interaction:
             prompt, errors = plan_prompt(self.world, cfg, state.feedback), []
             for _ in range(3):
-                await self.author_step(interaction, runtime, prompt, attempt, "plan")
+                await self.take_turn(interaction, runtime, prompt, attempt, "plan")
                 errors = unplanned(self.world, cfg, state.quota)
                 note = await self.note(runtime, "plan.md")
                 errors += ["write /task/notes/plan.md"] * (not (note or "").strip() or note == imported)
@@ -249,11 +259,11 @@ class WorldEnv(SessionEnv):
         issues = [i.model_dump(mode="json") for i in state.issues]
         if issues:
             self.store.event("issues_delivered", attempt=attempt, issues=len(issues))
-        task = AuthorTask.create("day", day, self.world.path, self.author_context(), attempt)
+        task = AuthorTask.create("day", day, self.world.path, self.tools_context(), attempt)
         async with agents.author.interaction(task, runtime=runtime) as interaction:
             prompt, errors = day_prompt(self.world, day, issues, state.feedback), []
             for _ in range(3):
-                await self.author_step(interaction, runtime, prompt, attempt, "day")
+                await self.take_turn(interaction, runtime, prompt, attempt, "day")
                 errors = []
                 if today(self.world) == day:
                     errors = close_day(self.world, cfg, day) or [
@@ -313,11 +323,11 @@ class WorldEnv(SessionEnv):
                 issues = [i.model_dump(mode="json") for i in verdict.issues]
                 if interaction is None:
                     await self.bring_notes(runtime, state.restore_point)
-                    task = AuthorTask.create("fix", 0, self.world.path, self.author_context(), attempt)
+                    task = AuthorTask.create("fix", 0, self.world.path, self.tools_context(), attempt)
                     interaction = await stack.enter_async_context(
                         agents.author.interaction(task, runtime=runtime)
                     )
-                await self.author_step(interaction, runtime, fix_prompt(issues), attempt, "fix")
+                await self.take_turn(interaction, runtime, fix_prompt(issues), attempt, "fix")
         if interaction is not None:
             self.store.trace(interaction.trace)
             require_session(interaction.trace)

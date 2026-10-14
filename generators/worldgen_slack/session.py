@@ -129,9 +129,10 @@ SETUP_FILES = (
 
 
 class SessionEnv(vf.Env[Seats]):
-    """An env whose author works in one VM for the whole run, one interaction per block of work: the VM provisioned
-    again after a lost session, code's memory rendered before every turn, and the notes an attempt kept brought back.
-    A subclass says which seat works its blocks, what the VM is provisioned with, and what its blocks are."""
+    """An env whose agent (a world's author, a forge's proposer) works in one VM for the whole run, one interaction
+    per block of work: the VM provisioned again after a lost session, code's memory rendered before every turn, and
+    the notes an attempt kept brought back. A subclass says which seat works its blocks, what the VM is provisioned
+    with, and what its blocks are."""
 
     seat = "author"  # the seat whose agent works in the VM
     seats = ("author", "judge")  # every seat of the run, none trained
@@ -150,17 +151,16 @@ class SessionEnv(vf.Env[Seats]):
         for name in self.seats:
             getattr(agents, name).trainable = False
 
-    def author_context(self) -> dict:
+    def tools_context(self) -> dict:
+        """What the agent's world tools are configured with, from the run's state."""
         state = self.store.state
         return context_of(self.settings, state, self.store.root, state.drafts.get("organization"))
 
-    async def author_step(
-        self, interaction, runtime, prompt: str, attempt: str, mode: str, extra=None
-    ) -> None:
-        """One author turn: code's memory of the world, rendered fresh (with `extra` memory files, such as the solver's
-        tries), then the turn; the author works through its tools, and the world file is code's again when the turn
-        ends."""
-        memory = files(self.world, self.settings, self.author_context()) | (extra or {})
+    async def take_turn(self, interaction, runtime, prompt: str, attempt: str, mode: str, extra=None) -> None:
+        """One turn of the agent: code's memory of the world, rendered fresh (with `extra` memory files, such as the
+        solver's tries), then the turn; the agent works through its tools, and the world file is code's again when the
+        turn ends."""
+        memory = files(self.world, self.settings, self.tools_context()) | (extra or {})
         await upload(runtime, memory, "/task/memory")
         self.store.event(f"{self.seat}_turn", attempt=attempt, mode=mode, day=self.store.state.day)
         segment = await interaction.turn(prompt)
@@ -175,23 +175,23 @@ class SessionEnv(vf.Env[Seats]):
             return None
 
     async def keep_notes(self, runtime, attempt: str) -> None:
-        """The author's notes as the attempt left them, kept with its world."""
+        """The agent's notes as the attempt left them, kept with its world."""
         for name in NOTES:
             if (text := await self.note(runtime, name)) is not None:
                 self.store.path(attempt, "notes/" + name).write_text(text)
 
     async def bring_notes(self, runtime, attempt: str) -> None:
-        """The notes an attempt kept, and only those, back in the author's workspace: a day starts from where the
-        last one closed, and a failed attempt's notes are gone."""
+        """The notes an attempt kept, and only those, back in the agent's VM: a day (or a round) starts from where the
+        last one ended, and a failed attempt's notes are gone."""
         kept = self.store.root / "attempts" / attempt / "notes"
         notes = {f"notes/{name}": (kept / name).read_bytes() for name in NOTES if (kept / name).exists()}
         await upload(runtime, notes, "/task/notes")
 
-    async def author_world(self, agents) -> None:
-        """One author agent and one VM for the whole world; one interaction per block of work. A session lost to its
-        sandbox, tunnel or provider (or a VM gone mid-run) is none of the author's limits: a fresh VM takes the run up
-        where its state says, as a resume does, and the attempt it cut off spends no round. A second loss in the same
-        block stops the run."""
+    async def work_in_vm(self, agents) -> None:
+        """One agent and one VM for the whole run; one interaction per block of work. A session lost to its sandbox,
+        tunnel or provider (or a VM gone mid-run) is none of the agent's limits: a fresh VM takes the run up where its
+        state says, as a resume does, and the attempt it cut off spends no round. A second loss in the same block
+        stops the run."""
         state, last = self.store.state, None
         setup = self.provision_task()
         while True:
@@ -211,7 +211,7 @@ class SessionEnv(vf.Env[Seats]):
                 last = where
 
     async def run(self, task, agents):
-        return await self.author_world(agents)
+        return await self.work_in_vm(agents)
 
     def provision_task(self) -> vf.Task:
         """The task the VM is provisioned with: provisioning runs none of its setup."""
