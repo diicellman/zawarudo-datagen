@@ -39,7 +39,10 @@ def real_users(path: Path) -> dict:
 def scorecard(world: Workspace, targets: ActivityConfig) -> dict:
     """Each [activity] target beside the world's measured value: a chapter's own days against its own targets."""
     measured = activity(world, frozen_before(world))
-    one = lambda sql: world.db.execute(sql).fetchone()[0]  # noqa: E731
+
+    def one(sql):
+        return world.db.execute(sql).fetchone()[0]
+
     shares = ("reply_share", "reaction_rate", "dm_share", "mention_rate", "emoji_rate")
     return (
         {"messages": {"target": targets.messages, "measured": measured["messages"]}}
@@ -59,7 +62,10 @@ def author(run: Path, world: Workspace, settings) -> dict | None:
     """A world, as its author wrote it: each day against its quota, the ledger and its events, promises, the
     author's turns and tool calls, the solver's probes, the reviews, and how often a ledger task's answer sits in one
     message."""
-    one = lambda sql, *args: world.db.execute(sql, args).fetchone()[0]  # noqa: E731
+
+    def one(sql, *args):
+        return world.db.execute(sql, args).fetchone()[0]
+
     events = [json.loads(line) for line in (run / "progress.jsonl").read_text().splitlines()]
     calls = (
         [json.loads(line) for line in (run / "world-calls.jsonl").read_text().splitlines()]

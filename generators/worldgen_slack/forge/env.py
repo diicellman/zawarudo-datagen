@@ -108,8 +108,7 @@ class ForgeEnv(SessionEnv):
     async def measure(self, agents) -> None:
         """Round 0: the finished run's own tasks, under their own ids, checked for validity only (T1-T7, the columns
         the tools show) and not by the forge's own gates, then measured as any candidate is: the screen, 8 tries, the
-        witness, the hint, the judge. S3's tasks and the forge's are then read with one measuring stick: S3's rates
-        came from 4 tries at temperature 0."""
+        witness, the hint, the judge. A run's own tasks and the forge's are then read with one measuring stick."""
         state = self.store.state
         attempt = self.store.reserve("measure", 2)
         source = Workspace(self.settings.world / "world.sqlite")
@@ -254,8 +253,7 @@ class ForgeEnv(SessionEnv):
         (hard, not broken). Its place is its category and that level, which holds up to `target` tasks (MAP-Elites
         over task features, as OMNI-EPIC keeps its archive). A newcomer to a full place replaces a holder when it
         brings a structure the place lacks while two holders share one, or when the solver's tries are more mixed on it than
-        on the weakest holder, by 4p(1-p), the shorter question winning a tie. forge-t1's 10 tasks filled 10 cells of
-        their own, so nothing competed and every easy task was kept."""
+        on the weakest holder, by 4p(1-p), the shorter question winning a tie."""
         state, bands = self.store.state, self.settings.bands
         row = self.world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         gold = json.loads(row["gold_json"])
@@ -322,7 +320,10 @@ class ForgeEnv(SessionEnv):
         }
         holders = state.archive.setdefault(where, [])
         if len(holders) >= self.settings.target:
-            weakest = lambda hs: min(hs, key=lambda h: (h["score"], -h["words"]))  # noqa: E731
+
+            def weakest(hs):
+                return min(hs, key=lambda h: (h["score"], -h["words"]))
+
             shared = [h for h in holders if [g["bucket"] for g in holders].count(h["bucket"]) > 1]
             if shaped not in {h["bucket"] for h in holders} and shared:
                 out_ = weakest(shared)
@@ -472,7 +473,10 @@ class ForgeEnv(SessionEnv):
 def dry_run(config: ForgeConfig) -> dict:
     """What a forge would start from, spending nothing: the world, its board, its goal, and the rounds."""
     world = Workspace(config.world / "world.sqlite")
-    count = lambda table: world.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: E731
+
+    def count(table):
+        return world.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
     return {
         "world": str(config.world),
         "world_hash": file_hash(config.world / "world.sqlite"),

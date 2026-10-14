@@ -674,7 +674,10 @@ def test_contracts(tmp_path):
     plan = background_plan(world, org(), small, 7, 2, 12)  # a day's agenda: 12 messages of everyday talk
     members = {(r[0], r[1]) for r in world.db.execute("SELECT channel_id, user_id FROM members")}
     assert plan == background_plan(world, org(), small, 7, 2, 12) and sum(s.length for s in plan) in (11, 12)
-    drawn = lambda scenes: [(x.channel_id, x.part, x.situation, x.length) for x in scenes]  # noqa: E731
+
+    def drawn(scenes):
+        return [(x.channel_id, x.part, x.situation, x.length) for x in scenes]
+
     assert drawn(plan) != drawn(background_plan(world, org(), small, 7, 3, 12)), "each day draws its own"
     assert all(s.situation in {r.kind for r in routines} and s.day == 2 for s in plan)
     assert all((s.channel_id, p) in members for s in plan for p in s.participants)
@@ -1276,7 +1279,9 @@ def test_clock(tmp_path):
         for i, c, n in (("t1", "semantic", 3), ("t3", "search", 1), ("t2", "lookup", 1))
     ]
     spread = needing(settings, "semantic", 3, channels=2)
-    entries = lambda *pairs: [BoardEntry(slot=slot, facts=ids) for slot, ids in pairs]  # noqa: E731
+
+    def entries(*pairs):
+        return [BoardEntry(slot=slot, facts=ids) for slot, ids in pairs]
 
     def boarded(document):
         with world.trial() as copy:
@@ -1885,7 +1890,10 @@ async def test_tools(tmp_path):
     day1 = tools_for("day", 1)
     await day1.setup()
     with_state(day1)
-    call = lambda tools, name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
+
+    def call(tools, name, **kwargs):
+        return tools._with_state(getattr(tools, name))(**kwargs)
+
     page = await call(day1, "now")
     assert page.startswith("# Now: ") and "day 1 of 10" in page and "[[f1]]" in page and "## Brief" in page
     assert "everyday conversations code drew for today" in page and agenda[1]

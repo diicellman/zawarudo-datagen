@@ -71,7 +71,10 @@ def unmet(needs, measured: dict) -> list[str]:
 
 def needs_text(needs) -> str:
     """A level's needs, as the author reads them in now.md."""
-    many = lambda n, word: f"{n} {word}" + ("s" if n > 1 else "")  # noqa: E731
+
+    def many(n, word):
+        return f"{n} {word}" + ("s" if n > 1 else "")
+
     out = []
     if needs.channels:
         out.append(f"facts first stated in {many(needs.channels, 'channel')}")
@@ -102,7 +105,7 @@ def fact_measures(world, ids: list[str], actor: str | None = None, gold=None, re
     """What a task's facts give it: the channels they are first stated in, the relations among them, and its
     near-misses (`decoys`): facts on an answer fact's subject and attribute, other than its answer facts, that `actor`
     can read and that no fact `actor` can see supersedes: an unretracted decoy, or a value whose change is out of the
-    actor's sight. A near-miss the world corrects in plain sight is no near-miss: S2's solver followed every such
+    actor's sight. A near-miss the world corrects in plain sight is no near-miss: a solver follows every such
     chain. Planned before any actor is chosen, a near-miss counts wherever it is stated, and a change counts as seen
     when it is public."""
     marks = ", ".join("?" * len(ids))

@@ -27,7 +27,8 @@ class ForgeSeats(Seats):
         update={"runtime": vf.SubprocessConfig()}
     )
     # A stronger solver with the same tools, for the tasks GLM rarely answers: hard, or broken?
-    # It thinks hard (FC1's took 2-5 calls and lost tasks the solver answered): it shows a task can be answered.
+    # It thinks hard (at its default effort it took 2-5 calls and lost tasks the solver answered): it shows a task
+    # can be answered.
     witness: vf.AgentConfig = role("openai/gpt-6-sol", solver=True).model_copy(
         update={
             "runtime": vf.SubprocessConfig(),

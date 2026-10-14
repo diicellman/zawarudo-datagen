@@ -47,8 +47,8 @@ CREATE TEMP VIEW thread_stats AS SELECT p.id AS root_id, COUNT(r.id) AS reply_co
 """
 # Of the workspace, the columns the solver's tools show (slack.py), or let it work out (a mention is <@U..> in a
 # message's text; a thread's latest reply is the last one it reads; a channel's members are those who have not left): a gold
-# query filters on and returns these alone. S3's gold read reactions.created_us, when the tools say who reacted but
-# never when.
+# query filters on and returns these alone: a gold reading reactions.created_us would ask when someone reacted, which
+# the tools never show.
 SHOWN = {
     "users": {
         "id",

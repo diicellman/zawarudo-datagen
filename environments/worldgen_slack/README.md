@@ -40,4 +40,5 @@ Public channels are readable by everyone in the workspace; private channels and 
 member who left no longer has. Deleted messages are excluded. There are no writes.
 
 The tool server runs on the host and opens the world file by path, after checking its hash. Each call is recorded
-for grading.
+for grading. `generators/worldgen_slack/tests/test_capture.py` replays the capture against the workspace it was taken
+in, rebuilt as a world, and lists where the env reads otherwise than the server.

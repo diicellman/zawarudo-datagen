@@ -29,8 +29,8 @@ def panel(world, task_id: str, rows: list[dict]) -> dict:
     """Lazy solvers, played by code over the ledger as a task's actor can read it (StateMemBench's heuristics,
     2608.19652): the first value stated on its answer's subject and attribute, the latest, the most stated, and the
     first a search for the question's own words reaches. `traps` are the ones that answer wrong. A task the search
-    for its own words answers right is a shortcut: in S2 and S3, GLM never missed one of its 20 such tasks, and
-    missed 8 of the 17 where that search found a wrong value first."""
+    for its own words answers right is a shortcut: on earlier worlds the solver never missed one of 20 such tasks,
+    and missed 8 of the 17 where that search found a wrong value first."""
     task = world.db.execute(
         "SELECT actor_id, question, answer_type FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()

@@ -1,9 +1,8 @@
-# One generation run: uv run --frozen worldgen-slack --config configs/worldgen_slack/worldgen.toml
-# A new world needs a new `seed` and `output`; a run resumes only with the configuration it started with.
-# Now: S3 (2026-10-08), S2's sector at 2.5 times its size, with the S2 fixes (C40-C48): 10 days, 1,000 messages, 4 tasks
-# per 100 messages (40) in batches of 10, reviewed after days 3 and 6. Scale and the task fixes go together (the
-# user's decision, 2026-10-07): scale shows what fails next. S2 (data/v7-02) was seed 20261009, 400 messages, 10 per
-# 100; the S2a smoke (data/v7-04-smoke) seed 20261010, 2 days, 80 messages, 8 tasks; S1 (data/v7-01) seed 20261008.
+# S3's world (2026-10-08): uv run --frozen worldgen-slack --config configs/worldgen_slack/worldgen.toml [--dry-run]
+# 10 days and 1,000 messages of a business-to-business software company, reviewed after days 3 and 6. Its chapter
+# (chapter-c1.toml) and its forges (forge.toml, measure-s3.toml) start from data/v7-05/software, and the chapter takes
+# this file as its base. A new world needs a new `seed` and `output`; a run resumes only with the configuration it
+# started with.
 sector = "IT for a business-to-business software company: cloud platform operations, service releases, and customer incident coordination"
 seed = 20261011
 output = "data/v7-05/software"
@@ -42,12 +41,12 @@ episode = 43200
 finalize = 300
 
 [env.author]
-model = "anthropic/claude-opus-5.5"  # the voice lab (2026-10-04): 0.77 blind realism on one prompt, against terra's 0.43
+model = "anthropic/claude-opus-5.5"  # blind judges rated its days 0.77 for realism on one prompt, the next best 0.43
 
 # Anthropic caches a prompt only when asked: each request's prefix is cached up to its end, so an agent's next step
-# pays for its new tail alone. Without it every step was billed in full, and the harness's token cap (new tokens only)
-# cut smoke 02's second day. The cache lives an hour: a probe keeps the author waiting 8 to 39 minutes (S2), past the
-# default five, and each hardening turn then re-read its whole context uncached until S2's batch 4 hit the cap.
+# pays for its new tail alone; without it every step is billed in full, and the harness's token cap (new tokens only)
+# cuts a long day short. The cache lives an hour, not the default five minutes: a review keeps the author waiting
+# longer than that.
 [env.author.sampling]
 cache_control = { type = "ephemeral", ttl = "1h" }
 

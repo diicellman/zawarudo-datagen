@@ -67,7 +67,7 @@ class Needs(Section):
     """What a level needs of the facts a board entry rests on, checked when the plan is written: the channels its facts
     are first stated in; the relations among them; its near-misses (decoys, or values whose change its actor cannot
     see, on its answer's subject and attribute, readable and unretracted in its actor's sight:
-    `contracts.fact_measures`); and, for a chapter's brief, `values`, how many values its answer's subject and
+    `world.board.fact_measures`); and, for a chapter's brief, `values`, how many values its answer's subject and
     attribute takes (the answer's among them), and `fresh`, an answer first stated in the chapter, so that what it
     plants is new. `hidden`, an answer stated where it is harder to see than its near-misses (a thread reply, a DM, or
     a later day), is checked when the answer is posted. `named`, at most how many of its evidence's channel names and

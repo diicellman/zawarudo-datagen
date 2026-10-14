@@ -89,9 +89,9 @@ def require_trace(trace):
 
 
 def ended(trace) -> RuntimeError:
-    """Why an author's session ended before its work did: its own limits (the turn cap, the token budget), or an
-    error of its sandbox, tunnel or provider, which is none of the author's (S3's three stops: Prime's process stream
-    dropped, and each was reported as the author's limits)."""
+    """Why an agent's session ended before its work did: its own limits (the turn cap, the token budget), or an
+    error of its sandbox, tunnel or provider, which is none of the agent's (a dropped process stream once read as the
+    agent's own limits)."""
     errors = "; ".join(f"{e.type}: {e.message}" for e in getattr(trace, "errors", None) or [])
     if not errors or getattr(trace, "is_truncated", False) or "budget reached" in errors:
         return ReviewLimit(

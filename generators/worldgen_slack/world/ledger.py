@@ -355,8 +355,8 @@ def fact_row(fact: PlanFact, events: dict[str, Event], moment: dict[str, int], z
 def front_loaded(world, settings, facts: list, day: int) -> str | None:
     """Why the plan's facts are front-loaded, if they are: each third of the segment being written (the world's
     calendar, or a chapter's days) not yet over first states at least half its share of the facts first stated in that
-    segment, its share of the segment's messages (an event day weighs as a workday). S1's storylines were told by day
-    8, and its last days had nothing left to state. A third still open can always take more facts, today or later."""
+    segment, its share of the segment's messages (an event day weighs as a workday). Unchecked, an author tells its
+    storylines early and leaves its last days nothing to state. A third still open can always take more facts, today or later."""
     span = segment_of(world, settings, day)
     shares = quotas(world, settings)
     days = list(range(span["first"], span["last"] + 1))

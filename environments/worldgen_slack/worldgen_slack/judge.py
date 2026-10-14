@@ -79,8 +79,8 @@ class AnswerJudge(vf.Judge[AnswerGrade]):
 
 def reward(grade: AnswerGrade) -> float:
     """+1 for a right answer the observations ground, 0 for a right one they don't or for declining to answer, -1 for
-    a wrong one: under a 1-or-0 grade a guess always beats saying it cannot be told (TruthRL, Kalai et al.), and S3's
-    solver gave a provisional figure as final in 38 of its 65 misses."""
+    a wrong one: under a 1-or-0 grade a guess always beats saying it cannot be told (TruthRL, Kalai et al.), and a
+    solver gave a provisional figure as final in 38 of 65 misses."""
     if grade.correct:
         return 1.0 if grade.grounded else 0.0
     return 0.0 if grade.abstained else -1.0

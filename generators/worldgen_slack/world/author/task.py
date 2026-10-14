@@ -18,8 +18,8 @@ AUTHOR_GUIDE = render(
     parts=", ".join(f"{part} {start:02d}-{end:02d}" for part, (start, end) in PARTS.items()),
 )
 # How a real workspace's days go, beyond how each line is typed: discourse-level craft from StoryScope (arXiv
-# 2604.03136). Voice lab 02 (2026-10-12) tested it after the guide: blind judges of two families preferred the days it
-# wrote 72% and 66% of the time, and its plans escalated more and left more open.
+# 2604.03136). Tested after the guide, blind judges of two model families preferred the days written with it 72% and
+# 66% of the time, and its plans escalated more and left more open.
 CRAFT_GUIDE = prompt(__file__, "craft.md")
 CHAPTER_GUIDE = prompt(__file__, "chapter.md")
 
@@ -78,7 +78,7 @@ def plan_prompt(world, settings, feedback: str = "") -> str:
     )
 
 
-# S3's judge flagged its planned decoys as defects, and the author corrected them where their readers see them: a
+# A judge flags planned decoys as defects, and an author told nothing corrects them where their readers see them: a
 # near-miss corrected in plain sight misleads no one.
 DECOY_ISSUES = (
     "An issue about a message that states a decoy is answered in /task/notes/plan.md, not in the world: correcting or "

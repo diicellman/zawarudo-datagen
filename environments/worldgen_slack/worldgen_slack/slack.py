@@ -429,7 +429,10 @@ def context(world, row, length: int | None) -> dict:
             ::-1
         ]
         after = messages(world, near.format(">"), [row["channel_id"], row["ts_us"]], "m.ts_us")[:2]
-    cut = lambda m: m | {"text": m["text"][:length]} if length else m  # noqa: E731
+
+    def cut(m):
+        return m | {"text": m["text"][:length]} if length else m
+
     return {
         "before": [cut(message(world, r)) for r in before],
         "after": [cut(message(world, r)) for r in after],

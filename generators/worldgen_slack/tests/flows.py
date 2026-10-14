@@ -340,7 +340,10 @@ def world_seats():
     async def script(prompt, tools, runtime):
         if tools is None:
             return setup_document(runtime)
-        call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
+
+        def call(name, **kwargs):
+            return tools._with_state(getattr(tools, name))(**kwargs)
+
         world = Workspace(tools.config.db_path)
         a, b, c, d = [r[0] for r in world.db.execute("SELECT id FROM users ORDER BY id")]
         ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
@@ -516,7 +519,9 @@ def forge_seats(note_on=None) -> dict:
     task (with a note on message `note_on`, when given), and a solver and a witness that answer right."""
 
     async def propose(prompt, tools, runtime):
-        call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
+        def call(name, **kwargs):
+            return tools._with_state(getattr(tools, name))(**kwargs)
+
         world = Workspace(tools.config.db_path)
         (actor,) = world.db.execute("SELECT id FROM users WHERE is_bot = 0 ORDER BY id LIMIT 1").fetchone()
         world.close()
@@ -876,7 +881,10 @@ async def run_flows(root):
         """The author: sets up, plans, writes each day, writes tasks, hardens two of them, fixes what the review names."""
         if tools is None:
             return setup_document(runtime)
-        call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
+
+        def call(name, **kwargs):
+            return tools._with_state(getattr(tools, name))(**kwargs)
+
         world = Workspace(tools.config.db_path)
         a, b, c, d = [r[0] for r in world.db.execute("SELECT id FROM users ORDER BY id")]
         ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
@@ -2286,7 +2294,9 @@ async def chapter_flow(root, parent, settings):
     turns = []
 
     async def script(prompt, tools, runtime):
-        call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
+        def call(name, **kwargs):
+            return tools._with_state(getattr(tools, name))(**kwargs)
+
         world = Workspace(tools.config.db_path)
         turns.append((tools.config.mode, tools.config.day, prompt))
         if tools.config.mode == "plan":

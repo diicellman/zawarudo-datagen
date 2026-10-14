@@ -126,7 +126,7 @@ class WorldEnv(SessionEnv):
 
     # ------------------------------------------------------------------ setup: the premise and the organization
     async def premise_and_organization(self, interaction, runtime, then: str) -> bool:
-        """S0-S1 in one author session: premises (the seed picks one), then the cast, then the organization; the phase
+        """The setup in one author session: premises (the seed picks one), then the cast, then the organization; the phase
         moves to `then`. Returns whether the session's next turn is its first."""
         state, cfg = self.store.state, self.settings
         first = True

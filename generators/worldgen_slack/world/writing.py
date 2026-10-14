@@ -370,7 +370,7 @@ def opening(world, settings, rng, now: int, day: int) -> int:
     conversations it can still expect (what its quota still holds, or what its pace so far brings in the time left,
     whichever is more); never longer than the day can spare, the rest of the day spread over the conversations it
     still needs to close. An author who writes past a part's quota keeps its pace: each conversation does not halve
-    the time left, which bunched S1's conversations at the end of the morning and of the evening."""
+    the time left, which would bunch conversations at the end of the morning and of the evening."""
     part = part_of(world, now)
     start, end = window(world, day, part)
     left = max(quotas(world, settings)[day]["parts"][part] - posted(world, start, now), 0)
@@ -635,7 +635,10 @@ def drift(world, cards: dict[str, dict], since_us: int = 0) -> dict[str, str]:
         card = cards.get(user)
         if card is None or len(texts) < 4:
             continue
-        share = lambda flags: sum(flags) / len(flags)  # noqa: E731
+
+        def share(flags):
+            return sum(flags) / len(flags)
+
         measured = {
             "short_share": share([len(t.split()) <= SHORT for t in texts]),
             "long_share": share([len(t.split()) > LONG for t in texts]),

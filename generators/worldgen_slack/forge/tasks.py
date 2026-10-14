@@ -206,10 +206,13 @@ def gold_source(task: Task, settings) -> str:
 
 def unsettled(world, task: Task, rows: list[dict]) -> None:
     """A status answer's ground: the value its gold gives is a fact its actor can read, that no fact in their sight
-    supersedes, and that a fact it rests on, out of their sight, does. S3's care team could read only the provisional
-    "15%... Grant can correct me", while a DM had settled 10%: the useful answer gives 15% as not settled."""
+    supersedes, and that a fact it rests on, out of their sight, does: a team that can read only a provisional
+    "15%... Grant can correct me", while a DM has settled 10%, is best answered 15%, as not settled."""
     values = {str(r.get("answer")).strip().casefold() for r in rows}
-    seen = lambda f: any(readable(world, task.actor_id, c) for c in places(world, f))  # noqa: E731
+
+    def seen(f):
+        return any(readable(world, task.actor_id, c) for c in places(world, f))
+
     marks = ", ".join("?" * len(task.facts))
     given = [
         f

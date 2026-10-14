@@ -23,7 +23,10 @@ def activity(world, start_us: int | None = None, end_us: int | None = None) -> d
         WHERE {PEOPLE} AND m.ts_us >= ? AND m.ts_us < ?""".format(PEOPLE=PEOPLE),
         span,
     ).fetchall()
-    share = lambda values: round(sum(values) / len(rows), 3) if rows else 0.0  # noqa: E731
+
+    def share(values):
+        return round(sum(values) / len(rows), 3) if rows else 0.0
+
     return {
         "messages": len(rows),
         "reply_share": share([r["reply"] for r in rows]),
@@ -45,7 +48,10 @@ def style(world, since_us: int = 0) -> dict:
     def measure(items):
         texts = [r["text"].strip() for r in items]
         local = [datetime.fromtimestamp(r["ts_us"] / 1e6, ZoneInfo(r["tz"])) for r in items]
-        share = lambda values: round(sum(values) / len(values), 2)  # noqa: E731
+
+        def share(values):
+            return round(sum(values) / len(values), 2)
+
         return {
             "messages": len(texts),
             "median_words": statistics.median(len(t.split()) for t in texts),

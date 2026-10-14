@@ -1,11 +1,11 @@
 # Worldgen viewer
 
-An offline HTML page per generation run. It reads a run's saved files and embeds them, with no model calls, no
-server, and no changes to run data.
+An offline HTML page per run: a world, a chapter or a forge. It reads the run's saved files and embeds them, with
+no model calls, no server, and no changes to run data.
 
 ```bash
-uv run --frozen python viewer/build.py data/v3-03/software --output viewer/artifacts-v3-03.html
-open viewer/artifacts-v3-03.html
+uv run --frozen python viewer/build.py data/v7-05/software --output viewer/artifacts-v7-05.html
+open viewer/artifacts-v7-05.html
 ```
 
 - Pass several run directories to compare them on one page.
@@ -13,40 +13,30 @@ open viewer/artifacts-v3-03.html
 - Generated pages are ignored by Git.
 - **A page contains private answers, facts and full snapshots.** The "Answers shown" toggle only hides them on
   screen; it is not redaction.
+- It reads runs written since v7 (S3, its chapter C1, and their forges) and later.
 
 ## Tabs
 
 | tab | shows | built from |
 |---|---|---|
-| Overview | company, premise, counts, cost, wall time, solve rate per task, usage by role | `summary.json`, `state.json` |
-| Lineage | the attempt graph (premise → catalog → groups → final → publish). Each edge is labelled with the route taken next: repair, rebind, re-plan, catalog repair, resume. Selecting an attempt shows its reviews, criteria, issues (with links to the flagged messages), validation errors, in-attempt corrections, and world changes since the previous snapshot. Below it, a timeline of every agent run by role | `attempts/*`, `progress.jsonl` (`attempt_routed`, `candidate_*`), `traces/*` |
-| World | a Slack-style view of the final world or of any attempt's world, by day, with each channel's members. It has a reader filter (only what one person can see). Each message shows its reactions (who reacted, on hover), mentions as names, its task-evidence chips, the facts it states (anchor or support; decoys marked) and the scene that wrote it; the thread pane shows the scene's situation, beats and open promises | the world file's `messages`, `reactions`, `members` and `evidence`, the scenes |
-| Tasks | question, reader, canonical answer, claims → evidence messages; the gold route step by step (results, evidence hits, which IDs feed the next call); the independent solves with their read routes; the task judge's verdict | bindings, `validation.json` `gold_outputs`, `review_input-<task>.json` solves, solver traces |
-| Cast | people with their persona, seeded profile, and typing target next to what they actually wrote | catalog personas, snapshot |
-| Traces | every agent run: role, attempt, task or scene, duration, tokens and cost. Transcripts appear only with `--traces` | `traces/*.json` |
+| Overview | the company and its premise, the storylines, counts, cost and wall time, each task's share of right answers, usage by role, and a chapter's brief with the facts its board entries rest on | `summary.json`, `state.json`, the world file |
+| Lineage | every attempt in the order it ran; selecting one shows its reviews, criteria and issues (linked to the flagged messages), validation errors, corrections, and how the world changed since the previous snapshot. Below it, a timeline of every agent run, a lane per role | `attempts/*`, `progress.jsonl`, `traces/*` |
+| World | a Slack-style view of the final world or of any attempt's, by day, with each channel's members, and a reader filter (only what one person can see). Each message shows its reactions, mentions as names, the facts it states (decoys marked) and the conversation that wrote it; the thread pane shows the conversation's situation, beats and open promises | the world file's `messages`, `reactions`, `members` and `evidence` |
+| Tasks | the question and its asker, the answer, the board entry and facts it rests on, its gold query, each solve with what it read, the witness's tries and the measured rates | the world file's tasks, `summary.json`, solver and witness traces |
+| Cast | people with their persona, seeded profile, and typing target next to what they actually wrote | the cast, the world file |
+| Traces | every agent run, filtered by role (author, proposer, judge, solver, witness): attempt, task or conversation, duration, tokens and cost. Transcripts appear only with `--traces` | `traces/*.json` |
 
-## Notes
-
-- The page reads saved outputs; it never imports or runs the generator.
-  - The gold chain uses the gold outputs saved with the latest candidate, so it describes the current bindings.
-  - Message → scene mapping uses the generator's message-id rule (`"m" + digest([scene_id, line])[:10]`).
-- **Older runs:**
-  - v2 runs predate per-review files and `attempt_routed`, so the lineage derives their routes from attempt
-    order.
-  - Writer traces before v3-03 have no scene id.
-- This is an omniscient reviewer view, not a replay of what a solver could access. The reader filter shows the
-  conversations a person can see; it does not re-run the tools.
+The page reads saved outputs; it never imports or runs the generator. It is an omniscient reviewer's view, not a
+replay of what a solver could access: the reader filter shows the conversations a person can see; it does not re-run
+the tools.
 
 ## Check
 
 ```bash
 uv run --frozen python viewer/check.py
-uv run --frozen ruff check viewer && uv run --frozen ruff format --check viewer
 ```
 
-The check builds a page from the scripted generation run. It asserts:
-- attempt order;
-- that route events reach the page;
-- that every task's gold chain reaches all its bound evidence;
-- that every message maps to its scene;
-- HTML escaping.
+The check builds a page from the tests' scripted runs (`generators/worldgen_slack/tests/flows.py`): a world, its
+forge, and a chapter. It asserts the attempts' order, the snapshots, each conversation by its lines, the cast,
+reactions and mentions, the facts each message states, every task's gold query and rates, the probes and the
+witness, the chapter and its board, and HTML escaping.

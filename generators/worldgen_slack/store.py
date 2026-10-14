@@ -244,7 +244,10 @@ class Store:
             if task in levels:
                 rates[task]["level"] = levels[task]
         right = [r["right_rate"] for r in rates.values()]
-        count = lambda sql: self.world.db.execute(sql).fetchone()[0]  # noqa: E731
+
+        def count(sql):
+            return self.world.db.execute(sql).fetchone()[0]
+
         summary = {
             "status": status,
             "reason": reason,

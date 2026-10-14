@@ -95,7 +95,10 @@ def groups(world) -> list[dict]:
 def profile(world) -> dict:
     """The world's profile: its size, its value groups and what they add up to, its threads, recurring conversations
     and people, and what tasks and the board rest on."""
-    count = lambda sql: world.db.execute(sql).fetchone()[0]  # noqa: E731
+
+    def count(sql):
+        return world.db.execute(sql).fetchone()[0]
+
     found = groups(world)
     replies = [
         n
