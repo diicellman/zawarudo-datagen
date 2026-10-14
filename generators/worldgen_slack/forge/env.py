@@ -1,33 +1,31 @@
 """The task forge: tasks proposed on a finished, frozen world, kept when their tries say they land.
 uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge.toml [--dry-run]
 
-A world run writes the workspace and its ledger (backward generation: the board plants each task slot's facts before
-day 1); the forge then writes tasks on that world, in rounds: a proposer in the author's seat writes candidates, the
-solver tries each, and code keeps what lands. The world is never written again, so no task goes stale under it."""
+A world run writes the workspace and its ledger (a chapter's brief plants its entries' facts on the board before its
+first day); the forge then writes tasks on that world, in rounds: a proposer in the author's seat writes candidates,
+the solver tries each, and code keeps what lands. The world is never written again, so no task goes stale under it."""
 
 import json
-import re
 import shutil
 import tomllib
 from collections import Counter
 from pathlib import Path
 
 from pydantic import Field, model_validator
-from worldgen_slack.world import SCHEMA, file_hash
-from ..workspace import Workspace
-
+from worldgen_slack.release import atomic_json
+from worldgen_slack.world import file_hash
 
 from ..agents.world import WorldAuthorTask, forge_prompt
-from .tasks import answer_of, forge_task
-from ..world.board import brief
-from ..config import Config, Section, load_config, pinned, rooted
-from .difficulty import features
-from .tasks import INTENTS, Task
-from .tries import miss_class
+from ..config import Config, Section, load_config, merged, pinned, rooted
 from ..judge.verdict import READING
-from ..env import SETUP_FILES, GenerationEnv, rates
-from ..session import keep_awake, require_session
+from ..session import SETUP_FILES, SessionEnv, keep_awake, require_session
 from ..store import Store
+from ..workspace import Workspace, reset_tasks
+from ..world.board import brief
+from .difficulty import features
+from .tasks import INTENTS, Task, answer_of, forge_task
+from .release import miss_class, release_rows
+from .tries import Tries, rates
 
 
 class ForgeConfig(Section):
@@ -54,13 +52,6 @@ class ForgeConfig(Section):
         return self
 
 
-def merged(base: dict, changes: dict) -> dict:
-    return {
-        k: merged(base[k], v) if isinstance(v, dict) and isinstance(base.get(k), dict) else v
-        for k, v in changes.items()
-    } | {k: v for k, v in base.items() if k not in changes}
-
-
 def load_forge(path: Path) -> tuple[ForgeConfig, Config]:
     """The forge's configuration, and the run settings it works under: the base's, with its changes and output."""
     forge = ForgeConfig.model_validate(tomllib.loads(path.read_text()))
@@ -78,19 +69,6 @@ def provenance(forge: ForgeConfig, settings: Config) -> dict:
         "config": settings.model_dump(mode="json"),
         "world_hash": file_hash(forge.world / "world.sqlite"),
     } | pinned()
-
-
-TASK_TABLES = ("task_facts", "tasks")
-
-
-def reset_tasks(world) -> None:
-    """A world's task tables emptied, as the schema now has them: a forge and a chapter start with no tasks."""
-    tables = {
-        m.group(1): m.group(0)
-        for m in re.finditer(r"CREATE TABLE (\w+) \(.*?\n\);", SCHEMA.read_text(), re.S)
-    }
-    world.db.executescript("".join(f"DROP TABLE {t};" for t in TASK_TABLES))
-    world.db.executescript("\n".join(tables[t] for t in reversed(TASK_TABLES)))
 
 
 def measured(forged: dict) -> list[str]:
@@ -131,7 +109,7 @@ def measured_level(right: float, bands) -> int:
     return next(i for i, (low, _) in enumerate(bands, 1) if right >= low)
 
 
-class ForgeEnv(GenerationEnv):
+class ForgeEnv(SessionEnv):
     def __init__(self, forge: ForgeConfig, settings: Config, store: Store):
         self.forge = forge
         places = sum(len(spec.levels) for spec in settings.taxonomy.values())
@@ -140,6 +118,12 @@ class ForgeEnv(GenerationEnv):
                 f"a goal of {forge.tasks} tasks is more than the archive's {places} places hold at {forge.target} each"
             )
         super().__init__(settings, store)
+        self.tries = Tries(settings, store)
+
+    def allow(self, ids, rework: dict | None = None) -> None:
+        """The ids the proposer's next turn may write, and the tasks sent back for another reading, each with its asker
+        and gold answer: its tools read them per call."""
+        atomic_json(self.store.root / "writable.json", {"ids": list(ids), "rework": rework or {}})
 
     async def run(self, task, agents):
         state = self.store.state
@@ -277,12 +261,12 @@ class ForgeEnv(GenerationEnv):
         state = self.store.state
         if not ids:
             return 0
-        self.refresh_gold()
-        keys = {t: self.task_key(t) for t in ids}
-        await self.judge_tasks(agents, ids, keys, attempt, self.settings.author.tries)
+        self.tries.refresh_gold()
+        keys = {t: self.tries.task_key(t) for t in ids}
+        await self.tries.judge_tasks(agents, ids, keys, attempt, self.settings.author.tries)
         approved = [t for t in ids if state.task_reviews.get(t, {}).get("key") == keys[t]]
         low = [t for t in approved if state.task_reviews[t]["right_rate"] <= 0.5 and self.answers_on(t)]
-        hinted = await self.solves(agents, low, attempt, 2, hint=True) if low else {}
+        hinted = await self.tries.solves(agents, low, attempt, 2, hint=True) if low else {}
         for t in ids:
             state.forged[t] = self.place(
                 t, state.task_reviews[t] if t in approved else None, hinted.get(t), attempt
@@ -292,7 +276,7 @@ class ForgeEnv(GenerationEnv):
 
     def answers_on(self, task_id: str) -> bool:
         """Whether a task's answer rests on messages a hint can show."""
-        return bool(self.store.release_rows("hint")[1][task_id].messages)
+        return bool(release_rows(self.store, "hint")[1][task_id].messages)
 
     def place(self, task_id: str, review: dict | None, hinted, attempt: str) -> dict:
         """One candidate's outcome. Its tries give its level; the lowest band also needs the witness to answer it

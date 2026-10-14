@@ -157,6 +157,19 @@ COMPLETION = {
 }
 
 
+TASK_TABLES = ("task_facts", "tasks")
+
+
+def reset_tasks(world) -> None:
+    """A world's task tables emptied, as the schema now has them: a forge and a chapter start with no tasks."""
+    tables = {
+        m.group(1): m.group(0)
+        for m in re.finditer(r"CREATE TABLE (\w+) \(.*?\n\);", SCHEMA.read_text(), re.S)
+    }
+    world.db.executescript("".join(f"DROP TABLE {t};" for t in TASK_TABLES))
+    world.db.executescript("\n".join(tables[t] for t in reversed(TASK_TABLES)))
+
+
 class Workspace(World):
     """A world file opened for code to write: a world (a person's view too) with the writes, the rules and the gold."""
 

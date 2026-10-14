@@ -15,6 +15,13 @@ from worldgen_slack.release import SafeId
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def merged(base: dict, changes: dict) -> dict:
+    return {
+        k: merged(base[k], v) if isinstance(v, dict) and isinstance(base.get(k), dict) else v
+        for k, v in changes.items()
+    } | {k: v for k, v in base.items() if k not in changes}
+
+
 def pinned() -> dict:
     """What every run's provenance pins beside its own settings: the verifiers revision pyproject.toml installs, and
     the lock file."""

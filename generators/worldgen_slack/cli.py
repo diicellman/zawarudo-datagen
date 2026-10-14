@@ -19,11 +19,12 @@ from verifiers.v1.runtimes.prime import set_base_sandbox_labels
 from verifiers.v1.utils.interrupt import install_interrupt
 from worldgen_slack.release import atomic_json
 
-from . import chapter
+from .world import chapter
 from .forge import env as forge
 from .forge import profile
+from .forge.release import publish
 from .config import Config, load_config
-from .env import GenerationEnv, dry_run, provenance
+from .world.env import WorldEnv, dry_run, provenance
 from .store import Store
 
 # Each run's episode prompt, and what its interruption calls it.
@@ -91,7 +92,7 @@ async def run(
 
 async def run_world(config: Config) -> dict:
     return await run(
-        "world", config.output, provenance(config), config, lambda store: GenerationEnv(config, store)
+        "world", config.output, provenance(config), config, lambda store: WorldEnv(config, store)
     )
 
 
@@ -106,15 +107,14 @@ async def run_chapter(plan: chapter.ChapterConfig, settings: Config) -> dict:
 
 
 async def run_forge(plan: forge.ForgeConfig, settings: Config) -> dict:
-    def publish(store: Store) -> None:
-        if store.world.db.execute(
-            "SELECT 1 FROM tasks"
-        ).fetchone():  # an archive that kept nothing has no release
-            store.publish()
+    def release(store: Store) -> None:
+        # an archive that kept nothing has no release
+        if store.world.db.execute("SELECT 1 FROM tasks").fetchone():
+            publish(store)
 
     origin = forge.provenance(plan, settings)
     return await run(
-        "forge", plan.output, origin, settings, lambda store: forge.ForgeEnv(plan, settings, store), publish
+        "forge", plan.output, origin, settings, lambda store: forge.ForgeEnv(plan, settings, store), release
     )
 
 

@@ -18,11 +18,11 @@ from pathlib import Path
 
 from pydantic import Field, model_validator
 from worldgen_slack.world import digest, file_hash
-from .workspace import Workspace
+from ..workspace import Workspace, reset_tasks
 
 
-from .world.clock import spread, start_clock
-from .config import (
+from .clock import spread, start_clock
+from ..config import (
     ActivityConfig,
     AuthorSettings,
     Config,
@@ -30,14 +30,14 @@ from .config import (
     Section,
     Text,
     load_config,
+    merged,
     pinned,
     rooted,
 )
-from .world.board import Slot
-from .world.clock import calendar_days, extend_calendar, frozen_digest, meta
-from .env import GenerationEnv
-from .forge.env import merged, reset_tasks
-from .store import RunState, Store
+from .board import Slot
+from .clock import calendar_days, extend_calendar, frozen_digest, meta
+from .env import WorldEnv
+from ..store import RunState, Store
 
 
 class Material(Section):
@@ -295,7 +295,7 @@ def adopt(store: Store, chapter: ChapterConfig, settings: Config, slots: list[Sl
     store.save()
 
 
-class ChapterEnv(GenerationEnv):
+class ChapterEnv(WorldEnv):
     """The world author in a chapter: the plan of its days, its days, and a final review of the world, with no
     tasks; its reviews read the earlier chapters as written and frozen."""
 

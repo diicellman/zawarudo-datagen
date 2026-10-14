@@ -7,10 +7,16 @@ import io
 import tarfile
 import time
 
+import verifiers.v1 as vf
 from verifiers.v1.dialects import base as dialects
 from verifiers.v1.errors import SandboxError
+from verifiers.v1.utils.interrupt import cleaning_up
 
-from .store import ReviewLimit, SessionLost
+from .agents import synthesizer
+from .agents.synthesizer import SynthesizerTask
+from .agents.world import context_of, files
+from .config import Config, PipelineConfig
+from .store import ReviewLimit, SessionLost, Store, used_names
 
 ARCHIVE = "/tmp/task-files.tgz"
 # What verifiers tells every agent on a restricted network, on the first user message of each request: by default,
@@ -93,3 +99,105 @@ def observable(record: dict) -> dict:
         node["message"].pop("reasoning_content", None)
         node["message"].pop("provider_state", None)
     return record
+
+
+NOTES = ("plan.md", "recap.md")  # the world author's own files in /task/notes
+
+
+SETUP_FILES = (
+    "input.json",
+    "guide.md",
+    "schemas.json",
+    "schema.sql",
+    "world.sqlite",
+    "premise.json",
+    "organization.json",
+)
+
+
+class SessionEnv(vf.Env[PipelineConfig]):
+    """An env whose author works in one VM for the whole run, one interaction per block of work: the VM provisioned
+    again after a lost session, code's memory rendered before every turn, and the notes an attempt kept brought back.
+    A subclass says what its blocks are."""
+
+    def __init__(self, settings: Config, store: Store):
+        self.settings, self.store = settings, store
+        self.used = used_names(settings.corpus, store.root)
+        apply_network_notice()
+        super().__init__(settings.env)
+
+    @property
+    def world(self):
+        return self.store.world
+
+    async def setup(self, agents):
+        for name in ("author", "judge", "solver", "witness"):
+            getattr(agents, name).trainable = False
+
+    def author_context(self) -> dict:
+        state = self.store.state
+        return context_of(self.settings, state, self.store.root, state.drafts.get("organization"))
+
+    async def author_step(
+        self, interaction, runtime, prompt: str, attempt: str, mode: str, extra=None
+    ) -> None:
+        """One author turn: code's memory of the world, rendered fresh (with `extra` memory files, such as the solver's
+        tries), then the turn; the author works through its tools, and the world file is code's again when the turn
+        ends."""
+        memory = files(self.world, self.settings, self.author_context(), mode) | (extra or {})
+        await upload(runtime, memory, "/task/memory")
+        self.store.event("author_turn", attempt=attempt, mode=mode, day=self.store.state.day)
+        segment = await interaction.turn(prompt)
+        self.store.trace(interaction.trace)
+        if segment.terminated:
+            raise ended(interaction.trace)
+
+    async def note(self, runtime, name: str) -> str | None:
+        try:
+            return (await runtime.read("/task/notes/" + name, max_bytes=2_000_000)).decode()
+        except SandboxError:
+            return None
+
+    async def keep_notes(self, runtime, attempt: str) -> None:
+        """The author's notes as the attempt left them, kept with its world."""
+        for name in NOTES:
+            if (text := await self.note(runtime, name)) is not None:
+                self.store.path(attempt, "notes/" + name).write_text(text)
+
+    async def bring_notes(self, runtime, attempt: str) -> None:
+        """The notes an attempt kept, and only those, back in the author's workspace: a day starts from where the
+        last one closed, and a failed attempt's notes are gone."""
+        kept = self.store.root / "attempts" / attempt / "notes"
+        notes = {f"notes/{name}": (kept / name).read_bytes() for name in NOTES if (kept / name).exists()}
+        await upload(runtime, notes, "/task/notes")
+
+    async def author_world(self, agents) -> None:
+        """One author agent and one VM for the whole world; one interaction per block of work. A session lost to its
+        sandbox, tunnel or provider (or a VM gone mid-run) is none of the author's limits: a fresh VM takes the run up
+        where its state says, as a resume does, and the attempt it cut off spends no round. A second loss in the same
+        block stops the run."""
+        state, last = self.store.state, None
+        setup = SynthesizerTask.create(
+            synthesizer.premise_context(self.settings, self.used), "setup", self.world.path
+        )
+        while True:
+            try:
+                async with agents.author.provision(setup) as runtime:
+                    return await self.blocks(agents, runtime, setup)
+            except (SessionLost, SandboxError) as error:
+                if cleaning_up():  # a stop cancels the session's streams: it is a stop, not a loss
+                    raise
+                where = (state.phase, state.day, state.batch)
+                attempt = self.store.lose()
+                self.store.event(
+                    "session_lost", attempt=attempt, error=str(error)[:2000], again=where != last
+                )
+                if where == last:
+                    raise
+                last = where
+
+    async def run(self, task, agents):
+        return await self.author_world(agents)
+
+    async def blocks(self, agents, runtime, setup) -> None:
+        raise NotImplementedError

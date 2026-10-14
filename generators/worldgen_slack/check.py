@@ -89,7 +89,7 @@ from .world.writing import (
     tally,
     today_line,
 )
-from .chapter import (
+from .world.chapter import (
     ChapterConfig,
     ChapterEnv,
     Material,
@@ -99,12 +99,14 @@ from .chapter import (
     same_schema,
     version_of,
 )
-from .chapter import provenance as chapter_provenance
+from .world.chapter import provenance as chapter_provenance
 from .cli import failure, run_forge, run_label, run_world
-from .env import GenerationEnv, provenance, rates
+from .forge.tries import rates
+from .world.env import WorldEnv, provenance
 from .judge.verdict import read_one_way
 from .session import ended, keep_awake
-from .store import ReviewLimit, SessionLost, Store, write_release
+from .store import ReviewLimit, SessionLost, Store
+from .forge.release import miss_class, publish, release_rows, write_release
 from .forge.env import ForgeConfig, ForgeEnv, bucket, measured_level
 from .forge.env import measured as forge_measured
 from .forge.profile import profile
@@ -112,7 +114,6 @@ from .forge.env import provenance as forge_provenance
 from .config import ROOT, Category, Config, Needs
 from .forge.difficulty import IDENTIFIER, failure_cases, features, measures, panel
 from .forge.tasks import Task, check_task, record_task
-from .forge.tries import miss_class
 from .world.board import Slot, needs_text
 from .world.cast import Gaps, Premise, Premises, SeedPersona, Typing, cards, pick_cast, user_id
 from .world.clock import (
@@ -4121,7 +4122,7 @@ async def world_run(root, settings, agents_of):
                 ),
             )
 
-    await GenerationEnv(settings, store).fix_world(
+    await WorldEnv(settings, store).fix_world(
         SimpleNamespace(author=ScriptedAuthor(fix), judge=Rejecting()), FakeRuntime()
     )
     kept = store.root / "attempts" / store.state.restore_point / "notes"
@@ -4674,7 +4675,7 @@ async def check_author(root):
     )
     manifest = provenance(settings)
     store = TestStore(settings.output, manifest)
-    env = GenerationEnv(settings, store)
+    env = WorldEnv(settings, store)
     await env.setup(agents)
     asked = [{"role": "user", "content": "write today"}]
     append_user_notice(asked)
@@ -4683,7 +4684,7 @@ async def check_author(root):
     )
     for _ in range(2):  # the review after day 2 is cut off, then day 3
         try:
-            await GenerationEnv(settings, store).run(None, agents)
+            await WorldEnv(settings, store).run(None, agents)
             raise AssertionError("the simulated crash did not happen")
         except KeyboardInterrupt:
             pass
@@ -4707,7 +4708,7 @@ async def check_author(root):
     )  # a run resumes only with its own config
     store = TestStore(settings.output, manifest)
     assert store.state.phase == "day" and store.state.day == 3 and store.state.restore_point == "day-02-01"
-    env = GenerationEnv(settings, store)
+    env = WorldEnv(settings, store)
     await env.run(None, agents)
     state = store.state
     assert state.phase == "done" and state.rounds["day-03"] == 2 and state.rounds["review-02"] == 2, (
@@ -4844,7 +4845,7 @@ async def check_author(root):
         pass
     blocks = []
 
-    class Dropping(GenerationEnv):  # the run's blocks, of which the first `losses` lose their session
+    class Dropping(WorldEnv):  # the run's blocks, of which the first `losses` lose their session
         def __init__(self, key, losses):
             super().__init__(settings, store)
             self.key, self.losses = key, losses
@@ -4925,7 +4926,7 @@ async def check_author(root):
         ).fetchone()
     ), "an annotation is placed by its first message"
     source_world.close()
-    forged.publish()
+    publish(forged)
     # The forge's output, as a measure starts from it: a finished run with tasks of its own.
     source = root / "measure-source"
     source.mkdir()
@@ -4947,9 +4948,11 @@ async def check_author(root):
         "the judge reads the witness's tries"
     )
     tried = sum(witnessed.values())
-    assert (await forge_env.witness(agents, ["r02-01"], {"r02-01": forge_env.task_key("r02-01")}, "check"))[
-        "r02-01"
-    ]["results"] and sum(witnessed.values()) == tried, "an unchanged task keeps its witness"
+    assert (
+        await forge_env.tries.witness(
+            agents, ["r02-01"], {"r02-01": forge_env.tries.task_key("r02-01")}, "check"
+        )
+    )["r02-01"]["results"] and sum(witnessed.values()) == tried, "an unchanged task keeps its witness"
 
     class Slow(
         ScriptedAgent
@@ -4973,7 +4976,7 @@ async def check_author(root):
             }
             return FakeTrace("slow", "solver", info={"evaluation": evaluation}, task=task)
 
-    await forge_env.solves(SimpleNamespace(solver=Slow()), ["r01-01", "r02-01"], "check", 3)
+    await forge_env.tries.solves(SimpleNamespace(solver=Slow()), ["r01-01", "r02-01"], "check", 3)
     assert Slow.peak == settings.author.solvers == 2, Slow.peak
 
     class Crashing(ScriptedAgent):
@@ -4988,7 +4991,7 @@ async def check_author(root):
             )
 
     try:
-        await forge_env.solves(SimpleNamespace(solver=Crashing()), ["r01-01"], "check", 2)
+        await forge_env.tries.solves(SimpleNamespace(solver=Crashing()), ["r01-01"], "check", 2)
         raise AssertionError("a task whose every try crashed was kept")
     except RuntimeError as error:
         assert "crashed twice" in str(error), error
@@ -5006,7 +5009,7 @@ async def check_author(root):
     ), "the summary reports each task's measured difficulty beside its level"
     # A release takes every task reviewed, on facts the world states.
     review = forged.state.task_reviews.pop("r01-01")
-    refused("an approved review of every task", forged.publish)  # a task nobody reviewed
+    refused("an approved review of every task", publish, forged)  # a task nobody reviewed
     forged.state.task_reviews["r01-01"] = review
     forged.world.insert(
         "facts",
@@ -5025,12 +5028,12 @@ async def check_author(root):
         ],
     )
     forged.world.insert("task_facts", [dict(task_id="r01-01", fact_id="f9")])
-    refused("a world that breaks no rule", forged.publish)  # a task resting on a fact no message states
+    refused("a world that breaks no rule", publish, forged)  # a task resting on a fact no message states
     forged.world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
     forged.world.db.execute("DELETE FROM facts WHERE id = 'f9'")
     # A task's key covers the decoys on its facts' subjects: a revised decoy is a changed task, tried again.
     keyed, lure = (
-        forge_env.task_key("r02-01"),
+        forge_env.tries.task_key("r02-01"),
         forged.world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0],
     )
     lured = forged.world.db.execute("SELECT text FROM messages WHERE id = ?", (lure,)).fetchone()[0]
@@ -5054,9 +5057,9 @@ async def check_author(root):
     forged.world.db.execute(
         "INSERT INTO evidence (fact_id, message_id, role) VALUES ('f8', ?, 'supporting')", (lure,)
     )
-    decoyed = forge_env.task_key("r02-01")
+    decoyed = forge_env.tries.task_key("r02-01")
     forged.world.db.execute("UPDATE messages SET text = 'still down, I think' WHERE id = ?", (lure,))
-    assert len({keyed, decoyed, forge_env.task_key("r02-01")}) == 3, "the key follows the task's decoys"
+    assert len({keyed, decoyed, forge_env.tries.task_key("r02-01")}) == 3, "the key follows the task's decoys"
     forged.world.db.execute("DELETE FROM evidence WHERE fact_id = 'f8'")
     forged.world.db.execute("DELETE FROM facts WHERE id = 'f8'")
     forged.world.db.execute("UPDATE messages SET text = ? WHERE id = ?", (lured, lure))
@@ -5072,21 +5075,21 @@ async def check_author(root):
             )
         }
 
-    assert {tuple(m) for m in forged.release_rows("h")[1]["r02-01"].messages} == stating("f2"), (
+    assert {tuple(m) for m in release_rows(forged, "h")[1]["r02-01"].messages} == stating("f2"), (
         "its answer's own"
     )
     forged.world.db.execute("INSERT INTO task_facts (task_id, fact_id) VALUES ('r02-01', 'f1')")
     forged.world.db.execute(
         "INSERT INTO fact_relations (src_fact, dst_fact, kind) VALUES ('f2', 'f1', 'supersedes')"
     )
-    released = forged.release_rows("h")[1]["r02-01"]
+    released = release_rows(forged, "h")[1]["r02-01"]
     forged.world.db.execute("DELETE FROM fact_relations WHERE src_fact = 'f2' AND dst_fact = 'f1'")
     forged.world.db.execute("DELETE FROM task_facts WHERE task_id = 'r02-01' AND fact_id = 'f1'")
     assert stating("f1") and {tuple(m) for m in released.messages} == stating("f2"), (
         "a stale value is no evidence"
     )
     forged.world.db.execute("UPDATE facts SET is_decoy = 1 WHERE id = 'f2'")
-    released = forged.release_rows("h")[1]["r02-01"]
+    released = release_rows(forged, "h")[1]["r02-01"]
     forged.world.db.execute("UPDATE facts SET is_decoy = 0 WHERE id = 'f2'")
     assert not released.messages, "a decoy is no evidence"
     leads = channel_id("private", "leads", [])
@@ -5102,7 +5105,7 @@ async def check_author(root):
     forged.world.db.execute(
         "INSERT INTO evidence (fact_id, message_id, role) VALUES ('f2', ?, 'supporting')", (hidden[0],)
     )
-    released = forged.release_rows("h")[1]["r02-01"]
+    released = release_rows(forged, "h")[1]["r02-01"]
     forged.world.db.execute("DELETE FROM evidence WHERE fact_id = 'f2' AND message_id = ?", (hidden[0],))
     forged.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = 'r02-01'", (asker,))
     assert released.messages and [hidden[1], hidden[2]] not in released.messages, "out of sight, no evidence"
@@ -5115,7 +5118,7 @@ async def check_author(root):
             "SELECT m.channel_id, m.ts FROM evidence e JOIN messages m ON m.id = e.message_id WHERE e.fact_id = 'f3' AND e.role = 'anchor'"
         )
     ]
-    private = forged.release_rows("h")[1]["r01-01"]
+    private = release_rows(forged, "h")[1]["r01-01"]
     forged.world.db.execute("UPDATE tasks SET actor_id = ? WHERE id = 'r01-01'", (asker,))
     forged.world.db.execute("DELETE FROM task_facts WHERE task_id = 'r01-01' AND fact_id = 'f3'")
     assert truth and private.unseen == truth and not [m for m in private.messages if m in truth], private
@@ -5156,19 +5159,23 @@ async def check_author(root):
         and any(n == "declining to answer" for n, _ in cases)
     ), cases
     GRADER["loose"] = True
-    _, verdict = await forge_env.judge_tasks(agents, ["r01-01"], {"r01-01": "screened loose"}, "check", 3)
+    _, verdict = await forge_env.tries.judge_tasks(
+        agents, ["r01-01"], {"r01-01": "screened loose"}, "check", 3
+    )
     assert not verdict.approved and any(
         "accepts a wrong answer to it: a bare opener" in i.defect for i in forged.state.task_issues["r01-01"]
     ), verdict
     assert forged.state.screens["r01-01"]["failed"] == ["a bare opener ('Thought process:')"]
     GRADER["loose"], GRADER["blind"] = False, True
-    assert (await forge_env.screen(["r01-01"], {"r01-01": "screened blind"}, "check"))["r01-01"] == [
+    assert (await forge_env.tries.screen(["r01-01"], {"r01-01": "screened blind"}, "check"))["r01-01"] == [
         "its gold answer, judged wrong"
     ]
     GRADER["blind"] = False
     # An unchanged task keeps its tries: judged again, as a resumed round judges it, it is not solved again.
     tried = sum(solved.values())
-    await forge_env.judge_tasks(agents, ["r02-01"], {"r02-01": forge_env.task_key("r02-01")}, "check", 3)
+    await forge_env.tries.judge_tasks(
+        agents, ["r02-01"], {"r02-01": forge_env.tries.task_key("r02-01")}, "check", 3
+    )
     assert sum(solved.values()) == tried, "an unchanged task was solved again"
     store.state.active_attempt = "forge"
     # A cell keeps the candidate GLM's tries are most mixed on; the lowest band also needs the witness to answer it.
@@ -5443,7 +5450,7 @@ async def check_author(root):
         "no proposer turn"
     )
     assert any(o["verdict"].startswith("kept") for o in measured.state.forged.values())
-    measured.publish()
+    publish(measured)
     measured.close()
     fails(
         ForgeConfig, base=Path("w.toml"), world=root, output=root, rounds=0
@@ -5968,8 +5975,6 @@ PROMPT_SOURCES = [
             "agents/synthesizer.py",
             "agents/author.py",
             "session.py",
-            "env.py",
-            "chapter.py",
         )
     ),
     *sorted((ROOT / "generators/worldgen_slack/world").glob("*.py")),
