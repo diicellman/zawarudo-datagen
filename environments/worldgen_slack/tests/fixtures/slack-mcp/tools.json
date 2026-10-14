@@ -1,0 +1,499 @@
+{
+ "meta": {
+  "source": "Slack's own MCP server, through the Claude Slack connector, 2026-10-14; a private channel made for the capture, with one member",
+  "scrubbed": "the user's name, handle, email, ids, workspace domain, organization, time zone and avatar; a channel list's names",
+  "seed": "a root with a link and a ticket id; three thread replies (a mention, and one also sent to the channel); a top-level checklist with a channel link; reactions eyes and white_check_mark on the root, thumbsup on reply 1. Every message posted through the connector carries a '*Sent using* Claude' suffix, which world messages will not.",
+  "other_tools": {
+   "read, not mirrored yet (canvases, files, lists, emoji)": [
+    "slack_read_canvas",
+    "slack_read_file",
+    "slack_read_list",
+    "slack_search_emojis"
+   ],
+   "write (later, with write tasks)": [
+    "slack_send_message",
+    "slack_send_message_draft",
+    "slack_schedule_message",
+    "slack_add_reaction",
+    "slack_create_conversation",
+    "slack_create_canvas",
+    "slack_update_canvas",
+    "slack_create_list",
+    "slack_add_list_record",
+    "slack_update_list",
+    "slack_update_list_record",
+    "slack_get_file_upload_url",
+    "slack_complete_file_upload"
+   ]
+  }
+ },
+ "tools": [
+  {
+   "name": "slack_search_public",
+   "description": "Searches for messages, files in public Slack channels ONLY. Current logged in user's user_id is U0EXAMPLE01. `slack_search_public` does NOT generally require user consent for use, whereas you should request and wait for user consent to use `slack_search_public_and_private`. --- Split your search query into 3 fields: 1. `keywords` — Lexical terms that must appear in content. Each element should be a single word or \"quoted phrase\". All AND'd. Use nouns identifying subject matter. People/channels/dates go in filters. 2. `filters` — Slack search modifiers to constrain results: in:<#C123456> | in:@username | from:<@U123456> | from:username | with:<@U123456> | creator:@user has:pin | has:link | has:file | has:reaction | has::emoji: | hasmy::emoji: | is:thread | is:saved | is:dm before:YYYY-MM-DD | after:YYYY-MM-DD | on:YYYY-MM-DD | during:month Same modifier repeated = OR (except with/has = AND). 3. `natural_language_query` — User's question in conversational tone. Preserve original phrasing; on follow-ups incorporate prior context. Don't include filter-like content. Pass \"\" for filter-only queries with no semantic content. Require at least one of `keywords` or `filters`. ❌ Semantic search is not available for this user. <examples> User: What's the latest on Project Unicorn? > keywords: [\"Project\", \"Unicorn\"], natural_language_query: What's the latest on Project Unicorn? User: What did <@U0123456ABC> talk about last week? > keywords: [], filters: from:<@U0123456ABC> after:2025-06-12 User: Find the budget spreadsheet shared in <#C024BE7LR> > keywords: [\"\\\"budget spreadsheet\\\"\"], filters: in:<#C024BE7LR> > natural_language_query: Where is the budget spreadsheet shared in <#C024BE7LR>? </examples> Strategy: Decompose complex requests into parallel searches. Use keywords for subject terms, filters for people/channels/dates. If 0 results, broaden by removing filters or simplifying keywords. ---",
+   "input_schema": {
+    "properties": {
+     "after": {
+      "description": "Only messages after this Unix timestamp (inclusive)",
+      "type": "string"
+     },
+     "before": {
+      "description": "Only messages before this Unix timestamp (inclusive)",
+      "type": "string"
+     },
+     "content_types": {
+      "description": "Content types to include, a comma-separated list of any combination of messages, files. Here's more info about the content types: messages: Slack messages from public channels accessible to the acting user\nfiles: Files of all types accessible to the acting user\n",
+      "type": "string"
+     },
+     "context_channel_id": {
+      "description": "Context channel ID to support boosting the search results for a channel when applicable",
+      "type": "string"
+     },
+     "cursor": {
+      "description": "The cursor returned by the API. Omit this parameter for the first request, and use this to get the next page of results",
+      "type": "string"
+     },
+     "filters": {
+      "description": "Slack search modifiers (e.g., 'from:<@U123> in:<#C456> after:2025-01-01'). Use for people, channels, dates, and content type constraints.",
+      "type": "string"
+     },
+     "include_bots": {
+      "description": "Include bot messages (default: false)",
+      "type": "boolean"
+     },
+     "include_context": {
+      "description": "Include surrounding context messages for each result (default: true). Set to false to reduce response size.",
+      "type": "boolean"
+     },
+     "keywords": {
+      "description": "Array of lexical search terms. Each element MUST be a single word (no spaces) OR an exact phrase in quotes. All elements are AND'd (every element must match). Use the author test: only include words the author would naturally write.",
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     },
+     "limit": {
+      "description": "Number of results to return, up to a max of 20. Defaults to 20.",
+      "type": "integer"
+     },
+     "max_context_length": {
+      "description": "Max character length for each context message. Longer messages are truncated.",
+      "type": "integer"
+     },
+     "natural_language_query": {
+      "description": "The user's question restated in conversational tone. Used for semantic reranking. Do not include filter-like content (people, channels, dates) — those belong in filters. Pass an empty string when the query is purely structural (only filters, no semantic question).",
+      "type": "string"
+     },
+     "only_my_channels": {
+      "description": "Limit results to public channels the user is a member of. Set to true when the user asks to search only their own or joined channels. Default: false.",
+      "type": "boolean"
+     },
+     "response_format": {
+      "description": "Level of detail (default: 'detailed'). Options: 'detailed', 'concise'",
+      "enum": [
+       "detailed",
+       "concise"
+      ],
+      "type": "string"
+     },
+     "sort": {
+      "description": "Sort order: 'score' (relevance, default) or 'timestamp' (newest first unless sort_dir is 'asc').",
+      "enum": [
+       "score",
+       "timestamp"
+      ],
+      "type": "string"
+     },
+     "sort_dir": {
+      "description": "Sort direction (default: 'desc'). Options: 'asc', 'desc'",
+      "enum": [
+       "asc",
+       "desc"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [],
+    "type": "object"
+   }
+  },
+  {
+   "name": "slack_search_public_and_private",
+   "description": "Searches for messages, files in ALL Slack channels, including public channels, private channels, DMs, and group DMs. Current logged in user's user_id is U0EXAMPLE01. --- Split your search query into 3 fields: 1. `keywords` — Lexical terms that must appear in content. Each element should be a single word or \"quoted phrase\". All AND'd. Use nouns identifying subject matter. People/channels/dates go in filters. 2. `filters` — Slack search modifiers to constrain results: in:<#C123456> | in:@username | from:<@U123456> | from:username | with:<@U123456> | creator:@user has:pin | has:link | has:file | has:reaction | has::emoji: | hasmy::emoji: | is:thread | is:saved | is:dm before:YYYY-MM-DD | after:YYYY-MM-DD | on:YYYY-MM-DD | during:month Same modifier repeated = OR (except with/has = AND). 3. `natural_language_query` — User's question in conversational tone. Preserve original phrasing; on follow-ups incorporate prior context. Don't include filter-like content. Pass \"\" for filter-only queries with no semantic content. Require at least one of `keywords` or `filters`. ❌ Semantic search is not available for this user. <examples> User: What's the latest on Project Unicorn? > keywords: [\"Project\", \"Unicorn\"], natural_language_query: What's the latest on Project Unicorn? User: What did <@U0123456ABC> talk about last week? > keywords: [], filters: from:<@U0123456ABC> after:2025-06-12 User: Find the budget spreadsheet shared in <#C024BE7LR> > keywords: [\"\\\"budget spreadsheet\\\"\"], filters: in:<#C024BE7LR> > natural_language_query: Where is the budget spreadsheet shared in <#C024BE7LR>? </examples> Strategy: Decompose complex requests into parallel searches. Use keywords for subject terms, filters for people/channels/dates. If 0 results, broaden by removing filters or simplifying keywords. ---",
+   "input_schema": {
+    "properties": {
+     "after": {
+      "description": "Only messages after this Unix timestamp (inclusive)",
+      "type": "string"
+     },
+     "before": {
+      "description": "Only messages before this Unix timestamp (inclusive)",
+      "type": "string"
+     },
+     "channel_types": {
+      "description": "Comma-separated list of channel types to include in the search. Defaults to 'public_channel,private_channel,mpim,im' (all channel types including private channels, group DMs, and DMs). Mix and match channel types by providing a comma-separated list of any combination of `public_channel`, `private_channel`, `mpim`, `im`",
+      "type": "string"
+     },
+     "content_types": {
+      "description": "Content types to include, a comma-separated list of any combination of messages, files. Here's more info about the content types: messages: Slack messages from channels accessible to the acting user\nfiles: Files of all types accessible to the acting user\n",
+      "type": "string"
+     },
+     "context_channel_id": {
+      "description": "Context channel ID to support boosting the search results for a channel when applicable",
+      "type": "string"
+     },
+     "cursor": {
+      "description": "The cursor returned by the API. Omit this parameter for the first request, and use this to get the next page of results",
+      "type": "string"
+     },
+     "filters": {
+      "description": "Slack search modifiers (e.g., 'from:<@U123> in:<#C456> after:2025-01-01'). Use for people, channels, dates, and content type constraints.",
+      "type": "string"
+     },
+     "include_bots": {
+      "description": "Include bot messages (default: false)",
+      "type": "boolean"
+     },
+     "include_context": {
+      "description": "Include surrounding context messages for each result (default: true). Set to false to reduce response size.",
+      "type": "boolean"
+     },
+     "keywords": {
+      "description": "Array of lexical search terms. Each element MUST be a single word (no spaces) OR an exact phrase in quotes. All elements are AND'd (every element must match). Use the author test: only include words the author would naturally write.",
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     },
+     "limit": {
+      "description": "Number of results to return, up to a max of 20. Defaults to 20.",
+      "type": "integer"
+     },
+     "max_context_length": {
+      "description": "Max character length for each context message. Longer messages are truncated.",
+      "type": "integer"
+     },
+     "natural_language_query": {
+      "description": "The user's question restated in conversational tone. Used for semantic reranking. Do not include filter-like content (people, channels, dates) — those belong in filters. Pass an empty string when the query is purely structural (only filters, no semantic question).",
+      "type": "string"
+     },
+     "only_my_channels": {
+      "description": "Limit results to channels the user is a member of. Set to true when the user asks to search only their own or joined channels. Default: false.",
+      "type": "boolean"
+     },
+     "response_format": {
+      "description": "Level of detail (default: 'detailed'). Options: 'detailed', 'concise'",
+      "enum": [
+       "detailed",
+       "concise"
+      ],
+      "type": "string"
+     },
+     "sort": {
+      "description": "Sort order: 'score' (relevance, default) or 'timestamp' (newest first unless sort_dir is 'asc').",
+      "enum": [
+       "score",
+       "timestamp"
+      ],
+      "type": "string"
+     },
+     "sort_dir": {
+      "description": "Sort direction (default: 'desc'). Options: 'asc', 'desc'",
+      "enum": [
+       "asc",
+       "desc"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [],
+    "type": "object"
+   }
+  },
+  {
+   "name": "slack_search_channels",
+   "description": "Search for Slack channels by name or description. Returns channel names, IDs, topics, purposes, and archive status. Keyword tips: use terms matching channel names/descriptions (e.g., \"engineering\", \"\\\"project alpha\\\"\"). Names are typically lowercase with hyphens. Use slack_read_channel to read messages from a known channel. Use slack_search_public to search message content across channels. --- Split your search query into 2 fields: 1. `keywords` — Lexical terms that must appear in the channel's name or attributes. Each element should be a single word or \"quoted phrase\". All AND'd. 2. `natural_language_query` — User's question in conversational tone for semantic re-ranking. Preserve original phrasing; on follow-ups incorporate prior context. Require `natural_language_query` + `keywords`. ❌ Semantic search is not available for this user. Strategy: Use keywords for subject terms. If 0 results, broaden by simplifying keywords. ---",
+   "input_schema": {
+    "properties": {
+     "channel_types": {
+      "description": "Comma-separated list of channel types to include in the search. Defaults to public_channel. Mix and match channel types by providing a comma-separated list of any combination of public_channel, private_channel. Example: public_channel,private_channel; Second Example: public_channel",
+      "type": "string"
+     },
+     "cursor": {
+      "description": "The cursor returned by the API. Omit this parameter for the first request, and use this to get the next page of results",
+      "type": "string"
+     },
+     "include_archived": {
+      "description": "Include archived channels in the search results",
+      "type": "boolean"
+     },
+     "keywords": {
+      "description": "Array of lexical search terms. Each element MUST be a single word (no spaces) OR an exact phrase in quotes. All elements are AND'd (every element must match). Use the author test: only include words the author would naturally write.",
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     },
+     "limit": {
+      "description": "Number of results to return, up to a max of 20. Defaults to 20.",
+      "type": "integer"
+     },
+     "natural_language_query": {
+      "description": "The user's question restated in conversational tone. Used for semantic reranking. Do not include filter-like content (people, channels, dates) — those belong in filters. Pass an empty string when the query is purely structural (only filters, no semantic question).",
+      "type": "string"
+     },
+     "response_format": {
+      "description": "Level of detail (default: 'detailed'). Options: 'detailed', 'concise'",
+      "enum": [
+       "detailed",
+       "concise"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [],
+    "type": "object"
+   }
+  },
+  {
+   "name": "slack_search_users",
+   "description": "Search for Slack users by name, email, or profile attributes (department, role, title). Current logged in user's Slack user_id is U0EXAMPLE01. Keyword tips: full names (\"\\\"John Smith\\\"\"), partial names (\"John\"), emails (\"john@company.com\"), departments/roles (\"engineering\"). Combine terms as separate keywords ([\"John\", \"engineering\"]); prefix with - to exclude ([\"engineering\", \"-intern\"]). Use slack_read_user_profile for detailed info on a known user ID. Use slack_search_public with from: filter to find messages by a user. --- Split your search query into 2 fields: 1. `keywords` — Lexical terms that must appear in the user's name or attributes. Each element should be a single word or \"quoted phrase\". All AND'd. 2. `natural_language_query` — User's question in conversational tone for semantic re-ranking. Preserve original phrasing; on follow-ups incorporate prior context. Require `natural_language_query` + `keywords`. ❌ Semantic search is not available for this user. Strategy: Use keywords for subject terms. If 0 results, broaden by simplifying keywords. ---",
+   "input_schema": {
+    "properties": {
+     "cursor": {
+      "description": "The cursor returned by the API. Omit this parameter for the first request, and use this to get the next page of results",
+      "type": "string"
+     },
+     "keywords": {
+      "description": "Array of lexical search terms. Each element MUST be a single word (no spaces) OR an exact phrase in quotes. All elements are AND'd (every element must match). Use the author test: only include words the author would naturally write.",
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     },
+     "limit": {
+      "description": "Number of results to return, up to a max of 20. Defaults to 20.",
+      "type": "integer"
+     },
+     "natural_language_query": {
+      "description": "The user's question restated in conversational tone. Used for semantic reranking. Do not include filter-like content (people, channels, dates) — those belong in filters. Pass an empty string when the query is purely structural (only filters, no semantic question).",
+      "type": "string"
+     },
+     "response_format": {
+      "description": "Level of detail (default: 'detailed'). Options: 'detailed', 'concise'",
+      "enum": [
+       "detailed",
+       "concise"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [],
+    "type": "object"
+   }
+  },
+  {
+   "name": "slack_read_channel",
+   "description": "Reads messages from a Slack channel in reverse chronological order (newest first). To read DM history, use a user_id as channel_id. Read-only. Use slack_read_thread with message_ts to read thread replies. Use slack_search_channels to find a channel ID by name. Use slack_search_public to search across channels. If 'channel_not_found', try slack_search_channels first.",
+   "input_schema": {
+    "properties": {
+     "channel_id": {
+      "description": "ID of the Channel, private group, or IM channel to fetch history for. Can also be a user_id to read DM history.",
+      "type": "string"
+     },
+     "cursor": {
+      "description": "Paginate through collections of data by setting the cursor parameter to a next_cursor attribute returned by a previous request",
+      "type": "string"
+     },
+     "latest": {
+      "description": "End of time range of messages to include in results (timestamp)",
+      "type": "string"
+     },
+     "limit": {
+      "description": "Number of messages to return, between 1 and 100. Default value is 100.",
+      "type": "integer"
+     },
+     "oldest": {
+      "description": "Start of time range of messages to include in results (timestamp)",
+      "type": "string"
+     },
+     "response_format": {
+      "description": "Level of detail: 'detailed' (default, includes reactions + thread info) or 'concise'.",
+      "type": "string"
+     }
+    },
+    "required": [
+     "channel_id"
+    ],
+    "type": "object"
+   }
+  },
+  {
+   "name": "slack_read_thread",
+   "description": "Reads messages from a specific Slack thread (parent message + all replies). Read-only. Requires channel_id and message_ts of the parent message. Use slack_search_public or slack_read_channel to find these values. Use slack_search_public with \"is:thread\" to find threads by content. Use slack_send_message with thread_ts to reply to a thread.",
+   "input_schema": {
+    "properties": {
+     "channel_id": {
+      "description": "Channel, private group, or IM channel to fetch thread replies for",
+      "type": "string"
+     },
+     "cursor": {
+      "description": "Paginate through collections of data by setting the cursor parameter to a next_cursor attribute returned by a previous request",
+      "type": "string"
+     },
+     "latest": {
+      "description": "End of time range of messages to include in results. Slack ts format string (e.g. \"1234567890.123456\").",
+      "type": "string"
+     },
+     "limit": {
+      "description": "Number of messages to return, between 1 and 1000. Default value is 100.",
+      "type": "integer"
+     },
+     "message_ts": {
+      "description": "Timestamp of the parent message (e.g. \"1234567890.123456\"). Must be a string in Slack ts format with a decimal point.",
+      "type": "string"
+     },
+     "oldest": {
+      "description": "Start of time range of messages to include in results. Slack ts format string (e.g. \"1234567890.123456\").",
+      "type": "string"
+     },
+     "response_format": {
+      "description": "Level of detail: 'detailed' (default, includes reactions + thread info) or 'concise'.",
+      "type": "string"
+     }
+    },
+    "required": [
+     "channel_id",
+     "message_ts"
+    ],
+    "type": "object"
+   }
+  },
+  {
+   "name": "slack_read_user_profile",
+   "description": "Retrieves detailed profile information for a Slack user: contact info, status, timezone, organization, and role. Read-only. Defaults to current user if user_id not provided. Use slack_search_users to find a user ID by name or email.",
+   "input_schema": {
+    "properties": {
+     "include_locale": {
+      "description": "Include user's locale information. Default: false",
+      "type": "boolean"
+     },
+     "response_format": {
+      "description": "Level of detail in response. 'detailed' includes all fields, 'concise' shows essential info. Default: detailed'",
+      "enum": [
+       "detailed",
+       "concise"
+      ],
+      "type": "string"
+     },
+     "user_id": {
+      "description": "Slack user ID to look up (e.g., 'U0ABC12345'). Defaults to current user if not provided",
+      "type": "string"
+     }
+    },
+    "required": [],
+    "type": "object"
+   }
+  },
+  {
+   "name": "slack_get_reactions",
+   "description": "Retrieves all reactions (emoji) on a specific Slack message. Read-only. Requires channel_id and message_ts of the target message. Returns each reaction's emoji name, count, and the users who reacted (with display names and user IDs). Up to 50 users are shown per reaction. The count is always accurate even if the user list is truncated. Messages can have up to 50 unique emoji reactions. If no reactions exist, returns a \"no reactions\" message. Use slack_read_channel or slack_read_thread to find channel_id and message_ts. Use slack_add_reaction to add a reaction.",
+   "input_schema": {
+    "properties": {
+     "channel_id": {
+      "description": "The ID of the channel containing the message",
+      "type": "string"
+     },
+     "message_ts": {
+      "description": "Timestamp of the message to get reactions for",
+      "type": "string"
+     }
+    },
+    "required": [
+     "channel_id",
+     "message_ts"
+    ],
+    "type": "object"
+   }
+  },
+  {
+   "name": "slack_list_channel_members",
+   "description": "Lists members of a Slack channel, group, or group DM (MPIM). Returns profile details or just user IDs. Your user_id: U0EXAMPLE01. Does not support DMs. Formats: 'detailed' (default) = full profile, 'concise' = @username + display name, 'ids_only' = user IDs only (fastest, skip profile fetch). Filters out deleted users and bots by default (use include_deleted/include_bots to include) for 'detailed' and 'concise' formats. 'ids_only' returns all member IDs without filtering (no profile data is fetched). Returns up to 30 members per page (limit is capped at 30). Use cursor from pagination_info to fetch next page. Use slack_search_channels to find a channel ID first. Use slack_search_users to find users across the workspace. Use slack_read_user_profile for detailed info on a specific user.",
+   "input_schema": {
+    "properties": {
+     "channel_id": {
+      "description": "ID of the channel to list members from",
+      "type": "string"
+     },
+     "cursor": {
+      "description": "Pagination cursor from previous response",
+      "type": "string"
+     },
+     "include_bots": {
+      "description": "Include bots and apps in the member list (default: false)",
+      "type": "boolean"
+     },
+     "include_deleted": {
+      "description": "Include deleted/deactivated users in the member list (default: false)",
+      "type": "boolean"
+     },
+     "limit": {
+      "description": "Number of members to return per page (default: 30, max: 30)",
+      "type": "integer"
+     },
+     "response_format": {
+      "description": "Level of detail (default: 'detailed'). Options: 'detailed', 'concise', 'ids_only'",
+      "enum": [
+       "detailed",
+       "concise",
+       "ids_only"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [
+     "channel_id"
+    ],
+    "type": "object"
+   }
+  },
+  {
+   "name": "slack_list_user_channels",
+   "description": "Lists channels the user is a member of. Supports public channels, private channels, DMs (im = 1-on-1 direct messages), and Group DMs (mpim = multi-party direct messages). types accepts a comma-separated list: public_channel, private_channel, im (DM), mpim (Group DM). Default: \"public_channel,private_channel\". To include DMs or Group DMs, add them explicitly (e.g., types=\"public_channel,private_channel,im,mpim\" for all). Archived channels are included by default. Pass exclude_archived=true to hide them. DMs and Group DMs lack user-set names/topics. DMs show the other participant's display name; Group DMs show members. name_prefix is case-insensitive. cursor is ignored when name_prefix is set (prefix filtering scans pages internally). team_id restricts the results to a single workspace. On a multi-workspace (Grid) org, channel memberships are per-workspace, so pass team_id (an encoded workspace ID like \"T012AB3C4\") to list channels in a specific workspace; without it, results come from the user's default workspace only. Related: slack_search_channels (channels you're not in), slack_read_channel (read messages). Examples: - DMs only: slack_list_user_channels(types=\"im\") - Group DMs only: slack_list_user_channels(types=\"mpim\") - Private + DMs: slack_list_user_channels(types=\"private_channel,im\") - All types: slack_list_user_channels(types=\"public_channel,private_channel,im,mpim\") - Prefix filter: slack_list_user_channels(name_prefix=\"eng-\") - IDs only: slack_list_user_channels(format=\"ids_only\")",
+   "input_schema": {
+    "properties": {
+     "cursor": {
+      "description": "Pagination cursor from previous response. Ignored when name_prefix is provided, because prefix filtering scans multiple internal pages and cannot resume from a single cursor.",
+      "type": "string"
+     },
+     "exclude_archived": {
+      "description": "Exclude archived channels (default: false)",
+      "type": "boolean"
+     },
+     "format": {
+      "description": "Output format: 'full' (default, all details), 'ids_only' (just channel IDs), or 'names_only' (just channel names)",
+      "type": "string"
+     },
+     "limit": {
+      "description": "Max channels to return (default: 50, max: 200)",
+      "type": "integer"
+     },
+     "name_prefix": {
+      "description": "Filter channels whose name starts with this string (case-insensitive)",
+      "type": "string"
+     },
+     "team_id": {
+      "description": "Encoded workspace ID (e.g. \"T012AB3C4\") to list channels from. On a multi-workspace org, channel memberships are per-workspace; without this, results come from the user's default workspace only.",
+      "type": "string"
+     },
+     "types": {
+      "description": "Comma-separated list of channel types to include. Valid values: public_channel, private_channel, mpim, im. Default: \"public_channel,private_channel\" (DMs and Group DMs are excluded unless explicitly listed).",
+      "type": "string"
+     }
+    },
+    "required": [],
+    "type": "object"
+   }
+  }
+ ]
+}
