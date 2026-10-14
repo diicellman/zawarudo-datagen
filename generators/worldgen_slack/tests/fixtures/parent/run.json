@@ -1,0 +1,41 @@
+{
+ "config": {
+  "activity": {
+   "bot_posts": 0.0,
+   "channel_skew": 1.1,
+   "conversation_lines": 3.0,
+   "dm_share": 0.4,
+   "dms_per_person": 0.4,
+   "emoji_rate": 0.08,
+   "mention_rate": 0.11,
+   "messages": 16,
+   "parts": {
+    "afternoon": 0.4,
+    "early": 0.1,
+    "evening": 0.12,
+    "morning": 0.35,
+    "night": 0.03
+   },
+   "promise_rate": 0.0,
+   "reaction_rate": 0.3,
+   "reply_share": 0.3
+  },
+  "author": {
+   "day_attempts": 2,
+   "keepalive": 0.0005,
+   "mention_tolerance": 0.05,
+   "plan_attempts": 3,
+   "review_chunk": 1,
+   "review_days": [
+    2
+   ],
+   "share_tolerance": 1.0,
+   "solvers": 2,
+   "task_rounds": 1,
+   "tolerance": 1.0,
+   "tries": 3,
+   "weekend": 0.1,
+   "witness_tries": 2
+  }
+ }
+}

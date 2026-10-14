@@ -3410,9 +3410,11 @@ async def check_author(root):
     )
     assert failure("day", SimpleNamespace(errors=[], traces=[retried])) == "TaskError: malformed verdict"
     assert failure("done", SimpleNamespace(errors=[limit], traces=[])) == "ReviewLimit: no valid ledger"
-    parent = root / "parent"  # the finished world as its run left it
-    shutil.copytree(world_dir, parent, ignore=shutil.ignore_patterns(".lock"))
-    await check_chapter(root / "chapter", parent, world_settings)
+    # A chapter continues a world written with tasks of its own, as S3 was (tests/fixtures/parent, written by the flow
+    # above as it ran before worlds left their tasks to the forge): its board and its notes are the parent's.
+    parent = root / "parent"
+    shutil.copytree(Path(__file__).parent / "tests/fixtures/parent", parent)
+    await check_chapter(root / "chapter", parent, settings)
     GRADER["on"] = False
     print(
         "PASS author: plan, days closed only when done, review issues delivered, crash and resume, tasks, probes, fix"
