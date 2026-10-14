@@ -8,7 +8,8 @@ import verifiers.v1 as vf
 from pydantic import Field, JsonValue
 from worldgen_slack import slack
 from worldgen_slack.toolset import Call, watch_parent
-from worldgen_slack.world import World, file_hash
+from worldgen_slack.world import file_hash
+from ..workspace import Workspace
 
 from ..contracts import frozen_before, measures, style
 
@@ -54,7 +55,7 @@ class ReviewTools(vf.Toolset[ReviewToolsConfig, ReviewState]):
         """Run code's rules over the world, re-run each reviewed task's gold query as its actor, measure each task
         (how many read_channel pages deep its evidence sits for its actor, the tables its gold query reads, its
         evidence's search rank for the question's own words), and report each author's style."""
-        world = World(self.config.db_path)
+        world = Workspace(self.config.db_path)
         tasks = {}
         for task_id in self.config.task_ids:
             row = world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -78,14 +79,14 @@ class ReviewTools(vf.Toolset[ReviewToolsConfig, ReviewState]):
         """Call a Slack read tool as a task's actor, by the solver's tool names without slack_: search_public,
         search_public_and_private, search_channels, search_users, read_channel, read_thread, read_user_profile,
         get_reactions, list_channel_members or list_user_channels. Returns what it showed, structured."""
-        output = slack.read(World(self.config.db_path, actor=self._actor(actor_id)), tool, arguments)
+        output = slack.read(Workspace(self.config.db_path, actor=self._actor(actor_id)), tool, arguments)
         self.state.calls.append(Call(tool=tool, arguments=arguments | {"actor_id": actor_id}, output=output))
         return output
 
     @vf.tool
     async def sql(self, actor_id: str, sql: str) -> dict:
         """Run one SELECT over the world as a task's actor sees it, the way gold queries run."""
-        return World(self.config.db_path).gold(self._actor(actor_id), sql, max_rows=50)
+        return Workspace(self.config.db_path).gold(self._actor(actor_id), sql, max_rows=50)
 
 
 if __name__ == "__main__":

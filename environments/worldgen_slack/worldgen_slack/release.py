@@ -2,7 +2,6 @@
 
 import json
 import os
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Annotated, Literal
@@ -131,26 +130,3 @@ def load_release(root: Path) -> tuple[Path, list[PublicTask], dict[str, PrivateA
                 raise ValueError(f"{row.task_id}: a gold person who is not in the workspace")
         reader.close()
     return root / "world.sqlite", rows, answers
-
-
-def write_release(root: Path, world: Path, rows: list[PublicTask], answers: dict[str, PrivateAnswer]) -> None:
-    """Publish atomically; an existing release must be the same one."""
-    if root.exists():
-        _, old_rows, old_answers = load_release(root)
-        if (old_rows, old_answers) != (rows, answers) or file_hash(root / "world.sqlite") != file_hash(world):
-            raise ValueError("refusing to overwrite a different release")
-        return
-    root.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=root.parent, prefix=".release-") as temporary:
-        stage = Path(temporary) / "release"
-        stage.mkdir()
-        shutil.copyfile(world, stage / "world.sqlite")
-        atomic_json(stage / "tasks.json", [r.model_dump(mode="json") for r in rows])
-        atomic_json(stage / "answers.json", {k: v.model_dump(mode="json") for k, v in answers.items()})
-        files = {name: file_hash(stage / name) for name in sorted(FILES)}
-        atomic_json(
-            stage / "manifest.json", Manifest(world_hash=files["world.sqlite"], files=files).model_dump()
-        )
-        if load_release(stage)[1:] != (rows, answers):
-            raise ValueError("published data differs from approved inputs")
-        os.rename(stage, root)

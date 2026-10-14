@@ -7,7 +7,8 @@ from typing import Self
 import verifiers.v1 as vf
 from pydantic import Field
 from worldgen_slack.taskset import WorldTaskData
-from worldgen_slack.world import SCHEMA, World, file_hash
+from worldgen_slack.world import SCHEMA, file_hash
+from ..workspace import Workspace
 
 from ..contracts import PHASE_CRITERIA, Verdict, quality, validate_verdict, verdict_schema
 from .inspection import ReviewState, ReviewTools, ReviewToolsConfig
@@ -139,7 +140,7 @@ class JudgeTask(vf.Task[WorldTaskData, ReviewState, JudgeConfig]):
             trace.record_metric(payload["phase"] + "_quality", quality(verdict))
 
 
-def review_payload(world: World, phase: str, task_ids: list[str], taxonomy=None, **extra) -> dict:
+def review_payload(world: Workspace, phase: str, task_ids: list[str], taxonomy=None, **extra) -> dict:
     """What a review covers: its phase, the world's version, and the requested tasks with their gold and, given
     the taxonomy, what their category and level mean."""
     tasks = []

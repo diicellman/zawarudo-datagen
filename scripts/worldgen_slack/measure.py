@@ -22,7 +22,7 @@ from generators.worldgen_slack.contracts import (
     style,
     user_id,
 )
-from worldgen_slack.world import World
+from generators.worldgen_slack.workspace import Workspace
 
 TYPING = {
     "median_words": "median_words",
@@ -39,7 +39,7 @@ def real_users(path: Path) -> dict:
     return {ours: round(statistics.median(r[theirs] for r in rows), 2) for ours, theirs in TYPING.items()}
 
 
-def scorecard(world: World, targets: ActivityConfig) -> dict:
+def scorecard(world: Workspace, targets: ActivityConfig) -> dict:
     """Each [activity] target beside the world's measured value: a chapter's own days against its own targets."""
     measured = activity(world, frozen_before(world))
     one = lambda sql: world.db.execute(sql).fetchone()[0]  # noqa: E731
@@ -58,7 +58,7 @@ def known(model, section: dict):
     return model.model_validate({k: v for k, v in section.items() if k in model.model_fields})
 
 
-def author(run: Path, world: World, settings) -> dict | None:
+def author(run: Path, world: Workspace, settings) -> dict | None:
     """A world, as its author wrote it: each day against its quota, the ledger and its events, promises, the
     author's turns and tool calls, the solver's probes, the reviews, and how often a ledger task's answer sits in one
     message."""
@@ -143,14 +143,14 @@ def measure(run: Path) -> dict:
         tempfile.TemporaryDirectory() as directory
     ):  # a world of an older schema, read as today's code reads it
         shutil.copy(run / "world.sqlite", Path(directory) / "world.sqlite")
-        world = World(Path(directory) / "world.sqlite", writable=True)
+        world = Workspace(Path(directory) / "world.sqlite", writable=True)
         world.migrate()
         report = read(run, world, state, summary)
         world.close()
     return report
 
 
-def read(run: Path, world: World, state: dict, summary: dict) -> dict:
+def read(run: Path, world: Workspace, state: dict, summary: dict) -> dict:
     stats = style(world, frozen_before(world))  # a chapter: its own messages
     cast = {user_id(p["uuid"]): SeedPersona.model_validate(p) for p in state["cast"]}
     authors = {

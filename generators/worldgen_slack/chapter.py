@@ -22,7 +22,8 @@ from pydantic import Field, model_validator
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from verifiers.v1.runtimes.prime import set_base_sandbox_labels
 from worldgen_slack.release import atomic_json
-from worldgen_slack.world import World, digest, file_hash
+from worldgen_slack.world import digest, file_hash
+from .workspace import Workspace
 
 import verifiers.v1 as vf
 
@@ -71,8 +72,8 @@ class ChapterConfig(Section):
         return self
 
 
-def parent_world(path: Path) -> World:
-    return World(path / "world.sqlite")
+def parent_world(path: Path) -> Workspace:
+    return Workspace(path / "world.sqlite")
 
 
 def load_chapter(path: Path) -> tuple[ChapterConfig, Config]:
@@ -196,7 +197,7 @@ def same_schema(world) -> list[str]:
         }
 
     with tempfile.TemporaryDirectory() as directory:
-        fresh = World.create(Path(directory) / "schema.sqlite")
+        fresh = Workspace.create(Path(directory) / "schema.sqlite")
         want = defined(fresh.db)
         fresh.close()
     have = defined(world.db)

@@ -4,7 +4,9 @@ import fcntl
 from collections import Counter
 import json
 import os
+import shutil
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 from typing import Literal
@@ -13,14 +15,17 @@ from pydantic import Field
 from worldgen_slack import slack
 from worldgen_slack.config import role
 from worldgen_slack.release import (
+    FILES,
+    Manifest,
     PrivateAnswer,
     PublicTask,
     StrictModel,
     atomic_json,
+    load_release,
     read_json,
-    write_release,
 )
-from worldgen_slack.world import World, canonical, file_hash
+from worldgen_slack.world import canonical, file_hash
+from .workspace import Workspace
 
 from .contracts import Issue, Premise, SeedPersona, Slot, Verdict, measures, miss_class
 
@@ -96,7 +101,7 @@ class Store:
             if read_json(manifest) != config:
                 raise ValueError("resume configuration differs; use a new output directory")
             self.state = RunState.model_validate_json((self.root / "state.json").read_bytes())
-            self.world = World(self.root / "world.sqlite", writable=True)
+            self.world = Workspace(self.root / "world.sqlite", writable=True)
             if self.state.active_attempt:
                 self.event("interrupted", attempt=self.state.active_attempt)
                 self.state.active_attempt = None
@@ -105,7 +110,7 @@ class Store:
             if any(p.name != ".lock" for p in self.root.iterdir()):
                 raise ValueError("output is nonempty without a run manifest")
             self.state = RunState()
-            self.world = World.create(self.root / "world.sqlite")
+            self.world = Workspace.create(self.root / "world.sqlite")
             atomic_json(manifest, config)
             self.save()
 
@@ -322,7 +327,7 @@ class Store:
                 r["message_id"] for r in gold if r.get("message_id") is not None
             }
             marks = ", ".join("?" * len(stating))
-            reader = World(self.world.path, actor=task["actor_id"])
+            reader = Workspace(self.world.path, actor=task["actor_id"])
             readable = {
                 r[0]
                 for r in reader.db.execute(f"SELECT id FROM messages WHERE id IN ({marks})", sorted(stating))
@@ -423,3 +428,26 @@ class Store:
         self.world.solver_copy(copy)
         rows, answers = self.release_rows(file_hash(copy))
         write_release(self.root / "release", copy, rows, answers)
+
+
+def write_release(root: Path, world: Path, rows: list[PublicTask], answers: dict[str, PrivateAnswer]) -> None:
+    """Publish atomically; an existing release must be the same one."""
+    if root.exists():
+        _, old_rows, old_answers = load_release(root)
+        if (old_rows, old_answers) != (rows, answers) or file_hash(root / "world.sqlite") != file_hash(world):
+            raise ValueError("refusing to overwrite a different release")
+        return
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=root.parent, prefix=".release-") as temporary:
+        stage = Path(temporary) / "release"
+        stage.mkdir()
+        shutil.copyfile(world, stage / "world.sqlite")
+        atomic_json(stage / "tasks.json", [r.model_dump(mode="json") for r in rows])
+        atomic_json(stage / "answers.json", {k: v.model_dump(mode="json") for k, v in answers.items()})
+        files = {name: file_hash(stage / name) for name in sorted(FILES)}
+        atomic_json(
+            stage / "manifest.json", Manifest(world_hash=files["world.sqlite"], files=files).model_dump()
+        )
+        if load_release(stage)[1:] != (rows, answers):
+            raise ValueError("published data differs from approved inputs")
+        os.rename(stage, root)

@@ -18,7 +18,8 @@ from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 from worldgen_slack.judge import EMPTY
 from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
 from worldgen_slack.slack import PAGE
-from worldgen_slack.world import SCHEMA_VERSION, SHOWN, World, canonical, digest, words
+from worldgen_slack.world import SHOWN, canonical, digest, words
+from .workspace import SCHEMA_VERSION, Workspace
 
 from .config import Needs
 
@@ -1279,7 +1280,7 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
             (task_id,),
         )
     ]
-    reader = World(world.path, actor=task["actor_id"])
+    reader = Workspace(world.path, actor=task["actor_id"])
     # A refusal may rest on the truth out of its actor's sight: what the actor cannot read is counted, not measured.
     evidence = list(dict.fromkeys(evidence))
     seen = [m for m in evidence if reader.db.execute("SELECT 1 FROM messages WHERE id = ?", (m,)).fetchone()]
@@ -1324,7 +1325,7 @@ def measures(world, task_id: str, rows: list[dict], tables) -> dict:
 def stated_values(world, facts: list[str], actor: str) -> dict[str, list[int]]:
     """The values its actor can read stated on the subjects and attributes of a task's facts, each with the messages
     that state it, oldest first."""
-    reader, out = World(world.path, actor=actor), {}
+    reader, out = Workspace(world.path, actor=actor), {}
     seen = {r[0] for r in reader.db.execute("SELECT id FROM messages")}
     reader.close()
     marks = ", ".join("?" * len(facts))
@@ -1358,7 +1359,7 @@ def panel(world, task_id: str, rows: list[dict]) -> dict:
         ).fetchone()
         for v, ms in stated.items()
     }
-    reader = World(world.path, actor=task["actor_id"])
+    reader = Workspace(world.path, actor=task["actor_id"])
     ranks = {v: reader.rank(task["question"], ms) for v, ms in stated.items()}
     reader.close()
     found = [v for v in stated if ranks[v] is not None]
@@ -1443,7 +1444,7 @@ def features(world, task_id: str, rows: list[dict]) -> dict:
             )
         except ValueError:
             continue  # the query returns what that person cannot read
-    readable = World(world.path, actor=task["actor_id"])
+    readable = Workspace(world.path, actor=task["actor_id"])
     verbatim = all(
         readable.db.execute(
             "SELECT 1 FROM messages WHERE instr(lower(text), lower(?)) LIMIT 1", (a,)

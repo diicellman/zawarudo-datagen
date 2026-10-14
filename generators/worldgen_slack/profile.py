@@ -9,7 +9,7 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from worldgen_slack.world import World
+from .workspace import Workspace
 
 from .contracts import answer_facts, meta, readable
 
@@ -185,7 +185,7 @@ def page(found: dict) -> str:
 
 def write(run: Path) -> dict:
     """A run's profile, written beside its world as profile.json and profile.md."""
-    world = World(run / "world.sqlite")
+    world = Workspace(run / "world.sqlite")
     try:
         found = profile(world)
     finally:

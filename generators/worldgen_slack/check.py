@@ -34,11 +34,12 @@ from verifiers.v1.errors import SandboxError
 from verifiers.v1.mcp.launch import serve
 from worldgen_slack import slack
 from worldgen_slack.judge import EMPTY, AnswerGrade, AnswerJudge
-from worldgen_slack.release import PrivateAnswer, PublicTask, load_release, write_release
+from worldgen_slack.release import PrivateAnswer, PublicTask, load_release
 from worldgen_slack.slack import PAGE, compact, people_shown, shown
 from worldgen_slack.taskset import SolverTask, system_prompt
 from worldgen_slack.toolset import SlackToolset, WorldToolsConfig, stage_world, watch_parent
-from worldgen_slack.world import ANSWER_KEY, SHADOWED, SHOWN, World, file_hash
+from worldgen_slack.world import SHADOWED, SHOWN, file_hash
+from .workspace import ANSWER_KEY, Workspace
 from .agents.inspection import ReviewState
 from .agents.judge import PHASE_GUIDES, JudgeTask, review_payload
 from .agents.synthesizer import parse_premise
@@ -105,7 +106,7 @@ from .chapter import provenance as chapter_provenance
 from .env import GenerationEnv, ended, keep_awake, rates, read_one_way
 from .generate import failure, provenance, run_label
 from .generate import run as generate_run
-from .store import ReviewLimit, SessionLost, Store
+from .store import ReviewLimit, SessionLost, Store, write_release
 from .forge import ForgeConfig, ForgeEnv, bucket, measured_level
 from .forge import measured as forge_measured
 from .profile import profile
@@ -186,7 +187,7 @@ def fails(function, *args, **kwargs):
 
 def world_fixture(path):
     """Three people on Chicago time: #releases (public: U1, U2), #exec (private: U1), a DM (U1, U2)."""
-    world = World.create(path)
+    world = Workspace.create(path)
     zone = ZoneInfo("America/Chicago")
 
     def at(day, hour, minute=0):
@@ -499,7 +500,7 @@ async def check_world(root):
     ), "completion is due only for the named tasks"
 
     world.solver_copy(root / "solver.sqlite")
-    solver = World(root / "solver.sqlite", actor="U2")
+    solver = Workspace(root / "solver.sqlite", actor="U2")
     names = {r[0] for r in solver.db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert not names & set(ANSWER_KEY) and {"messages", "messages_fts"} <= names
 
@@ -510,7 +511,7 @@ async def check_world(root):
         found = read(reader, "search_public_and_private", keywords=list(keywords), filters=filters, **kwargs)
         return [i["text"] for i in found["items"]]
 
-    u1, u3 = World(root / "solver.sqlite", actor="U1"), World(root / "solver.sqlite", actor="U3")
+    u1, u3 = Workspace(root / "solver.sqlite", actor="U1"), Workspace(root / "solver.sqlite", actor="U3")
     fails(read, solver, "read_channel", channel_id="G1")
     fails(read, u3, "read_channel", channel_id="G1")
     assert read(u3, "list_user_channels")["items"] == [] and texts(solver, "deleted") == []
@@ -675,7 +676,7 @@ async def check_world(root):
                     )
                 ],
             )
-            bots = World(copy.path, actor="U1")
+            bots = Workspace(copy.path, actor="U1")
             assert texts(bots, "notes") == [] and texts(bots, "notes", include_bots=True) == [
                 "notes posted for release 4.2"
             ]
@@ -879,9 +880,9 @@ def check_tasks(root):
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT COUNT(*) FROM c",
         seconds=0.2,
     )
-    fails(World(world.path, actor="U1").checks)
+    fails(Workspace(world.path, actor="U1").checks)
 
-    scoped = World(world.path, actor="U2")
+    scoped = Workspace(world.path, actor="U2")
     assert scoped.rank("rollback release", [1]) == 1 and scoped.rank("zebra", [1]) is None
     print("PASS tasks: gold as its actor, reads only, readable evidence, time limit, rank, trial")
 
@@ -1088,7 +1089,7 @@ def check_contracts(root):
     premise = Premise(
         company="Lattice Creek", niche="n", region="r", size="s", culture="c", cast="x", staffing={}
     )
-    world = World.create(root / "world.sqlite")
+    world = Workspace.create(root / "world.sqlite")
 
     routines = [
         Routine(kind=k, probability=p) for k, p in (("standup", 0.5), ("review", 0.3), ("lunch", 0.2))
@@ -1650,7 +1651,7 @@ def organized(root, settings, apps=(), groups=()):
         company="Lattice Creek", niche="n", region="r", size="s", culture="c", cast="x", staffing={}
     )
     root.mkdir(parents=True, exist_ok=True)
-    world = World.create(root / "world.sqlite")
+    world = Workspace.create(root / "world.sqlite")
     with world.trial() as copy:
         organize(copy, org, cast, premise, settings)
     return world, cast, org, (a, b, c, d)
@@ -1792,7 +1793,7 @@ def check_apps(root):
         settings,
         Slot(id="t9", category="lookup", level=1, concept="c", style="s"),
     )
-    reader = World(world.path, actor=c)
+    reader = Workspace(world.path, actor=c)
     assert (
         not slack.read(reader, "search_public_and_private", {"keywords": ["production"]})["items"]
         and slack.read(
@@ -1933,7 +1934,7 @@ def check_churn(root):
     refused(
         "a status names no time",
         lambda: organize(
-            World.create(root / "status.sqlite"),
+            Workspace.create(root / "status.sqlite"),
             org.model_copy(update={"people": [person, *org.people[1:]]}),
             cast,
             Premise(
@@ -1942,7 +1943,7 @@ def check_churn(root):
             settings,
         ),
     )
-    reader = World(world.path, actor=a)
+    reader = Workspace(world.path, actor=a)
     history = slack.render(reader, "read_channel", slack.read(reader, "read_channel", {"channel_id": leads}))[
         "messages"
     ]
@@ -2059,7 +2060,7 @@ def check_links(root):
     assert [tuple(r) for r in announced] == [
         (f"<{url}|TKT-1> created: audit runbook · assigned to <@{b}>", bot_id("Tracker"))
     ], announced
-    reader = World(world.path, actor=c)
+    reader = Workspace(world.path, actor=c)
     assert (
         "rollback decided (edited)"
         in slack.render(reader, "read_channel", slack.read(reader, "read_channel", {"channel_id": ops}))[
@@ -3239,7 +3240,7 @@ async def check_reviews(root):
         and result["tasks"]["t1"]["rows"] == [{"answer": "rollback"}]
         and result["violations"] == []
     )
-    rank = World(root / "review.sqlite", actor="U2").rank(payload["tasks"][0]["question"], [1])
+    rank = Workspace(root / "review.sqlite", actor="U2").rank(payload["tasks"][0]["question"], [1])
     assert result["tasks"]["t1"]["bm25_rank"] == rank == 2 and "U1" in result["style"]["authors"]
     assert (
         await tools._with_state(tools.read)(
@@ -3272,7 +3273,7 @@ async def check_reviews(root):
     assert checked.info["verdict"]["approved"]
 
     world.snapshot(root / "planted.sqlite")
-    planted = World(root / "planted.sqlite", writable=True)
+    planted = Workspace(root / "planted.sqlite", writable=True)
     with planted.batch():  # a fact t1 needs that no message states yet
         fact = dict(id="f9", storyline="r", subject="c", attribute="d", value="v", summary="s", day=2)
         planted.insert("facts", [fact | dict(channel_id="C1", author_id="U1")])
@@ -3756,7 +3757,7 @@ def world_seats():
         if tools is None:
             return setup_document(runtime)
         call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
-        world = World(tools.config.db_path)
+        world = Workspace(tools.config.db_path)
         a, b, c, d = [r[0] for r in world.db.execute("SELECT id FROM users ORDER BY id")]
         ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
 
@@ -3899,7 +3900,7 @@ def world_seats():
         async def run(self, task):
             payload, attempt = json.loads(task.config.payload), task.data.attempt
             reviewed.append(attempt)
-            world = World(task.config.tools.db_path)
+            world = Workspace(task.config.tools.db_path)
             first, second = [m for (m,) in world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")]
             world.close()
             issues = []
@@ -4001,7 +4002,7 @@ def forge_seats(note_on=None) -> dict:
 
     async def propose(prompt, tools, runtime):
         call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
-        world = World(tools.config.db_path)
+        world = Workspace(tools.config.db_path)
         (actor,) = world.db.execute("SELECT id FROM users WHERE is_bot = 0 ORDER BY id LIMIT 1").fetchone()
         world.close()
         for open_id in re.findall(r"r\d\d-\d\d", prompt):
@@ -4105,7 +4106,7 @@ async def world_run(root, settings, agents_of):
 
     class Rejecting(ScriptedAgent):  # the next final review rejects once, then approves
         async def run(self, task):
-            world = World(task.config.tools.db_path)
+            world = Workspace(task.config.tools.db_path)
             first, second = [m for (m,) in world.db.execute("SELECT id FROM messages ORDER BY id LIMIT 2")]
             world.close()
             issues = (
@@ -4261,7 +4262,7 @@ async def check_author(root):
             if attempt == "review-02-01" and crash["review"]:
                 crash["review"] = False
                 raise KeyboardInterrupt("simulated crash in a review")
-            world = World(task.config.tools.db_path)
+            world = Workspace(task.config.tools.db_path)
             issues = []
             if payload["phase"] == "world" and attempt in ("review-02-02", "final-01"):
                 first, second = [
@@ -4326,7 +4327,7 @@ async def check_author(root):
         if tools is None:
             return setup_document(runtime)
         call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
-        world = World(tools.config.db_path)
+        world = Workspace(tools.config.db_path)
         a, b, c, d = [r[0] for r in world.db.execute("SELECT id FROM users ORDER BY id")]
         ops, leads = channel_id("public", "ops", []), channel_id("private", "leads", [])
         assert runtime.files["/task/memory/now.md"].startswith(b"# Now: "), (
@@ -4706,7 +4707,7 @@ async def check_author(root):
             store.close()
             store = TestStore(settings.output, manifest)
     after_day_2 = (
-        World(store.root / "attempts" / store.state.restore_point / "world.sqlite")
+        Workspace(store.root / "attempts" / store.state.restore_point / "world.sqlite")
         .db.execute("SELECT COUNT(*) FROM messages")
         .fetchone()[0]
     )
@@ -4888,7 +4889,7 @@ async def check_author(root):
     world_dir, world_settings = await world_run(
         root, settings, lambda **seats: SimpleNamespace(**(vars(agents) | seats))
     )
-    source_world = World(world_dir / "world.sqlite")
+    source_world = Workspace(world_dir / "world.sqlite")
     # The forge: tasks proposed on the finished world, which stays frozen; what the judge approves is kept.
     plan = ForgeConfig(
         base=Path("worldgen.toml"), world=world_dir, output=root / "forge", rounds=2, candidates=2, tasks=30
@@ -5416,7 +5417,9 @@ async def check_author(root):
         early_store.close()
     # A forge that only measures: the finished run's own tasks, imported as written (past the forge's own gates; a
     # level-2 count with no near-miss query here), then measured like any candidate, with no proposer turn.
-    extra = World(source / "world.sqlite", writable=True)  # the forge's output, with one more task of its own
+    extra = Workspace(
+        source / "world.sqlite", writable=True
+    )  # the forge's output, with one more task of its own
     with extra.trial() as copy:
         record_task(
             copy,
@@ -5491,7 +5494,7 @@ async def check_chapter(root, parent, settings):
     # A world of the first schema (before 2026-10-14) comes forward in place, once: its rows as they were.
     old = root / "schema-1.sqlite"
     shutil.copy(parent / "world.sqlite", old)
-    aged = World(old, writable=True)
+    aged = Workspace(old, writable=True)
     for sql in (
         "DROP TABLE queue",
         "DROP TABLE integrations",
@@ -5539,7 +5542,7 @@ async def check_chapter(root, parent, settings):
         settings,
     )
     fails(ChapterConfig, **chapter.model_dump() | {"review_days": [2]})  # a review after the last day
-    before = World(parent / "world.sqlite")
+    before = Workspace(parent / "world.sqlite")
     slots, parent_quotas, parent_hash = (
         brief_slots(chapter, cfg, version_of(before) + 1),
         quotas(before, settings),
@@ -5554,7 +5557,7 @@ async def check_chapter(root, parent, settings):
     elder = root / "elder"
     shutil.copytree(parent, elder)
     shutil.copy(old, elder / "world.sqlite")
-    aged = World(elder / "world.sqlite", writable=True)
+    aged = Workspace(elder / "world.sqlite", writable=True)
     for sql in (
         "DROP TABLE queue",
         "ALTER TABLE messages DROP COLUMN subtype",
@@ -5738,7 +5741,7 @@ async def check_chapter(root, parent, settings):
 
     async def script(prompt, tools, runtime):
         call = lambda name, **kwargs: tools._with_state(getattr(tools, name))(**kwargs)  # noqa: E731
-        world = World(tools.config.db_path)
+        world = Workspace(tools.config.db_path)
         turns.append((tools.config.mode, tools.config.day, prompt))
         if tools.config.mode == "plan":
             if prompt.startswith("Before day 5"):
@@ -5797,7 +5800,7 @@ async def check_chapter(root, parent, settings):
         async def run(self, task):
             payload, attempt = json.loads(task.config.payload), task.data.attempt
             reviewed.append((attempt, "written_from" in payload, "written_through" in payload))
-            judged_world = World(task.config.tools.db_path)
+            judged_world = Workspace(task.config.tools.db_path)
             old_id = judged_world.db.execute("SELECT MIN(id) FROM messages").fetchone()[0]
             new_id = judged_world.db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
             issues = [
@@ -6095,7 +6098,7 @@ def check_prompts(root):
     assert "written and frozen" in CHAPTER_GUIDE and "No tasks are written in a chapter" in CHAPTER_GUIDE
     # The world's author writes with the craft page (voice lab 02); the proposer has its own guide, and a chapter's
     # author has the chapter's too.
-    world = World.create(root / "w.sqlite")
+    world = Workspace.create(root / "w.sqlite")
     context = {"settings": settings.model_dump(mode="json")}
     systems = {
         name: WorldAuthorTask.create(mode, 1, world.path, context | extra, "x").data.system_prompt

@@ -21,7 +21,8 @@ from verifiers.v1.utils.decorators import discover_decorated
 from worldgen_slack import slack
 from worldgen_slack.taskset import WorldTaskData
 from worldgen_slack.toolset import watch_parent
-from worldgen_slack.world import World, digest, file_hash
+from worldgen_slack.world import digest, file_hash
+from ..workspace import Workspace
 
 from ..profile import profile
 from ..chronicle import (
@@ -728,8 +729,8 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         finally:
             self._log(tool, arguments, error)
 
-    def _world(self, writable: bool = False) -> World:
-        return World(self.config.db_path, writable=writable)
+    def _world(self, writable: bool = False) -> Workspace:
+        return Workspace(self.config.db_path, writable=writable)
 
     def _turn(self, tool: str, *modes: str) -> None:
         if self.config.mode not in modes:
@@ -784,7 +785,7 @@ class WorldTools(vf.Toolset[AuthoringToolsConfig, vf.State]):
         return self._logged(
             "read",
             {"actor_id": actor_id, "tool": tool, "arguments": arguments},
-            lambda: slack.read(World(self.config.db_path, actor=actor_id), tool, arguments),
+            lambda: slack.read(Workspace(self.config.db_path, actor=actor_id), tool, arguments),
         )
 
     @vf.tool

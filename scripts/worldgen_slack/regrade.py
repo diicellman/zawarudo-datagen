@@ -23,7 +23,7 @@ import verifiers.v1 as vf
 from worldgen_slack.judge import AnswerJudge
 
 from generators.worldgen_slack.contracts import failure_cases
-from worldgen_slack.world import World
+from generators.worldgen_slack.workspace import Workspace
 
 # $ per million input, output and cached input tokens (list prices)
 PRICES = {"z-ai/glm-5.3": (1.4, 4.4, 0.26)}
@@ -163,7 +163,7 @@ async def main() -> None:
         work = wrong + random.Random(args.seed).sample(rest, max(0, args.tries - len(wrong)))
     cases = []
     if args.screen:
-        world = World(args.run / "world.sqlite")
+        world = Workspace(args.run / "world.sqlite")
         for t in sorted(kept):
             gold, failures = failure_cases(world, t, reference[t]["rows"])
             cases += [dict(task=t, case="gold", response=gold, expect=True)]

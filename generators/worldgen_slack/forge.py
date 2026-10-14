@@ -18,7 +18,8 @@ from pydantic import Field, model_validator
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from verifiers.v1.runtimes.prime import set_base_sandbox_labels
 from worldgen_slack.release import atomic_json
-from worldgen_slack.world import SCHEMA, World, file_hash
+from worldgen_slack.world import SCHEMA, file_hash
+from .workspace import Workspace
 
 import verifiers.v1 as vf
 
@@ -162,7 +163,7 @@ class ForgeEnv(GenerationEnv):
         came from 4 tries at temperature 0."""
         state = self.store.state
         attempt = self.store.reserve("measure", 2)
-        source = World(self.forge.world / "world.sqlite")
+        source = Workspace(self.forge.world / "world.sqlite")
         rows = source.db.execute("SELECT * FROM tasks ORDER BY id").fetchall()
         ids = [r["id"] for r in rows]
         for row in rows:
@@ -206,7 +207,7 @@ class ForgeEnv(GenerationEnv):
     def adopt(self) -> None:
         """The finished world, frozen: its final file with no tasks (their tables as the schema now has them), its board
         and ledger, and the world author's last notes for the proposer to start from."""
-        source = World(self.forge.world / "world.sqlite")
+        source = Workspace(self.forge.world / "world.sqlite")
         source.db.backup(self.world.db)
         source.close()
         self.world.migrate()
@@ -552,7 +553,7 @@ async def run(forge: ForgeConfig, settings: Config) -> dict:
 
 def dry_run(forge: ForgeConfig, settings: Config) -> dict:
     """What a forge would start from, spending nothing: the world, its board, its goal, and the rounds."""
-    world = World(forge.world / "world.sqlite")
+    world = Workspace(forge.world / "world.sqlite")
     count = lambda table: world.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: E731
     return {
         "world": str(forge.world),
