@@ -6,12 +6,13 @@ import tempfile
 from pathlib import Path
 
 from build import load_run, render
-from generators.worldgen_slack.check import check_author
+from generators.worldgen_slack.tests.flows import run_flows, scripted_judges
 
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
-        asyncio.run(check_author(Path(tmp) / "author"))
+        with scripted_judges():
+            asyncio.run(run_flows(Path(tmp) / "author"))
         world, forge, chapter = (
             load_run(Path(tmp) / "author" / name) for name in ("run", "forge", "chapter/run")
         )

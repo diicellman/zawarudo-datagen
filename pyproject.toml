@@ -21,6 +21,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["generators"]
+exclude = ["generators/worldgen_slack/tests"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/generators", "/environments/worldgen_slack", "/configs", "/README.md", "/uv.lock"]
@@ -30,10 +31,16 @@ worldgen-slack = { workspace = true }
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "ac2ec29" }
 
 [dependency-groups]
-dev = ["ruff==0.14.3"]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.14.3",
+]
 
 [tool.ruff]
 line-length = 110
+
+[tool.pytest.ini_options]
+testpaths = ["generators/worldgen_slack/tests"]
 
 [tool.uv.workspace]
 members = ["environments/worldgen_slack"]
