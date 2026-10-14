@@ -4,12 +4,15 @@ The author picks a workspace's integrations in its organization (each with the c
 posts about); code writes every bot post. A post is queued at its moment and written when the present reaches it, in
 time order with everyone's messages (`drain`), so the world stays one written forward. A post's text comes from its
 kind's template and its subject, or from a ledger event that *happened*, whose title states no fact: a bot never
-states an answer first. Bots and joins are no one's messages: no quota, share or task counts them (`PEOPLE`)."""
+states an answer first. An event's post frames its title and claims no outcome of its own: the title tells what
+happened (a build that failed, a deploy rolled back). Bots and joins are no one's messages: no quota, share or task
+counts them (`PEOPLE`)."""
 
 import datetime as dt
 import json
 import random
 import re
+from collections import Counter
 
 from worldgen_slack.world import digest
 
@@ -17,16 +20,16 @@ from .organization import APP_KINDS
 from .text import MENTION, TIME_LITERAL
 
 # What each kind of app posts: about one of its subjects (noise, drawn by the seed on workdays), and when a ledger
-# event it reports happens. {n} is a running number, {who} a member of its channel, {subject} or {title} the matter.
+# event it reports happens. {n} is a running number, {who} the ticket's assignee, {subject} or {title} the matter.
 KINDS = {
     "deploys": {
         "noise": "Deployed {subject} to staging · build #{n}",
-        "event": "✅ {title}: deployed to production",
+        "event": "🚀 Production deploy: {title}",
     },
     "alerts": {
         "noise": "🔴 Triggered: {subject}",
         "resolved": "✅ Resolved: {subject}",
-        "event": "🔴 Triggered: {title}",
+        "event": "🚨 {title}",
     },
     "tickets": {
         "noise": "{prefix}-{n} created: {subject} · assigned to <@{who}>",
@@ -34,7 +37,7 @@ KINDS = {
     },
     "ci": {
         "noise": "Build #{n} on main {outcome} · {minutes} min",
-        "event": "Build #{n} for {title} passed ✅ · {minutes} min",
+        "event": "Build #{n} · {title} · {minutes} min",
     },
     "reminders": {"noise": "Reminder: {subject}", "event": "Reminder: {title}"},
 }
@@ -124,16 +127,19 @@ def number(world, app: dict, start: int = 1000) -> int:
     return start + int(digest([app["user_id"]])[:3], 16) % 4000 + n
 
 
-def member(world, channel_id: str, rng, at_us: int) -> str:
-    """A person in the channel at that moment."""
+def assignee(world, channel_id: str, rng, at_us: int) -> str:
+    """Who a ticket goes to: a person in the channel at that moment, of the team that works it (the team most of its
+    people are on; a tie goes to the first by name). An engineer who sits in the support channel is not its queue."""
     people = [
-        r[0]
+        (r[0], json.loads(r[1]).get("Team", ""))
         for r in world.db.execute(
-            "SELECT m.user_id FROM members m JOIN users u ON u.id = m.user_id WHERE m.channel_id = ? AND m.joined_us <= ? AND (m.left_us IS NULL OR m.left_us > ?) AND u.is_bot = 0 ORDER BY m.user_id",
+            "SELECT m.user_id, u.profile_json FROM members m JOIN users u ON u.id = m.user_id WHERE m.channel_id = ? AND m.joined_us <= ? AND (m.left_us IS NULL OR m.left_us > ?) AND u.is_bot = 0 ORDER BY m.user_id",
             (channel_id, at_us, at_us),
         )
     ]
-    return rng.choice(people)
+    teams = Counter(team for _, team in people)
+    works = min(teams, key=lambda team: (-teams[team], team))
+    return rng.choice([user for user, team in people if team == works])
 
 
 def text(world, app: dict, template: str, rng, at_us: int, **fields) -> str:
@@ -142,7 +148,7 @@ def text(world, app: dict, template: str, rng, at_us: int, **fields) -> str:
     fields.setdefault("outcome", "failed ❌" if rng.random() < FAILS else "passed ✅")
     fields.setdefault("minutes", rng.randint(4, 28))
     if "{who}" in template:
-        fields.setdefault("who", member(world, app["channel_id"], rng, at_us))
+        fields.setdefault("who", assignee(world, app["channel_id"], rng, at_us))
     return template.format(**fields)
 
 

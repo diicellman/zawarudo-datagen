@@ -20,6 +20,7 @@ from ..forge.difficulty import failure_cases, features, panel
 from ..forge.proposer.task import ProposerTask
 from ..forge.tasks import Task, record_task
 from ..workspace import Workspace
+from ..world import integrations
 from ..world.author.memory import files, ledger_digest
 from ..world.author.setup import parse_premise
 from ..world.author.task import AuthorTask
@@ -751,6 +752,28 @@ def test_apps(tmp_path):
     assert world.db.execute(
         "SELECT u.is_bot, m.channel_id FROM users u JOIN members m ON m.user_id = u.id WHERE u.id = ?", (bot,)
     ).fetchone()[:] == (1, ops)
+    for kind in ("deploys", "alerts", "ci"):
+        said = integrations.text(
+            world,
+            integrations.apps(world)[0],
+            integrations.KINDS[kind]["event"],
+            random.Random(1),
+            0,
+            title="checkout e2e failed",
+        )
+        assert "checkout e2e failed" in said and not re.search("passed|✅|Resolved", said), (
+            f"an event's post claims no outcome its title may contradict: {said}"
+        )
+    world.snapshot(tmp_path / "teams.sqlite")
+    teams = Workspace(tmp_path / "teams.sqlite", writable=True)
+    teams.db.execute(
+        "UPDATE users SET profile_json = ? WHERE id IN (?, ?, ?)", ('{"Team": "Support"}', a, b, c)
+    )
+    end = teams.db.execute("SELECT MAX(end_us) FROM calendar").fetchone()[0]
+    assert {integrations.assignee(teams, ops, random.Random(k), end) for k in range(30)} == {a, b, c}, (
+        "a ticket goes to the team that works the channel, not to whoever else sits in it"
+    )
+    teams.close()
     with world.trial() as copy:
         start_clock(copy)
     released = Event(
@@ -815,7 +838,7 @@ def test_apps(tmp_path):
     ).fetchall()
     e3 = world.db.execute("SELECT moment_us FROM events WHERE id = 'e3'").fetchone()[0]
     assert [(p[0], p[1]) for p in posts if "production release" in p[1]] == [
-        (e3, "✅ production release: deployed to production")
+        (e3, "🚀 Production deploy: production release")
     ], "an event's post, at its moment"
     assert (
         posts
@@ -855,7 +878,7 @@ def test_apps(tmp_path):
         )["items"]
     ), "a search leaves apps out unless asked"
     assert (
-        "✅ production release: deployed to production"
+        "🚀 Production deploy: production release"
         in slack.render(reader, "read_channel", slack.read(reader, "read_channel", {"channel_id": ops}))[
             "messages"
         ]
