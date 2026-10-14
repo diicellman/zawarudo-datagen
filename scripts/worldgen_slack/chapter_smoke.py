@@ -53,7 +53,8 @@ def main(parent: Path) -> None:
         config = root / "chapter.toml"
         config.write_text(
             f'base = "{ROOT / "configs/worldgen_slack/worldgen.toml"}"\nworld = "{parent.resolve()}"\n'
-            f'output = "{root / "out"}"\nseed = 7\ndays = 2\nmessages = 8\n'
+            f'output = "{root / "out"}"\ntaxonomy = "{ROOT / "configs/worldgen_slack/taxonomy.toml"}"\n'
+            "seed = 7\ndays = 2\nmessages = 8\n"
             '[[material]]\ncategory = "semantic"\nlevel = 4\nneeds = { values = 6 }\n'
             "[settings.author]\ntolerance = 1.0\nshare_tolerance = 1.0\n"
         )

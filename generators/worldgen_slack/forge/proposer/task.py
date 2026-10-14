@@ -38,7 +38,7 @@ def forge_guide(settings: dict) -> str:
     """The proposer's guide, with the forge's own numbers: the solver's tries, and the right-answer rates of the
     middle levels (the bands between the first and the last). It names no model: the proposer knows the solver by
     its tries."""
-    tries, bands = settings["author"]["tries"], settings["tasks"]["bands"]
+    tries, bands = settings["tries"], settings["bands"]
     middle = bands[1:-1] or bands
     low, high = min(b[0] for b in middle), max(b[1] for b in middle)
     return (

@@ -22,20 +22,10 @@ from ..workspace import Workspace, reset_tasks
 
 
 from .clock import spread, start_clock
-from ..config import (
-    ActivityConfig,
-    AuthorSettings,
-    Config,
-    Needs,
-    Section,
-    Text,
-    load_config,
-    merged,
-    pinned,
-    rooted,
-)
+from ..config import Needs, Section, Text, load_taxonomy, merged, pinned, rooted
 from .board import Slot
 from .clock import calendar_days, extend_calendar, frozen_digest, meta
+from .config import ActivityConfig, AuthorSettings, WorldConfig, load_world
 from .env import WorldEnv
 from ..store import RunState, Store
 
@@ -47,20 +37,21 @@ class Material(Section):
     category: Text
     level: int = Field(ge=1)
     count: int = Field(default=1, ge=1, le=20)
-    concept: Text | None = (
-        None  # what the entries are about; the seed draws one of the level's concepts when unset
-    )
+    # what the entries are about; the seed draws one of the level's concepts when unset
+    concept: Text | None = None
     needs: dict = Field(default_factory=dict)
 
 
 class ChapterConfig(Section):
     """One chapter, configured in one file: the finished world it continues, its days and messages, the storylines it
-    adds, when the judge reviews it (days counted from its first), its brief, and what it changes of the base
-    configuration's settings, merged by key. `seed` is the chapter's own, so that two chapters of one world differ."""
+    adds, when the judge reviews it (days counted from its first), its brief and the taxonomy its entries are cells
+    of, and what it changes of the base configuration's settings, merged by key. `seed` is the chapter's own, so that
+    two chapters of one world differ."""
 
-    base: Path  # the configuration the world was generated with (its sector, people, taxonomy and roles)
+    base: Path  # the configuration the world was generated with (its sector, people and seats)
     world: Path  # the finished run or chapter it continues
     output: Path
+    taxonomy: Path  # taxonomy.toml: the cells its brief's entries are, and the question styles drawn for them
     seed: int = Field(ge=0)
     days: int = Field(ge=1, le=30)
     messages: int = Field(ge=1, le=5000)
@@ -80,21 +71,18 @@ def parent_world(path: Path) -> Workspace:
     return Workspace(path / "world.sqlite")
 
 
-def load_chapter(path: Path) -> tuple[ChapterConfig, Config]:
+def load_chapter(path: Path) -> tuple[ChapterConfig, WorldConfig]:
     """The chapter's configuration, and the settings it runs under (`chapter_settings`)."""
     chapter = ChapterConfig.model_validate(tomllib.loads(path.read_text()))
-    chapter.base, chapter.world, chapter.output = (
-        rooted(chapter.base),
-        rooted(chapter.world),
-        rooted(chapter.output),
-    )
-    return chapter, chapter_settings(chapter, load_config(chapter.base))
+    chapter.base, chapter.world = rooted(chapter.base), rooted(chapter.world)
+    chapter.output, chapter.taxonomy = rooted(chapter.output), rooted(chapter.taxonomy)
+    return chapter, chapter_settings(chapter, load_world(chapter.base))
 
 
-def chapter_settings(chapter: ChapterConfig, base: Config) -> Config:
+def chapter_settings(chapter: ChapterConfig, base: WorldConfig) -> WorldConfig:
     """The settings a chapter runs under: the base's, with its changes, its seed and output, its messages, the
-    storylines in all (the parent's and its own), and its review days on the calendar. The parent is a finished
-    world that breaks none of the world's rules, and each material is a cell of the taxonomy."""
+    storylines in all (the parent's and its own), its review days on the calendar, and its taxonomy. The parent is a
+    finished world that breaks none of the world's rules, and each material is a cell of the taxonomy."""
     state = json.loads((chapter.world / "state.json").read_text())
     if state.get("phase") != "done":
         raise ValueError(
@@ -115,12 +103,15 @@ def chapter_settings(chapter: ChapterConfig, base: Config) -> Config:
             "activity": {"messages": chapter.messages},
         },
     )
+    taxonomy = load_taxonomy(chapter.taxonomy)
     fixed = {
         "output": str(chapter.output),
         "seed": chapter.seed,
         "storylines": storylines + chapter.storylines,
+        "taxonomy": taxonomy.model_dump(mode="json")["categories"],
+        "styles": taxonomy.styles,
     }
-    settings = Config.model_validate(merged(base.model_dump(mode="json"), changes) | fixed)
+    settings = WorldConfig.model_validate(merged(base.model_dump(mode="json"), changes) | fixed)
     for m in chapter.material:
         spec = settings.taxonomy.get(m.category)
         if spec is None or not 1 <= m.level <= len(spec.levels):
@@ -133,7 +124,7 @@ def version_of(world) -> int:
     return int(meta(world, "version", 1))
 
 
-def brief_slots(chapter: ChapterConfig, settings: Config, version: int) -> list[Slot]:
+def brief_slots(chapter: ChapterConfig, settings: WorldConfig, version: int) -> list[Slot]:
     """The brief as slots on the board: each material's entries, ids `{category}-l{level}-v{version}-{n}` (a forge
     reads an entry's category from its id), each with its level's needs under the material's, always fresh, and a
     concept (a cell's entries walk its level's concepts in a seeded order) and a question style the seed draws."""
@@ -157,7 +148,7 @@ def brief_slots(chapter: ChapterConfig, settings: Config, version: int) -> list[
                     category=m.category,
                     level=m.level,
                     concept=concept,
-                    style=rng.choice(settings.tasks.styles),
+                    style=rng.choice(settings.styles),
                     needs=needs,
                 )
             )
@@ -226,7 +217,7 @@ def last_day_attempt(path: Path) -> str:
     return closed[-1]["attempt"]
 
 
-def adopt(store: Store, chapter: ChapterConfig, settings: Config, slots: list[Slot]) -> None:
+def adopt(store: Store, chapter: ChapterConfig, settings: WorldConfig, slots: list[Slot]) -> None:
     """The parent, frozen, as the chapter's start: its world with no tasks, its calendar running on by the chapter's
     days, its segments and the chapter's, the lineage (version, the parent's hash, the chapter's first day, the digest
     of everything before it), the brief's needs, the present at the chapter's first morning; its premise, people,
@@ -299,7 +290,7 @@ class ChapterEnv(WorldEnv):
     """The world author in a chapter: the plan of its days, its days, and a final review of the world, with no
     tasks; its reviews read the earlier chapters as written and frozen."""
 
-    def __init__(self, chapter: ChapterConfig, settings: Config, store: Store, slots: list[Slot]):
+    def __init__(self, chapter: ChapterConfig, settings: WorldConfig, store: Store, slots: list[Slot]):
         self.chapter, self.slots = chapter, slots
         super().__init__(settings, store)
 
@@ -313,7 +304,7 @@ class ChapterEnv(WorldEnv):
         return await self.author_world(agents)
 
 
-def provenance(chapter: ChapterConfig, settings: Config) -> dict:
+def provenance(chapter: ChapterConfig, settings: WorldConfig) -> dict:
     """Everything a resumed chapter must share with its start: its configuration and settings, the world it continues
     (by hash), the pinned framework and the lock file."""
     return {
@@ -323,7 +314,7 @@ def provenance(chapter: ChapterConfig, settings: Config) -> dict:
     } | pinned()
 
 
-def dry_run(chapter: ChapterConfig, settings: Config) -> dict:
+def dry_run(chapter: ChapterConfig, settings: WorldConfig) -> dict:
     """What a chapter would start from, spending nothing: the parent, the version it makes, the new days with their
     quotas before the plan marks event days, the brief with each entry's needs, and the storylines."""
     world = parent_world(chapter.world)

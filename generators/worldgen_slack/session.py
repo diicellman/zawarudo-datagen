@@ -23,11 +23,12 @@ from verifiers.v1.utils.interrupt import cleaning_up
 from worldgen_slack import slack
 from worldgen_slack.world import file_hash
 
-from .config import Config, PipelineConfig
+from .config import Seats
 from .store import ReviewLimit, SessionLost, Store
 from .workspace import Workspace
 from .world.author.memory import files, now_page, view
 from .world.cast import cards, selves
+from .world.config import WorldConfig
 from .world.organization import channel_id
 
 ARCHIVE = "/tmp/task-files.tgz"
@@ -127,15 +128,16 @@ SETUP_FILES = (
 )
 
 
-class SessionEnv(vf.Env[PipelineConfig]):
+class SessionEnv(vf.Env[Seats]):
     """An env whose author works in one VM for the whole run, one interaction per block of work: the VM provisioned
     again after a lost session, code's memory rendered before every turn, and the notes an attempt kept brought back.
     A subclass says which seat works its blocks, what the VM is provisioned with, and what its blocks are."""
 
     seat = "author"  # the seat whose agent works in the VM
-    seats = ("author", "judge", "solver", "witness")  # every seat of the run, none trained
+    seats = ("author", "judge")  # every seat of the run, none trained
 
-    def __init__(self, settings: Config, store: Store):
+    def __init__(self, settings, store: Store):
+        """`settings` is the run's (a world's or a forge's), whose `env` holds its seats."""
         self.settings, self.store = settings, store
         apply_network_notice()
         super().__init__(settings.env)
@@ -317,7 +319,7 @@ class WorldReads:
     vf.Toolset; the tools keep no state of their own, so with the base state a call makes no state round trip through
     the tunnel."""
 
-    settings_model: type[Config] = Config  # what the context's settings validate as
+    settings_model: type = WorldConfig  # what the context's settings validate as
 
     async def setup(self) -> None:
         self._lock = asyncio.Lock()

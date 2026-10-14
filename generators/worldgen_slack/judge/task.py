@@ -203,10 +203,13 @@ def thaw(verdict: Verdict, world) -> tuple[Verdict, list[Issue]]:
     return verdict.model_copy(update={"issues": kept}), apart
 
 
-async def review(store, agents, payload: dict, attempt: str, max_rows: int, files=None, label="") -> Verdict:
+async def review(
+    store, agents, payload: dict, attempt: str, max_rows: int = 5, files=None, label=""
+) -> Verdict:
     """One review by the judge, kept with its attempt: its input, its verdict, and the issues a chapter's frozen past
-    sets apart. `files` maps /task file names to trace records the judge may investigate; `label` names one of an
-    attempt's several reviews. A malformed verdict is absorbed by one fresh rerun."""
+    sets apart. `max_rows` bounds a reviewed task's gold rows (a world review has none); `files` maps /task file
+    names to trace records the judge may investigate; `label` names one of an attempt's several reviews. A malformed
+    verdict is absorbed by one fresh rerun."""
     suffix, files = ("-" + label if label else ""), files or {}
     store.artifact(attempt, "review_input" + suffix, payload)
     store.event("review_started", attempt=attempt, label=label, task_ids=[t["id"] for t in payload["tasks"]])

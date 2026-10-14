@@ -20,7 +20,6 @@ from types import SimpleNamespace
 import random
 import re
 import tempfile
-import tomllib
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -99,11 +98,13 @@ from .judge.verdict import read_one_way
 from .session import context_of, ended, keep_awake
 from .store import ReviewLimit, SessionLost, Store
 from .forge.release import miss_class, publish, release_rows, write_release
-from .forge.env import ForgeConfig, ForgeEnv, bucket, measured_level
+from .forge.config import ForgeConfig, load_forge
+from .forge.env import ForgeEnv, bucket, measured_level
 from .forge.env import measured as forge_measured
 from .forge.profile import profile
 from .forge.env import provenance as forge_provenance
-from .config import ROOT, Category, Config, ForgeSettings, Needs
+from .config import ROOT, Category, Needs, load_taxonomy
+from .world.config import WorldConfig
 from .forge.difficulty import IDENTIFIER, failure_cases, features, measures, panel
 from .forge.tasks import Task, check_task, record_task
 from .world.board import Slot, needs_text
@@ -781,7 +782,7 @@ def check_tasks(root):
         "reactions.emoji",
     ], "a gold query's own columns are read off"
     assert len(world.gold("U1", every, max_rows=2)["rows"]) == 3, "one row past the cap shows the cap was hit"
-    settings = contracts_settings(root)
+    settings = forge_of(contracts_settings(root))
     who = "SELECT u.real_name AS answer, m.id AS message_id FROM messages m JOIN users u ON u.id = m.user_id"
 
     def lookup(sql):
@@ -900,24 +901,43 @@ def seed_person(i, zone="America/Chicago"):
     )
 
 
-def contracts_settings(root):
+# The checks' own taxonomy, a copy of configs/worldgen_slack/taxonomy.toml, and the bands its forge configs state.
+TAXONOMY = Path(__file__).parent / "tests/fixtures/taxonomy.toml"
+BANDS = [(0.75, 1.0), (0.5, 0.75), (0.25, 0.5), (0.0, 0.25)]
+
+
+def contracts_settings(root) -> WorldConfig:
+    """A world's settings, with the checks' taxonomy as a chapter's."""
     gaps = root / "gaps.json"
     gaps.write_text(json.dumps({"quantiles": [i * 7.2 for i in range(1001)]}) + "\n")
-    spec = tomllib.loads((Path(__file__).parent / "tests/fixtures/taxonomy.toml").read_text())
-    return Config.model_validate(
+    taxonomy = load_taxonomy(TAXONOMY)
+    return WorldConfig.model_validate(
         {
             "sector": "software",
             "seed": 3,
             "output": str(root / "run"),
             "personas": {"path": str(root / "p.jsonl"), "typing": str(root / "t.jsonl"), "gaps": str(gaps)},
             "storylines": 2,
-            "tasks": {
-                "bands": spec["tasks"]["bands"],
-                "max_answer_rows": 2,
-                "styles": spec["tasks"]["styles"],
-            },
-            "taxonomy": spec["taxonomy"],
+            "taxonomy": taxonomy.model_dump(mode="json")["categories"],
+            "styles": taxonomy.styles,
         }
+    )
+
+
+def forge_of(settings: WorldConfig, **changes) -> ForgeConfig:
+    """A forge on a world with these settings: their taxonomy, the checks' bands, gold of at most 2 rows, and the
+    world's seats, its proposer seated as its author is (as each forge config states it)."""
+    seats = settings.env.model_dump(mode="json")
+    return ForgeConfig.model_validate(
+        {
+            "world": str(settings.output),
+            "output": str(settings.output),
+            "taxonomy": settings.model_dump(mode="json")["taxonomy"],
+            "bands": BANDS,
+            "max_answer_rows": 2,
+            "env": {k: v for k, v in seats.items() if k != "author"} | {"proposer": seats["author"]},
+        }
+        | changes
     )
 
 
@@ -1013,16 +1033,17 @@ def check_contracts(root):
     on a planned ledger (T2-T7), the agenda of everyday conversations; no literal times."""
     root.mkdir(parents=True)
     settings = contracts_settings(root)
+    tasks = forge_of(settings)
     for wrong in ({"concepts": [["x"]]}, {"needs": [{}]}, {"concepts": [["x"], [], ["y"]]}):
         fails(Category.model_validate, settings.taxonomy["semantic"].model_dump() | wrong)
-    whole = settings.model_dump(mode="json")
-    fails(
-        Config.model_validate, whole | {"tasks": whole["tasks"] | {"bands": whole["tasks"]["bands"][:2]}}
-    )  # 3 levels
-    fails(
-        Config.model_validate,
-        whole | {"tasks": whole["tasks"] | {"bands": [[0.5, 0.25]] * len(whole["tasks"]["bands"])}},
+    toml = root / "forge.toml"
+    toml.write_text(
+        f'world = "{root}"\noutput = "{root / "forge"}"\ntaxonomy = "{TAXONOMY}"\nbands = {json.dumps(BANDS)}\n'
     )
+    assert load_forge(toml).taxonomy == tasks.taxonomy, "a forge reads the taxonomy its config names"
+    whole = tasks.model_dump(mode="json")
+    fails(ForgeConfig.model_validate, whole | {"bands": whole["bands"][:2]})  # 3 levels
+    fails(ForgeConfig.model_validate, whole | {"bands": [[0.5, 0.25]] * len(whole["bands"])})
     jobs = ["software_developer"] * 3 + ["accountant_or_auditor"] * 2 + ["manager"]
     people = [seed_person(i).model_copy(update={"occupation": job}) for i, job in enumerate(jobs)]
     (root / "p.jsonl").write_text("".join(p.model_dump_json() + "\n" for p in people))
@@ -1159,7 +1180,7 @@ def check_contracts(root):
         try:
             with world.trial() as copy:
                 setup(copy)
-                record_task(copy, task_, settings_ or settings, slot_)
+                record_task(copy, task_, settings_ or tasks, slot_)
                 raise LookupError([r[0] for r in copy.db.execute("SELECT id FROM tasks ORDER BY id")])
         except LookupError as out:
             return out.args[0]
@@ -1215,20 +1236,20 @@ def check_contracts(root):
     )
     assert "t1" in recorded(nobody, slot("robustness", 1)), "nor a refusal"
     with world.trial() as copy:
-        record_task(copy, search, settings, found)
+        record_task(copy, search, tasks, found)
     assert json.loads(world.db.execute("SELECT gold_json FROM tasks").fetchone()[0]) == [
         {"answer": "rollback"}
     ]
     assert world.db.execute("SELECT concept FROM tasks").fetchone()[0] == "a concept", (
         "the slot's concept is stored"
     )
-    fails(record_task, world, task(id="t2"), settings, slot("search", 1, id="t2"))  # t1 asks it
+    fails(record_task, world, task(id="t2"), tasks, slot("search", 1, id="t2"))  # t1 asks it
     refused(
         "its answer differs for them",
         record_task,
         world,
         task(id="t2", actor_id=d),
-        settings,
+        tasks,
         slot("search", 1, id="t2"),
     )  # d asks it too, and gets t1's answer
 
@@ -1246,7 +1267,7 @@ def check_contracts(root):
     assert "t3" in recorded(
         count("t3", c),
         slot("lookup", 1, id="t3"),
-        setup=lambda copy: record_task(copy, count("t2", a), settings, slot("lookup", 1, id="t2")),
+        setup=lambda copy: record_task(copy, count("t2", a), tasks, slot("lookup", 1, id="t2")),
     ), "a perspective twin: another asker, another answer"
 
     def settled(facts):  # a level-3 semantic task needs its facts first stated in 2 channels
@@ -1304,7 +1325,7 @@ def check_contracts(root):
         try:
             with world.trial() as copy:
                 setup(copy)
-                raise LookupError(record_task(copy, task_, settings, slot_))
+                raise LookupError(record_task(copy, task_, tasks, slot_))
         except LookupError as out:
             return out.args[0]
 
@@ -1380,13 +1401,13 @@ def check_contracts(root):
         facts=["f3", "f7"],
     )
     three = slot("robustness", 3, id="t9")
-    assert "t9" in recorded(status, three, settings, stale)
+    assert "t9" in recorded(status, three, tasks, stale)
     refused(
         "out of its actor's sight, that supersedes the value it gives",
         recorded,
         status.model_copy(update={"facts": ["f7"]}),
         three,
-        settings,
+        tasks,
         stale,
     )  # nothing settles it
     refused(
@@ -1394,7 +1415,7 @@ def check_contracts(root):
         recorded,
         status.model_copy(update={"actor_id": a}),
         three,
-        settings,
+        tasks,
         stale,
     )  # a reads #leads: f3 is the answer
     refused(
@@ -1402,7 +1423,7 @@ def check_contracts(root):
         recorded,
         status.model_copy(update={"gold_sql": "SELECT value AS answer FROM facts WHERE id = 'f3'"}),
         three,
-        settings,
+        tasks,
         stale,
     )
     refused(
@@ -1410,7 +1431,7 @@ def check_contracts(root):
         recorded,
         status.model_copy(update={"gold_sql": "SELECT real_name AS answer FROM users LIMIT 1"}),
         three,
-        settings,
+        tasks,
         stale,
     )
 
@@ -1435,7 +1456,7 @@ def check_contracts(root):
                     )
                 ],
             )  # out of c's sight
-            record_task(copy, asked, settings, nine)
+            record_task(copy, asked, tasks, nine)
             raise LookupError(failure_cases(copy, "t9", [{"answer": "Owen"}]))
     except LookupError as out:
         gold, cases = out.args[0]
@@ -1498,7 +1519,7 @@ def check_contracts(root):
     try:
         with world.trial() as copy:
             chain(copy)
-            record_task(copy, window, settings, nine)
+            record_task(copy, window, tasks, nine)
             count = Task(
                 id="t8",
                 category="lookup",
@@ -1508,7 +1529,7 @@ def check_contracts(root):
                 answer_type="number",
                 gold_sql="SELECT COUNT(*) AS answer FROM messages",
             )
-            counted = record_task(copy, count, settings, slot("lookup", 1, id="t8"))["gold"]
+            counted = record_task(copy, count, tasks, slot("lookup", 1, id="t8"))["gold"]
             who = window.model_copy(
                 update={
                     "id": "t7",
@@ -1516,7 +1537,7 @@ def check_contracts(root):
                     "gold_sql": "SELECT u.real_name AS answer FROM facts f JOIN users u ON u.id = f.author_id WHERE f.id = 'f3'",
                 }
             )
-            settler = record_task(copy, who, settings, slot("semantic", 3, id="t7"))["gold"]
+            settler = record_task(copy, who, tasks, slot("semantic", 3, id="t7"))["gold"]
             raise LookupError(
                 (
                     panel(copy, "t9", [{"answer": "dry run"}]),
@@ -1548,13 +1569,13 @@ def check_contracts(root):
         )
         copy.insert("evidence", [dict(fact_id="f3", message_id=truth, role="anchor", anchor_token="dry run")])
 
-    assert "t9" in recorded(status, three, settings, stated_unseen), (
+    assert "t9" in recorded(status, three, tasks, stated_unseen), (
         "a status rests on its truth stated out of sight"
     )
     try:
         with world.trial() as copy:
             stated_unseen(copy)
-            raise LookupError(record_task(copy, unseen, settings, four))
+            raise LookupError(record_task(copy, unseen, tasks, four))
     except LookupError as out:
         measured = out.args[0]
     assert (measured["unseen"], measured["evidence_pages"], measured["decoys"]) == (1, None, 1), (
@@ -1570,7 +1591,7 @@ def check_contracts(root):
     unread = Task(
         id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
     )  # in leads
-    fails(record_task, world, unread, settings, slot("hybrid", 1, id="h1"))  # its actor cannot read its fact
+    fails(record_task, world, unread, tasks, slot("hybrid", 1, id="h1"))  # its actor cannot read its fact
     read = Task(id="h1", question="How many messages surround the rollback?", facts=["f1"], **hybrid)
     assert "h1" in recorded(read, slot("hybrid", 1, id="h1"))
     small = settings.activity.model_copy(update={"conversation_lines": 4})
@@ -1604,17 +1625,16 @@ def check_contracts(root):
         "v2",
     ]
     # Every seat that runs code needs an immutable VM with no egress: the world's author, and the forge's proposer.
-    forge = seated(settings)
-    for seat in ("author", "proposer"):
-        agent = getattr(forge.env, seat)
+    for config, seat in ((settings, "author"), (tasks, "proposer")):
+        agent = getattr(config.env, seat)
         loose = agent.model_copy(
             update={"runtime": agent.runtime.model_copy(update={"image": "python:3.12-slim"})}
         )
         refused(
             f"{seat} executes code, so it requires an immutable Prime VM",
-            ForgeSettings.model_validate,
-            forge.model_dump(mode="json")
-            | {"env": forge.env.model_dump(mode="json") | {seat: loose.model_dump(mode="json")}},
+            type(config).model_validate,
+            config.model_dump(mode="json")
+            | {"env": config.env.model_dump(mode="json") | {seat: loose.model_dump(mode="json")}},
         )
     print(
         "PASS contracts: cast, premise, organization, task gold (T2-T7) on a planned ledger, agenda, no literal times"
@@ -2370,7 +2390,7 @@ def check_clock(root):
             setup(copy)
             copy.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
             copy.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
-            return record_task(copy, task, settings, slot)
+            return record_task(copy, task, forge_of(settings), slot)
 
     def posted_(conversation):
         with world.trial() as copy:
@@ -2992,7 +3012,10 @@ async def check_tools(root):
         set(described) == reads | {"plan", "post", "advance", "revise", "edit"}
         and served.server_name == "world"
     )
-    proposer = ProposerTask.create(world.path, context, "forge-check")
+    forge = {
+        "settings": json.loads(forge_of(settings).model_dump_json())
+    }  # a forge's settings in its context
+    proposer = ProposerTask.create(world.path, context | forge, "forge-check")
     (proposing,) = proposer.toolsets(proposer.config)
     with_state(proposing)
     proposed = await served_tools(proposing)
@@ -3897,21 +3920,36 @@ def world_seats():
     return ScriptedAuthor(script), Judge(), fixed, reviewed
 
 
-def seated(settings) -> ForgeSettings:
-    """A world's settings as a forge runs under them: its proposer seated as its author is, as each forge config states
-    it."""
-    seats = settings.env.model_dump(mode="json")
-    return ForgeSettings.model_validate(
-        settings.model_dump(mode="json") | {"env": seats | {"proposer": seats["author"]}}
+def taxonomy_toml(settings: WorldConfig) -> str:
+    """A world's taxonomy and question styles as taxonomy.toml holds them (the flows' categories have no needs)."""
+    lines = [f"styles = {json.dumps(settings.styles)}"]
+    for name, category in settings.taxonomy.items():
+        lines.append(f"\n[categories.{name}]")
+        lines += [
+            f"{k} = {json.dumps(v)}" for k, v in category.model_dump(mode="json", exclude_none=True).items()
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def flow_forge(settings, **plan) -> ForgeConfig:
+    """The flows' forge on a world of these settings: 3 tries of a candidate, one task in a review, 2 tries at once,
+    and level 3's band starting at 0, so the witness tries its tasks."""
+    return forge_of(
+        settings,
+        bands=[(0.75, 1.0), (0.5, 0.75), (0.0, 0.5)],
+        tries=3,
+        review_chunk=1,
+        solvers=2,
+        keepalive=0.0005,
+        **plan,
     )
 
 
 def flow_run_settings(root):
-    """The flows' settings: a 4-day world of 16 messages, a review after day 2, 3 tries of a task."""
+    """The flows' settings: a 4-day world of 16 messages, a review after day 2."""
     base = flow_settings(root, 3)
-    cut = {
-        "robustness": 2
-    }  # S1's 17 cells, without needs: the flow's scripted tasks are not built to taxonomy v2
+    # S1's 17 cells, without needs: the flow's scripted tasks are not built to taxonomy v2
+    cut = {"robustness": 2}
     flow = {
         n: c.model_copy(
             update={
@@ -3927,18 +3965,8 @@ def flow_run_settings(root):
             "taxonomy": flow,
             "calendar": base.calendar.model_copy(update={"days": 4}),
             "activity": base.activity.model_copy(update={"messages": 16}),
-            # level 3's band starts at 0, so the witness tries its tasks
-            "tasks": base.tasks.model_copy(update={"bands": [(0.75, 1.0), (0.5, 0.75), (0.0, 0.5)]}),
             "author": base.author.model_copy(
-                update={
-                    "tolerance": 1.0,
-                    "share_tolerance": 1.0,
-                    "review_days": [2],
-                    "tries": 3,
-                    "review_chunk": 1,
-                    "solvers": 2,
-                    "keepalive": 0.0005,
-                }
+                update={"tolerance": 1.0, "share_tolerance": 1.0, "review_days": [2], "keepalive": 0.0005}
             ),
         }
     )
@@ -4786,9 +4814,10 @@ async def check_author(root):
     )
     # A solver samples as a policy in training does, so its tries differ; a rate comes with its 90% interval, wide
     # at a few tries.
+    seats = flow_forge(settings, world=root, output=root).env
     assert (
-        settings.env.solver.sampling.temperature == 1.0 == settings.env.witness.sampling.temperature
-        and settings.env.judge.sampling.temperature == 0.0
+        seats.solver.sampling.temperature == 1.0 == seats.witness.sampling.temperature
+        and seats.judge.sampling.temperature == 0.0
     )
     assert rates([{"correct": i < 6, "semantic_correctness": 0.0} for i in range(8)])["right_interval"] == [
         0.46,
@@ -4876,20 +4905,17 @@ async def check_author(root):
     )
     source_world = Workspace(world_dir / "world.sqlite")
     # The forge: tasks proposed on the finished world, which stays frozen; what the judge approves is kept.
-    forge_settings = seated(settings)
-    plan = ForgeConfig(
-        base=Path("worldgen.toml"), world=world_dir, output=root / "forge", rounds=2, candidates=2, tasks=30
-    )
+    plan = flow_forge(settings, world=world_dir, output=root / "forge", rounds=2, candidates=2, tasks=30)
     workspace = source_world.db.execute(
         "SELECT group_concat(id || ':' || text, '|') FROM messages"
     ).fetchone()[0]
-    forged = TestStore(plan.output, forge_provenance(plan, forge_settings))
+    forged = TestStore(plan.output, forge_provenance(plan))
 
     Forging = ForgeEnv
 
     ScriptedAgent.traced.clear()
     store.state.active_attempt = "forge"  # the scripted solver names its tries by the run it reads
-    await Forging(plan, forge_settings, forged).run(None, agents)
+    await Forging(plan, forged).run(None, agents)
     assert [x[1] for x in seen if x[0] == "forge"] == [("r01-01", "r01-02"), ("r02-01", "r02-02")]
     chunks = {
         a: sorted(s[6] for s in seen if s[:3] == ("review", a, "task")) for a in ("round-01", "round-02")
@@ -4945,8 +4971,8 @@ async def check_author(root):
     # The forge's tries, as the forge keeps them. The witness tried the task the solver rarely answers, twice; an
     # unchanged task keeps its witness. The scripted solver counts these tries apart from the forge runs'.
     store.state.active_attempt = "check"
-    forge_env = Forging(plan, forge_settings, forged)
-    assert len(forged.state.witness["r02-01"]["results"]) == settings.author.witness_tries
+    forge_env = Forging(plan, forged)
+    assert len(forged.state.witness["r02-01"]["results"]) == plan.witness_tries
     assert any(x[0] == "witnessed" and "r02-01" in x[2] and x[3] == 2 for x in seen), (
         "the judge reads the witness's tries"
     )
@@ -4980,7 +5006,7 @@ async def check_author(root):
             return FakeTrace("slow", "solver", info={"evaluation": evaluation}, task=task)
 
     await forge_env.tries.solves(SimpleNamespace(solver=Slow()), ["r01-01", "r02-01"], "check", 3)
-    assert Slow.peak == settings.author.solvers == 2, Slow.peak
+    assert Slow.peak == plan.solvers == 2, Slow.peak
 
     class Crashing(ScriptedAgent):
         async def run(self, task):
@@ -5002,7 +5028,7 @@ async def check_author(root):
     summary = forged.summary("complete")
     assert (
         summary["rates"]["r02-01"]["crashed"] == 1
-        and summary["rates"]["r02-01"]["tries"] == settings.author.tries - 1
+        and summary["rates"]["r02-01"]["tries"] == plan.tries - 1
         and summary["rates"]["r01-01"]["level"] == 2
     ), summary["rates"]
     assert summary["witness_tries"] == 2 and summary["crashed_solves"] == 1, summary
@@ -5136,7 +5162,7 @@ async def check_author(root):
             reviews[r.task_id]["right_rate"],
             reviews[r.task_id]["strict_rate"],
             reviews[r.task_id]["tries"],
-            settings.env.solver.model,
+            plan.env.solver.model,
         )
         for r in rows
     ), "each task's rates are published"
@@ -5144,7 +5170,7 @@ async def check_author(root):
         "each task's surface, turns and misses"
     )
     assert {r.task_id: (r.witness, r.witness_right) for r in rows if r.witness} == {
-        "r02-01": (settings.env.witness.model, 1.0)
+        "r02-01": (plan.env.witness.model, 1.0)
     }, "the witness, on the task it tried"
     # A task ships with the wrong answers its grade must reject: one the answer judge accepts makes it ambiguous as
     # asked, and it is not approved, whatever its tries.
@@ -5182,7 +5208,7 @@ async def check_author(root):
     assert sum(solved.values()) == tried, "an unchanged task was solved again"
     store.state.active_attempt = "forge"
     # A cell keeps the candidate GLM's tries are most mixed on; the lowest band also needs the witness to answer it.
-    assert [measured_level(r, settings.tasks.bands) for r in (1.0, 0.75, 0.6, 0.5, 0.25, 0.0)] == [
+    assert [measured_level(r, plan.bands) for r in (1.0, 0.75, 0.6, 0.5, 0.25, 0.0)] == [
         1,
         1,
         2,
@@ -5206,7 +5232,7 @@ async def check_author(root):
     # A place holds two tasks. A newcomer to a full one replaces a holder if GLM's tries are more mixed on it, or if
     # it brings a structure the place lacks while two holders share one; else it is dropped.
     weigher, actor = (
-        Forging(plan, forge_settings, forged),
+        Forging(plan, forged),
         forged.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0],
     )
     newest = Task(
@@ -5270,9 +5296,7 @@ async def check_author(root):
         ),  # a new structure
     ):
         with forged.world.trial() as copy:
-            forge_task(
-                copy, task_.model_copy(update={"id": open_id, "question": question}), settings, [open_id]
-            )
+            forge_task(copy, task_.model_copy(update={"id": open_id, "question": question}), plan, [open_id])
         forged.state.solves[open_id] = {"key": "k", "results": [], "traces": []}
         forged.state.forged[open_id] = weigher.place(
             open_id, {"right_rate": right, "witness_right": witness}, None, "x"
@@ -5286,13 +5310,13 @@ async def check_author(root):
     assert any(line.startswith("- lookup·structure: ") and " kept" in line for line in steering) and any(
         line.startswith("- search·when: ") for line in steering
     ), steering
-    pages_ = Forging(plan, forge_settings, forged).pages()
+    pages_ = Forging(plan, forged).pages()
     assert (
         "## What this forge has measured" in pages_["memory/archive.md"]
         and steering[0] in pages_["memory/archive.md"]
         and "- promised: what someone promised" in pages_["memory/taxonomy.md"]
     )
-    assert settings.env.witness.sampling.reasoning_effort == "high", "the witness thinks hard"
+    assert plan.env.witness.sampling.reasoning_effort == "high", "the witness thinks hard"
     assert (forged.state.forged["r01-01"]["verdict"], forged.state.forged["r09-02"]["verdict"]) == (
         "replaced by r09-02",
         "replaced by r09-04",
@@ -5327,7 +5351,7 @@ async def check_author(root):
         update={"id": "r09-05", "question": "Who is the newest person here, r09-05?"}
     )
     with forged.world.trial() as copy:
-        forge_task(copy, readable, settings, ["r09-05"])
+        forge_task(copy, readable, plan, ["r09-05"])
     forged.state.task_issues["r09-05"] = [i for i in ruled.issues if "r09-05" in i.task_ids]
     sent = weigher.place("r09-05", None, None, "x")
     gold_answer = [
@@ -5359,12 +5383,12 @@ async def check_author(root):
     ):
         try:
             with forged.world.trial() as copy:
-                forge_task(copy, bad, settings, ["r09-06"], rework=rework)
+                forge_task(copy, bad, plan, ["r09-06"], rework=rework)
             raise AssertionError(f"a rewording was accepted: {bad}")
         except ValueError as error:
             assert why in str(error), error
     with forged.world.trial() as copy:
-        forge_task(copy, again, settings, ["r09-06"], rework=rework)
+        forge_task(copy, again, plan, ["r09-06"], rework=rework)
     # Code classes each wrong try: out of turns, evidence never shown, or all of it shown and answered otherwise.
     tried = [
         {"correct": False, "unanswered": True, "reason": EMPTY},
@@ -5388,12 +5412,10 @@ async def check_author(root):
         )
     ] == ["abstained", "overclaim", "trap", "saw_all"]
     forged.close()
-    fails(
-        Store, plan.output, forge_provenance(plan.model_copy(update={"rounds": 3}), forge_settings)
-    )  # its own config only
+    fails(Store, plan.output, forge_provenance(plan.model_copy(update={"rounds": 3})))  # its own config only
     # A forge stops early: at its goal (here, one task and no board), or after two rounds that place nothing. A goal
     # the archive's places cannot hold is refused.
-    fails(Forging, plan.model_copy(update={"tasks": 1000}), settings, forged)
+    fails(Forging, plan.model_copy(update={"tasks": 1000}), forged)
     crashes.clear()  # the forge above is the one whose solver crashes
     for name, changes, vague, rounds in (
         ("forge-full", {"tasks": 1}, False, 1),
@@ -5404,9 +5426,9 @@ async def check_author(root):
         early = plan.model_copy(update={"output": root / name, "rounds": 4} | changes)
         forging["vague"], early_store = (
             vague,
-            TestStore(early.output, forge_provenance(early, forge_settings)),
+            TestStore(early.output, forge_provenance(early)),
         )
-        env_ = Forging(early, forge_settings, early_store)
+        env_ = Forging(early, early_store)
         env_.adopt()
         early_store.world.db.execute("DELETE FROM board")
         await env_.run(None, agents)
@@ -5432,7 +5454,7 @@ async def check_author(root):
                 answer_type="number",
                 gold_sql="SELECT COUNT(*) AS answer FROM messages",
             ),
-            settings,
+            plan,
             Slot(id="extra-l2", category="join", level=2, concept="c", style="s"),
         )
     source_ids = sorted(t for (t,) in extra.db.execute("SELECT id FROM tasks"))
@@ -5443,10 +5465,10 @@ async def check_author(root):
         update={"world": source, "output": root / "measured", "rounds": 0, "measure": True, "target": 30}
     )
     measured, turns = (
-        TestStore(measuring.output, forge_provenance(measuring, forge_settings)),
+        TestStore(measuring.output, forge_provenance(measuring)),
         len([x for x in seen if x[0] == "forge"]),
     )
-    await Forging(measuring, forge_settings, measured).run(None, agents)
+    await Forging(measuring, measured).run(None, agents)
     assert (
         "extra-l2" in source_ids
         and sorted(measured.state.forged) == source_ids
@@ -5458,9 +5480,11 @@ async def check_author(root):
     assert any(o["verdict"].startswith("kept") for o in measured.state.forged.values())
     publish(measured)
     measured.close()
-    fails(
-        ForgeConfig, base=Path("w.toml"), world=root, output=root, rounds=0
-    )  # no rounds and nothing to measure
+    refused(
+        "a forge with no rounds only measures",
+        ForgeConfig.model_validate,
+        plan.model_dump(mode="json") | {"rounds": 0, "measure": False},
+    )
     store.close()
     retried = SimpleNamespace(
         ok=False, errors=[SimpleNamespace(type="TaskError", message="malformed verdict")]
@@ -5523,10 +5547,13 @@ async def check_chapter(root, parent, settings):
     )
     assert aged.db.execute("SELECT COUNT(*), group_concat(text) FROM messages").fetchone()[:] == rows
     aged.close()
+    taxonomy = root / "taxonomy.toml"  # the flows' own taxonomy, as a chapter's config names one
+    taxonomy.write_text(taxonomy_toml(settings))
     chapter = ChapterConfig(
         base=Path("worldgen.toml"),
         world=parent,
         output=root / "unit",
+        taxonomy=taxonomy,
         seed=11,
         days=2,
         messages=6,
@@ -5534,12 +5561,14 @@ async def check_chapter(root, parent, settings):
         review_days=[1],
         material=[Material(category="semantic", level=3, needs={"values": 2, "hidden": True})],
     )
-    cfg = chapter_settings(chapter, settings)
+    world_config = settings.model_copy(update={"taxonomy": {}, "styles": []})  # a world's names no taxonomy
+    cfg = chapter_settings(chapter, world_config)
     assert (cfg.storylines, cfg.author.review_days, cfg.activity.messages, cfg.seed) == (3, [5], 6, 11), cfg
+    assert (cfg.taxonomy, cfg.styles) == (settings.taxonomy, settings.styles), "the chapter's own taxonomy"
     fails(
         chapter_settings,
         chapter.model_copy(update={"material": [Material(category="nowhere", level=1)]}),
-        settings,
+        world_config,
     )
     fails(ChapterConfig, **chapter.model_dump() | {"review_days": [2]})  # a review after the last day
     before = Workspace(parent / "world.sqlite")
@@ -5898,19 +5927,17 @@ async def check_chapter(root, parent, settings):
         Store, run.output, chapter_provenance(run.model_copy(update={"days": 3}), cfg)
     )  # its own config only
     # A forge on the version the chapter leaves: the brief is its board; the earlier entries were covered before.
-    forge = ForgeConfig(
-        base=Path("worldgen.toml"), world=run.output, output=root / "forge", rounds=1, candidates=1, tasks=1
-    )
-    forging = TestStore(forge.output, forge_provenance(forge, seated(cfg)))
-    on_chapter = ForgeEnv(forge, seated(cfg), forging)
+    forge = flow_forge(cfg, world=run.output, output=root / "forge", rounds=1, candidates=1, tasks=1)
+    forging = TestStore(forge.output, forge_provenance(forge))
+    on_chapter = ForgeEnv(forge, forging)
     on_chapter.adopt()
     assert on_chapter.covered()[1] == ["semantic-l3-v2-1"], on_chapter.covered()
     # One round on it, whose task review notes a message of the frozen past: thawed, the note is set apart, and the
     # candidate is kept.
     forging.close()
     with episodes(SimpleNamespace(**forge_seats(note_on=old))):
-        summary = await run_forge(forge, seated(cfg))
-    forging = TestStore(forge.output, forge_provenance(forge, seated(cfg)))
+        summary = await run_forge(forge)
+    forging = TestStore(forge.output, forge_provenance(forge))
     assert summary["status"] == "complete" and forging.state.forged["r01-01"]["verdict"].startswith("kept"), (
         forging.state.forged
     )
@@ -6002,12 +6029,13 @@ def check_prompts(root):
     day, the near-miss queries a task may name."""
     root.mkdir(parents=True)
     settings = contracts_settings(root)
+    forge = forge_of(settings)
     models = [
         settings.env.author.model,
         settings.env.judge.model,
-        settings.env.solver.model,
-        settings.env.witness.model,
-        settings.answer_judge.model,
+        forge.env.solver.model,
+        forge.env.witness.model,
+        forge.answer_judge.model,
         "deepseek/deepseek-v4.1-flash",
     ]
     names = {
@@ -6039,7 +6067,7 @@ def check_prompts(root):
         for m in banned.finditer(text)
     ]
     configured = [
-        settings.tasks.styles,
+        settings.styles,
         *(
             [c.definition, *c.levels, *(x for level in c.concepts for x in level)]
             for c in settings.taxonomy.values()
@@ -6052,16 +6080,11 @@ def check_prompts(root):
         for m in banned.finditer(text)
     ]
     assert not found, "model or run names in what a model reads: " + "; ".join(found)
-    guide = forge_guide(settings.model_dump(mode="json"))
+    guide = forge_guide(forge.model_dump(mode="json"))
     assert "tries each one 8 times" in guide and "right in 25%-75% of its tries" in guide, (
         "the forge's own numbers"
     )
-    other = settings.model_copy(
-        update={
-            "author": settings.author.model_copy(update={"tries": 3}),
-            "tasks": settings.tasks.model_copy(update={"bands": [(0.8, 1.0), (0.2, 0.8), (0.0, 0.2)]}),
-        }
-    )
+    other = forge.model_copy(update={"tries": 3, "bands": [(0.8, 1.0), (0.2, 0.8), (0.0, 0.2)]})
     guide = forge_guide(other.model_dump(mode="json"))
     assert "tries each one 3 times" in guide and "right in 20%-80% of its tries" in guide, guide[:600]
     parts = ", ".join(f"{p} {a:02d}-{b:02d}" for p, (a, b) in PARTS.items())
@@ -6084,7 +6107,8 @@ def check_prompts(root):
             ("chapter", "day", {"chapter": {"first": 5}}),
         )
     }
-    systems["forge"] = ProposerTask.create(world.path, context, "x").data.system_prompt
+    proposing = {"settings": forge.model_dump(mode="json")}
+    systems["forge"] = ProposerTask.create(world.path, proposing, "x").data.system_prompt
     assert (
         all(
             "Nobody states the lesson" in systems[m] and "Stakes move" in systems[m]

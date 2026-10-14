@@ -8,8 +8,8 @@ from pathlib import Path
 import verifiers.v1 as vf
 from worldgen_slack.toolset import watch_parent
 
-from ...config import ForgeSettings
 from ...session import AuthoringToolsConfig, WorldReads
+from ..config import ForgeConfig
 from ..difficulty import failure_cases
 from ..profile import profile
 from ..tasks import Annotation, Task, annotate, forge_task
@@ -19,7 +19,7 @@ class ProposerTools(WorldReads, vf.Toolset[AuthoringToolsConfig, vf.State]):
     """The proposer's tools. It works in one turn, the forge's, writing the ids its round allows."""
 
     TOOL_PREFIX = "world"
-    settings_model = ForgeSettings
+    settings_model = ForgeConfig
 
     def allowed(self) -> dict:
         """What the env allows the proposer's turn at hand, read per call: the ids it may write, and the tasks sent

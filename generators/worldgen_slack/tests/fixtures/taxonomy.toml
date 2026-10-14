@@ -1,6 +1,7 @@
-# The tests' own task settings and taxonomy: a copy of the run config's, so editing a run's config changes no check.
-[tasks]
-bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5], [0.0, 0.25]]
+# The checks' own taxonomy: a copy of configs/worldgen_slack/taxonomy.toml, so that editing the runs' changes no
+# check.
+
+# How a question is asked; the seed draws one per entry, as DataDesigner draws instruction styles.
 styles = [
   "a direct question",
   "a request to look something up, in the imperative",
@@ -8,21 +9,7 @@ styles = [
   "a terse question, the way someone types in a hurry",
 ]
 
-# The task taxonomy (v2, 2026-10-05: a fourth level, robustness levels 3 and 4, and each level's needs). Each world's
-# slots walk its (category, level) cells in an order the run seed draws. `gold` says where an answer comes from:
-# "sql" over what the asker can see, the "ledger" of facts planned before any message is written, or a "hybrid" of
-# both. Every task is written on the finished world.
-# `concepts`, one list per level, are concrete things a task of that level requires; the seed draws one per slot
-# (DataDesigner's complexity -> concept subcategories). `needs`, one table per level, is what code checks a task for
-# when it is written: `channels`, the channels its facts are first stated in; `relations`, supersedes and after links
-# among its facts; `decoys`, its near-misses: decoys, or values whose change the asker cannot see, on its answer's
-# subject and attribute, that the asker can read and nothing in their sight retracts; `hidden`, its answer stated where
-# it is harder to see than its near-misses (a thread reply, a DM, a later day); `named`, at most how many of its
-# evidence's channel names and identifiers (words with digits, as PWSQL-03) the question names. Taxonomy v3
-# (2026-10-07): S2's medium tries came from unretracted near-misses beside a less visible truth, while GLM followed
-# every correction made in plain sight; search rank and depth left the needs (the author met rank by rewording, and
-# every channel of a 400-message world reads in one page), and are still measured.
-[taxonomy.lookup]
+[categories.lookup]
 gold = "sql"
 answer_types = ["text", "set", "number"]
 definition = "Read one thing off the workspace's structure: who posted, where, when, in which thread, who is a member, who reacted."
@@ -39,7 +26,7 @@ concepts = [
   ["the message just before or after a described one in a busy channel", "one of several near-identical messages, told apart by who reacted or replied", "a reply deep in a long thread, described by the discussion around it"],
 ]
 
-[taxonomy.search]
+[categories.search]
 gold = "ledger"
 answer_types = ["text", "set", "number"]
 definition = "Find the message that states a fact the question asks about, and answer with that fact."
@@ -57,7 +44,7 @@ concepts = [
 ]
 needs = [{}, {}, {decoys = 1, named = 0}, {decoys = 2, hidden = true, named = 0}]
 
-[taxonomy.semantic]
+[categories.semantic]
 gold = "ledger"
 answer_types = ["text", "set", "number"]
 definition = "Answer from facts related to each other: a value superseded by a later one, an alias, a value split across messages, a contradiction."
@@ -75,7 +62,7 @@ concepts = [
 ]
 needs = [{relations = 1}, {relations = 1}, {relations = 1, channels = 2, decoys = 1, hidden = true}, {relations = 2, channels = 3, decoys = 1, hidden = true, named = 0}]
 
-[taxonomy.join]
+[categories.join]
 gold = "sql"
 answer_types = ["text", "set", "number"]
 definition = "Combine the workspace's structure across channels, threads, members and reactions: compare, intersect, subtract or count."
@@ -92,7 +79,7 @@ concepts = [
   ["people who replied in every thread of a kind within a window", "messages in one channel reacted to by people who never posted there", "people active in three channels but silent in a fourth within a window"],
 ]
 
-[taxonomy.hybrid]
+[categories.hybrid]
 gold = "hybrid"
 answer_types = ["text", "set", "number"]
 definition = "Find the message that states a fact, then answer a structural question about that message: who replied, reacted, was mentioned, or stayed silent."
@@ -108,12 +95,12 @@ concepts = [
   ["which members of a channel stayed silent within a window after the message stating a fact"],
   ["who reacted to the message stating a fact, found among near-identical announcements, and also posted in another channel that day", "who replied to the correction of a fact but not to its first statement"],
 ]
-needs = [{}, {}, {decoys = 1}, {decoys = 1}]  # S2's hybrid L4 in band (0.25) had its near-miss on its truth's day
+needs = [{}, {}, {decoys = 1}, {decoys = 1}]
 
-# Robustness L3-L4 (2026-10-09): a value the asker can see that was settled where they cannot is a status answer,
-# the latest visible value given as not settled, not a refusal: S3's solver found the provisional value and its
-# caveat, and a refusal graded that wrong.
-[taxonomy.robustness]
+# Robustness levels 3 and 4: a value the asker can see that was settled where they cannot is a status answer, the
+# latest visible value given as not settled, not a refusal: a solver finds the provisional value and its caveat, and
+# a refusal grades that wrong.
+[categories.robustness]
 gold = "sql"              # a status answer's gold reads the ledger: its value as the asker can see it stated
 answer_types = ["refusal", "status"]
 definition = "A request the asker cannot fulfill as asked from what they can see; the right answer says so, and why: nothing to find, or only a value that is not settled."
@@ -130,5 +117,3 @@ concepts = [
   ["an outdated public plan a private decision replaced", "a figure discussed publicly as an estimate and settled only in a private channel", "a swap arranged in direct messages behind a posted roster"],
 ]
 needs = [{}, {}, {}, {decoys = 1}]
-
-# One model per agent. Unset fields (harness, runtime, sampling) keep the role defaults in config.py.

@@ -61,7 +61,7 @@ class Tries:
     def __init__(self, settings, store):
         self.settings, self.store = settings, store
         # GLM has its own gate, under the episode's: judges and the witness are not held up behind its solves.
-        self.glm = asyncio.Semaphore(settings.author.solvers)
+        self.glm = asyncio.Semaphore(settings.solvers)
 
     @property
     def world(self):
@@ -92,7 +92,7 @@ class Tries:
         """Gold rows follow the world: every task's query runs again as its actor after the world changes."""
         with self.world.trial() as copy:
             for task_id, actor, sql in copy.db.execute("SELECT id, actor_id, gold_sql FROM tasks").fetchall():
-                rows = copy.gold(actor, sql, max_rows=self.settings.tasks.max_answer_rows)["rows"]
+                rows = copy.gold(actor, sql, max_rows=self.settings.max_answer_rows)["rows"]
                 copy.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(rows), task_id))
 
     def solver_task(self, task_id, world, release: dict, hint: bool = False):
@@ -168,7 +168,7 @@ class Tries:
             self.keep_solves(task_id, keys[task_id], task_runs)
         runs = {t: state.solves[t] for t in due}
         witnessed = await self.witness(agents, due, keys, attempt)
-        size = self.settings.author.review_chunk
+        size = self.settings.review_chunk
         chunks = [due[i : i + size] for i in range(0, len(due), size)]
 
         async def judged(k: int, chunk: list[str]) -> Verdict:
@@ -195,7 +195,7 @@ class Tries:
                 agents,
                 payload,
                 attempt,
-                self.settings.tasks.max_answer_rows,
+                self.settings.max_answer_rows,
                 files,
                 "tasks" if len(chunks) == 1 else f"tasks-{k}",
             )
@@ -295,15 +295,13 @@ class Tries:
         level = dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())
 
         def low(t: str) -> bool:
-            floor = cfg.tasks.bands[level[t] - 1][0]
+            floor = cfg.bands[level[t] - 1][0]
             return floor == 0 or rates(state.solves[t]["results"])["right_rate"] < floor
 
-        if cfg.author.witness_tries and (
+        if cfg.witness_tries and (
             fresh := [t for t in due if low(t) and state.witness.get(t, {}).get("key") != keys[t]]
         ):
-            for t, runs in (
-                await self.solves(agents, fresh, attempt, cfg.author.witness_tries, "witness")
-            ).items():
+            for t, runs in (await self.solves(agents, fresh, attempt, cfg.witness_tries, "witness")).items():
                 state.witness[t] = {
                     "key": keys[t],
                     "results": [r for r, _ in runs],

@@ -17,9 +17,10 @@ from .author.task import AuthorTask, day_prompt, fix_prompt, plan_prompt
 from .clock import bounds, daily, present, start_clock, today
 from .ledger import unplanned
 from .writing import agenda_budget, close_day, posted
-from ..config import Config, pinned
+from ..config import pinned
 from .cast import cards, census, pick_cast
 from .clock import calendar, clock, frozen_before, frozen_digest, meta
+from .config import WorldConfig
 from .organization import Organization, background_plan, organize
 from ..judge.verdict import Verdict, combined
 from ..store import ReviewLimit, Store, used_names
@@ -32,13 +33,12 @@ from ..session import (
 )
 
 
-def provenance(config: Config) -> dict:
-    """Everything a resumed world run must share with its start: its configuration (taxonomy included), and what every
-    run pins."""
+def provenance(config: WorldConfig) -> dict:
+    """Everything a resumed world run must share with its start: its configuration, and what every run pins."""
     return {"config": config.model_dump(mode="json")} | pinned()
 
 
-def dry_run(config: Config) -> dict:
+def dry_run(config: WorldConfig) -> dict:
     """What a world run would start from, spending nothing: its configuration, the cast drawn, and each date's messages
     and their parts."""
     (occupation, _), *_ = census(config.personas)[1].most_common(1)
@@ -53,7 +53,7 @@ class WorldEnv(SessionEnv):
     """One world written in time order by one author: the premise and the organization, the plan, each day with
     reviews on the way, and a final review the author fixes until the judge approves."""
 
-    def __init__(self, settings: Config, store: Store):
+    def __init__(self, settings: WorldConfig, store: Store):
         super().__init__(settings, store)
         self.used = used_names(settings.corpus, store.root)
 
@@ -181,13 +181,7 @@ class WorldEnv(SessionEnv):
             **({"previous_issues": workspace} if workspace else {}),
             **self.written_from(),
         )
-        verdict = combined(
-            [
-                await review(
-                    self.store, agents, payload, attempt, self.settings.tasks.max_answer_rows, {}, "world"
-                )
-            ]
-        )
+        verdict = combined([await review(self.store, agents, payload, attempt, files={}, label="world")])
         self.store.artifact(attempt, "verdict", verdict.model_dump(mode="json"))
         self.store.artifact(attempt, "acceptance", {"approved": verdict.approved})
         return verdict
@@ -298,9 +292,7 @@ class WorldEnv(SessionEnv):
             ledger=ledger_digest(self.world),
             **self.written_from(),
         )
-        verdict = await review(
-            self.store, agents, payload, attempt, self.settings.tasks.max_answer_rows, {}, "world"
-        )
+        verdict = await review(self.store, agents, payload, attempt, files={}, label="world")
         # It rejects nothing, so every issue is a note for what is written next, blocking or not.
         state.issues = verdict.issues
         state.day, state.phase = state.day + 1, "day"

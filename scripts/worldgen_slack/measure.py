@@ -14,7 +14,8 @@ from types import SimpleNamespace
 
 from generators.worldgen_slack.world.clock import bounds
 from generators.worldgen_slack.world.writing import posted, quotas
-from generators.worldgen_slack.config import ROOT, ActivityConfig, AuthorSettings
+from generators.worldgen_slack.config import ROOT
+from generators.worldgen_slack.world.config import ActivityConfig, AuthorSettings
 from generators.worldgen_slack.world.cast import SeedPersona, user_id
 from generators.worldgen_slack.world.clock import frozen_before
 from generators.worldgen_slack.world.style import activity, style

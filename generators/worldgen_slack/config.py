@@ -1,10 +1,12 @@
-"""Validated run settings; all role overrides use native Verifiers configs."""
+"""What both parts' settings are written in: the types a config's fields take, the task taxonomy, and the seats every
+run has, held to code's rules. A world's settings are in world/config.py, a forge's in forge/config.py."""
 
 import hashlib
 import json
 import tomllib
 from pathlib import Path
 from typing import Annotated, Literal
+
 import verifiers.v1 as vf
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 from verifiers.v1.configs.retries import RetryConfig
@@ -34,46 +36,6 @@ def pinned() -> dict:
     }
 
 
-def world_author(model: str) -> vf.AgentConfig:
-    """The world author: an rlm coding agent in one VM for the whole world, with one interaction per block of work
-    (setup, plan, each day, tasks); each interaction gets these turn, token and time budgets."""
-    base = role(model, author=True)
-    return base.model_copy(
-        update={
-            "harness": base.harness.model_copy(update={"max_total_tokens": 600_000}),
-            # Idle between interactions only while the judge or the solver works; a VM left behind ends in 30 min.
-            "runtime": base.runtime.model_copy(update={"idle_timeout": 1800}),
-            "max_turns": 200,
-            "timeout": base.timeout.model_copy(update={"rollout": 5400}),
-        }
-    )
-
-
-class PipelineConfig(vf.EnvConfig):
-    taskset: vf.TasksetConfig = vf.TasksetConfig(id="worldgen-slack")
-    author: vf.AgentConfig = world_author("z-ai/glm-5.3")
-    judge: vf.AgentConfig = role("openai/gpt-6-sol")
-    # The solver executes no code (null harness; its Slack tools are host-side servers), so a local process
-    # replaces the VM.
-    solver: vf.AgentConfig = role("z-ai/glm-5.2", solver=True).model_copy(
-        update={"runtime": vf.SubprocessConfig()}
-    )
-    # A stronger solver with the same tools, for the tasks GLM rarely answers: hard, or broken?
-    # It thinks hard (FC1's took 2-5 calls and lost tasks the solver answered): it shows a task can be answered.
-    witness: vf.AgentConfig = role("openai/gpt-6-sol", solver=True).model_copy(
-        update={
-            "runtime": vf.SubprocessConfig(),
-            "sampling": role("openai/gpt-6-sol", solver=True).sampling.model_copy(
-                update={"reasoning_effort": "high"}
-            ),
-        }
-    )
-    retries: RetryConfig = RetryConfig(max_retries=0)
-    # The episode's agents at once. GLM, whose account allows 8 concurrent requests, is gated on its own by
-    # [author] solvers, so the judge's reviews run beside its solves.
-    max_concurrent_agents: int | None = 16
-
-
 def rooted(path: Path) -> Path:
     return path if path.is_absolute() else (ROOT / path).resolve()
 
@@ -98,64 +60,7 @@ class Section(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class PersonasConfig(Section):
-    """The seeded cast and how real Slack users type and reply; all three files come from
-    scripts/worldgen_slack/personas.sql."""
-
-    path: RootedPath
-    typing: RootedPath
-    gaps: RootedPath
-    pool: int = Field(default=36, ge=4, le=200)
-
-
-class CalendarConfig(Section):
-    """The world's days on the company clock; the run seed picks a Monday of `year` as day 1."""
-
-    days: int = Field(default=10, ge=1, le=60)
-    year: int = Field(default=2026, ge=2000, le=2100)
-
-
-class TasksConfig(Section):
-    # Per level, the band of the solver's right-answer rate a task of that level measures in.
-    bands: list[tuple[float, float]] = Field(min_length=1)
-    max_answer_rows: int = Field(default=5, ge=1, le=50)
-    styles: list[Text] = Field(min_length=1)  # how a question is asked: a chapter's brief draws one per entry
-
-    @model_validator(mode="after")
-    def ordered(self):
-        if any(not 0 <= lo <= hi <= 1 for lo, hi in self.bands):
-            raise ValueError("a band is [low, high] within 0 to 1")
-        return self
-
-
-class ActivityConfig(Section):
-    """Reference targets for the workspace's shape. One table drives where code places conversations and
-    measure.py's scorecard; each value's provenance is noted in the run config."""
-
-    messages: int = Field(default=400, ge=0, le=5000)
-    channel_skew: float = Field(default=1.1, ge=0, le=4)
-    dms_per_person: float = Field(default=0.4, ge=0, le=5)
-    dm_share: float = Field(default=0.25, ge=0, le=1)
-    conversation_lines: float = Field(default=6, ge=2, le=30)
-    reply_share: float = Field(default=0.3, ge=0, le=0.95)
-    reaction_rate: float = Field(default=0.2, ge=0, le=1)
-    parts: dict[Literal["early", "morning", "afternoon", "evening", "night"], float] = Field(
-        default_factory=lambda: {
-            "early": 0.1,
-            "morning": 0.35,
-            "afternoon": 0.4,
-            "evening": 0.12,
-            "night": 0.03,
-        }
-    )
-    mention_rate: float = Field(default=0.11, ge=0, le=1)
-    emoji_rate: float = Field(default=0.08, ge=0, le=1)
-    # Promises made per message, at least, each day ("I'll have it by Friday"): what was promised and is still open is
-    # a request people bring to an assistant. Off unless a world's config sets it (S3 and its chapters left it out).
-    promise_rate: float = Field(default=0.0, ge=0, le=0.2)
-    # Each app's routine posts per workday (builds, alerts, staging deploys, tickets; a reminder posts once): code's,
-    # never a person's. Off unless a world's config sets it, with the apps its organization lists.
-    bot_posts: float = Field(default=0.0, ge=0, le=30)
+# ---------------------------------------------------------------------- the task taxonomy
 
 
 class Needs(Section):
@@ -205,74 +110,56 @@ class Category(Section):
         return self
 
 
-class ReviewRounds(Section):
-    """Bounded allowances: final reviews per run."""
-
-    final: int = Field(default=4, ge=1, le=20)
+Categories = dict[Annotated[str, Field(pattern=r"^[a-z_]+$")], Category]
 
 
-class AuthorSettings(Section):
-    """The world author: one agent writes the world in time order."""
+class Taxonomy(Section):
+    """The task taxonomy (configs/worldgen_slack/taxonomy.toml): how a question may be asked (a chapter's brief draws
+    a style for each entry), and the categories a task is written in, each with its levels."""
 
-    tolerance: float = Field(default=0.3, ge=0, le=1)  # how far a day's message count may be from its quota
-    weekend: float = Field(default=0.1, ge=0, le=1)  # a weekend day's share of a workday's messages
-    share_tolerance: float = Field(
-        default=0.1, ge=0, le=1
-    )  # reply, reaction and DM shares, checked at the end
-    mention_tolerance: float = Field(
-        default=0.05, ge=0, le=1
-    )  # the share of messages mentioning someone, per day
-    review_days: list[int] = Field(
-        default_factory=lambda: [5]
-    )  # the judge reviews the world after these days
-    # The solver's tries of a task (8: at 4, a task right 80% of the time shows 4 of 4 in 41% of probes); the tasks
-    # in one judge review (a round's reviews run side by side); the solver's tries at once; the witness's tries of a
-    # task below its band's floor.
-    tries: int = Field(default=8, ge=1, le=16)
-    review_chunk: int = Field(default=5, ge=1, le=50)
-    solvers: int = Field(default=8, ge=1, le=64)
-    witness_tries: int = Field(default=2, ge=0, le=8)
-    keepalive: float = Field(
-        default=600, gt=0, le=1700
-    )  # seconds between pings of the author's idle VM (30-min timeout)
-    day_attempts: int = Field(
-        default=2, ge=1, le=5
-    )  # a day that cannot close is written again from its start
-    plan_attempts: int = Field(default=3, ge=1, le=10)  # a plan that cannot be recorded is written again
+    styles: list[Text] = Field(min_length=1)
+    categories: Categories = Field(min_length=1)
 
 
-class Config(Section):
-    """One run, configured in one file."""
+def load_taxonomy(path: Path) -> Taxonomy:
+    return Taxonomy.model_validate(tomllib.loads(rooted(path).read_text()))
 
-    sector: Text
-    seed: int = Field(default=0, ge=0)
-    output: Path
-    corpus: Path = Path("data")
-    language: Text = "English"
-    premise_count: int = Field(default=12, ge=2, le=30)
-    personas: PersonasConfig
-    calendar: CalendarConfig = Field(default_factory=CalendarConfig)
-    activity: ActivityConfig = Field(default_factory=ActivityConfig)
-    storylines: int = Field(default=2, ge=1, le=20)  # the plot the ledger plans before day 1
-    tasks: TasksConfig
-    taxonomy: dict[Annotated[str, Field(pattern=r"^[a-z_]+$")], Category] = Field(min_length=1)
-    review_rounds: ReviewRounds = Field(default_factory=ReviewRounds)
-    author: AuthorSettings = Field(default_factory=AuthorSettings)
-    env: PipelineConfig = Field(default_factory=PipelineConfig)
-    answer_judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
 
-    @model_validator(mode="after")
-    def banded(self):
-        if short := [n for n, c in self.taxonomy.items() if len(c.levels) > len(self.tasks.bands)]:
-            raise ValueError(f"[tasks] bands has one band for each level of {short}")
-        return self
+# ---------------------------------------------------------------------- seats
+
+
+def vm_seat(model: str) -> vf.AgentConfig:
+    """An rlm coding agent in one VM for the whole run (the world's author, the forge's proposer), with one interaction
+    per block of work; each interaction gets these turn, token and time budgets."""
+    base = role(model, author=True)
+    return base.model_copy(
+        update={
+            "harness": base.harness.model_copy(update={"max_total_tokens": 600_000}),
+            # Idle between interactions only while the judge or the solver works; a VM left behind ends in 30 min.
+            "runtime": base.runtime.model_copy(update={"idle_timeout": 1800}),
+            "max_turns": 200,
+            "timeout": base.timeout.model_copy(update={"rollout": 5400}),
+        }
+    )
+
+
+class Seats(vf.EnvConfig):
+    """The seats every run has (a part adds its own), held to code's rules: an agent that runs code works in an
+    immutable Prime VM with framework-only egress, and every seat names its model."""
+
+    taskset: vf.TasksetConfig = vf.TasksetConfig(id="worldgen-slack")
+    judge: vf.AgentConfig = role("openai/gpt-6-sol")
+    retries: RetryConfig = RetryConfig(max_retries=0)
+    # The episode's agents at once. GLM, whose account allows 8 concurrent requests, is gated on its own by a forge's
+    # `solvers`, so the judge's reviews run beside its solves.
+    max_concurrent_agents: int | None = 16
 
     @model_validator(mode="after")
     def secure(self):
-        if self.env.retries.max_retries:
+        if self.retries.max_retries:
             raise ValueError("whole-pipeline retries would replay mutable work")
-        for name in type(self.env).model_fields:
-            agent = getattr(self.env, name)
+        for name in type(self).model_fields:
+            agent = getattr(self, name)
             if not isinstance(agent, vf.AgentConfig):
                 continue
             runtime = agent.runtime
@@ -289,21 +176,3 @@ class Config(Section):
             if not agent.model:
                 raise ValueError(f"{name} needs an explicit model")
         return self
-
-
-class ForgeSeats(PipelineConfig):
-    # The forge's proposer: an rlm agent in one VM, one interaction per round, as the world's author is. Each forge
-    # config states the seat whole: a partial table would merge over this default, not over the world's author.
-    proposer: vf.AgentConfig = world_author("z-ai/glm-5.3")
-
-
-class ForgeSettings(Config):
-    """The settings a forge runs under: its world's, with the proposer's seat."""
-
-    env: ForgeSeats = Field(default_factory=ForgeSeats)
-
-
-def load_config(path: Path) -> Config:
-    config = Config.model_validate(tomllib.loads(path.read_text()))
-    config.output, config.corpus = rooted(config.output), rooted(config.corpus)
-    return config

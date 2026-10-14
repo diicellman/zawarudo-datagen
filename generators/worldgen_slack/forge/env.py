@@ -7,21 +7,19 @@ each, and code keeps what lands. The world is never written again, so no task go
 
 import json
 import shutil
-import tomllib
 from collections import Counter
-from pathlib import Path
 
-from pydantic import Field, model_validator
 from worldgen_slack.release import atomic_json
 from worldgen_slack.world import file_hash
 
-from ..config import Config, ForgeSettings, Section, load_config, merged, pinned, rooted
+from ..config import pinned
 from ..judge.verdict import READING
 from ..session import SETUP_FILES, SessionEnv, keep_awake, require_session
 from ..store import Store
 from ..workspace import Workspace, reset_tasks
 from ..world.author.memory import task_page
 from ..world.board import brief
+from .config import ForgeConfig
 from .difficulty import features
 from .tasks import INTENTS, Task, answer_of, forge_task
 from .release import miss_class, release_rows
@@ -29,46 +27,12 @@ from .proposer.task import ProposerTask, forge_prompt
 from .tries import Tries, rates
 
 
-class ForgeConfig(Section):
-    """One forge, configured in one file: the world run it writes on, and what it changes of that run's settings.
-    `tasks` is its goal, the tasks the archive holds when it is done; `rounds` the most rounds it runs toward it;
-    `candidates` the candidates one round writes; `target` the tasks a place (a category and a level) holds;
-    `measure` has round 0 measure the finished run's own tasks, as written, before any proposer round; `settings`
-    the sections of the base configuration it replaces, merged by key."""
-
-    base: Path  # the configuration the world was generated with (its sector, people, taxonomy and roles)
-    world: Path  # the finished run: its final world.sqlite, with the ledger and the board
-    output: Path
-    tasks: int = Field(default=40, ge=1, le=10_000)
-    rounds: int = Field(default=12, ge=0, le=100)
-    candidates: int = Field(default=12, ge=1, le=50)
-    target: int = Field(default=2, ge=1, le=100)
-    measure: bool = False
-    settings: dict = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def works(self):
-        if self.rounds == 0 and not self.measure:
-            raise ValueError("a forge with no rounds only measures: set measure = true")
-        return self
-
-
-def load_forge(path: Path) -> tuple[ForgeConfig, ForgeSettings]:
-    """The forge's configuration, and the run settings it works under: the base's, with its changes and output."""
-    forge = ForgeConfig.model_validate(tomllib.loads(path.read_text()))
-    forge.base, forge.world, forge.output = rooted(forge.base), rooted(forge.world), rooted(forge.output)
-    base = load_config(forge.base).model_dump(mode="json")
-    settings = ForgeSettings.model_validate(merged(base, forge.settings) | {"output": str(forge.output)})
-    return forge, settings
-
-
-def provenance(forge: ForgeConfig, settings: Config) -> dict:
-    """Everything a resumed forge must share with its start: its configuration and settings, the world it writes on
-    (by hash), the pinned framework and the lock file."""
+def provenance(config: ForgeConfig) -> dict:
+    """Everything a resumed forge must share with its start: its configuration (its taxonomy as read), the world it
+    writes on (by hash), the pinned framework and the lock file."""
     return {
-        "forge": forge.model_dump(mode="json"),
-        "config": settings.model_dump(mode="json"),
-        "world_hash": file_hash(forge.world / "world.sqlite"),
+        "config": config.model_dump(mode="json"),
+        "world_hash": file_hash(config.world / "world.sqlite"),
     } | pinned()
 
 
@@ -112,14 +76,13 @@ def measured_level(right: float, bands) -> int:
 
 class ForgeEnv(SessionEnv):
     seat = "proposer"
-    seats = ("author", "proposer", "judge", "solver", "witness")
+    seats = ("proposer", "judge", "solver", "witness")
 
-    def __init__(self, forge: ForgeConfig, settings: Config, store: Store):
-        self.forge = forge
+    def __init__(self, settings: ForgeConfig, store: Store):
         places = sum(len(spec.levels) for spec in settings.taxonomy.values())
-        if forge.tasks > forge.target * places:
+        if settings.tasks > settings.target * places:
             raise ValueError(
-                f"a goal of {forge.tasks} tasks is more than the archive's {places} places hold at {forge.target} each"
+                f"a goal of {settings.tasks} tasks is more than the archive's {places} places hold at {settings.target} each"
             )
         super().__init__(settings, store)
         self.tries = Tries(settings, store)
@@ -137,7 +100,7 @@ class ForgeEnv(SessionEnv):
         state = self.store.state
         if state.phase == "premise":
             self.adopt()
-        if self.forge.measure and not state.plans.get("forge", {}).get("measured"):
+        if self.settings.measure and not state.plans.get("forge", {}).get("measured"):
             await self.measure(agents)
         if state.phase == "tasks":  # a forge that only measures needs no proposer, and no VM
             await self.author_world(agents)
@@ -149,7 +112,7 @@ class ForgeEnv(SessionEnv):
         came from 4 tries at temperature 0."""
         state = self.store.state
         attempt = self.store.reserve("measure", 2)
-        source = Workspace(self.forge.world / "world.sqlite")
+        source = Workspace(self.settings.world / "world.sqlite")
         rows = source.db.execute("SELECT * FROM tasks ORDER BY id").fetchall()
         ids = [r["id"] for r in rows]
         for row in rows:
@@ -185,7 +148,7 @@ class ForgeEnv(SessionEnv):
         self.store.event("tasks_imported", attempt=attempt, tasks=len(self.written(ids)), of=len(ids))
         await self.weigh(agents, attempt, self.written(ids))
         state.plans.setdefault("forge", {})["measured"] = True
-        if self.forge.rounds == 0:
+        if self.settings.rounds == 0:
             state.phase = "done"
         self.store.finish_attempt(True)
         self.store.save()
@@ -193,19 +156,19 @@ class ForgeEnv(SessionEnv):
     def adopt(self) -> None:
         """The finished world, frozen: its final file with no tasks (their tables as the schema now has them), its board
         and ledger, and the world author's last notes for the proposer to start from."""
-        source = Workspace(self.forge.world / "world.sqlite")
+        source = Workspace(self.settings.world / "world.sqlite")
         source.db.backup(self.world.db)
         source.close()
         self.world.migrate()
         reset_tasks(self.world)
-        state = json.loads((self.forge.world / "state.json").read_text())
-        notes = self.forge.world / "attempts" / state.get("restore_point", "") / "notes"
+        state = json.loads((self.settings.world / "state.json").read_text())
+        notes = self.settings.world / "attempts" / state.get("restore_point", "") / "notes"
         if state.get("restore_point") and notes.is_dir():
             shutil.copytree(notes, self.store.path("source", "notes"), dirs_exist_ok=True)
         self.store.state.phase, self.store.state.batch, self.store.state.restore_point = "tasks", 0, "source"
         self.store.event(
             "world_adopted",
-            world=str(self.forge.world),
+            world=str(self.settings.world),
             messages=self.world.db.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
         )
         self.store.save()
@@ -221,7 +184,7 @@ class ForgeEnv(SessionEnv):
     async def forge_round(self, agents, runtime) -> None:
         """One round: the proposer writes a candidate for each open id in a fresh interaction that starts from the last
         round's notes; then the solver tries them, and what the judge approves is kept."""
-        state, cfg = self.store.state, self.forge
+        state, cfg = self.store.state, self.settings
         number = state.batch + 1
         attempt = self.store.reserve("round", 2 * cfg.rounds)  # a round cut off is written again once
         ids = [f"r{number:02d}-{n:02d}" for n in range(1, cfg.candidates + 1)]
@@ -251,7 +214,7 @@ class ForgeEnv(SessionEnv):
         self.store.trace(interaction.trace)
         require_session(interaction.trace)
         await self.keep_notes(runtime, attempt)
-        async with keep_awake(runtime, self.settings.author.keepalive):
+        async with keep_awake(runtime, self.settings.keepalive):
             added = await self.weigh(agents, attempt, self.written(ids))
         state.batch, state.restore_point = number, attempt
         counts = state.plans.setdefault("forge", {})
@@ -271,7 +234,7 @@ class ForgeEnv(SessionEnv):
             return 0
         self.tries.refresh_gold()
         keys = {t: self.tries.task_key(t) for t in ids}
-        await self.tries.judge_tasks(agents, ids, keys, attempt, self.settings.author.tries)
+        await self.tries.judge_tasks(agents, ids, keys, attempt, self.settings.tries)
         approved = [t for t in ids if state.task_reviews.get(t, {}).get("key") == keys[t]]
         low = [t for t in approved if state.task_reviews[t]["right_rate"] <= 0.5 and self.answers_on(t)]
         hinted = await self.tries.solves(agents, low, attempt, 2, hint=True) if low else {}
@@ -293,7 +256,7 @@ class ForgeEnv(SessionEnv):
         brings a structure the place lacks while two holders share one, or when the solver's tries are more mixed on it than
         on the weakest holder, by 4p(1-p), the shorter question winning a tie. forge-t1's 10 tasks filled 10 cells of
         their own, so nothing competed and every easy task was kept."""
-        state, bands = self.store.state, self.settings.tasks.bands
+        state, bands = self.store.state, self.settings.bands
         row = self.world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         gold = json.loads(row["gold_json"])
         shape = features(self.world, task_id, gold)
@@ -358,7 +321,7 @@ class ForgeEnv(SessionEnv):
             "bucket": shaped,
         }
         holders = state.archive.setdefault(where, [])
-        if len(holders) >= self.forge.target:
+        if len(holders) >= self.settings.target:
             weakest = lambda hs: min(hs, key=lambda h: (h["score"], -h["words"]))  # noqa: E731
             shared = [h for h in holders if [g["bucket"] for g in holders].count(h["bucket"]) > 1]
             if shaped not in {h["bucket"] for h in holders} and shared:
@@ -409,7 +372,7 @@ class ForgeEnv(SessionEnv):
     def done(self) -> bool:
         """The forge is at its goal: the archive holds `tasks` tasks, and every board entry is covered."""
         kept, open_ = self.covered()
-        return not open_ and sum(kept.values()) >= self.forge.tasks
+        return not open_ and sum(kept.values()) >= self.settings.tasks
 
     def drop(self, task_id: str, attempt: str, why: str) -> None:
         self.world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task_id,))
@@ -431,14 +394,14 @@ class ForgeEnv(SessionEnv):
         lines = [
             "# Archive",
             "",
-            f"Goal: {self.forge.tasks} kept tasks, at most {self.forge.target} per category and level, and every board entry covered. It holds {sum(kept.values())}. The solver tries each candidate {self.settings.author.tries} times.",
+            f"Goal: {self.settings.tasks} kept tasks, at most {self.settings.target} per category and level, and every board entry covered. It holds {sum(kept.values())}. The solver tries each candidate {self.settings.tries} times.",
             "",
         ]
         for category, spec in self.settings.taxonomy.items():
             lines.append(
                 f"- {category}: "
                 + " · ".join(
-                    f"L{lvl} {kept.get((category, lvl), 0)}/{self.forge.target}"
+                    f"L{lvl} {kept.get((category, lvl), 0)}/{self.settings.target}"
                     for lvl in range(1, len(spec.levels) + 1)
                 )
             )
@@ -449,7 +412,7 @@ class ForgeEnv(SessionEnv):
             "## Kept (a full place takes a newcomer only if the solver's tries are more mixed on it, or it brings a new structure)",
         ]
         for where, holders in sorted(self.store.state.archive.items()):
-            full = " (full)" if len(holders) >= self.forge.target else ""
+            full = " (full)" if len(holders) >= self.settings.target else ""
             for held in holders:
                 question = self.world.db.execute(
                     "SELECT question FROM tasks WHERE id = ?", (held["task"],)
@@ -506,22 +469,22 @@ class ForgeEnv(SessionEnv):
         }
 
 
-def dry_run(forge: ForgeConfig, settings: Config) -> dict:
+def dry_run(config: ForgeConfig) -> dict:
     """What a forge would start from, spending nothing: the world, its board, its goal, and the rounds."""
-    world = Workspace(forge.world / "world.sqlite")
+    world = Workspace(config.world / "world.sqlite")
     count = lambda table: world.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: E731
     return {
-        "world": str(forge.world),
-        "world_hash": file_hash(forge.world / "world.sqlite"),
+        "world": str(config.world),
+        "world_hash": file_hash(config.world / "world.sqlite"),
         "messages": count("messages"),
         "facts": count("facts"),
         "board": dict(world.db.execute("SELECT slot, group_concat(fact_id, ', ') FROM board GROUP BY slot")),
-        "tasks": forge.tasks,
-        "target": forge.target,
-        "measure": forge.measure,
-        "rounds": forge.rounds,
-        "candidates": forge.candidates,
-        "tries": settings.author.tries,
-        "proposer": settings.env.proposer.model,
-        "solver": settings.env.solver.model,
+        "tasks": config.tasks,
+        "target": config.target,
+        "measure": config.measure,
+        "rounds": config.rounds,
+        "candidates": config.candidates,
+        "tries": config.tries,
+        "proposer": config.env.proposer.model,
+        "solver": config.env.solver.model,
     }

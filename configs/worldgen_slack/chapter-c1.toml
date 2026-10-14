@@ -5,9 +5,10 @@
 # holds 3 value groups of 4+ values, all of them used by tasks, and every decoy is used. Each entry is a board entry
 # whose facts code checks when the ledger is planned (its level's needs, these on top, and always first stated in the
 # chapter), and whose hidden answer code checks where it is posted.
-base = "configs/worldgen_slack/worldgen.toml"   # S3's configuration: its people, taxonomy and roles
+base = "configs/worldgen_slack/worldgen.toml"   # S3's configuration: its people and seats
 world = "data/v7-05/software"
 output = "data/v7-06/chapter-c1"
+taxonomy = "configs/worldgen_slack/taxonomy.toml"  # the cells its brief's entries are
 seed = 20261013
 days = 7                  # Thu 2026-08-20 to Wed 08-26: five workdays and a weekend
 messages = 500            # S3's pace, about 100 a workday

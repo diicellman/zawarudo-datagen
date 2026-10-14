@@ -86,7 +86,7 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
             f"{task.id}: actor_id {task.actor_id} is a bot or no longer at the company; a person asks"
         )
     try:
-        out = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)
+        out = world.gold(task.actor_id, task.gold_sql, max_rows=settings.max_answer_rows)
     except LookupError:
         raise ValueError(f"{task.id}: actor_id {task.actor_id} is not a person in the world") from None
     except ValueError as error:
@@ -95,7 +95,7 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
     if renumbered is not None:
         copy, back = renumbered
         try:
-            again = copy.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)["rows"]
+            again = copy.gold(task.actor_id, task.gold_sql, max_rows=settings.max_answer_rows)["rows"]
         except ValueError:
             again = None
         if again is None or not same_rows(rows, again, back):
@@ -131,10 +131,10 @@ def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
         return rows
     if "answer" not in out["columns"]:
         raise ValueError(f"{task.id}: the gold query returns an `answer` column")
-    if not 1 <= len(rows) <= settings.tasks.max_answer_rows:
+    if not 1 <= len(rows) <= settings.max_answer_rows:
         raise ValueError(
-            f"{task.id}: the gold query returns 1 to {settings.tasks.max_answer_rows} rows as its actor, not "
-            f"{len(rows) if len(rows) <= settings.tasks.max_answer_rows else 'more'}"
+            f"{task.id}: the gold query returns 1 to {settings.max_answer_rows} rows as its actor, not "
+            f"{len(rows) if len(rows) <= settings.max_answer_rows else 'more'}"
         )
     if task.answer_type != "set" and len(rows) != 1:
         raise ValueError(
@@ -190,7 +190,7 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
         world.insert("tasks", [task_row(task, settings) | {"concept": slot.concept}])
         world.insert("task_facts", [dict(task_id=task.id, fact_id=f) for f in dict.fromkeys(task.facts)])
     world.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(gold), task.id))
-    tables = world.gold(task.actor_id, task.gold_sql, max_rows=settings.tasks.max_answer_rows)["tables"]
+    tables = world.gold(task.actor_id, task.gold_sql, max_rows=settings.max_answer_rows)["tables"]
     return {"gold": gold} | measures(world, task.id, gold, tables)
 
 

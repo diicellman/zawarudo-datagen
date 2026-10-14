@@ -19,13 +19,14 @@ from verifiers.v1.runtimes.prime import set_base_sandbox_labels
 from verifiers.v1.utils.interrupt import install_interrupt
 from worldgen_slack.release import atomic_json
 
-from .world import chapter
 from .forge import env as forge
 from .forge import profile
+from .forge.config import ForgeConfig, load_forge
 from .forge.release import publish
-from .config import Config, load_config
-from .world.env import WorldEnv, dry_run, provenance
 from .store import Store
+from .world import chapter
+from .world.config import WorldConfig, load_world
+from .world.env import WorldEnv, dry_run, provenance
 
 # Each run's episode prompt, and what its interruption calls it.
 PARTS = {
@@ -53,24 +54,27 @@ async def run(
     part: str,
     output: Path,
     origin: dict,
-    settings: Config,
+    seed: int,
     start: Callable[[Store], vf.Env],
     finish: Callable[[Store], None] = lambda store: None,
 ) -> dict:
     """One run: its env (`start`) as one episode on its run directory, from where the directory left off, then
-    `finish` once it is complete. Its summary says how it ended; an interrupted run keeps its committed progress."""
+    `finish` once it is complete; `seed` is the episode's task index. Its summary says how it ended; an interrupted run
+    keeps its committed progress."""
     prompt, name = PARTS[part]
     set_base_sandbox_labels([run_label(output)])
     store = Store(output, origin)
     try:
         if store.state.phase != "done":
             env = start(store)
+            # Every seat names its model (Seats.secure), so the episode's model is a stand-in that no agent uses: the
+            # model of the seat the run's session works in.
             context = ModelContext(
-                model=settings.env.solver.model, client=EvalClientConfig(), sampling=vf.Sampling()
+                model=getattr(env.config, env.seat).model, client=EvalClientConfig(), sampling=vf.Sampling()
             )
-            seed = vf.Task(vf.TaskData(idx=settings.seed, prompt=prompt))
+            task = vf.Task(vf.TaskData(idx=seed, prompt=prompt))
             async with env.serving():
-                episode = await env.run_episode(seed, context)
+                episode = await env.run_episode(task, context)
             for trace in episode.traces:
                 store.trace(trace)
             atomic_json(store.root / f"episode-{episode.id}.json", episode.to_record())
@@ -90,32 +94,32 @@ async def run(
         store.close()
 
 
-async def run_world(config: Config) -> dict:
+async def run_world(config: WorldConfig) -> dict:
     return await run(
-        "world", config.output, provenance(config), config, lambda store: WorldEnv(config, store)
+        "world", config.output, provenance(config), config.seed, lambda store: WorldEnv(config, store)
     )
 
 
-async def run_chapter(plan: chapter.ChapterConfig, settings: Config) -> dict:
+async def run_chapter(plan: chapter.ChapterConfig, settings: WorldConfig) -> dict:
     def start(store: Store) -> chapter.ChapterEnv:
         parent = chapter.parent_world(plan.world)
         slots = chapter.brief_slots(plan, settings, chapter.version_of(parent) + 1)
         parent.close()
         return chapter.ChapterEnv(plan, settings, store, slots)
 
-    return await run("chapter", plan.output, chapter.provenance(plan, settings), settings, start)
+    return await run("chapter", plan.output, chapter.provenance(plan, settings), settings.seed, start)
 
 
-async def run_forge(plan: forge.ForgeConfig, settings: Config) -> dict:
+async def run_forge(config: ForgeConfig) -> dict:
+    """A forge: its one episode is task 0, as it draws nothing at random."""
+
     def release(store: Store) -> None:
         # an archive that kept nothing has no release
         if store.world.db.execute("SELECT 1 FROM tasks").fetchone():
             publish(store)
 
-    origin = forge.provenance(plan, settings)
-    return await run(
-        "forge", plan.output, origin, settings, lambda store: forge.ForgeEnv(plan, settings, store), release
-    )
+    origin = forge.provenance(config)
+    return await run("forge", config.output, origin, 0, lambda store: forge.ForgeEnv(config, store), release)
 
 
 def main() -> int:
@@ -137,13 +141,13 @@ def main() -> int:
     if args.config is None:
         parser.error("--config is required")
     if args.command == "forge":
-        plan, settings = forge.load_forge(args.config)
-        dry, going = (lambda: forge.dry_run(plan, settings)), (lambda: run_forge(plan, settings))
+        config = load_forge(args.config)
+        dry, going = (lambda: forge.dry_run(config)), (lambda: run_forge(config))
     elif args.command == "chapter":
         plan, settings = chapter.load_chapter(args.config)
         dry, going = (lambda: chapter.dry_run(plan, settings)), (lambda: run_chapter(plan, settings))
     else:
-        config = load_config(args.config)
+        config = load_world(args.config)
         dry, going = (lambda: dry_run(config)), (lambda: run_world(config))
     if args.dry_run:
         print(json.dumps(dry(), indent=1))
