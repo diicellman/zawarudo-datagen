@@ -26,19 +26,22 @@ load; older ones are read from git.
 
 ## The solver's tools
 
-The read tools of Slack's own MCP server, as captured on 2026-10-14 (`capture/slack-mcp`): `search_public`,
-`search_public_and_private`, `search_channels`, `search_users`, `read_channel`, `read_thread`, `read_user_profile`,
-`get_reactions`, `list_channel_members` and `list_user_channels` (served as `slack_*`), with the real server's
-parameters and descriptions, as the task's actor. Each returns the real server's text: names filled in, times on the
-actor's clock with their offset, reactions as counts in a channel's history (`get_reactions` names who). Search takes
-`keywords` (all required) and `filters` (Slack's modifiers) and ranks by BM25; a hit carries the messages around it.
-The system prompt says who the actor is and when it is, as a Slack client does; a profile with no `user_id` is the
-actor's own. Each call keeps a record of what it showed (`slack.py`), which grading reads; the solver reads the text.
-Release v10 records the surface and turn limit each task was measured on.
+The read tools of Slack's own MCP server, as captured in two sessions on 2026-10-14 (`capture/slack-mcp`):
+`search_public`, `search_public_and_private`, `search_channels`, `search_users`, `read_channel`, `read_thread`,
+`read_user_profile`, `get_reactions`, `list_channel_members` and `list_user_channels` (served as `slack_*`), with
+the real server's parameters and descriptions, as the task's actor. Each returns the real server's text: names
+filled in, times on the actor's clock with their offset, reactions as counts in a channel's history (`get_reactions`
+names who). Search takes `keywords` (all required) and `filters` (Slack's modifiers) and ranks by BM25; a hit
+carries the messages around it. Cursors are the server's and name a place, not a request: a channel's history and a
+thread page back from a message (`next_ts`), a search by page number (`CURRENT_PAGE`), a list by its last item. The
+system prompt says who the actor is and when it is, as a Slack client does; a profile with no `user_id` is the
+actor's own. Each call keeps a record of what it showed (`slack.py`), which grading reads; the solver reads the
+text. Release v10 records the surface and turn limit each task was measured on.
 
 Public channels are readable by everyone in the workspace; private channels and DMs need membership, which a
 member who left no longer has. Deleted messages are excluded. There are no writes.
 
 The tool server runs on the host and opens the world file by path, after checking its hash. Each call is recorded
 for grading. `generators/worldgen_slack/tests/test_capture.py` replays the capture against the workspace it was taken
-in, rebuilt as a world, and lists where the env reads otherwise than the server.
+in, rebuilt as a world, and lists where the env reads otherwise than the server: only around a reply that was also
+sent to the channel, which worlds do not have.

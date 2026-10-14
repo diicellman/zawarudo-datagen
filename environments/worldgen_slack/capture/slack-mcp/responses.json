@@ -25,9 +25,9 @@
    "limit": 50
   },
   "response": {
-   "result": "## My Channels (showing 4 of 4 total)\n\n#general\n#zawarudo-capture\nDM: Jordan Lee\nDM: Slackbot\n"
+   "result": "## My Channels (showing 5 of 5 total)\n\n#general\n#banter\n#zawarudo-capture\nDM: Jordan Lee\nDM: Slackbot\n"
   },
-  "note": "names replaced: the real list held the user's colleagues"
+  "note": "names replaced and the list cut: the real one held the user's colleagues and their channels"
  },
  {
   "tool": "slack_list_user_channels",
@@ -240,9 +240,10 @@
    "natural_language_query": "find Alex Rivera"
   },
   "response": {
-   "results": "# Search Results for: \n\n## Users (1 results)\n### Result 1 of 1\nName: Alex Rivera\nUser ID: U0EXAMPLE01\nTitle: \nEmail: alex.rivera@example.com\nTimezone: Etc/GMT-5\nProfile Pic: [Photo](https://avatars.slack-edge.com/example.png)\nPermalink: [link](https://example-co.slack.com/team/U0EXAMPLE01)\n\n---\n\n",
+   "results": "# Search Results for: \n\n## Users (1 results)\n### Result 1 of 1\nName: Alex Rivera\nUser ID: U0EXAMPLE01\nTitle: \nEmail: alex.rivera@example.com\nTimezone: Etc/GMT-5\nProfile Pic: [Photo](https://avatars.slack-edge.com/2026-10-14/109726857899076385_3a67b5edbfb55394e869_original.png)\nPermalink: [link](https://example-co.slack.com/team/U0EXAMPLE01)\n\n---\n\n",
    "pagination_info": "End of results - No more pages available.\\n"
-  }
+  },
+  "note": "the photo's address is replaced; the real one has the same shape: /<upload day>/<number>_<hash>_original.png"
  },
  {
   "tool": "slack_list_channel_members",
@@ -357,5 +358,207 @@
    "pagination_info": "There are no more messages in this thread.\n"
   },
   "note": "'messsages' is the server's own spelling"
+ },
+ {
+  "tool": "slack_list_user_channels",
+  "arguments": {
+   "types": "mpim"
+  },
+  "response": {
+   "result": "You are not a member of any channels matching your criteria."
+  },
+  "note": "an empty list with no prefix"
+ },
+ {
+  "tool": "slack_list_user_channels",
+  "arguments": {
+   "limit": 1
+  },
+  "response": {
+   "result": "## My Channels (showing 1, more results available)\n\n### #general\n- **ID:** C0EXAMPLE00\n- **Type:** Public Channel\n- **Purpose:** This is the one channel that will always include everyone. It’s a great spot for announcements and team-wide conversations.\n- **Archived:** No\n\n---\nPagination: More results available. Use cursor: \"aWQ6NDM5MTYwMDU5Nzc5NDI4MTY=\"\n"
+  },
+  "note": "a page with more after it shows no total; a channel's purpose shows (Slack's English default here, the real one its Russian default); the cursor is base64 of id:<a number the server keeps for a channel>, replaced with the env's own"
+ },
+ {
+  "tool": "slack_list_user_channels",
+  "arguments": {
+   "limit": 1,
+   "cursor": "aWQ6NDM5MTYwMDU5Nzc5NDI4MTY="
+  },
+  "response": {
+   "result": "## My Channels (showing 1, more results available)\n\n### #banter\n- **ID:** C0EXAMPLE02\n- **Type:** Public Channel\n- **Purpose:** This channel is for... well, everything else. It’s a place for team jokes, spur-of-the-moment ideas, and funny GIFs. Go wild!\n- **Archived:** No\n\n---\nPagination: More results available. Use cursor: \"aWQ6NDM5MTYwMDU5Nzc5NDI4MTg=\"\n"
+  },
+  "note": "channels come in the order they were made: #general before #banter, though their real names sort the other way"
+ },
+ {
+  "tool": "slack_list_user_channels",
+  "arguments": {
+   "cursor": "aWQ6NDM5MTYwMDU5Nzc5NDI4MTY=",
+   "limit": 200,
+   "format": "names_only"
+  },
+  "response": {
+   "result": "## My Channels (showing 2 of 2 total)\n\n#banter\n#zawarudo-capture\n"
+  },
+  "note": "the last page counts only its own channels; the real page also held two project channels, left out"
+ },
+ {
+  "tool": "slack_read_thread",
+  "arguments": {
+   "channel_id": "C0EXAMPLE01",
+   "message_ts": "1791967180.718159",
+   "limit": 1
+  },
+  "response": {
+   "messages": "=== THREAD PARENT MESSAGE ===\nFrom: Alex Rivera <alex.rivera@example.com> (U0EXAMPLE01)\nTime: 2026-10-14 13:39:40 +05\nMessage TS: 1791967180.718159\nHeads up: the 2026.08 prod deploy window moves to Tue 23:00 ET. Details in TKT-4471: <https://example.com/tickets/TKT-4471|example.com/tickets/TKT-4471>\n*Sent using* Claude\nReactions: eyes (1), white_check_mark (1)\n\n=== THREAD REPLIES (1 total) ===\n\n--- Reply 1 of 1 ---\nFrom: Alex Rivera <alex.rivera@example.com> (U0EXAMPLE01)\nTime: 2026-10-14 13:39:53 +05\nMessage TS: 1791967193.334969\nCorrection: it's Wed 01:00 ET now, freeze stays Tue 17:00.\n*Sent using* Claude\n",
+   "pagination_info": "There are more messages in this thread. To view the next page, use cursor: `bmV4dF90czoxNzkxOTY3MTkyMjU0MTU5`\n"
+  },
+  "note": "a thread pages from its newest reply back and counts the page's replies; the cursor is base64 of next_ts:<the next page's newest reply, its digits>"
+ },
+ {
+  "tool": "slack_read_thread",
+  "arguments": {
+   "channel_id": "C0EXAMPLE01",
+   "message_ts": "1791967180.718159",
+   "limit": 1,
+   "cursor": "bmV4dF90czoxNzkxOTY3MTkyMjU0MTU5"
+  },
+  "response": {
+   "messages": "=== THREAD PARENT MESSAGE ===\nFrom: Alex Rivera <alex.rivera@example.com> (U0EXAMPLE01)\nTime: 2026-10-14 13:39:40 +05\nMessage TS: 1791967180.718159\nHeads up: the 2026.08 prod deploy window moves to Tue 23:00 ET. Details in TKT-4471: <https://example.com/tickets/TKT-4471|example.com/tickets/TKT-4471>\n*Sent using* Claude\nReactions: eyes (1), white_check_mark (1)\n\n=== THREAD REPLIES (1 total) ===\n\n--- Reply 1 of 1 ---\nFrom: Alex Rivera <alex.rivera@example.com> (U0EXAMPLE01)\nTime: 2026-10-14 13:39:52 +05\nMessage TS: 1791967192.254159\n<@U0EXAMPLE01|Alex Rivera> can you confirm the rollback plan is the same as July?\n*Sent using* Claude\n",
+   "pagination_info": "There are more messages in this thread. To view the next page, use cursor: `bmV4dF90czoxNzkxOTY3MTkxMDY2Mjc5`\n"
+  },
+  "note": "every page repeats the parent"
+ },
+ {
+  "tool": "slack_read_thread",
+  "arguments": {
+   "channel_id": "C0EXAMPLE01",
+   "message_ts": "1791967180.718159",
+   "limit": 2,
+   "response_format": "concise"
+  },
+  "response": {
+   "messages": "THREAD: Heads up: the 2026.08 prod deploy window moves to Tue 23:00 ET. Details in TKT-4471: <https://example.com/tickets/TKT-4471|example.com/tickets/TKT-4471>\n*Sent using* Claude [Alex Rivera <alex.rivera@example.com>]\n\n> Alex Rivera <alex.rivera@example.com>: <@U0EXAMPLE01|Alex Rivera> can you confirm the rollback plan is the same as July?\n*Sent using* Claude\n> Alex Rivera <alex.rivera@example.com>: Correction: it's Wed 01:00 ET now, freeze stays Tue 17:00.\n*Sent using* Claude\n",
+   "pagination_info": "There are more messages in this thread. To view the next page, use cursor: `bmV4dF90czoxNzkxOTY3MTkxMDY2Mjc5`\n"
+  },
+  "note": "a page's replies run oldest first"
+ },
+ {
+  "tool": "slack_read_thread",
+  "arguments": {
+   "channel_id": "C0EXAMPLE01",
+   "message_ts": "1791967100.000000"
+  },
+  "error": "execution_failed: thread_not_found"
+ },
+ {
+  "tool": "slack_get_reactions",
+  "arguments": {
+   "channel_id": "C0EXAMPLE01",
+   "message_ts": "1791967100.000000"
+  },
+  "error": "execution_failed: message_not_found"
+ },
+ {
+  "tool": "slack_search_channels",
+  "arguments": {
+   "keywords": [
+    "zawarudo"
+   ],
+   "natural_language_query": "the capture channel",
+   "channel_types": "public_channel,private_channel",
+   "response_format": "concise"
+  },
+  "response": {
+   "results": "# Search Results for: \n\n## Channels (1 results)\n1. #zawarudo-capture (C0EXAMPLE01) - private_channel - Creator: Alex Rivera  - 2026-10-14 - Not Archived\n",
+   "pagination_info": "End of results - No more pages available.\\n"
+  }
+ },
+ {
+  "tool": "slack_search_channels",
+  "arguments": {
+   "keywords": [
+    "channel"
+   ],
+   "natural_language_query": "",
+   "limit": 1
+  },
+  "response": {
+   "results": "# Search Results for: \n\n## Channels (1 results)\n### Result 1 of 1\nName: #banter\nCreator: Jordan Lee (<@U0EXAMPLE00)\nCreated: 2023-06-07 11:37:30 +05\nPurpose: This channel is for... well, everything else. It’s a place for team jokes, spur-of-the-moment ideas, and funny GIFs. Go wild!\nPermalink: [link](https://example-co.slack.com/archives/C0EXAMPLE02)\nIs Archived: false\nChannel Type: public_channel\n\n---\n\n",
+   "pagination_info": "For the next page of results use cursor `Q1VSUkVOVF9QQUdFOjI=`\n"
+  },
+  "note": "a purpose shows after Created; #banter comes before #general, as their real names sort; the cursor is base64 of CURRENT_PAGE:2, as a message search's is"
+ },
+ {
+  "tool": "slack_search_users",
+  "arguments": {
+   "keywords": [
+    "alex.rivera"
+   ],
+   "natural_language_query": "find me",
+   "response_format": "concise"
+  },
+  "response": {
+   "results": "# Search Results for: \n\n## Users (1 results)\n1. Alex Rivera - U0EXAMPLE01 - alex.rivera@example.com\n",
+   "pagination_info": "End of results - No more pages available.\\n"
+  }
+ },
+ {
+  "tool": "slack_list_channel_members",
+  "arguments": {
+   "channel_id": "C0EXAMPLE00",
+   "response_format": "ids_only",
+   "limit": 1
+  },
+  "response": {
+   "members": "# Channel Members (1)\n\nU0EXAMPLE00\n",
+   "pagination_info": "There are more members available. To view the next page, use cursor: `dXNlcl9pZDoxMDk3MjY4NTc4OTkwNzYzODQ=`\n"
+  },
+  "note": "the count is the page's; the cursor is base64 of user_id:<a number the server keeps for a person>, replaced with the env's own"
+ },
+ {
+  "tool": "slack_search_public",
+  "arguments": {
+   "keywords": [
+    "deploy"
+   ],
+   "filters": "in:<#C0EXAMPLE01>",
+   "natural_language_query": ""
+  },
+  "response": {
+   "results": "# Search Results for: \n\nNo results found.\n",
+   "pagination_info": "End of results - No more pages available.\\n"
+  },
+  "note": "the public search does not read the private capture channel"
+ },
+ {
+  "tool": "slack_search_public",
+  "arguments": {
+   "keywords": [
+    "deploy"
+   ],
+   "filters": "in:<#C0EXAMPLE01>",
+   "natural_language_query": "",
+   "response_format": "concise"
+  },
+  "response": {
+   "results": "# Search Results for: \n\nNo results found.\n",
+   "pagination_info": "End of results - No more pages available.\\n"
+  }
+ },
+ {
+  "tool": "slack_search_public_and_private",
+  "arguments": {
+   "filters": "in:<#C0EXAMPLE01> is:thread",
+   "natural_language_query": "",
+   "limit": 1,
+   "sort": "timestamp",
+   "cursor": "Q1VSUkVOVF9QQUdFOjI="
+  },
+  "response": {
+   "results": "# Search Results for: \n\n## Messages (1 results)\n### Result 1 of 1\nChannel: #zawarudo-capture (ID: C0EXAMPLE01)\nFrom: Alex Rivera <alex.rivera@example.com> (ID: U0EXAMPLE01) \nTime: 2026-10-14 13:39:52 +05\nMessage_ts: 1791967192.254159\nPermalink: [link](https://example-co.slack.com/archives/C0EXAMPLE01/p1791967192254159?thread_ts=1791967180.718159&cid=C0EXAMPLE01)\nText: \n<@U0EXAMPLE01|Alex Rivera> can you confirm the rollback plan is the same as July?\nContext before: \n- From: Alex Rivera <alex.rivera@example.com> (ID: U0EXAMPLE01) \n  Message_ts: 1791967180.718159\n  Heads up: the 2026.08 prod deploy window moves to Tue 23:00 ET. Details in TKT-4471: <https://example.com/tickets/TKT-4471|example.com/tickets/TKT-4471> *Sent using* Claude\n- From: Alex Rivera <alex.rivera@example.com> (ID: U0EXAMPLE01) \n  Message_ts: 1791967191.066279\n  ack, pager is mine for that night *Sent using* Claude\nContext after: \n- From: Alex Rivera <alex.rivera@example.com> (ID: U0EXAMPLE01) \n  Message_ts: 1791967193.334969\n  Correction: it's Wed 01:00 ET now, freeze stays Tue 17:00. *Sent using* Claude\n\n---\n\n",
+   "pagination_info": "For the next page of results use cursor `Q1VSUkVOVF9QQUdFOjM=`\n"
+  },
+  "note": "page 2 of the search above: results are numbered per page"
  }
 ]

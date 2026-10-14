@@ -17,15 +17,10 @@ ME, CAPTURED_IN = "U0EXAMPLE01", "C0EXAMPLE01"
 # Where a world, or the env, reads otherwise than the server did. A strict expectation: if one comes to read the same,
 # its entry goes.
 DIFFERENT = {
-    3: "the server names the prefix nothing matched ('starting with ...'); the env says 'matching that request'",
     4: "the capture's last reply was also sent to the channel; a world's replies stay in their threads",
-    5: "the reply sent to the channel too, and the env's own cursors (the server's are base64 of next_ts:<ts>)",
-    6: "the server's cursor, which the env does not issue",
+    5: "the reply sent to the channel too, so the page and its cursor differ",
     7: "the reply sent to the channel too, inside the window",
-    8: "the server explains a channel_not_found at length; the env gives its code",
-    19: "people in a world have no profile photo, so they show no Profile Pic line",
-    25: "the env's own search cursors (the server's are base64 of CURRENT_PAGE:<n>)",
-    27: "the server drops a hit's markdown (bold, code) from its text; the env keeps it",
+    27: "the reply sent to the channel too, beside the hit in its channel",
 }
 # The capture's messages were posted through the server, which signs each; a world's messages are not signed.
 SIGNED = re.compile(r"(\n| )\*Sent using\* Claude")
@@ -38,21 +33,41 @@ def us(ts: str) -> int:
 
 @pytest.fixture(scope="module")
 def captured_in(tmp_path_factory) -> Workspace:
-    """Example Co's workspace as the capture saw it: Alex Rivera (Etc/GMT-5), a colleague and Slackbot; #general, a DM
-    with each, and the private #zawarudo-capture: a join, a post with a thread of three replies, a checklist, and
-    reactions."""
+    """Example Co's workspace as the capture saw it: Alex Rivera (Etc/GMT-5), a colleague and Slackbot; #general and
+    #banter, made in 2023 with Slack's default purposes; a DM with each person; and the private #zawarudo-capture: a
+    join, a post with a thread of three replies, a checklist, and reactions."""
     world = Workspace.create(tmp_path_factory.mktemp("capture") / "world.sqlite")
-    join, root = us("1791967174.350069"), us("1791967180.718159")
+    join, root, made = us("1791967174.350069"), us("1791967180.718159"), us("1686119850.000000")
     people = [
         ("U0EXAMPLE01", "alex.rivera", "Alex Rivera", 0),
-        ("U0EXAMPLE02", "jordan.lee", "Jordan Lee", 0),
+        ("U0EXAMPLE00", "jordan.lee", "Jordan Lee", 0),
         ("USLACKBOT", "slackbot", "Slackbot", 1),
     ]
+    # id, name, type, members, creator, made, purpose
     channels = [
-        (CAPTURED_IN, "zawarudo-capture", "private", ["U0EXAMPLE01"]),
-        ("C0EXAMPLE00", "general", "public", ["U0EXAMPLE01", "U0EXAMPLE02"]),
-        ("D0EXAMPLE01", None, "im", ["U0EXAMPLE01", "U0EXAMPLE02"]),
-        ("D0EXAMPLE02", None, "im", ["U0EXAMPLE01", "USLACKBOT"]),
+        (CAPTURED_IN, "zawarudo-capture", "private", ["U0EXAMPLE01"], ME, join, ""),
+        (
+            "C0EXAMPLE00",
+            "general",
+            "public",
+            ["U0EXAMPLE01", "U0EXAMPLE00"],
+            None,
+            made - 1_000_000,
+            "This is the one channel that will always include everyone. It’s a great spot for announcements and "
+            "team-wide conversations.",
+        ),
+        (
+            "C0EXAMPLE02",
+            "banter",
+            "public",
+            ["U0EXAMPLE01", "U0EXAMPLE00"],
+            "U0EXAMPLE00",
+            made,
+            "This channel is for... well, everything else. It’s a place for team jokes, spur-of-the-moment ideas, and "
+            "funny GIFs. Go wild!",
+        ),
+        ("D0EXAMPLE01", None, "im", ["U0EXAMPLE01", "U0EXAMPLE00"], None, join - 1_000_000, ""),
+        ("D0EXAMPLE02", None, "im", ["U0EXAMPLE01", "USLACKBOT"], None, join - 1_000_000, ""),
     ]
     messages = [
         ("1791967174.350069", None, f"<@{ME}> has joined the channel", "channel_join"),
@@ -110,21 +125,15 @@ def captured_in(tmp_path_factory) -> Workspace:
         world.insert(
             "channels",
             [
-                dict(
-                    id=id,
-                    name=name,
-                    type=kind,
-                    creator_id=ME if id == CAPTURED_IN else None,
-                    created_us=join if id == CAPTURED_IN else join - 1_000_000,
-                )
-                for id, name, kind, _ in channels
+                dict(id=id, name=name, type=kind, creator_id=creator, created_us=at, purpose=purpose)
+                for id, name, kind, _, creator, at, purpose in channels
             ],
         )
         world.insert(
             "members",
             [
                 dict(channel_id=id, user_id=user, joined_us=join if id == CAPTURED_IN else join - 1_000_000)
-                for id, _, _, users in channels
+                for id, _, _, users, *_ in channels
                 for user in users
             ],
         )
@@ -183,9 +192,28 @@ def test_reads_as_the_server(captured_in, entry):
         )
 
 
+def test_a_hit_reads_as_the_server(captured_in):
+    """A hit listed above for what is around it (a reply sent to the channel too) reads as the server's up to its
+    context: its text without bold and code marks."""
+    entry = CAPTURE[27]
+    have = slack.render(
+        captured_in,
+        "search_public_and_private",
+        slack.read(captured_in, "search_public_and_private", entry["arguments"]),
+    )
+    assert (
+        "*Release checklist*"
+        in slack.read(captured_in, "read_channel", {"channel_id": CAPTURED_IN})["items"][0]["text"]
+    )
+    assert (
+        have["results"].split("Context before")[0]
+        == unsigned(entry["response"])["results"].split("Context before")[0]
+    )
+
+
 def test_what_the_capture_covers():
-    """The capture holds a call of each read tool in each of its formats but four: search_public (in either format),
-    and the concise format of search_channels and of search_users."""
+    """The capture holds a call of each read tool in each of its formats; search_public's only as an empty result (the
+    capture's messages are in a private channel), which shares its hits' text with search_public_and_private."""
     served = json.loads((ROOT / "environments/worldgen_slack/capture/slack-mcp/tools.json").read_text())[
         "tools"
     ]
@@ -195,9 +223,4 @@ def test_what_the_capture_covers():
         for option in t["input_schema"]["properties"].get("response_format", {}).get("enum") or ["detailed"]
     }
     captured = {(e["tool"], e["arguments"].get("response_format", "detailed")) for e in CAPTURE}
-    assert formats - captured == {
-        ("slack_search_public", "detailed"),
-        ("slack_search_public", "concise"),
-        ("slack_search_channels", "concise"),
-        ("slack_search_users", "concise"),
-    }, sorted(formats - captured)
+    assert formats <= captured, sorted(formats - captured)

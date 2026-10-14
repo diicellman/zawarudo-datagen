@@ -317,7 +317,11 @@ async def test_world(tmp_path):
         ][0]["text"]
         == "notes posted for release 4.2"
     )
-    fails(read, solver, "search_public_and_private", keywords=["rollback"], cursor=page["next_cursor"])
+    assert (
+        read(solver, "search_public_and_private", keywords=["rollback"], cursor=page["next_cursor"])["items"]
+        == []
+    ), "a cursor names a page, not a request, as the server's do"
+    fails(read, solver, "search_public_and_private", keywords=["release"], cursor=slack._cursor("next_ts", 1))
     fails(read, solver, "search_public_and_private", keywords=["release"], limit=21)
     fails(read, solver, "search_public_and_private", keywords=[])
     assert read(solver, "get_reactions", channel_id="C1", message_ts=root_ts)["reactions"] == [
@@ -410,7 +414,9 @@ async def test_world(tmp_path):
     try:
         read(solver, "read_channel", channel_id="C9")
     except ValueError as error:
-        assert str(error) == "execution_failed: channel_not_found", error
+        assert (
+            str(error) == "execution_failed: channel_not_found\n\n" + slack.EXPLAINED["channel_not_found"]
+        ), error
 
     fails(stage_world, WorldToolsConfig(actor_id="U2", colocated=True), tmp_path / "solver.sqlite")
     config = WorldToolsConfig(actor_id="U2")
