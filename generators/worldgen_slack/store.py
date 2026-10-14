@@ -15,9 +15,9 @@ from worldgen_slack.release import (
     read_json,
 )
 from worldgen_slack.world import canonical
+from .evidence import measures
 from .workspace import Workspace
 
-from .forge.difficulty import measures
 from .world.board import Slot
 from .world.cast import Premise, SeedPersona
 from .judge.verdict import Issue, Verdict

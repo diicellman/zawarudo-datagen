@@ -8,7 +8,8 @@ from typing import Literal
 from pydantic import Field
 from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
 from worldgen_slack.world import SHOWN, canonical
-from .difficulty import features, measures, panel
+from ..evidence import measures
+from .difficulty import features, panel
 from ..config import Ids
 from ..world.board import Slot, places, readable
 from ..world.text import normalized

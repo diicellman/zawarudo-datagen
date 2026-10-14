@@ -105,7 +105,8 @@ from .forge.profile import profile
 from .forge.env import provenance as forge_provenance
 from .config import ROOT, Category, Needs, load_taxonomy
 from .world.config import WorldConfig
-from .forge.difficulty import IDENTIFIER, failure_cases, features, measures, panel
+from .evidence import IDENTIFIER, measures
+from .forge.difficulty import failure_cases, features, panel
 from .forge.tasks import Task, check_task, record_task
 from .world.board import Slot, needs_text
 from .world.cast import Gaps, Premise, Premises, SeedPersona, Typing, cards, pick_cast, user_id
