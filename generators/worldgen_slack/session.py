@@ -5,6 +5,7 @@ world tools both agents in a VM (the world author and the proposer) share."""
 import asyncio
 import contextlib
 import functools
+import hashlib
 import inspect
 import io
 import json
@@ -226,20 +227,36 @@ class SessionEnv(vf.Env[Seats]):
 
 class AuthoringToolsConfig(vf.ToolsetConfig):
     """An agent's world tools for one turn: the turn (mode) and its day, the world file and its hash, and the context
-    code renders the memory from."""
+    code renders the memory from, a file and its hash. A toolset's config reaches its server in one environment
+    variable, which holds at most 128 KB; the context grows with the cast and the days, so it travels as a file."""
 
     mode: Literal["plan", "day", "fix", "forge"] = "plan"
     day: int = 0
     db_path: str = ""
     db_hash: str = ""
     # settings, task slots, typing cards, the day's drawn conversations, routines, the call log
-    context: str = "{}"
+    context_path: str = ""
+    context_hash: str = ""
 
 
 def tools_config(mode: str, day: int, world: Path, context: dict) -> AuthoringToolsConfig:
-    """An agent's world tools for one turn, served host-side, where the world file is and code writes it."""
+    """An agent's world tools for one turn, served host-side, where the world file is and code writes it. The context
+    is kept beside the world file, named by its hash (`contexts/<sha256>.json`), so a turn never rewrites another's."""
+    text = json.dumps(context).encode()
+    key = hashlib.sha256(text).hexdigest()
+    path = world.parent / "contexts" / f"{key}.json"
+    if not path.exists():
+        path.parent.mkdir(exist_ok=True)
+        staged = path.with_suffix(".tmp")
+        staged.write_bytes(text)
+        staged.replace(path)
     tools = AuthoringToolsConfig(
-        mode=mode, day=day, db_path=str(world), db_hash=file_hash(world), context=json.dumps(context)
+        mode=mode,
+        day=day,
+        db_path=str(world),
+        db_hash=file_hash(world),
+        context_path=str(path),
+        context_hash=key,
     )
     if tools.colocated or tools.runtime.type != "subprocess" or tools.url is not None:
         raise ValueError("the world file requires a host-side tool server")
@@ -325,7 +342,9 @@ class WorldReads:
         self._lock = asyncio.Lock()
         if file_hash(self.config.db_path) != self.config.db_hash:
             raise ValueError("world file hash mismatch")
-        self.context = json.loads(self.config.context)
+        if file_hash(self.config.context_path) != self.config.context_hash:
+            raise ValueError("context file hash mismatch")
+        self.context = json.loads(Path(self.config.context_path).read_bytes())
         self.settings = self.settings_model.model_validate(self.context["settings"])
 
     def _with_state(self, fn):

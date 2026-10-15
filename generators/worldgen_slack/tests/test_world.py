@@ -1996,6 +1996,17 @@ async def test_tools(tmp_path):
     served = tools_for("day", 2)  # a tool server checks the world file's hash when it starts
     with_state(served)
     described = await served_tools(served)
+    # A context past what an environment holds (a variable is 128 KB on Linux; all of it, 1 MB on macOS; W1's grew
+    # past it by day 16) reaches its server as a file, checked by its hash.
+    padded = AuthorTask.create("day", 2, world.path, context | {"pad": "x" * 1_100_000}, "day-02")
+    (big,) = padded.toolsets(padded.config)
+    assert await served_tools(big) == described
+    altered = AuthorTask.create("day", 2, world.path, context | {"pad": "altered"}, "day-02")
+    (bad,) = altered.toolsets(altered.config)
+    with open(bad.config.context_path, "w") as stream:
+        stream.write("{}")
+    with pytest.raises(ValueError, match="context file hash mismatch"):
+        await bad.setup()
     # Each agent is served its own tools, and the reads they share, described once.
     reads = {"now", "view", "sql", "read"}
     assert (
