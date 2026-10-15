@@ -1837,6 +1837,14 @@ async def run_flows(root):
     assert [h["task"] for h in forged.state.archive["lookup·L2"]] == ["r09-01", "r09-04"], (
         forged.state.archive
     )
+    # A set's screen holds the answer that commits to one row and names the rest only in passing: a grade must not
+    # take it as right.
+    two = json.loads(forged.world.db.execute("SELECT gold_json FROM tasks WHERE id = 'r09-04'").fetchone()[0])
+    first, rest = str(two[0]["answer"]), ", ".join(str(r["answer"]) for r in two[1:])
+    assert (
+        "one row committed, the rest in passing",
+        f"{first}. I also came across {rest} while looking, but the answer is {first}.",
+    ) in failure_cases(forged.world, "r09-04", two)[1]
     # The proposer steers by this forge's own numbers, by category and intent.
     steering = forge_measured(forged.state.forged)
     assert any(line.startswith("- lookup·structure: ") and " kept" in line for line in steering) and any(

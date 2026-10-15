@@ -170,7 +170,8 @@ async def test_reviews(tmp_path):
     assert (
         "lists alternatives without settling on one is wrong" in asks[0].content
         and "do not change grounded" in asks[0].content
-    )
+        and "a value named only in passing, as an aside or a side option, is not committed" in asks[0].content
+    ), "a row named in passing does not complete a set"
     assert "never ask for a decoy to be\ncorrected or hedged" in PHASE_GUIDES["world"], (
         "the world judge knows a decoy is planned"
     )

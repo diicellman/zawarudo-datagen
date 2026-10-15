@@ -151,7 +151,7 @@ def features(world, task_id: str, rows: list[dict]) -> dict:
 def failure_cases(world, task_id: str, rows: list[dict]) -> tuple[str, list[tuple[str, str]]]:
     """A task's gold as a plain answer, and the wrong answers its grade must reject, built by code: each near-miss
     value its actor can read on its answer's subject and attribute, a hedge between the gold and the first of them, a
-    set with a row left out, declining to answer, a bare opener (judges accept one 60-90% of the time, 2507.08794),
+    set with a row left out or with all but one row named only in passing, declining to answer, a bare opener (judges accept one 60-90% of the time, 2507.08794),
     and a status given as final. A grade that accepts one, or rejects the gold, is ambiguous as asked
     (Self-Challenging's failure cases, 2506.01716)."""
     task = world.db.execute(
@@ -198,6 +198,14 @@ def failure_cases(world, task_id: str, rows: list[dict]) -> tuple[str, list[tupl
         cases.append(("a hedge", f"Either {gold} or {misses[0]}; I can't tell which."))
     if kind == "set" and len(answers) > 1:
         cases.append(("a set with a row left out", ", ".join(answers[:-1]) + "."))
+        # the rest named only in passing: committed to one, it lacks them (a grader took one such as right in FC1)
+        rest = ", ".join(answers[1:])
+        cases.append(
+            (
+                "one row committed, the rest in passing",
+                f"{answers[0]}. I also came across {rest} while looking, but the answer is {answers[0]}.",
+            )
+        )
     if kind == "status":
         cases.append(("the status given as final", f"{gold}. That is final and confirmed."))
         return f"{gold}, though it is not settled: nothing you can see confirms it.", cases

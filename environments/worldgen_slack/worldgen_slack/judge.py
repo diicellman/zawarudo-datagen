@@ -51,7 +51,9 @@ class AnswerJudge(vf.Judge[AnswerGrade]):
                 content=(
                     "Grade a Slack answer against the question and its reference. First find the answer the response "
                     "commits to: one that lists alternatives without settling on one is wrong, while side options it "
-                    "labels as such do not count against an answer it commits to. A response that gives no answer and "
+                    "labels as such do not count against an answer it commits to, nor toward it: a value named only in "
+                    "passing, as an aside or a side option, is not committed, so a set whose committed answer lacks a "
+                    "reference row is wrong however the response mentions that row elsewhere. A response that gives no answer and "
                     "says the request cannot be answered or determined has abstained, whether or not that is right. "
                     "The reference's rows are the answer: for a set every row is required and order does not matter; "
                     "text and number are one value; a time asked for on the asker's clock is given on that clock; a "
