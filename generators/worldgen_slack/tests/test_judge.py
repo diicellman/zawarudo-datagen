@@ -87,8 +87,9 @@ async def test_reviews(tmp_path):
     ] and not accepted_task(blocked, "t1")
     assert (
         "Realism, on each task's review" in PHASE_GUIDES["task"]
-        and "who stayed quiet after an event" in (PHASE_GUIDES["task"])
-    ), "the reviewer is told what a colleague asks, from the user's labels"
+        and "Ask what its asker would do with the answer" in PHASE_GUIDES["task"]
+        and "treats colleagues' activity as data" in PHASE_GUIDES["task"]
+    ), "the reviewer is told what a colleague asks, in the user's terms"
     workspace = Issue(artifact="workspace", defect="d", requested_change="c")
     fails(
         validate_verdict, verdict(approved=False, issues=[workspace]), payload
