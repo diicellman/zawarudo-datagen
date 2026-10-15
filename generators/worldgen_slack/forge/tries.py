@@ -94,7 +94,9 @@ class Tries:
     def refresh_gold(self):
         """Gold rows follow the world: every task's query runs again as its actor after the world changes."""
         with self.world.trial() as copy:
-            for task_id, actor, sql in copy.db.execute("SELECT id, actor_id, gold_sql FROM tasks").fetchall():
+            for task_id, actor, sql in copy.db.execute(
+                "SELECT id, actor_id, gold_sql FROM tasks WHERE answer_type <> 'composite'"
+            ).fetchall():  # a composite's parts carry its gold
                 rows = copy.gold(actor, sql, max_rows=self.settings.max_answer_rows)["rows"]
                 copy.db.execute("UPDATE tasks SET gold_json = ? WHERE id = ?", (json.dumps(rows), task_id))
 

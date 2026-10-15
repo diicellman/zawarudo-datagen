@@ -42,7 +42,7 @@ def release_rows(store, world_hash: str) -> tuple[list[PublicTask], dict[str, Pr
     other of them supersedes. A stale value or a decoy beside them is not its evidence."""
     rows, answers = [], {}
     db = store.world.db
-    for task in db.execute("SELECT * FROM tasks ORDER BY id").fetchall():
+    for task in db.execute("SELECT * FROM tasks WHERE parent IS NULL ORDER BY id").fetchall():
         gold = json.loads(task["gold_json"])
         anchors = {
             (f, m)
@@ -142,7 +142,9 @@ def publish(store) -> None:
     if store.state.phase != "done":
         raise ValueError("release requires a finished run")
     if missing := [
-        t for (t,) in store.world.db.execute("SELECT id FROM tasks") if t not in store.state.task_reviews
+        t
+        for (t,) in store.world.db.execute("SELECT id FROM tasks WHERE parent IS NULL")
+        if t not in store.state.task_reviews
     ]:
         raise ValueError(f"release requires an approved review of every task; missing {missing}")
     if store.world.violations(complete=True):

@@ -5,7 +5,7 @@ import re
 import unicodedata
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from worldgen_slack.release import NonEmptyText, SafeId, StrictModel
 from worldgen_slack.world import SHOWN, canonical
 
@@ -31,6 +31,26 @@ INTENTS = {
     "stance": "who said, agreed or objected",
     "structure": "who posted, reacted or replied where: the workspace's own record",
 }
+# What a task is, as a request: what people ask a colleague who reads Slack for them. A forge balances its tasks by
+# family (they replace the intents), and a request of several parts asks for what a real catch-up or report needs.
+FAMILIES = {
+    "catch-up": "what the asker missed on something, or what changed about it since a moment",
+    "decisions": "what was decided about something, and why; whether it is still the plan",
+    "commitments": "what someone promised, to whom, and whether it was done",
+    "status": "who handles something now, where it stands, or who to ask about it",
+}
+
+
+class Part(StrictModel):
+    """One part of a composite request: what it asks, in the request's own words (`label`), and its gold as a task's:
+    a category of the taxonomy, an answer type, the gold query, the facts it rests on and its near-miss queries."""
+
+    label: NonEmptyText
+    category: NonEmptyText
+    answer_type: Literal["text", "set", "number", "refusal", "status"]
+    gold_sql: NonEmptyText
+    facts: Ids = Field(default_factory=list)
+    near_sql: list[NonEmptyText] = Field(default_factory=list, max_length=3)
 
 
 class Task(StrictModel):
@@ -39,8 +59,8 @@ class Task(StrictModel):
     level: int = Field(ge=1)
     actor_id: SafeId
     question: NonEmptyText
-    answer_type: Literal["text", "set", "number", "refusal", "status"]
-    gold_sql: NonEmptyText
+    answer_type: Literal["text", "set", "number", "refusal", "status", "composite"]
+    gold_sql: NonEmptyText | None = None
     facts: Ids = Field(default_factory=list)
     # The gold query with one condition relaxed (a day, a channel, a reaction left out): what a hasty reader answers.
     near_sql: list[NonEmptyText] = Field(default_factory=list, max_length=3)
@@ -49,6 +69,42 @@ class Task(StrictModel):
     rewords: SafeId | None = None
     # In the forge, the request it is (INTENTS): the archive balances them, so the tasks read like real requests.
     intent: Literal["find", "status", "owner", "promised", "when", "stance", "structure"] | None = None
+    # The request family it is (FAMILIES): a forge's places are its families by measured level.
+    family: Literal["catch-up", "decisions", "commitments", "status"] | None = None
+    # A composite request (category and answer_type composite): its 2 to 4 parts, each with its own gold; it is
+    # answered right only when every part is.
+    parts: list[Part] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def shaped(self):
+        if self.parts or "composite" in (self.answer_type, self.category):
+            if not 2 <= len(self.parts) <= 4 or (self.answer_type, self.category) != (
+                "composite",
+                "composite",
+            ):
+                raise ValueError(
+                    "a composite request has category and answer_type composite, and 2 to 4 parts"
+                )
+            if self.gold_sql or self.facts or self.near_sql:
+                raise ValueError("a composite request's gold, facts and near-miss queries are its parts'")
+        elif not self.gold_sql:
+            raise ValueError("a task names its gold_sql, or is a composite request of parts")
+        return self
+
+
+def part_of(task: Task, n: int, part: Part) -> Task:
+    """A composite's `n`th part as a task of its own, never asked alone: its request's asker and level, its own gold."""
+    return Task(
+        id=f"{task.id}-p{n}",
+        category=part.category,
+        level=task.level,
+        actor_id=task.actor_id,
+        question=part.label,
+        answer_type=part.answer_type,
+        gold_sql=part.gold_sql,
+        facts=part.facts,
+        near_sql=part.near_sql,
+    )
 
 
 LEDGER_TABLES = {
@@ -71,9 +127,28 @@ def same_rows(rows: list[dict], again: list[dict], back) -> bool:
     return sorted(map(canonical, rows)) == sorted(map(canonical, mapped))
 
 
-def check_task(world, task: Task, settings, renumbered=None) -> list[dict]:
+def check_task(world, task: Task, settings, renumbered=None) -> list:
     """T1-T5, and T7 given the world `renumbered`: the gold query runs as the task's actor, reads what the task's
-    category promises, and finds its messages by what they say; the rows are the gold answer. Returns them."""
+    category promises, and finds its messages by what they say; the rows are the gold answer. Returns them; for a
+    composite request, each part's, each part checked as a task, its answers its own and none given in the request."""
+    if task.parts:
+        golds = [
+            check_task(world, part_of(task, n, p), settings, renumbered) for n, p in enumerate(task.parts, 1)
+        ]
+        answers = [tuple(sorted(str(r.get("answer")) for r in rows)) for rows in golds]
+        if len(set(answers)) < len(answers):
+            raise ValueError(
+                f"{task.id}: each part asks for something of its own; two parts give the same answer"
+            )
+        if given := [
+            str(r["answer"])
+            for p, rows in zip(task.parts, golds)
+            if p.answer_type != "number"
+            for r in rows
+            if not _meaningful_tokens(str(r["answer"])) - _meaningful_tokens(task.question)
+        ]:
+            raise ValueError(f"{task.id}: the request gives away its answer {given}")
+        return golds
     category = settings.taxonomy.get(task.category)
     if category is None:
         raise ValueError(f"{task.id}: category must be one of {sorted(settings.taxonomy)}")
@@ -169,7 +244,8 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
     measures. Run inside `World.trial()`."""
     if (task.id, task.category, task.level) != (slot.id, slot.category, slot.level):
         raise ValueError(f"{slot.id} is a {slot.category} level {slot.level} task, with the slot's id")
-
+    if task.parts:
+        return record_composite(world, task, settings, slot)
     for fact in (
         task.facts if task.answer_type not in ("refusal", "status") else ()
     ):  # a refusal or a status may rest on the truth out of sight
@@ -180,7 +256,7 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
         gold = check_task(world, task, settings, renumbered)
     # A question no other task asks, but for a perspective twin: another asker, for whom its answer differs.
     for question, actor, rows in world.db.execute(
-        "SELECT question, actor_id, gold_json FROM tasks WHERE id != ?", (task.id,)
+        "SELECT question, actor_id, gold_json FROM tasks WHERE id != ? AND parent IS NULL", (task.id,)
     ):
         if normalized(question) == normalized(task.question) and (
             actor == task.actor_id or json.loads(rows) == gold
@@ -196,9 +272,50 @@ def record_task(world, task: Task, settings, slot: Slot) -> dict:
     return {"gold": gold} | measures(world, task.id, gold, tables)
 
 
+def record_composite(world, task: Task, settings, slot: Slot) -> dict:
+    """A composite request recorded: its parts checked (T1-T7, readable facts, each as a task), then the request and
+    each part inserted, a part a task of its own under its request (parent, part, label) with its gold rows and facts.
+    Returns each part's gold rows and code's measures."""
+    parts = [part_of(task, n, p) for n, p in enumerate(task.parts, 1)]
+    for part in parts:
+        for fact in part.facts if part.answer_type not in ("refusal", "status") else ():
+            row = world.db.execute("SELECT channel_id FROM facts WHERE id = ?", (fact,)).fetchone()
+            if row and not readable(world, part.actor_id, row[0]):
+                raise ValueError(f"{part.id}: its actor cannot read {row[0]}, where {fact} is stated")
+    with world.renumbered() as renumbered:
+        golds = check_task(world, task, settings, renumbered)
+    for (question,) in world.db.execute(
+        "SELECT question FROM tasks WHERE id != ? AND parent IS NULL AND actor_id = ?",
+        (task.id, task.actor_id),
+    ):
+        if normalized(question) == normalized(task.question):
+            raise ValueError(f"{task.id}: a request no other task of its asker makes")
+    with world.batch():
+        world.insert("tasks", [task_row(task, settings) | {"concept": slot.concept}])
+        for n, (part, rows) in enumerate(zip(parts, golds), 1):
+            world.insert(
+                "tasks",
+                [
+                    task_row(part, settings)
+                    | {"concept": slot.concept, "parent": task.id, "part": n, "label": part.question}
+                    | {"gold_json": json.dumps(rows)}
+                ],
+            )
+            world.insert("task_facts", [dict(task_id=part.id, fact_id=f) for f in dict.fromkeys(part.facts)])
+    out = []
+    for part, rows in zip(parts, golds):
+        tables = world.gold(part.actor_id, part.gold_sql, max_rows=settings.max_answer_rows)["tables"]
+        out.append(
+            {"part": part.id, "label": part.question, "gold": rows} | measures(world, part.id, rows, tables)
+        )
+    return {"gold": golds, "parts": out}
+
+
 def gold_source(task: Task, settings) -> str:
     """Where a task's answer comes from: its category's gold, but a status answer is a value of the ledger as its
-    actor can see it stated."""
+    actor can see it stated, and a composite request's answer is its parts'."""
+    if task.parts:
+        return "composite"
     if task.answer_type == "status":
         return "ledger"
     return settings.taxonomy[task.category].gold if task.category in settings.taxonomy else "sql"
@@ -247,18 +364,40 @@ def unsettled(world, task: Task, rows: list[dict]) -> None:
 
 def task_row(task: Task, settings) -> dict:
     return task.model_dump(
-        include={"id", "category", "level", "actor_id", "question", "answer_type", "gold_sql", "intent"}
-    ) | {"gold_source": gold_source(task, settings), "near_sql": json.dumps(task.near_sql)}
+        include={"id", "category", "level", "actor_id", "question", "answer_type", "intent", "family"}
+    ) | {
+        "gold_sql": task.gold_sql or "",
+        "gold_source": gold_source(task, settings),
+        "near_sql": json.dumps(task.near_sql),
+    }
 
 
 def answer_of(world, task_id: str) -> list:
-    """What a task answers: its gold rows' answers, or, for a refusal, the facts it rests on."""
+    """What a task answers: its gold rows' answers, or, for a refusal, the facts it rests on; for a composite request,
+    each part's, by its label."""
     row = world.db.execute("SELECT answer_type, gold_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row["answer_type"] == "composite":
+        return [
+            f"{label}: {', '.join(answer_of(world, part))}"
+            for part, label in world.db.execute(
+                "SELECT id, label FROM tasks WHERE parent = ? ORDER BY part", (task_id,)
+            ).fetchall()
+        ]
     if row["answer_type"] == "refusal":
         return sorted(
             f for (f,) in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))
         )
     return sorted(str(r.get("answer")) for r in json.loads(row["gold_json"]))
+
+
+def forget(world, task_id: str) -> None:
+    """A task taken off the world, its parts with it."""
+    for t in [r[0] for r in world.db.execute("SELECT id FROM tasks WHERE parent = ?", (task_id,))] + [
+        task_id
+    ]:
+        world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (t,))
+    world.db.execute("DELETE FROM tasks WHERE parent = ?", (task_id,))
+    world.db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
 
 
 def forge_task(
@@ -271,8 +410,8 @@ def forge_task(
     queries) are left out. Returns its gold rows and code's measures."""
     if task.id not in open_ids:
         raise ValueError(f"a candidate's id is one of this round's open ids: {open_ids}")
-    if gates and task.intent is None:
-        raise ValueError(f"{task.id}: name its intent, the request it is: {sorted(INTENTS)}")
+    if gates and task.family is None:
+        raise ValueError(f"{task.id}: name its family, the request it is: {sorted(FAMILIES)}")
     was = None
     if task.rewords is not None:
         if (was := (rework or {}).get(task.rewords)) is None:
@@ -288,14 +427,17 @@ def forge_task(
     slot = Slot(
         id=task.id, category=task.category, level=task.level, concept=concept, style="the proposer's own"
     )
-    world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
-    world.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
+    forget(world, task.id)
     result = {"task": task.id} | record_task(world, task, settings, slot)
     if was is not None and (now := answer_of(world, task.id)) != was["answer"]:
         raise ValueError(
             f"{task.id} rewords {task.rewords} and keeps its gold answer: that one answers {was['answer']}, this one "
             f"{now}. Change the words so they rule the other reading out ({was['reading']}), not the answer"
         )
+    if (
+        task.parts
+    ):  # its difficulty is its parts', each measured as a task's; no one search answers a whole request
+        return result | {"features": [features(world, p["part"], p["gold"]) for p in result["parts"]]}
     lazy = panel(world, task.id, result["gold"])
     if gates and task.level > 1 and not task.facts and task.answer_type != "refusal" and not task.near_sql:
         raise ValueError(

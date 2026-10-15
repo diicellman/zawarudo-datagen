@@ -250,15 +250,19 @@ CREATE TABLE tasks (
   concept      TEXT NOT NULL DEFAULT '',             -- what a task of its level requires, drawn by the seed
   actor_id     TEXT NOT NULL REFERENCES users(id),
   question     TEXT NOT NULL,
-  answer_type  TEXT NOT NULL CHECK (answer_type IN ('text', 'set', 'number', 'refusal', 'status')),
-  gold_source  TEXT NOT NULL CHECK (gold_source IN ('sql', 'ledger', 'hybrid')),
+  answer_type  TEXT NOT NULL CHECK (answer_type IN ('text', 'set', 'number', 'refusal', 'status', 'composite')),
+  gold_source  TEXT NOT NULL CHECK (gold_source IN ('sql', 'ledger', 'hybrid', 'composite')),
   gold_sql     TEXT NOT NULL,                        -- run as the actor; returns answer (+ message_id, user_id)
   gold_json    TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(gold_json)),  -- its rows
   near_sql     TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(near_sql)),   -- the gold, one condition relaxed
   min_calls    INTEGER,                              -- the fewest tool calls of a right probe
   right_rate   REAL,                                 -- the probes' share of right answers: the task's difficulty
   strict_rate  REAL,                                 -- the probes' share right and grounded: the released reward
-  intent       TEXT                                  -- v2: the request it is, a person's to an assistant
+  intent       TEXT,                                 -- v2: the request it is, a person's to an assistant
+  family       TEXT,                                 -- v3: the request family it is (catch-up, decisions, ...)
+  parent       TEXT REFERENCES tasks(id),            -- v3: a part's composite task; a part is never asked alone
+  part         INTEGER,                              -- v3: its place among its composite's parts, from 1
+  label        TEXT                                  -- v3: what part of its composite's request it answers
 );
 
 CREATE TABLE task_facts (

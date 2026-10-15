@@ -255,11 +255,13 @@ class Store:
             "day": self.state.day,
             "rounds": self.state.rounds,
             "final_approved": "final" in self.state.reviews,
-            "tasks": count("SELECT COUNT(*) FROM tasks"),
+            "tasks": count("SELECT COUNT(*) FROM tasks WHERE parent IS NULL"),
             "messages": count("SELECT COUNT(*) FROM messages"),
             "task_mix": [
                 list(r)
-                for r in self.world.db.execute("SELECT category, level, COUNT(*) FROM tasks GROUP BY 1, 2")
+                for r in self.world.db.execute(
+                    "SELECT category, level, COUNT(*) FROM tasks WHERE parent IS NULL GROUP BY 1, 2"
+                )
             ],
             "rates": rates,
             "crashed_solves": sum(r["crashed"] or 0 for r in rates.values()),

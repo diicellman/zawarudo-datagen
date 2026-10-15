@@ -13,9 +13,11 @@ from zoneinfo import ZoneInfo
 
 from worldgen_slack.world import SCHEMA, SHADOWED, World, words
 
-# The schema's version, and how a world of an older one comes forward to it: the columns each version added (the
-# tables it added are made from schema.sql). A world adopted by a chapter or a forge is brought forward first.
-SCHEMA_VERSION = 2
+# The schema's version, and how a world of an older one comes forward to it: the columns each version added, and the
+# tables it changed in a way no ALTER can (a CHECK), remade from schema.sql with their rows (the tables it added are
+# made from schema.sql). A world adopted by a chapter or a forge is brought forward first.
+SCHEMA_VERSION = 3
+REBUILT = {3: ["tasks"]}  # v3: a task may be composite, its parts tasks of their own
 COLUMNS = {
     2: [
         ("users", "deactivated_us", "ALTER TABLE users ADD COLUMN deactivated_us INTEGER"),
@@ -29,6 +31,13 @@ COLUMNS = {
         ("tasks", "intent", "ALTER TABLE tasks ADD COLUMN intent TEXT"),
     ],
 }
+
+
+def asked(db) -> str:
+    """The tasks a world asks, as a condition on its tasks table: every one but a composite's parts. A world before v3,
+    read as it is (not brought forward), has no parts."""
+    return "parent IS NULL" if "parent" in {r[1] for r in db.execute("PRAGMA table_info(tasks)")} else "1"
+
 
 ANSWER_KEY = (
     "queue",
@@ -192,6 +201,8 @@ class Workspace(World):
             "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid"
         ).fetchall()
         fresh.close()
+        if rebuilt := [t for v in range(was + 1, SCHEMA_VERSION + 1) for t in REBUILT.get(v, [])]:
+            self.rebuild(rebuilt, objects)
         have = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master")}
         with self.batch():
             for version in range(was + 1, SCHEMA_VERSION + 1):
@@ -206,6 +217,30 @@ class Workspace(World):
                 (str(SCHEMA_VERSION),),
             )
         return was
+
+    def rebuild(self, tables: list[str], objects: list) -> None:
+        """Tables remade from schema.sql with their rows, the way SQLite changes a table no ALTER can: foreign keys
+        off, a new table filled from the old (the columns both have), the old dropped and the new renamed, the keys
+        checked, all or nothing."""
+        self.db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with self.batch():
+                for table in tables:
+                    create = next(sql for kind, name, sql in objects if kind == "table" and name == table)
+                    old = [r[1] for r in self.db.execute(f"PRAGMA table_info({table})")]
+                    self.db.execute(create.replace(f"CREATE TABLE {table}", f"CREATE TABLE {table}_new", 1))
+                    both = ", ".join(
+                        c
+                        for c in (r[1] for r in self.db.execute(f"PRAGMA table_info({table}_new)"))
+                        if c in old
+                    )
+                    self.db.execute(f"INSERT INTO {table}_new ({both}) SELECT {both} FROM {table}")
+                    self.db.execute(f"DROP TABLE {table}")
+                    self.db.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+                if broken := self.db.execute("PRAGMA foreign_key_check").fetchall():
+                    raise ValueError(f"a rebuilt table breaks a foreign key: {broken[:3]}")
+        finally:
+            self.db.execute("PRAGMA foreign_keys = ON")
 
     # ------------------------------------------------------------------ writes
     def insert(self, table: str, rows: list[dict]) -> list[int]:

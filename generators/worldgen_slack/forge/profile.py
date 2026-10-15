@@ -9,7 +9,7 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from ..workspace import Workspace
+from ..workspace import Workspace, asked
 from ..world.board import answer_facts, readable
 from ..world.clock import meta
 
@@ -122,7 +122,7 @@ def profile(world) -> dict:
             ),
             "people": count("SELECT COUNT(*) FROM users"),
             "facts": count("SELECT COUNT(*) FROM facts"),
-            "tasks": count("SELECT COUNT(*) FROM tasks"),
+            "tasks": count(f"SELECT COUNT(*) FROM tasks WHERE {asked(world.db)}"),
             "board_entries": count("SELECT COUNT(DISTINCT slot) FROM board"),
         },
         "material": {

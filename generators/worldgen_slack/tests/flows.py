@@ -538,6 +538,7 @@ def forge_seats(note_on=None) -> dict:
                     answer_type="text",
                     gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1",
                     intent="structure",
+                    family="status",
                 ),
             )
 
@@ -1141,6 +1142,7 @@ async def run_flows(root):
                     gold_sql="SELECT value AS answer FROM facts WHERE id = 'f2'",
                     facts=["f2"],
                     intent="when",
+                    family="status",
                 )
                 # else a shortcut was written above level 1
                 with pytest.raises(ValueError, match=re.escape("so it is a level-1 task")):
@@ -1162,9 +1164,9 @@ async def run_flows(root):
                     and "failure_cases" in probed
                     and not world.db.execute("SELECT 1 FROM tasks WHERE id = ?", (ids[1],)).fetchone()
                 ), "a probe writes nothing"
-                # else a candidate with no intent was written
-                with pytest.raises(ValueError, match=re.escape("name its intent")):
-                    await call("add_task", task=notes.model_copy(update={"level": 1, "intent": None}))
+                # else a candidate with no family was written
+                with pytest.raises(ValueError, match=re.escape("name its family")):
+                    await call("add_task", task=notes.model_copy(update={"level": 1, "family": None}))
                 # A task on no facts above level 1 names the answer a hasty reader gives: another one.
                 newest = Task(
                     id=ids[0],
@@ -1175,6 +1177,7 @@ async def run_flows(root):
                     answer_type="text",
                     gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1",
                     intent="structure",
+                    family="status",
                 )
                 for near, why in (([], "near_sql"), ([newest.gold_sql], "returns its gold answer")):
                     # else a near-miss query was accepted: {near}
@@ -1196,6 +1199,7 @@ async def run_flows(root):
                         gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1",
                         near_sql=["SELECT real_name AS answer FROM users ORDER BY id LIMIT 1"],
                         intent="structure",
+                        family="status",
                     ),
                 )
                 assert (
@@ -1218,6 +1222,7 @@ async def run_flows(root):
                         gold_sql="SELECT value AS answer FROM facts WHERE id = 'f2'",
                         facts=["f2"],
                         intent="when",
+                        family="status",
                     ),
                 )
         elif prompt.startswith("The review rejected"):
@@ -1777,6 +1782,7 @@ async def run_flows(root):
         gold_sql="SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1",
         near_sql=["SELECT real_name AS answer FROM users ORDER BY id LIMIT 1"],
         intent="structure",
+        family="status",
     )
     newest_two = newest.model_copy(
         update={
@@ -1854,8 +1860,9 @@ async def run_flows(root):
     assert (
         "## What this forge has measured" in pages_["memory/archive.md"]
         and steering[0] in pages_["memory/archive.md"]
-        and "- promised: what someone promised" in pages_["memory/taxonomy.md"]
-    )
+        and "- commitments: what someone promised, to whom, and whether it was done"
+        in pages_["memory/taxonomy.md"]
+    ), "the proposer is told the families a task is"
     assert plan.env.witness.sampling.reasoning_effort == "high", "the witness thinks hard"
     # A candidate counts its tries run again (cut on a hung request, or crashed), and the archive says so.
     batch, forged.state.batch = forged.state.batch, forged.state.forged["r02-01"]["round"]
@@ -2073,6 +2080,7 @@ async def chapter_flow(root, parent, settings):
     ):
         aged.db.execute(sql)
     rows = aged.db.execute("SELECT COUNT(*), group_concat(text) FROM messages").fetchone()[:]
+    tasks = aged.db.execute("SELECT * FROM tasks ORDER BY id").fetchall()
     assert set(same_schema(aged)) == {
         "artifacts",
         "channels",
@@ -2083,10 +2091,17 @@ async def chapter_flow(root, parent, settings):
         "usergroups",
         "users",
     }
-    assert (aged.migrate(), same_schema(aged), aged.migrate(), aged.violations()) == (1, [], 2, []), (
+    assert (aged.migrate(), same_schema(aged), aged.migrate(), aged.violations()) == (1, [], 3, []), (
         "forward, once"
     )
     assert aged.db.execute("SELECT COUNT(*), group_concat(text) FROM messages").fetchone()[:] == rows
+    # v3 remade the tasks table (a task may be composite): its rows as they were, the new columns empty.
+    assert [tuple(t)[: len(tasks[0])] for t in aged.db.execute("SELECT * FROM tasks ORDER BY id")] == [
+        tuple(t) for t in tasks
+    ] and aged.db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert {"family", "parent", "part", "label"} <= {
+        r[1] for r in aged.db.execute("PRAGMA table_info(tasks)")
+    }
     aged.close()
     taxonomy = root / "taxonomy.toml"  # the flows' own taxonomy, as a chapter's config names one
     taxonomy.write_text(taxonomy_toml(settings))
@@ -2138,7 +2153,7 @@ async def chapter_flow(root, parent, settings):
     on_elder = chapter.model_copy(update={"world": elder, "output": root / "on-elder"})
     elder_store = TestStore(on_elder.output, chapter_provenance(on_elder, cfg))
     adopt(elder_store, on_elder, cfg, slots)
-    assert (meta(elder_store.world, "schema_version"), same_schema(elder_store.world)) == ("2", []), (
+    assert (meta(elder_store.world, "schema_version"), same_schema(elder_store.world)) == ("3", []), (
         "brought forward"
     )
     elder_store.close()

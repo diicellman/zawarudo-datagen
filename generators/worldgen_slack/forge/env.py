@@ -16,14 +16,14 @@ from ..config import pinned
 from ..judge.verdict import READING
 from ..session import SETUP_FILES, SessionEnv, keep_awake, require_session
 from ..store import Store
-from ..workspace import Workspace, reset_tasks
+from ..workspace import Workspace, asked, reset_tasks
 from ..world.author.memory import task_page
 from ..world.board import brief
 from .config import ForgeConfig
 from .difficulty import features
 from .proposer.task import ProposerTask, forge_prompt
 from .release import miss_class, release_rows
-from .tasks import INTENTS, Task, answer_of, forge_task
+from .tasks import FAMILIES, Task, answer_of, forge_task, forget
 from .tries import Tries, rates
 
 
@@ -112,7 +112,7 @@ class ForgeEnv(SessionEnv):
         state = self.store.state
         attempt = self.store.reserve("measure", 2)
         source = Workspace(self.settings.world / "world.sqlite")
-        rows = source.db.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+        rows = source.db.execute(f"SELECT * FROM tasks WHERE {asked(source.db)} ORDER BY id").fetchall()
         ids = [r["id"] for r in rows]
         for row in rows:
             facts = [
@@ -202,7 +202,10 @@ class ForgeEnv(SessionEnv):
                 if not (missing := [t for t in ids if t not in self.written(ids)]):
                     break
                 held = self.world.db.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE id NOT IN (" + ", ".join("?" * len(ids)) + ")", ids
+                    "SELECT COUNT(*) FROM tasks WHERE parent IS NULL AND id NOT IN ("
+                    + ", ".join("?" * len(ids))
+                    + ")",
+                    ids,
                 ).fetchone()[0]
                 prompt = (
                     forge_prompt(number, cfg.rounds, ids, held, cfg.tasks)
@@ -350,7 +353,7 @@ class ForgeEnv(SessionEnv):
         kept = {
             (c, lvl): n
             for c, lvl, n in self.world.db.execute(
-                "SELECT category, level, COUNT(*) FROM tasks GROUP BY category, level"
+                "SELECT category, level, COUNT(*) FROM tasks WHERE parent IS NULL GROUP BY category, level"
             )
         }
         rests = {
@@ -378,8 +381,7 @@ class ForgeEnv(SessionEnv):
         return not open_ and sum(kept.values()) >= self.settings.tasks
 
     def drop(self, task_id: str, attempt: str, why: str) -> None:
-        self.world.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task_id,))
-        self.world.db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        forget(self.world, task_id)
         self.store.event("candidate_dropped", attempt=attempt, task_id=task_id, why=why)
 
     def pages(self) -> dict[str, str]:
@@ -460,11 +462,15 @@ class ForgeEnv(SessionEnv):
             ]
             taxonomy.append("")
         taxonomy += [
-            "# Intents: the request a task is, a person's to an assistant (name one on each candidate)",
+            "# Families: the request a task is, a person's to a colleague who reads Slack for them (name one on each "
+            "candidate)",
             "",
         ]
-        taxonomy += [f"- {k}: {v}" for k, v in INTENTS.items()]
-        tasks = [task_page(dict(t)) for t in self.world.db.execute("SELECT * FROM tasks ORDER BY id")]
+        taxonomy += [f"- {k}: {v}" for k, v in FAMILIES.items()]
+        tasks = [
+            task_page(dict(t))
+            for t in self.world.db.execute("SELECT * FROM tasks WHERE parent IS NULL ORDER BY id")
+        ]
         return {
             "memory/tasks.md": "# Tasks\n" + "\n".join(tasks) + "\n",
             "memory/board.md": "\n".join(board) + "\n",

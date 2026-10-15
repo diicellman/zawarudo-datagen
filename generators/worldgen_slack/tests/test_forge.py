@@ -13,10 +13,10 @@ from worldgen_slack.world import SHADOWED, SHOWN
 from ..evidence import measures
 from ..forge import tries as tries_module
 from ..forge.config import ForgeSeats
-from ..forge.tasks import Task, check_task
+from ..forge.tasks import Part, Task, answer_of, check_task, forge_task, forget
 from ..forge.tries import Tries
-from ..workspace import Workspace
-from .support import contracts_settings, fails, forge_of, world_fixture
+from ..workspace import Workspace, asked
+from .support import contracts_settings, fails, forge_of, refused, world_fixture
 
 
 def test_tasks(tmp_path):
@@ -208,4 +208,81 @@ async def test_tries_cut_and_kept(monkeypatch):
         900,
         300,
         900,
+    )
+
+
+def test_composite(tmp_path):
+    """A composite request (2 to 4 parts, each with its own gold) is recorded as its request and its parts, each part a
+    task of its own under it, checked as a task is; its parts answer different things, its request gives none of them
+    away, a part's fault names the part, and taking it off takes its parts with it."""
+    world, at, message = world_fixture(tmp_path / "world.sqlite")
+    settings = forge_of(contracts_settings(tmp_path))
+    who = "SELECT u.real_name AS answer, m.id AS message_id FROM messages m JOIN users u ON u.id = m.user_id"
+    called, answered = who + " WHERE m.text LIKE '%rollback decided%'", who + " WHERE m.text LIKE 'ack%'"
+
+    def request(
+        *sqls, question="Catch me up on the 4.2 rollback: who called it, and who answered?", **changes
+    ):
+        labels = ("who called it", "who answered it", "who else")
+        return Task(
+            id="tc",
+            category="composite",
+            level=1,
+            actor_id="U2",
+            question=question,
+            answer_type="composite",
+            family="catch-up",
+            parts=[
+                Part(label=label, category="lookup", answer_type="text", gold_sql=sql)
+                for label, sql in zip(labels, sqls)
+            ],
+            **changes,
+        )
+
+    for shape in (
+        lambda: request(called),  # one part is no composite
+        lambda: request(called, answered, gold_sql="SELECT 1 AS answer"),  # its gold is its parts'
+        lambda: request(called, answered)
+        .model_copy(update={"category": "lookup"})
+        .model_validate(request(called, answered).model_dump() | {"category": "lookup"}),
+        lambda: Task(id="t", category="lookup", level=1, actor_id="U2", question="q?", answer_type="text"),
+    ):
+        fails(shape)
+    caller = world.db.execute("SELECT real_name FROM users WHERE id = 'U1'").fetchone()[0]
+    with world.trial() as copy:
+        forged = forge_task(copy, request(called, answered), settings, ["tc"])
+        assert [p["gold"] for p in forged["parts"]] == [
+            [{"answer": caller, "message_id": 1}],
+            [{"answer": "Owen Sato", "message_id": 2}],
+        ] and len(forged["features"]) == 2
+    rows = [dict(r) for r in world.db.execute("SELECT * FROM tasks WHERE id LIKE 'tc%' ORDER BY id")]
+    assert [(r["id"], r["answer_type"], r["parent"], r["part"], r["label"], r["family"]) for r in rows] == [
+        ("tc", "composite", None, None, None, "catch-up"),
+        ("tc-p1", "text", "tc", 1, "who called it", None),
+        ("tc-p2", "text", "tc", 2, "who answered it", None),
+    ] and (rows[0]["gold_sql"], rows[0]["gold_source"]) == ("", "composite")
+    assert answer_of(world, "tc") == [f"who called it: {caller}", "who answered it: Owen Sato"]
+    assert world.db.execute(f"SELECT COUNT(*) FROM tasks WHERE {asked(world.db)}").fetchone()[0] == 2, (
+        "a request is asked once, its parts never"
+    )
+    with world.trial() as copy:  # else two parts that ask for one thing were kept
+        refused("two parts give the same answer", forge_task, copy, request(called, called), settings, ["tc"])
+    with world.trial() as copy:  # else a request that tells its own answer was kept
+        refused(
+            "gives away its answer",
+            forge_task,
+            copy,
+            request(
+                called,
+                answered,
+                question="Did Owen Sato or someone else answer the 4.2 rollback, and who called it?",
+            ),
+            settings,
+            ["tc"],
+        )
+    with world.trial() as copy:  # a part's fault is the part's: its id names it
+        refused("tc-p2:", forge_task, copy, request(called, who + " WHERE m.id = 2"), settings, ["tc"])
+    forget(world, "tc")
+    assert not world.db.execute("SELECT 1 FROM tasks WHERE id LIKE 'tc%'").fetchone(), (
+        "a request goes with its parts"
     )
