@@ -7,6 +7,7 @@ from pathlib import Path
 from ..config import ROOT
 from ..forge.proposer.task import ProposerTask, forge_guide
 from ..forge.tasks import Task
+from ..judge.task import PHASE_GUIDES
 from ..workspace import Workspace
 from ..world.author.task import AUTHOR_GUIDE, CHAPTER_GUIDE, CRAFT_GUIDE, AuthorTask
 from ..world.clock import PARTS
@@ -120,6 +121,26 @@ def test_prompts(tmp_path):
     other = forge.model_copy(update={"tries": 3, "bands": [(0.8, 1.0), (0.2, 0.8), (0.0, 0.2)]})
     guide = forge_guide(other.model_dump(mode="json"))
     assert "tries each one 3 times" in guide and "right in 20%-80% of its tries" in guide, guide[:600]
+    # The proposer writes requests a colleague would make, by the judge's own test, and gets its middle rates from
+    # composite requests along the four skills, not from tool tedium; a hedge is wrong.
+    flat, review = " ".join(guide.split()), " ".join(PHASE_GUIDES["task"].split())
+    assert all(
+        phrase in flat
+        for phrase in (
+            "Ask what the asker would do with the answer",
+            "Name its family",
+            "Pick the asker whose work needs the answer",
+            "A composite request is the main lever for the middle levels",
+            "calibrated abstention",
+            "tool mechanics and tedium",
+            "A hedge is wrong",
+            "right and grounded",
+        )
+    ), "the guide's rules"
+    assert (
+        "treats colleagues' activity as data" in flat and "treats colleagues' activity as data" in review
+    ), "the proposer aims at the judge's own test of a request"
+    assert "intent" not in flat, "a task is a family, not one of the seven intents"
     parts = ", ".join(f"{p} {a:02d}-{b:02d}" for p, (a, b) in PARTS.items())
     assert (
         parts in " ".join(AUTHOR_GUIDE.split())

@@ -54,6 +54,9 @@ class Part(StrictModel):
 
 
 class Task(StrictModel):
+    """One request a colleague would make, of a family: a single question (a category, a level, its gold query) or a
+    composite request in 2 to 4 parts, each with its own gold, answered right only when every part is."""
+
     id: SafeId
     category: NonEmptyText
     level: int = Field(ge=1)

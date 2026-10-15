@@ -15,3 +15,5 @@
 - near_sql, optional: up to {near_sql} queries, the gold with one condition relaxed, each answering otherwise (the answer
   a hasty reader gives).
 - question is what actor_id asks, in `language`; it does not contain its answer.
+- A composite request's gold is its parts': each part's gold_sql, answer_type and near_sql follow these rules, as
+  its own.

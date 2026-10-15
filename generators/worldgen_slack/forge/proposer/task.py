@@ -60,7 +60,7 @@ def forge_prompt(round_: int, rounds: int, ids: list[str], held: int, goal: int)
     return (
         f"Round {round_}, of at most {rounds}. The archive holds {held} of the {goal} tasks it aims for; a full place "
         "takes a task only if the solver's tries are more mixed on it, or it brings a structure the place lacks. Read "
-        "/task/memory/archive.md and board.md, and your notes. Then write one "
-        f"candidate with world_add_task for each open id: {', '.join(ids)}. Walk each one's route as its asker first. "
+        "/task/memory/archive.md and board.md, and your notes. Then write, for each open id, one request its asker "
+        f"would really make, with world_add_task: {', '.join(ids)}. Walk each one's route as its asker first. "
         "Write in /task/notes/plan.md what you tried and why, then end your turn."
     )
