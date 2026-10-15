@@ -25,7 +25,9 @@ witness's share of right answers (`witness`, `witness_right`). A curriculum can 
 `family`, the request it is: catch-up, decisions & why, commitments, or who-knows & status. A `composite` task is one
 request in 2-4 parts, each with its own gold rows (its private answer's `parts`, each under its `label`); it is graded
 part by part and settled by code, all or nothing: +1 only when every part is right and grounded, -1 when any part is
-wrong, 0 when it declined what it could not tell. Only v11 releases load; older ones are read from git.
+wrong, 0 when it declined what it could not tell. Each private answer carries its `solution`: a try that reached
+its gold from Slack alone, right and grounded (the solver's, or else the witness's), with its answer and its calls;
+a task no try reached is not released. Only v11 releases load; older ones are read from git.
 
 ## The solver's tools
 

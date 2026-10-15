@@ -12,7 +12,15 @@ from pathlib import Path
 from worldgen_slack import slack
 from worldgen_slack.config import role
 from worldgen_slack.judge import EMPTY
-from worldgen_slack.release import FILES, Manifest, PrivateAnswer, PublicTask, atomic_json, load_release
+from worldgen_slack.release import (
+    FILES,
+    Manifest,
+    PrivateAnswer,
+    PublicTask,
+    Solution,
+    atomic_json,
+    load_release,
+)
 from worldgen_slack.world import file_hash
 
 from ..workspace import Workspace
@@ -76,6 +84,29 @@ def right_by_part(world, task_id: str, results: list[dict]) -> dict[str, float] 
     if not graded:
         return None
     return {label: sum(g[n]["correct"] for g in graded) / len(graded) for n, label in enumerate(labels)}
+
+
+def solution(store, task_id: str) -> Solution | None:
+    """A try that reached a task's gold from Slack alone, right and grounded: the solver's first, else the witness's
+    of the same version of the task, with its answer and its calls from its saved trace. None when no try did: such a
+    task's gold is the ledger's word alone, and it is not kept."""
+    state, env = store.state, store.settings.get("env", {})
+    solves = state.solves.get(task_id, {})
+    witness = state.witness.get(task_id, {})
+    books = [("solver", solves)] + ([("witness", witness)] if witness.get("key") == solves.get("key") else [])
+    for seat, book in books:
+        for result, trace_id in zip(book.get("results", []), book.get("traces", [])):
+            path = store.root / "traces" / f"{trace_id}.json"
+            if result and result.get("semantic_correctness") == 1.0 and path.exists():
+                calls = json.loads(path.read_text())["info"].get("observations", [])
+                return Solution(
+                    seat=seat,
+                    model=env.get(seat, {}).get("model"),
+                    trace_id=trace_id,
+                    answer=result["response"],
+                    calls=[{"tool": c["tool"], "arguments": c["arguments"]} for c in calls],
+                )
+    return None
 
 
 def private_answer(store, task) -> PrivateAnswer:
@@ -202,7 +233,9 @@ def release_rows(store, world_hash: str) -> tuple[list[PublicTask], dict[str, Pr
                 **measured,
             )
         )
-        answers[task["id"]] = private_answer(store, task)
+        answers[task["id"]] = private_answer(store, task).model_copy(
+            update={"solution": solution(store, task["id"])}
+        )
     return rows, answers
 
 
@@ -216,6 +249,12 @@ def publish(store) -> None:
         if t not in store.state.task_reviews
     ]:
         raise ValueError(f"release requires an approved review of every task; missing {missing}")
+    if unsolved := [
+        t
+        for (t,) in store.world.db.execute("SELECT id FROM tasks WHERE parent IS NULL")
+        if solution(store, t) is None
+    ]:
+        raise ValueError(f"release requires a right and grounded try of every task; none of {unsolved}")
     if store.world.violations(complete=True):
         raise ValueError("release requires a world that breaks no rule")
     copy = store.root / "solver.sqlite"

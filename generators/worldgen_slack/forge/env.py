@@ -22,7 +22,7 @@ from ..world.board import brief
 from .config import ForgeConfig
 from .difficulty import features
 from .proposer.task import ProposerTask, forge_prompt
-from .release import miss_classes, release_rows, right_by_part
+from .release import miss_classes, release_rows, right_by_part, solution
 from .tasks import FAMILIES, Task, answer_of, forge_task, forget
 from .tries import Tries, rates
 
@@ -255,7 +255,8 @@ class ForgeEnv(SessionEnv):
 
     def place(self, task_id: str, review: dict | None, hinted, attempt: str) -> dict:
         """One candidate's outcome. Its tries give its level; the lowest band also needs the witness to answer it
-        (hard, not broken). Its place is its family (a task with none: its category) and that level, which holds up
+        (hard, not broken), and every kept task needs a try that reached its gold from Slack, right and grounded
+        (`solution`). Its place is its family (a task with none: its category) and that level, which holds up
         to `target` tasks (MAP-Elites over task features, as OMNI-EPIC keeps its archive). A newcomer to a full place
         replaces a holder when it brings a structure the place lacks while two holders share one, or when the
         solver's tries are more mixed on it than on the weakest holder, by 4p(1-p), the shorter question winning a
@@ -321,6 +322,9 @@ class ForgeEnv(SessionEnv):
         if bands[level - 1][0] == 0 and not witness:
             self.drop(task_id, attempt, "neither solver answers it")
             return out | {"verdict": "dropped: the witness does not answer it either: hard, or broken"}
+        if solution(self.store, task_id) is None:  # its gold rests on the ledger's word alone
+            self.drop(task_id, attempt, "no right and grounded try")
+            return out | {"verdict": "dropped: no try reached its gold from Slack, right and grounded"}
         where, shaped = (
             f"{row['family'] or row['category']}·L{level}",
             bucket(shape) + (f"·{row['intent']}" if row["intent"] else ""),

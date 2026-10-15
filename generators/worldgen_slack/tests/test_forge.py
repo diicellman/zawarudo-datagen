@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -140,6 +141,42 @@ def test_tasks(tmp_path):
 
     scoped = Workspace(world.path, actor="U2")
     assert scoped.rank("rollback release", [1]) == 1 and scoped.rank("zebra", [1]) is None
+
+
+async def test_witness_tries(monkeypatch):
+    """The witness tries a task its band's floor is above, one at a band starting at 0, and one GLM answered right
+    but never grounded: its try shows the gold is reached from Slack. A task GLM reached, right and grounded, in its
+    band, it leaves."""
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE tasks (id TEXT, level INTEGER)")
+    db.executemany(
+        "INSERT INTO tasks VALUES (?, ?)", [("fine", 1), ("short", 1), ("bottom", 2), ("ungrounded", 1)]
+    )
+
+    def tries_of(right: int, grounded: bool) -> dict:
+        return {"results": [{"correct": i < right, "grounded": grounded} for i in range(4)]}
+
+    state = SimpleNamespace(
+        solves={
+            "fine": tries_of(4, True),
+            "short": tries_of(1, True),
+            "bottom": tries_of(4, True),
+            "ungrounded": tries_of(4, False),
+        },
+        witness={},
+    )
+    tries = Tries(
+        SimpleNamespace(solvers=2, bands=[(0.5, 1.0), (0.0, 0.5)], witness_tries=1),
+        SimpleNamespace(state=state, world=SimpleNamespace(db=db)),
+    )
+    asked = []
+
+    async def tried(agents, book, due, keys, attempt, n, seat):
+        asked.extend(due)
+
+    monkeypatch.setattr(tries, "tried", tried)
+    await tries.witness(None, list(state.solves), {t: "k" for t in state.solves}, "a")
+    assert asked == ["short", "bottom", "ungrounded"]
 
 
 async def test_tries_cut_and_kept(monkeypatch):

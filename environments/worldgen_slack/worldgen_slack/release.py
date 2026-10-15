@@ -82,11 +82,23 @@ class PublicTask(StrictModel):
     family: str | None = None  # v11: the request it is, of four (catch-up, decisions, commitments, status)
 
 
+class Solution(StrictModel):
+    """A right and grounded try of a task (v11): an agent's answer from Slack alone and the calls it made, each tool
+    with its arguments, in order. It shows its gold is reached by reading Slack, in an agent's words, and not only by
+    the ledger's query."""
+
+    seat: Literal["solver", "witness"]
+    model: str | None = None
+    trace_id: NonEmptyText
+    answer: NonEmptyText
+    calls: list[dict[str, JsonValue]]
+
+
 class PrivateAnswer(StrictModel):
     """The gold rows of a task, the messages (channel, ts) and people its answer rests on, and, for a refusal, the
     truth out of its actor's sight (`unseen`). A composite request's answer (v11) is its parts', each such an answer
     under its label, in the request's order: it has no rows or query of its own, and its messages, people and unseen
-    are its parts' together."""
+    are its parts' together. `solution` is a right and grounded try of it."""
 
     answer_type: Literal["text", "set", "number", "refusal", "status", "composite"]
     rows: list[dict[str, JsonValue]]
@@ -96,9 +108,12 @@ class PrivateAnswer(StrictModel):
     users: list[str]
     label: NonEmptyText | None = None  # v11: a part's, what of its request it answers
     parts: list["PrivateAnswer"] = []  # v11: a composite request's
+    solution: Solution | None = None  # v11: a try of it that reached its gold, the request's and not a part's
 
     @model_validator(mode="after")
     def shaped(self):
+        if any(p.solution for p in self.parts):
+            raise ValueError("a composite answer's solution is the request's, not a part's")
         if self.answer_type != "composite":
             if self.parts or not self.gold_sql:
                 raise ValueError("an answer has its gold query and no parts")

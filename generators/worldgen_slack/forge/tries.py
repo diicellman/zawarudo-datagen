@@ -320,15 +320,16 @@ class Tries:
         return {t: state.screens[t]["failed"] for t in due}
 
     async def witness(self, agents, due, keys, attempt) -> dict:
-        """A stronger solver's tries of each task GLM answers right less often than its band's floor, and of each task
-        whose band starts at 0: a task it answers is hard, not broken. Its tries are kept with the task's key and count
-        in no rate. Returns the tries of each low task."""
+        """A stronger solver's tries of each task GLM answers right less often than its band's floor, of each task
+        whose band starts at 0, and of each task none of GLM's tries reached right and grounded: a task it answers is
+        hard, not broken, and its try shows the gold is reached from Slack. Its tries are kept with the task's key and
+        count in no rate. Returns the tries of each low task."""
         state, cfg = self.store.state, self.settings
         level = dict(self.world.db.execute("SELECT id, level FROM tasks").fetchall())
 
         def low(t: str) -> bool:
-            floor = cfg.bands[level[t] - 1][0]
-            return floor == 0 or rates(state.solves[t]["results"])["right_rate"] < floor
+            floor, measured = cfg.bands[level[t] - 1][0], rates(state.solves[t]["results"])
+            return floor == 0 or measured["right_rate"] < floor or measured["strict_rate"] == 0
 
         if cfg.witness_tries and (hard := [t for t in due if low(t)]):
             await self.tried(agents, state.witness, hard, keys, attempt, cfg.witness_tries, "witness")

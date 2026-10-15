@@ -21,7 +21,7 @@ from verifiers.v1.dialects.base import append_user_notice
 from verifiers.v1.errors import SandboxError
 from worldgen_slack import slack
 from worldgen_slack.judge import EMPTY, AnswerGrade
-from worldgen_slack.release import load_release
+from worldgen_slack.release import atomic_json, load_release
 from worldgen_slack.taskset import SolverTask
 from worldgen_slack.world import file_hash
 
@@ -33,7 +33,7 @@ from ..forge.env import measured as forge_measured
 from ..forge.env import provenance as forge_provenance
 from ..forge.profile import profile
 from ..forge.proposer.task import ProposerTask
-from ..forge.release import miss_class, publish, release_rows
+from ..forge.release import miss_class, publish, release_rows, solution
 from ..forge.tasks import FAMILIES, Annotation, Part, Task, forge_task, record_task
 from ..forge.tries import rates
 from ..judge.verdict import PHASE_CRITERIA, READING, Issue, TaskReview, Verdict, read_one_way
@@ -1505,6 +1505,19 @@ async def run_flows(root):
         ("r01-01", "status"),
         ("r02-01", "status"),
     }, "a release names each task's family"
+    released = load_release(plan.output / "release")[2]
+    assert released["r01-01"].solution.seat == "solver" and released["r02-01"].solution.seat == "witness", (
+        "each task ships a try that reached its gold: the solver's, or the witness's for one only it answered"
+    )
+    tries_of = forged.state.solves.pop("r01-01")
+    with pytest.raises(ValueError, match="a right and grounded try of every task"):
+        publish(forged)  # a release holds only tasks a try reached, right and grounded
+    forged.state.solves["r01-01"] = tries_of
+    key, forged.state.witness["r02-01"]["key"] = forged.state.witness["r02-01"]["key"], "an older version"
+    assert solution(forged, "r02-01") is None, (
+        "a witness try of another version of the task reached another task"
+    )
+    forged.state.witness["r02-01"]["key"] = key
     _, cases = failure_cases(
         forged.world,
         "r01-01",
@@ -1770,8 +1783,29 @@ async def run_flows(root):
         )
         == "k3+dm+set+perspective"
     )
+
     # A place holds two tasks. A newcomer to a full one replaces a holder if GLM's tries are more mixed on it, or if
     # it brings a structure the place lacks while two holders share one; else it is dropped.
+    def tried_once(task_id: str, grounded: bool) -> dict:
+        """A task's tries as weigh keeps them: one right, grounded or not, with its trace saved."""
+        right = {
+            "correct": True,
+            "grounded": grounded,
+            "semantic_correctness": float(grounded),
+            "response": "Ann.",
+        }
+        observations = [{"tool": "read_channel", "arguments": {"channel_id": "C1"}, "output": {}}]
+        record = {
+            "id": f"try-{task_id}",
+            "agent": {"name": "solver", "config": {}},
+            "task": {"data": {"task_id": task_id}},
+            "ok": True,
+            "nodes": [],
+            "info": {"observations": observations, "evaluation": right},
+        }
+        atomic_json(forged.root / "traces" / f"try-{task_id}.json", record)
+        return {"key": "k", "results": [right], "traces": [f"try-{task_id}"]}
+
     weigher, actor = (
         Forging(plan, forged),
         forged.world.db.execute("SELECT MIN(id) FROM users").fetchone()[0],
@@ -1839,13 +1873,32 @@ async def run_flows(root):
     ):
         with forged.world.trial() as copy:
             forge_task(copy, task_.model_copy(update={"id": open_id, "question": question}), plan, [open_id])
-        forged.state.solves[open_id] = {"key": "k", "results": [], "traces": []}
+        forged.state.solves[open_id] = tried_once(open_id, right > 0)
         forged.state.forged[open_id] = weigher.place(
             open_id, {"right_rate": right, "witness_right": witness}, None, "x"
         )  # as weigh records it
         assert forged.state.forged[open_id]["verdict"] == verdict, (open_id, right)
     assert [h["task"] for h in forged.state.archive["status·L2"]] == ["r09-01", "r09-04"], (
         forged.state.archive
+    )
+    assert release_rows(forged, "h")[1]["r09-04"].solution.model_dump() == {
+        "seat": "solver",
+        "model": forged.settings["env"]["solver"]["model"],
+        "trace_id": "try-r09-04",
+        "answer": "Ann.",
+        "calls": [{"tool": "read_channel", "arguments": {"channel_id": "C1"}}],
+    }, "a kept task ships the try that reached its gold, and the calls it made"
+    # A task none of whose tries reached its gold right and grounded rests on the ledger's word alone: not kept.
+    with forged.world.trial() as copy:
+        forge_task(
+            copy,
+            newest.model_copy(update={"id": "r09-06", "question": "Who joined last, r09-06?"}),
+            plan,
+            ["r09-06"],
+        )
+    forged.state.solves["r09-06"] = tried_once("r09-06", False)
+    assert weigher.place("r09-06", {"right_rate": 0.625, "witness_right": None}, None, "x")["verdict"] == (
+        "dropped: no try reached its gold from Slack, right and grounded"
     )
     # A composite request is placed by its family; its structure is its parts', and the archive shows which part the
     # solver misses.
@@ -1877,12 +1930,13 @@ async def run_flows(root):
             }
             for label, right in (("the newest", True), ("the two newest", second))
         ]
-        return {"correct": second, "crashed": False, "parts": grades, "part_coverage": [1.0, 0.5]}
+        return {"correct": second, "crashed": False, "parts": grades, "part_coverage": [1.0, 0.5]} | (
+            {"grounded": True, "semantic_correctness": 1.0, "response": "Ann; Ann and Bo."} if second else {}
+        )
 
-    forged.state.solves["r09-05"] = {
-        "key": "k",
+    forged.state.solves["r09-05"] = tried_once("r09-05", True) | {
         "results": [part_tried(s) for s in (True, False, False, True)],
-        "traces": [],
+        "traces": ["try-r09-05"] * 4,
     }
     forged.state.forged["r09-05"] = placed = weigher.place(
         "r09-05", {"right_rate": 0.5, "witness_right": None}, None, "x"

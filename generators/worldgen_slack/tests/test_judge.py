@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from worldgen_slack.judge import EMPTY, AnswerGrade, AnswerJudge, PartGrade
-from worldgen_slack.release import PrivateAnswer, PublicTask, load_release
+from worldgen_slack.release import PrivateAnswer, PublicTask, Solution, load_release
 from worldgen_slack.slack import compact, people_shown, shown
 from worldgen_slack.taskset import SolverTask
 from worldgen_slack.world import file_hash
@@ -458,6 +458,13 @@ async def test_composite_grade(tmp_path, monkeypatch):
         and answer.answers() == parts
     )
     whole = answer.model_dump()
+    solved = {
+        "seat": "witness",
+        "model": "z-ai/glm-5.3",
+        "trace_id": "w-1",
+        "answer": "Alicia Rao called it; Owen Sato posted the notes.",
+        "calls": [{"tool": "read_channel", "arguments": {"channel_id": "C1"}}],
+    }
     for broken in (
         whole
         | {
@@ -471,8 +478,13 @@ async def test_composite_grade(tmp_path, monkeypatch):
         whole | {"parts": [whole["parts"][0], whole["parts"][1] | {"label": None}]},
         whole["parts"][0] | {"parts": whole["parts"]},  # a single answer has no parts
         whole["parts"][0] | {"gold_sql": ""},
+        whole
+        | {
+            "parts": [whole["parts"][0] | {"solution": solved}, whole["parts"][1]]
+        },  # the request's, not a part's
     ):
         fails(PrivateAnswer.model_validate, broken)
+    answer = answer.model_copy(update={"solution": Solution.model_validate(solved)})
     task = PublicTask(
         task_id="t1",
         question="Catch me up on 4.2: who called the rollback, and who posted the notes?",
@@ -552,6 +564,9 @@ async def test_composite_grade(tmp_path, monkeypatch):
     )
     write_release(tmp_path / "release", tmp_path / "solver.sqlite", [task], {"t1": answer})
     assert load_release(tmp_path / "release")[1:] == ([task], {"t1": answer})
+    assert load_release(tmp_path / "release")[2]["t1"].solution.calls == solved["calls"], (
+        "it ships how it was solved"
+    )
     assert json.loads((tmp_path / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v11"
     fails(
         write_release,
