@@ -1849,6 +1849,13 @@ async def run_flows(root):
         and "- promised: what someone promised" in pages_["memory/taxonomy.md"]
     )
     assert plan.env.witness.sampling.reasoning_effort == "high", "the witness thinks hard"
+    # A candidate counts its tries run again (cut on a hung request, or crashed), and the archive says so.
+    batch, forged.state.batch = forged.state.batch, forged.state.forged["r02-01"]["round"]
+    rerun_page = Forging(plan, forged).pages()["memory/archive.md"]
+    forged.state.batch = batch
+    assert (
+        forged.state.forged["r02-01"]["reruns"] == 1 and "1 tried again after a cut or a crash" in rerun_page
+    )
     assert (forged.state.forged["r01-01"]["verdict"], forged.state.forged["r09-02"]["verdict"]) == (
         "replaced by r09-02",
         "replaced by r09-04",

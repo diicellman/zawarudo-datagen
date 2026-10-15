@@ -54,6 +54,9 @@ JOIN evidence e ON e.fact_id = d.id JOIN messages m ON m.id = e.message_id
 WHERE tf.task_id = ? GROUP BY m.id ORDER BY m.ts_us, m.id"""
 
 
+GRADE_TIMEOUT = 300  # seconds for one screen grade, as a try's own grade gets (forge/config.py TRY_TIMEOUT)
+
+
 class Tries:
     """A forge's tries of its candidates: the screen of wrong answers, the solver's runs (kept with what the task was
     when they ran), the witness, and the judge's review on them."""
@@ -129,21 +132,52 @@ class Tries:
 
     async def solve(self, agents, task, seat: str = "solver"):
         """One independent solve of a task by `seat` (GLM, or the witness), graded for correctness and grounding. A
-        solve that crashed runs once more; crashed again, it is kept as crashed, and the task's rates leave it out."""
+        solve that crashed (a hung request cut at its seat's rollout time among them) runs once more, and says why in
+        `rerun`; crashed again, it is kept as crashed, and the task's rates leave it out."""
+        first = None
         for _ in range(2):
             async with self.glm if seat == "solver" else contextlib.nullcontext():
                 trace = await getattr(agents, seat).run(task)
             self.store.trace(trace)
             if not (outcome := SolverTask.outcome(trace))["crashed"]:
                 break
-        return outcome, trace
+            first = outcome.get("reason") or "crashed" if first is None else first
+        return (outcome | {"rerun": first[:200]} if first is not None else outcome), trace
 
-    async def solves(self, agents, task_ids, attempt, n, seat: str = "solver", hint: bool = False) -> dict:
-        """`n` independent solves of each task by `seat`, on a solver copy of the world kept with the attempt."""
+    def copy(self, attempt: str, seat: str) -> tuple:
+        """A solver copy of the world kept with the attempt, and its release rows: every try reads the same copy."""
         copy = self.store.path(attempt, f"{seat}.sqlite")
         copy.unlink(missing_ok=True)
         self.world.solver_copy(copy)
-        release = self.answers(copy)  # once: every try reads the same copy
+        return copy, self.answers(copy)
+
+    async def tried(self, agents, book: dict, due: list, keys: dict, attempt: str, n: int, seat: str) -> None:
+        """`n` tries of each due task by `seat`, kept in `book` (the state's solves or witness) with the task's key,
+        each in its own place and saved the moment it finishes: a round cut off tops its tasks up to `n` when it
+        resumes, instead of trying them all again. A task whose key changed is tried afresh."""
+        for t in due:
+            if book.get(t, {}).get("key") != keys[t] or len(book[t]["results"]) != n:
+                book[t] = {"key": keys[t], "results": [None] * n, "traces": [None] * n}
+        open_ = [(t, i) for t in due for i, r in enumerate(book[t]["results"]) if r is None]
+        if not open_:
+            return
+        copy, release = self.copy(attempt, seat)
+
+        async def one(t: str, i: int) -> None:
+            outcome, trace = await self.solve(agents, self.solver_task(t, copy, release, False), seat)
+            book[t]["results"][i], book[t]["traces"][i] = outcome, trace.id
+            self.store.save()
+
+        await asyncio.gather(*(one(t, i) for t, i in open_))
+        if dead := [
+            t for t in dict.fromkeys(t for t, _ in open_) if all(r["crashed"] for r in book[t]["results"])
+        ]:
+            raise RuntimeError(f"every try of {dead} crashed twice: the solver or its grading is failing")
+
+    async def solves(self, agents, task_ids, attempt, n, seat: str = "solver", hint: bool = False) -> dict:
+        """`n` independent solves of each task by `seat`, on a solver copy of the world kept with the attempt, kept
+        nowhere (the hint's tries)."""
+        copy, release = self.copy(attempt, seat)
         runs = await asyncio.gather(
             *(
                 asyncio.gather(
@@ -162,10 +196,7 @@ class Tries:
         skips the task until it changes."""
         state = self.store.state
         loose = await self.screen(due, keys, attempt)
-        fresh = [t for t in due if state.solves.get(t, {}).get("key") != keys[t]]
-        solved = await self.solves(agents, fresh, attempt, n)
-        for task_id, task_runs in solved.items():
-            self.keep_solves(task_id, keys[task_id], task_runs)
+        await self.tried(agents, state.solves, due, keys, attempt, n, "solver")
         runs = {t: state.solves[t] for t in due}
         witnessed = await self.witness(agents, due, keys, attempt)
         size = self.settings.review_chunk
@@ -257,10 +288,11 @@ class Tries:
     async def grade(self, question: str, reference: dict, response: str):
         """The answer judge's grade of one response, with no observations: its `correct` is what a screen reads."""
         for again in (True, False):
-            try:
-                return await AnswerJudge(self.settings.answer_judge).evaluate(
-                    question=question, reference=reference, response=response, observations=[]
-                )
+            try:  # a hung request is cut and asked once more: the model client has no read timeout
+                async with asyncio.timeout(GRADE_TIMEOUT):
+                    return await AnswerJudge(self.settings.answer_judge).evaluate(
+                        question=question, reference=reference, response=response, observations=[]
+                    )
             except Exception:
                 if not again:
                     raise
@@ -298,24 +330,9 @@ class Tries:
             floor = cfg.bands[level[t] - 1][0]
             return floor == 0 or rates(state.solves[t]["results"])["right_rate"] < floor
 
-        if cfg.witness_tries and (
-            fresh := [t for t in due if low(t) and state.witness.get(t, {}).get("key") != keys[t]]
-        ):
-            for t, runs in (await self.solves(agents, fresh, attempt, cfg.witness_tries, "witness")).items():
-                state.witness[t] = {
-                    "key": keys[t],
-                    "results": [r for r, _ in runs],
-                    "traces": [x.id for _, x in runs],
-                }
+        if cfg.witness_tries and (hard := [t for t in due if low(t)]):
+            await self.tried(agents, state.witness, hard, keys, attempt, cfg.witness_tries, "witness")
         return {t: state.witness[t] for t in due if low(t) and state.witness.get(t, {}).get("key") == keys[t]}
-
-    def keep_solves(self, task_id: str, key: str, runs: list) -> None:
-        """A task's solver runs, kept with what the task was when they ran."""
-        self.store.state.solves[task_id] = {
-            "key": key,
-            "results": [r for r, _ in runs],
-            "traces": [t.id for _, t in runs],
-        }
 
     def saved_trace(self, trace_id: str) -> dict | None:
         """A saved solver trace, as the judge may read it."""

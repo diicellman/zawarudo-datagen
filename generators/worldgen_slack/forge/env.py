@@ -294,6 +294,8 @@ class ForgeEnv(SessionEnv):
             :2
         ]
         classes = dict(Counter(miss_class(r, row["answer_type"]) for r in wrong))
+        # tries that were cut (a hung request) or crashed and ran again: a rate resting on them is less sure
+        reruns = sum(1 for r in state.solves[task_id]["results"] if r.get("rerun"))
         out |= {
             "right": right,
             "interval": review.get("right_interval"),
@@ -303,7 +305,7 @@ class ForgeEnv(SessionEnv):
             "level": level,
             "misses": misses,
             "miss_classes": classes,
-        }
+        } | ({"reruns": reruns} if reruns else {})
         if bands[level - 1][0] == 0 and not witness:
             self.drop(task_id, attempt, "neither solver answers it")
             return out | {"verdict": "dropped: the witness does not answer it either: hard, or broken"}
@@ -427,6 +429,7 @@ class ForgeEnv(SessionEnv):
             o = self.store.state.forged[t]
             tried = (
                 f"right {o['right']:.2f} of {o['tries']} {o.get('interval')}, witness {o.get('witness')}, hint {o.get('hint')}"
+                + (f", {o['reruns']} tried again after a cut or a crash" if o.get("reruns") else "")
                 if "right" in o
                 else ""
             )

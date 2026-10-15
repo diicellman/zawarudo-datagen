@@ -8,6 +8,7 @@ from typing import Annotated
 
 import verifiers.v1 as vf
 from pydantic import BeforeValidator, Field, model_validator
+from verifiers.v1.configs.agent import TimeoutConfig
 from worldgen_slack.config import role
 
 from ..config import Categories, RootedPath, Seats, Section, load_taxonomy, vm_seat
@@ -18,13 +19,19 @@ def categories(value):
     return load_taxonomy(Path(value)).categories if isinstance(value, str | Path) else value
 
 
+# A try's time. Tries take seconds (FC1's 293: 25 s at the median, 7 min at most; the witness's 42 s at most); the
+# model client has no read timeout, so a request that hangs holds its try to the rollout's end, and the round with it.
+# At 15 min a hung try is cut and tried once more, and its grade gets 5 min.
+TRY_TIMEOUT = TimeoutConfig(setup=600, rollout=900, finalize=120, scoring=300)
+
+
 class ForgeSeats(Seats):
     # The proposer: an rlm agent in one VM, one interaction per round, as a world's author is.
     proposer: vf.AgentConfig = vm_seat("z-ai/glm-5.3")
     # The solver executes no code (null harness; its Slack tools are host-side servers), so a local process
     # replaces the VM.
     solver: vf.AgentConfig = role("z-ai/glm-5.2", solver=True).model_copy(
-        update={"runtime": vf.SubprocessConfig()}
+        update={"runtime": vf.SubprocessConfig(), "timeout": TRY_TIMEOUT}
     )
     # A stronger solver with the same tools, for the tasks GLM rarely answers: hard, or broken?
     # It thinks hard (at its default effort it took 2-5 calls and lost tasks the solver answered): it shows a task
@@ -35,6 +42,7 @@ class ForgeSeats(Seats):
             "sampling": role("openai/gpt-6-sol", solver=True).sampling.model_copy(
                 update={"reasoning_effort": "high"}
             ),
+            "timeout": TRY_TIMEOUT,
         }
     )
 
