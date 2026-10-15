@@ -15,8 +15,8 @@ from ..evidence import measures
 from ..forge import tries as tries_module
 from ..forge.config import ForgeSeats
 from ..forge.difficulty import failure_cases, features
-from ..forge.env import bucket
-from ..forge.release import miss_classes, private_answer, right_by_part
+from ..forge.env import bucket, heard_page, said
+from ..forge.release import miss_classes, miss_shape, miss_shapes, private_answer, right_by_part
 from ..forge.tasks import Part, Task, answer_of, check_task, forge_task, forget, reference_of
 from ..forge.tries import Tries
 from ..judge.task import JudgeTask, review_payload
@@ -141,6 +141,50 @@ def test_tasks(tmp_path):
 
     scoped = Workspace(world.path, actor="U2")
     assert scoped.rank("rollback release", [1]) == 1 and scoped.rank("zebra", [1]) is None
+
+
+def test_archive_feedback():
+    """A candidate's archive entry says how its wrong tries went wrong (by class, by shape, and how much of its
+    evidence they saw), the wrong answer two or more of them agree on, what the witness (on this version of the task)
+    and the hinted solver answered, and the judge's own words."""
+    wrong = [{"committed": ["Ann"]}, {"committed": ["Ann"]}, {"committed": ["Bo"]}, {"committed": []}]
+    state = SimpleNamespace(
+        witness={
+            "t": {
+                "key": "k",
+                "results": [None, {"crashed": True, "response": ""}, {"response": "Cy", "correct": True}],
+            }
+        },
+        solves={"t": {"key": "k"}},
+    )
+    heard = said(state, "t", wrong, [({"response": "Cy.", "correct": False, "crashed": False}, None)])
+    assert heard == {
+        "modal": {"answer": "Ann", "tries": 2, "of": 4},
+        "witness_said": {"answer": "Cy", "right": True},
+        "hint_said": {"answer": "Cy.", "right": False},
+    }
+    state.witness["t"]["key"] = "an older version"
+    assert said(state, "t", wrong[2:], None) == {}, (
+        "no agreement of one, no witness of another version, no hint"
+    )
+    page = heard_page(
+        heard | {"miss_classes": {"saw_all": 4}, "shapes": {"wrong": 3}, "coverage": 0.0, "judge": "fair"}
+    )
+    assert page == (
+        "\n  its wrong tries: saw_all 4; wrong 3; they saw 0% of its evidence"
+        "\n  the wrong answer 2 of its 4 wrong tries gave: 'Ann'"
+        "\n  the witness answered (right): 'Cy'"
+        "\n  shown its evidence, the solver answered (wrong): 'Cy.'"
+        "\n  the judge: 'fair'"
+    )
+    assert [
+        miss_shape(r) for r in ({"missing": ["a"]}, {"extra": ["b"]}, {"missing": ["a"], "extra": ["b"]}, {})
+    ] == [
+        "short",
+        "extra",
+        "wrong",
+        None,
+    ]
 
 
 async def test_witness_tries(monkeypatch):
@@ -368,6 +412,9 @@ async def test_composite(tmp_path):
         tried((False, False), (False, False), crashed=True),  # a crashed try tells nothing
     ]
     assert miss_classes(world, "tc", results) == {"search": 1, "abstained": 1}, "a wrong part's own class"
+    assert miss_shapes(world, "tc", results) == {"short": 1}, (
+        "the missed part lacks its row; a declined one has no shape"
+    )
     assert right_by_part(world, "tc", results) == {"who called it": 2 / 3, "who answered it": 2 / 3}
     assert right_by_part(world, "t1", results) is None, "a task with no parts"
     # Its review sees its parts, each with its label and gold, and checks each part's gold and facts.

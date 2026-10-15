@@ -44,8 +44,8 @@ def miss_class(result: dict, answer_type: str) -> str:
     return "search" if coverage is not None and coverage < 1 else "saw_all"
 
 
-def miss_classes(world, task_id: str, results: list[dict]) -> Counter:
-    """How a task's wrong tries went wrong (`miss_class`), crashed ones left out; a composite request's, by each wrong
+def wrong_answers(world, task_id: str, results: list[dict]) -> list[tuple[dict, str]]:
+    """A task's wrong tries, crashed ones left out, each with its answer type; a composite request's, each wrong
     part of each, as its own answer type, on its own evidence."""
     kind = world.db.execute("SELECT answer_type FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
     kinds = [
@@ -54,19 +54,38 @@ def miss_classes(world, task_id: str, results: list[dict]) -> Counter:
             "SELECT answer_type FROM tasks WHERE parent = ? ORDER BY part", (task_id,)
         )
     ]
-    out = Counter()
+    out = []
     for r in results:
         if r.get("correct") or r.get("crashed"):
             continue
         if kind != "composite" or len(r.get("parts") or []) != len(kinds):  # a grade that failed has no parts
-            out[miss_class(r, kind)] += 1
+            out.append((r, kind))
             continue
         cover = r.get("part_coverage") or [None] * len(kinds)
         for part, k, c in zip(r["parts"], kinds, cover):
             if not part["correct"]:
                 own = part | {key: r.get(key) for key in ("unanswered", "reason")} | {"evidence_coverage": c}
-                out[miss_class(own, k)] += 1
+                out.append((own, k))
     return out
+
+
+def miss_classes(world, task_id: str, results: list[dict]) -> Counter:
+    """How a task's wrong tries went wrong (`miss_class`), by each wrong answer (`wrong_answers`)."""
+    return Counter(miss_class(r, k) for r, k in wrong_answers(world, task_id, results))
+
+
+def miss_shape(result: dict) -> str | None:
+    """What a wrong answer's alignment with its reference shows: `short` (it lacks a row and adds none: an
+    incomplete aggregation), `extra` (it adds a value and lacks none), `wrong` (another value in place of one), or
+    None (aligned yet wrong: a status given as final, a refusal answered)."""
+    missing, extra = bool(result.get("missing")), bool(result.get("extra"))
+    return {(True, False): "short", (False, True): "extra", (True, True): "wrong"}.get((missing, extra))
+
+
+def miss_shapes(world, task_id: str, results: list[dict]) -> Counter:
+    return Counter(
+        shape for r, _ in wrong_answers(world, task_id, results) if (shape := miss_shape(r)) is not None
+    )
 
 
 def right_by_part(world, task_id: str, results: list[dict]) -> dict[str, float] | None:

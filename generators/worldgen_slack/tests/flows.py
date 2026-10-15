@@ -1472,6 +1472,9 @@ async def run_flows(root):
         t for (t,) in forged.world.db.execute("SELECT id FROM tasks")
     ) == ["r01-01", "r02-01"], "the vague candidates are dropped"
     hard = forged.state.forged["r02-01"]
+    assert (hard["judge"], hard["witness_said"]["right"], hard["hint_said"]["right"]) == ("r", True, True), (
+        "the archive hears the judge's words, the witness's answer and the hinted one"
+    )
     assert (hard["right"], hard["witness"], hard["hint"], hard["level"], hard["verdict"]) == (
         0.0,
         1.0,
@@ -1897,9 +1900,13 @@ async def run_flows(root):
             ["r09-08"],
         )
     forged.state.solves["r09-08"] = tried_once("r09-08", False)
-    assert weigher.place("r09-08", {"right_rate": 0.625, "witness_right": None}, None, "x")["verdict"] == (
-        "dropped: no try reached its gold from Slack, right and grounded"
+    unsolved = weigher.place(
+        "r09-08", {"right_rate": 0.625, "witness_right": None, "coverage": 0.0}, None, "x"
     )
+    assert (unsolved["verdict"], unsolved["coverage"]) == (
+        "dropped: no try reached its gold from Slack, right and grounded",
+        0.0,
+    ), "and its tries saw none of its evidence, which the archive says"
     # A composite request is placed by its family; its structure is its parts', and the archive shows which part the
     # solver misses.
     joined = Task(

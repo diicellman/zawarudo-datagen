@@ -22,7 +22,7 @@ from ..world.board import brief
 from .config import ForgeConfig
 from .difficulty import features
 from .proposer.task import ProposerTask, forge_prompt
-from .release import miss_classes, release_rows, right_by_part, solution
+from .release import miss_classes, miss_shapes, release_rows, right_by_part, solution
 from .tasks import FAMILIES, Task, answer_of, forge_task, forget
 from .tries import Tries, rates
 
@@ -57,6 +57,45 @@ def measured(forged: dict) -> list[str]:
         for (c, i), x in sorted(cells.items())
         if x["right"] or x["back"]
     ]
+
+
+def said(state, task_id: str, wrong: list[dict], hinted) -> dict:
+    """What a candidate's tries said, for its archive entry: the wrong answer its solver's tries agree on most (when
+    two or more do), and the first answer of the witness (its tries of this version of the task) and of the solver
+    shown its evidence (the hint), each with whether it was right."""
+    out = {}
+    common = Counter("; ".join(r["committed"]) for r in wrong if r.get("committed")).most_common(1)
+    if common and common[0][1] > 1:
+        out["modal"] = {"answer": common[0][0][:240], "tries": common[0][1], "of": len(wrong)}
+    witness = state.witness.get(task_id, {})
+    tried = (
+        witness.get("results", []) if witness.get("key") == state.solves.get(task_id, {}).get("key") else []
+    )
+    for name, results in (("witness_said", tried), ("hint_said", [o for o, _ in hinted or []])):
+        if first := next((r for r in results if r and not r.get("crashed")), None):
+            out[name] = {"answer": (first.get("response") or "")[:240], "right": bool(first.get("correct"))}
+    return out
+
+
+def heard_page(o: dict) -> str:
+    """A candidate's feedback lines in archive.md: its rate by part, how its wrong tries went wrong (by class and by
+    shape, and how much of its evidence they saw), the wrong answer they agree on, the witness's and the hint's
+    answers, and the judge's own words."""
+    out = ""
+    if o.get("parts"):
+        out += "\n  right by part: " + ", ".join(f"{label} {r:.2f}" for label, r in o["parts"].items())
+    if o.get("miss_classes"):
+        out += "\n  its wrong tries: " + ", ".join(f"{k} {v}" for k, v in sorted(o["miss_classes"].items()))
+        out += "; " + ", ".join(f"{k} {v}" for k, v in sorted(o["shapes"].items())) if o.get("shapes") else ""
+        out += f"; they saw {o['coverage']:.0%} of its evidence" if o.get("coverage") is not None else ""
+    if m := o.get("modal"):
+        out += f"\n  the wrong answer {m['tries']} of its {m['of']} wrong tries gave: {m['answer']!r}"
+    for key, who in (("witness_said", "the witness"), ("hint_said", "shown its evidence, the solver")):
+        if w := o.get(key):
+            out += f"\n  {who} answered ({'right' if w['right'] else 'wrong'}): {w['answer']!r}"
+    if o.get("judge"):
+        out += f"\n  the judge: {o['judge']!r}"
+    return out
 
 
 def bucket(shape: dict) -> str:
@@ -303,6 +342,15 @@ class ForgeEnv(SessionEnv):
         ]
         classes = dict(miss_classes(self.world, task_id, state.solves[task_id]["results"]))
         parts = right_by_part(self.world, task_id, state.solves[task_id]["results"])
+        heard = said(state, task_id, wrong, hinted) | {
+            k: v
+            for k, v in (
+                ("shapes", dict(miss_shapes(self.world, task_id, state.solves[task_id]["results"]))),
+                ("coverage", review.get("coverage")),
+                ("judge", review.get("reason")),
+            )
+            if v not in (None, {}, "")  # a coverage of 0 says the most
+        }
         # tries that were cut (a hung request) or crashed and ran again: a rate resting on them is less sure
         reruns = sum(1 for r in state.solves[task_id]["results"] if r.get("rerun"))
         out |= (
@@ -318,6 +366,7 @@ class ForgeEnv(SessionEnv):
             }
             | ({"reruns": reruns} if reruns else {})
             | ({"parts": parts} if parts else {})
+            | heard
         )
         if bands[level - 1][0] == 0 and not witness:
             self.drop(task_id, attempt, "neither solver answers it")
@@ -452,11 +501,7 @@ class ForgeEnv(SessionEnv):
             )
             lines.append(
                 f"- {t} ({o.get('family') or '-'}, {o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features']) if o['features'] else '-'}"
-                + (
-                    "\n  right by part: " + ", ".join(f"{label} {r:.2f}" for label, r in o["parts"].items())
-                    if o.get("parts")
-                    else ""
-                )
+                + heard_page(o)
                 + "".join(
                     f"\n  the solver answered: {m['answer']!r}; the grade: {m['why']!r}"
                     for m in o.get("misses", [])

@@ -267,14 +267,15 @@ class Tries:
             results = runs[task_id]["results"]
             rate = rates(results)
             approved = accepted_task(verdict_of[task_id], task_id)
-            fit = next(r.level_fit for r in verdict_of[task_id].tasks if r.task_id == task_id)
+            ruled = next(r for r in verdict_of[task_id].tasks if r.task_id == task_id)
             seen = rates(witnessed[task_id]["results"])["right_rate"] if task_id in witnessed else None
             if approved:
                 state.task_reviews[task_id] = {
                     "key": keys[task_id],
                     **rate,
                     "witness_right": seen,
-                    "level_fit": fit,
+                    "level_fit": ruled.level_fit,
+                    "reason": ruled.reason,  # the judge's own words on it, for the archive
                     "results": results,
                 }
             right = rate["right_rate"]
