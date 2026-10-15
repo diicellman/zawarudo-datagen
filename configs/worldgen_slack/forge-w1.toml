@@ -6,7 +6,7 @@ world = "data/v8-02/w1"
 output = "data/v8-02/forge-w1"
 taxonomy = "configs/worldgen_slack/taxonomy.toml"
 tasks = 36                # the goal: every candidate the rounds write, kept if valid
-target = 36               # the tasks one place (a category and a measured level) holds: no room limit
+target = 36               # the tasks one place (a family and a measured level) holds: no room limit
 rounds = 3
 candidates = 12           # one round's candidates, tried 8 times each
 

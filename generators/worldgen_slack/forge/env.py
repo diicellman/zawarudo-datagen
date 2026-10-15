@@ -22,7 +22,7 @@ from ..world.board import brief
 from .config import ForgeConfig
 from .difficulty import features
 from .proposer.task import ProposerTask, forge_prompt
-from .release import miss_class, release_rows
+from .release import miss_classes, release_rows, right_by_part
 from .tasks import FAMILIES, Task, answer_of, forge_task, forget
 from .tries import Tries, rates
 
@@ -37,13 +37,13 @@ def provenance(config: ForgeConfig) -> dict:
 
 
 def measured(forged: dict) -> list[str]:
-    """This forge's own numbers, by category and intent: candidates tried, kept, sent back for another reading, the
-    mean share of right answers of those tried, and how the wrong tries went wrong. Steering comes from these, not from
-    lore about any solver."""
+    """This forge's own numbers, by family and category (a task with no family: by category and intent):
+    candidates tried, kept, sent back for another reading, the mean share of right answers of those tried, and how
+    the wrong tries went wrong. Steering comes from these, not from lore about any solver."""
     cells: dict[tuple, dict] = {}
     for o in forged.values():
         cell = cells.setdefault(
-            (o["category"], o.get("intent") or "-"),
+            (o["family"], o["category"]) if o.get("family") else (o["category"], o.get("intent") or "-"),
             {"tried": 0, "kept": 0, "back": 0, "right": [], "misses": Counter()},
         )
         cell["tried"] += 1
@@ -61,7 +61,9 @@ def measured(forged: dict) -> list[str]:
 
 def bucket(shape: dict) -> str:
     """A task's structure, as one of the archive's coordinates: how many values its asker can see, where its answer
-    sits, a set, another asker's other answer, an answer to work out, a status."""
+    sits, a set, another asker's other answer, an answer to work out, a status; a composite request's, its parts'."""
+    if "parts" in shape:
+        return "parts:" + "|".join(sorted(map(bucket, shape["parts"])))
     parts = [f"k{min(shape['changes'], 3)}"] if shape["changes"] else []
     if shape["last_link"] and not shape["last_link"].startswith("channel"):
         parts.append(shape["last_link"].split("·")[0])
@@ -79,7 +81,7 @@ class ForgeEnv(SessionEnv):
     seats = ("proposer", "judge", "solver", "witness")
 
     def __init__(self, settings: ForgeConfig, store: Store):
-        places = sum(len(spec.levels) for spec in settings.taxonomy.values())
+        places = len(FAMILIES) * len(settings.bands)
         if settings.tasks > settings.target * places:
             raise ValueError(
                 f"a goal of {settings.tasks} tasks is more than the archive's {places} places hold at {settings.target} each"
@@ -253,10 +255,11 @@ class ForgeEnv(SessionEnv):
 
     def place(self, task_id: str, review: dict | None, hinted, attempt: str) -> dict:
         """One candidate's outcome. Its tries give its level; the lowest band also needs the witness to answer it
-        (hard, not broken). Its place is its category and that level, which holds up to `target` tasks (MAP-Elites
-        over task features, as OMNI-EPIC keeps its archive). A newcomer to a full place replaces a holder when it
-        brings a structure the place lacks while two holders share one, or when the solver's tries are more mixed on it than
-        on the weakest holder, by 4p(1-p), the shorter question winning a tie."""
+        (hard, not broken). Its place is its family (a task with none: its category) and that level, which holds up
+        to `target` tasks (MAP-Elites over task features, as OMNI-EPIC keeps its archive). A newcomer to a full place
+        replaces a holder when it brings a structure the place lacks while two holders share one, or when the
+        solver's tries are more mixed on it than on the weakest holder, by 4p(1-p), the shorter question winning a
+        tie. A composite request's misses and right rates are counted by part."""
         state, bands = self.store.state, self.settings.bands
         row = self.world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         gold = json.loads(row["gold_json"])
@@ -265,6 +268,7 @@ class ForgeEnv(SessionEnv):
             "round": state.batch + 1,
             "category": row["category"],
             "intent": row["intent"],
+            "family": row["family"],
             "declared": row["level"],
             "question": row["question"],
             "features": shape,
@@ -296,24 +300,29 @@ class ForgeEnv(SessionEnv):
         misses = [{"answer": r.get("response", "")[:240], "why": r.get("reason", "")[:240]} for r in wrong][
             :2
         ]
-        classes = dict(Counter(miss_class(r, row["answer_type"]) for r in wrong))
+        classes = dict(miss_classes(self.world, task_id, state.solves[task_id]["results"]))
+        parts = right_by_part(self.world, task_id, state.solves[task_id]["results"])
         # tries that were cut (a hung request) or crashed and ran again: a rate resting on them is less sure
         reruns = sum(1 for r in state.solves[task_id]["results"] if r.get("rerun"))
-        out |= {
-            "right": right,
-            "interval": review.get("right_interval"),
-            "tries": review.get("tries"),
-            "witness": witness,
-            "hint": hint,
-            "level": level,
-            "misses": misses,
-            "miss_classes": classes,
-        } | ({"reruns": reruns} if reruns else {})
+        out |= (
+            {
+                "right": right,
+                "interval": review.get("right_interval"),
+                "tries": review.get("tries"),
+                "witness": witness,
+                "hint": hint,
+                "level": level,
+                "misses": misses,
+                "miss_classes": classes,
+            }
+            | ({"reruns": reruns} if reruns else {})
+            | ({"parts": parts} if parts else {})
+        )
         if bands[level - 1][0] == 0 and not witness:
             self.drop(task_id, attempt, "neither solver answers it")
             return out | {"verdict": "dropped: the witness does not answer it either: hard, or broken"}
         where, shaped = (
-            f"{row['category']}·L{level}",
+            f"{row['family'] or row['category']}·L{level}",
             bucket(shape) + (f"·{row['intent']}" if row["intent"] else ""),
         )
         mine = {
@@ -348,12 +357,13 @@ class ForgeEnv(SessionEnv):
         return out | {"verdict": f"kept in {where} as {shaped}"}
 
     def covered(self) -> tuple[dict, list[str]]:
-        """What the archive covers: its tasks per category and level, and the board's entries no kept task rests on (a
-        kept task of the entry's category on one of its facts)."""
+        """What the archive covers: its tasks per place (family, or category for a task with none) and level, and the
+        board's entries no kept task rests on (a kept task, or a part of one, of the entry's category on one of its
+        facts)."""
         kept = {
             (c, lvl): n
             for c, lvl, n in self.world.db.execute(
-                "SELECT category, level, COUNT(*) FROM tasks WHERE parent IS NULL GROUP BY category, level"
+                "SELECT COALESCE(family, category), level, COUNT(*) FROM tasks WHERE parent IS NULL GROUP BY 1, 2"
             )
         }
         rests = {
@@ -399,15 +409,16 @@ class ForgeEnv(SessionEnv):
         lines = [
             "# Archive",
             "",
-            f"Goal: {self.settings.tasks} kept tasks, at most {self.settings.target} per category and level, and every board entry covered. It holds {sum(kept.values())}. The solver tries each candidate {self.settings.tries} times.",
+            f"Goal: {self.settings.tasks} kept tasks, at most {self.settings.target} per family and level, and every board entry covered. It holds {sum(kept.values())}. The solver tries each candidate {self.settings.tries} times.",
             "",
         ]
-        for category, spec in self.settings.taxonomy.items():
+        older = sorted({c for c, _ in kept if c not in FAMILIES})  # tasks with no family, placed by category
+        for place in [*FAMILIES, *older]:
             lines.append(
-                f"- {category}: "
+                f"- {place}{'' if place in FAMILIES else ' (no family)'}: "
                 + " · ".join(
-                    f"L{lvl} {kept.get((category, lvl), 0)}/{self.settings.target}"
-                    for lvl in range(1, len(spec.levels) + 1)
+                    f"L{lvl} {kept.get((place, lvl), 0)}/{self.settings.target}"
+                    for lvl in range(1, len(self.settings.bands) + 1)
                 )
             )
         lines += [
@@ -436,7 +447,12 @@ class ForgeEnv(SessionEnv):
                 else ""
             )
             lines.append(
-                f"- {t} ({o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features']) if o['features'] else '-'}"
+                f"- {t} ({o.get('family') or '-'}, {o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features']) if o['features'] else '-'}"
+                + (
+                    "\n  right by part: " + ", ".join(f"{label} {r:.2f}" for label, r in o["parts"].items())
+                    if o.get("parts")
+                    else ""
+                )
                 + "".join(
                     f"\n  the solver answered: {m['answer']!r}; the grade: {m['why']!r}"
                     for m in o.get("misses", [])
@@ -447,7 +463,7 @@ class ForgeEnv(SessionEnv):
                 lines.append(
                     f'  reword it this round: world_add_task with rewords="{t}", asked by {o["rework"]["actor"]}, whose gold answer stays {o["rework"]["answer"]}'
                 )
-        lines += ["", "## What this forge has measured (its own tries, by category and intent)"]
+        lines += ["", "## What this forge has measured (its own tries, by family and category)"]
         lines += measured(self.store.state.forged) or ["- nothing yet"]
         taxonomy = ["# Taxonomy: the categories and levels a candidate takes", ""]
         for category, spec in self.settings.taxonomy.items():

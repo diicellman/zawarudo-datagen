@@ -49,7 +49,7 @@ class ForgeSeats(Seats):
 
 class ForgeConfig(Section):
     """One forge. `tasks` is its goal, the tasks the archive holds when it is done; `rounds` the most rounds it runs
-    toward it; `candidates` the candidates one round writes; `target` the tasks a place (a category and a level)
+    toward it; `candidates` the candidates one round writes; `target` the tasks a place (a family and a level)
     holds; `measure` has round 0 measure the finished run's own tasks, as written, before any proposer round."""
 
     world: RootedPath  # the finished run: its final world.sqlite, with the ledger and the board
@@ -58,7 +58,7 @@ class ForgeConfig(Section):
     tasks: int = Field(default=40, ge=1, le=10_000)
     rounds: int = Field(default=12, ge=0, le=100)
     candidates: int = Field(default=12, ge=1, le=50)
-    target: int = Field(default=2, ge=1, le=100)
+    target: int = Field(default=3, ge=1, le=100)
     measure: bool = False
     # Per level, the band of the solver's right-answer rate a task of that level measures in.
     bands: list[tuple[float, float]] = Field(min_length=1)

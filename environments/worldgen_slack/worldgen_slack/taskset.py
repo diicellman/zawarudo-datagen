@@ -122,20 +122,18 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             raise ValueError("judge claimed grounding without observations")
         seen = set().union(*map(shown, observations))
         users = set().union(*map(people_shown, observations))
-        needed = len(reference.messages) + len(reference.users)
-        found = len({tuple(m) for m in reference.messages} & seen) + len(set(reference.users) & users)
-        coverage = found / needed if needed else None
 
+        def covered(answer) -> float | None:  # the share of what its answer rests on that its calls showed
+            needed = len(answer.messages) + len(answer.users)
+            found = len({tuple(m) for m in answer.messages} & seen) + len(set(answer.users) & users)
+            return found / needed if needed else None
+
+        coverage = covered(reference)
         # Grounded by message, not by topic alone: an answer whose gold rests on messages is grounded only if its
         # tries were shown one of them (a stale message is topically just as close); a composite request's, only if
         # each part's was.
-        def shown_one(answer) -> bool:
-            return not (answer.messages or answer.users) or bool(
-                {tuple(m) for m in answer.messages} & seen or set(answer.users) & users
-            )
-
         grade = grade.model_copy(
-            update={"grounded": grade.grounded and all(map(shown_one, reference.answers()))}
+            update={"grounded": grade.grounded and all(covered(a) != 0 for a in reference.answers())}
         )
         score = reward(grade)
         trace.info["evaluation"] = {
@@ -145,6 +143,7 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             **grade.model_dump(mode="json"),
             "response": trace.last_reply,
             "evidence_coverage": coverage,
+            **({"part_coverage": [covered(p) for p in reference.parts]} if reference.parts else {}),
             "calls": len(observations),
             "solver_trace_id": trace.id,
         }

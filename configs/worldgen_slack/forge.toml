@@ -8,7 +8,7 @@ world = "data/v7-05/software"
 output = "data/v7-05/forge-01"
 taxonomy = "configs/worldgen_slack/taxonomy.toml"
 tasks = 40                # the goal: kept tasks
-target = 2                # the tasks one place (a category and a measured level) holds
+target = 3                # the tasks one place (a family and a measured level) holds: 4 families x 4 levels x 3 reach the goal
 rounds = 12               # the most rounds toward the goal
 candidates = 12           # one round's candidates, tried 8 times each
 

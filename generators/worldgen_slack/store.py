@@ -18,7 +18,7 @@ from worldgen_slack.world import canonical
 
 from .evidence import measures
 from .judge.verdict import Issue, Verdict
-from .workspace import Workspace
+from .workspace import Workspace, asked
 from .world.board import Slot
 from .world.cast import Premise, SeedPersona
 
@@ -282,17 +282,34 @@ class Store:
 
     def difficulty(self) -> dict:
         """Each task's intended level beside how hard it measures on the final world: the judge's level_fit, the
-        solver's right-answer and strict rates, and code's measures (evidence pages, tables read, search rank)."""
-        out = {}
-        for task in self.world.db.execute(
-            "SELECT id, category, level, concept, actor_id, gold_sql FROM tasks"
-        ):
-            review = self.state.task_reviews.get(task["id"], {})
+        solver's right-answer and strict rates, and code's measures (evidence pages, tables read, search rank); a
+        composite request's measures are its parts', each one's."""
+
+        def measured_of(task) -> dict:
             try:
                 gold = self.world.gold(task["actor_id"], task["gold_sql"], max_rows=50)
-                measured = measures(self.world, task["id"], gold["rows"], gold["tables"])
+                return measures(self.world, task["id"], gold["rows"], gold["tables"])
             except ValueError as error:
-                measured = {"error": str(error)}
+                return {"error": str(error)}
+
+        out = {}
+        for task in self.world.db.execute(
+            f"SELECT id, category, level, concept, actor_id, gold_sql, answer_type FROM tasks WHERE {asked(self.world.db)}"
+        ):
+            review = self.state.task_reviews.get(task["id"], {})
+            measured = (
+                {
+                    "parts": {
+                        p["id"]: measured_of(p)
+                        for p in self.world.db.execute(
+                            "SELECT id, actor_id, gold_sql FROM tasks WHERE parent = ? ORDER BY part",
+                            (task["id"],),
+                        )
+                    }
+                }
+                if task["answer_type"] == "composite"
+                else measured_of(task)
+            )
             out[task["id"]] = (
                 {k: task[k] for k in ("category", "level", "concept")}
                 | {

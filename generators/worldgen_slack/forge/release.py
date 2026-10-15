@@ -36,6 +36,48 @@ def miss_class(result: dict, answer_type: str) -> str:
     return "search" if coverage is not None and coverage < 1 else "saw_all"
 
 
+def miss_classes(world, task_id: str, results: list[dict]) -> Counter:
+    """How a task's wrong tries went wrong (`miss_class`), crashed ones left out; a composite request's, by each wrong
+    part of each, as its own answer type, on its own evidence."""
+    kind = world.db.execute("SELECT answer_type FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+    kinds = [
+        k
+        for (k,) in world.db.execute(
+            "SELECT answer_type FROM tasks WHERE parent = ? ORDER BY part", (task_id,)
+        )
+    ]
+    out = Counter()
+    for r in results:
+        if r.get("correct") or r.get("crashed"):
+            continue
+        if kind != "composite" or len(r.get("parts") or []) != len(kinds):  # a grade that failed has no parts
+            out[miss_class(r, kind)] += 1
+            continue
+        cover = r.get("part_coverage") or [None] * len(kinds)
+        for part, k, c in zip(r["parts"], kinds, cover):
+            if not part["correct"]:
+                own = part | {key: r.get(key) for key in ("unanswered", "reason")} | {"evidence_coverage": c}
+                out[miss_class(own, k)] += 1
+    return out
+
+
+def right_by_part(world, task_id: str, results: list[dict]) -> dict[str, float] | None:
+    """A composite request's share of right answers by part, over its graded tries: which of its parts the solver
+    misses. None for a task with no parts, or no graded try."""
+    labels = [
+        label
+        for (label,) in world.db.execute("SELECT label FROM tasks WHERE parent = ? ORDER BY part", (task_id,))
+    ]
+    graded = [
+        r["parts"]
+        for r in results
+        if labels and not r.get("crashed") and len(r.get("parts") or []) == len(labels)
+    ]
+    if not graded:
+        return None
+    return {label: sum(g[n]["correct"] for g in graded) / len(graded) for n, label in enumerate(labels)}
+
+
 def private_answer(store, task) -> PrivateAnswer:
     """A task's private answer: its gold rows, and the messages and people they rest on; a refusal's truth out of
     its actor's sight goes apart, as `unseen`. The messages an answer rests on are its gold rows' and those stating
@@ -141,11 +183,10 @@ def release_rows(store, world_hash: str) -> tuple[list[PublicTask], dict[str, Pr
             }
         )
         if review is not None:
-            wrong = [r for r in review.get("results", []) if not r.get("correct") and not r.get("crashed")]
             measured |= {
                 "surface": slack.VERSION,
                 "turns": env.get("solver", {}).get("max_turns") or role("", solver=True).max_turns,
-                "miss_classes": dict(Counter(miss_class(r, task["answer_type"]) for r in wrong)),
+                "miss_classes": dict(miss_classes(store.world, task["id"], review.get("results", []))),
             }
         rows.append(
             PublicTask(

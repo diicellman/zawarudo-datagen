@@ -76,14 +76,27 @@ def panel(world, task_id: str, rows: list[dict]) -> dict:
     }
 
 
+def parts_of(world, task_id: str) -> list:
+    """A composite request's parts, in its order: each one's id, label and gold rows."""
+    return [
+        (part, label, json.loads(gold))
+        for part, label, gold in world.db.execute(
+            "SELECT id, label, gold_json FROM tasks WHERE parent = ? ORDER BY part", (task_id,)
+        )
+    ]
+
+
 def features(world, task_id: str, rows: list[dict]) -> dict:
     """What a task's structure is, measured by code: how many values its asker can see on its answer's subject and
     attribute (`changes`), where its answer's statement sits (`last_link`: a thread reply, a direct conversation, a
     private channel, or a channel, and later than the first value), how many rows it answers, whether another person
-    asking gets another answer (`perspective`), and whether its answer is in no message as written (`derived`)."""
+    asking gets another answer (`perspective`), and whether its answer is in no message as written (`derived`). A
+    composite request's structure is its parts', each one's (`parts`)."""
     task = world.db.execute(
         "SELECT actor_id, gold_sql, answer_type FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
+    if task["answer_type"] == "composite":
+        return {"parts": [features(world, part, gold) for part, _, gold in parts_of(world, task_id)]}
     facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
     answers = [str(r.get("answer")) for r in rows]
     stated = stated_values(world, facts, task["actor_id"]) if facts else {}
@@ -153,10 +166,12 @@ def failure_cases(world, task_id: str, rows: list[dict]) -> tuple[str, list[tupl
     value its actor can read on its answer's subject and attribute, a hedge between the gold and the first of them, a
     set with a row left out or with all but one row named only in passing, declining to answer, a bare opener (judges accept one 60-90% of the time, 2507.08794),
     and a status given as final. A grade that accepts one, or rejects the gold, is ambiguous as asked
-    (Self-Challenging's failure cases, 2506.01716)."""
+    (Self-Challenging's failure cases, 2506.01716). A composite request's are its parts' (`composite_cases`)."""
     task = world.db.execute(
         "SELECT actor_id, answer_type, near_sql FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
+    if task["answer_type"] == "composite":
+        return composite_cases(world, task_id)
     kind, answers = task["answer_type"], [str(r.get("answer")) for r in rows]
     facts = [r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))]
     misses = []
@@ -211,3 +226,28 @@ def failure_cases(world, task_id: str, rows: list[dict]) -> tuple[str, list[tupl
         return f"{gold}, though it is not settled: nothing you can see confirms it.", cases
     cases.append(("declining to answer", "I can't find that in anything you can see."))
     return f"{gold}.", cases
+
+
+WHOLE = {"a bare opener"}  # a case of a whole response, never of one part
+
+
+def composite_cases(world, task_id: str) -> tuple[str, list[tuple[str, str]]]:
+    """A composite request's gold, each part's under its label, and the wrong answers its grade must reject: each
+    part's own (its near-misses, hedge, short set, row named in passing, declining, status given as final) in an
+    answer otherwise right, each part left out, a bare opener and declining the whole. One wrong part makes the whole
+    wrong, so a grade that accepts any of them grades the request too loosely."""
+    parts = [(label, failure_cases(world, part, gold)) for part, label, gold in parts_of(world, task_id)]
+    golds = [f"{label}: {gold}" for label, (gold, _) in parts]
+    cases = []
+    for n, (label, (_, own)) in enumerate(parts):
+        cases += [
+            (f"{label}: {name}", "\n".join(golds[:n] + [f"{label}: {response}"] + golds[n + 1 :]))
+            for name, response in own
+            if name not in WHOLE
+        ]
+        cases.append((f"{label}: left out", "\n".join(golds[:n] + golds[n + 1 :])))
+    cases += [
+        ("a bare opener", "Thought process:"),
+        ("declining to answer", "I can't find any of that in anything you can see."),
+    ]
+    return "\n".join(golds), cases

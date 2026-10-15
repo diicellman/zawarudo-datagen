@@ -437,7 +437,7 @@ def forge_task(
     if (
         task.parts
     ):  # its difficulty is its parts', each measured as a task's; no one search answers a whole request
-        return result | {"features": [features(world, p["part"], p["gold"]) for p in result["parts"]]}
+        return result | {"features": features(world, task.id, [])}
     lazy = panel(world, task.id, result["gold"])
     if gates and task.level > 1 and not task.facts and task.answer_type != "refusal" and not task.near_sql:
         raise ValueError(

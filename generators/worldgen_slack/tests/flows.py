@@ -34,7 +34,7 @@ from ..forge.env import provenance as forge_provenance
 from ..forge.profile import profile
 from ..forge.proposer.task import ProposerTask
 from ..forge.release import miss_class, publish, release_rows
-from ..forge.tasks import Annotation, Task, forge_task, record_task
+from ..forge.tasks import FAMILIES, Annotation, Part, Task, forge_task, record_task
 from ..forge.tries import rates
 from ..judge.verdict import PHASE_CRITERIA, READING, Issue, TaskReview, Verdict, read_one_way
 from ..session import ended, keep_awake
@@ -309,10 +309,11 @@ def flow_run_settings(root):
 
 def flow_forge(settings, **plan) -> ForgeConfig:
     """The flows' forge on a world of these settings: 3 tries of a candidate, one task in a review, 2 tries at once,
-    and level 3's band starting at 0, so the witness tries its tasks."""
+    a place holding 2 tasks, and level 3's band starting at 0, so the witness tries its tasks."""
     return forge_of(
         settings,
         bands=[(0.75, 1.0), (0.5, 0.75), (0.0, 0.5)],
+        target=2,
         tries=3,
         review_chunk=1,
         solvers=2,
@@ -1077,11 +1078,11 @@ async def run_flows(root):
             ):  # the archive: what the last round kept, and why it dropped the rest
                 archive = runtime.files["/task/memory/archive.md"].decode()
                 assert (
-                    "holds 1 of the 30 tasks it aims for" in prompt
+                    "holds 1 of the 24 tasks it aims for" in prompt
                     and "r01-01" in archive
-                    and "kept in lookup·L2 as plain·structure" in archive
+                    and "kept in status·L2 as plain·structure" in archive
                     and "dropped: the judge did not approve it" in archive
-                    and "lookup: L1 0/2 · L2 1/2" in archive
+                    and "status: L1 0/2 · L2 1/2" in archive
                 ), archive
             assert not any(hasattr(tools, w) for w in ("plan", "post", "advance", "revise", "edit")), (
                 "the proposer is served no tool that writes the workspace"
@@ -1444,7 +1445,7 @@ async def run_flows(root):
     )
     source_world = Workspace(world_dir / "world.sqlite")
     # The forge: tasks proposed on the finished world, which stays frozen; what the judge approves is kept.
-    plan = flow_forge(settings, world=world_dir, output=root / "forge", rounds=2, candidates=2, tasks=30)
+    plan = flow_forge(settings, world=world_dir, output=root / "forge", rounds=2, candidates=2, tasks=24)
     workspace = source_world.db.execute(
         "SELECT group_concat(id || ':' || text, '|') FROM messages"
     ).fetchone()[0]
@@ -1476,7 +1477,7 @@ async def run_flows(root):
         1.0,
         1.0,
         3,
-        "kept in search·L3 as k1·when",
+        "kept in status·L3 as k1·when",
     ), hard
     assert dict(forged.world.db.execute("SELECT id, level FROM tasks").fetchall()) == {
         "r01-01": 2,
@@ -1809,7 +1810,7 @@ async def run_flows(root):
             "Who is the newest person here, r09-01?",
             0.5,
             None,
-            "kept in lookup·L2 as plain·structure",
+            "kept in status·L2 as plain·structure",
         ),  # the place had room
         (
             newest,
@@ -1817,7 +1818,7 @@ async def run_flows(root):
             "Who is the newest person here, r09-02?",
             0.625,
             None,
-            "kept in lookup·L2 as plain·structure",
+            "kept in status·L2 as plain·structure",
         ),  # more mixed than r01-01
         (
             newest,
@@ -1825,7 +1826,7 @@ async def run_flows(root):
             "Who is the newest person here, r09-03, by when they joined?",
             0.625,
             None,
-            "dropped: lookup·L2 is full (r09-01, r09-02), with tasks as mixed or more and its structure",
+            "dropped: status·L2 is full (r09-01, r09-02), with tasks as mixed or more and its structure",
         ),
         (
             newest_two,
@@ -1833,7 +1834,7 @@ async def run_flows(root):
             "Who are the two newest people here?",
             0.625,
             None,
-            "kept in lookup·L2 as set·structure",
+            "kept in status·L2 as set·structure",
         ),  # a new structure
     ):
         with forged.world.trial() as copy:
@@ -1843,8 +1844,61 @@ async def run_flows(root):
             open_id, {"right_rate": right, "witness_right": witness}, None, "x"
         )  # as weigh records it
         assert forged.state.forged[open_id]["verdict"] == verdict, (open_id, right)
-    assert [h["task"] for h in forged.state.archive["lookup·L2"]] == ["r09-01", "r09-04"], (
+    assert [h["task"] for h in forged.state.archive["status·L2"]] == ["r09-01", "r09-04"], (
         forged.state.archive
+    )
+    # A composite request is placed by its family; its structure is its parts', and the archive shows which part the
+    # solver misses.
+    joined = Task(
+        id="r09-05",
+        category="composite",
+        level=1,
+        actor_id=actor,
+        question="Catch me up on who joined: who is the newest person here, and who are the two newest?",
+        answer_type="composite",
+        family="catch-up",
+        parts=[
+            Part(label="the newest", category="lookup", answer_type="text", gold_sql=newest.gold_sql),
+            Part(label="the two newest", category="lookup", answer_type="set", gold_sql=newest_two.gold_sql),
+        ],
+    )
+    with forged.world.trial() as copy:
+        forge_task(copy, joined, plan, ["r09-05"])
+
+    def part_tried(second: bool) -> dict:
+        grades = [
+            {
+                "label": label,
+                "correct": right,
+                "abstained": False,
+                "committed": [],
+                "missing": [] if right else ["a"],
+                "extra": [],
+            }
+            for label, right in (("the newest", True), ("the two newest", second))
+        ]
+        return {"correct": second, "crashed": False, "parts": grades, "part_coverage": [1.0, 0.5]}
+
+    forged.state.solves["r09-05"] = {
+        "key": "k",
+        "results": [part_tried(s) for s in (True, False, False, True)],
+        "traces": [],
+    }
+    forged.state.forged["r09-05"] = placed = weigher.place(
+        "r09-05", {"right_rate": 0.5, "witness_right": None}, None, "x"
+    )
+    assert (
+        placed["verdict"].startswith("kept in catch-up·L2 as parts:")
+        and placed["parts"] == {"the newest": 1.0, "the two newest": 0.5}
+        and placed["miss_classes"] == {"search": 2}
+    ), placed
+    assert (
+        "right by part: the newest 1.00, the two newest 0.50"
+        in Forging(plan, forged).pages()["memory/archive.md"]
+    )
+    # Its places are its families' at each level: a goal they cannot hold is refused.
+    fails(
+        Forging, plan.model_copy(update={"tasks": len(FAMILIES) * len(plan.bands) * plan.target + 1}), forged
     )
     # A set's screen holds the answer that commits to one row and names the rest only in passing: a grade must not
     # take it as right.
@@ -1854,10 +1908,10 @@ async def run_flows(root):
         "one row committed, the rest in passing",
         f"{first}. I also came across {rest} while looking, but the answer is {first}.",
     ) in failure_cases(forged.world, "r09-04", two)[1]
-    # The proposer steers by this forge's own numbers, by category and intent.
+    # The proposer steers by this forge's own numbers, by family and category.
     steering = forge_measured(forged.state.forged)
-    assert any(line.startswith("- lookup·structure: ") and " kept" in line for line in steering) and any(
-        line.startswith("- search·when: ") for line in steering
+    assert any(line.startswith("- status·lookup: ") and " kept" in line for line in steering) and any(
+        line.startswith("- status·search: ") for line in steering
     ), steering
     pages_ = Forging(plan, forged).pages()
     assert (

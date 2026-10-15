@@ -516,6 +516,7 @@ async def test_composite_grade(tmp_path, monkeypatch):
     assert score == -1.0 and not evaluation["abstained"], "a wrong part is not undone by a declined one"
     score, evaluation = await scored(grade((True, False), (True, False)), read(1))
     assert score == 0.0 and not evaluation["grounded"], "each part grounded by its own messages"
+    assert evaluation["part_coverage"] == [1.0, 0.0] and evaluation["evidence_coverage"] == 0.5
     with pytest.raises(ValueError, match="each of its 2 parts"):
         await scored(grade((True, False)), read(1, 3))
     score, evaluation = await scored(grade(), read(1, 3), reply=" ")

@@ -13,9 +13,12 @@ from worldgen_slack.world import SHADOWED, SHOWN
 from ..evidence import measures
 from ..forge import tries as tries_module
 from ..forge.config import ForgeSeats
-from ..forge.release import private_answer
+from ..forge.difficulty import failure_cases, features
+from ..forge.env import bucket
+from ..forge.release import miss_classes, private_answer, right_by_part
 from ..forge.tasks import Part, Task, answer_of, check_task, forge_task, forget
 from ..forge.tries import Tries
+from ..store import Store
 from ..workspace import Workspace, asked
 from .support import contracts_settings, fails, forge_of, refused, world_fixture
 
@@ -255,7 +258,7 @@ def test_composite(tmp_path):
         assert [p["gold"] for p in forged["parts"]] == [
             [{"answer": caller, "message_id": 1}],
             [{"answer": "Owen Sato", "message_id": 2}],
-        ] and len(forged["features"]) == 2
+        ] and len(forged["features"]["parts"]) == 2
     rows = [dict(r) for r in world.db.execute("SELECT * FROM tasks WHERE id LIKE 'tc%' ORDER BY id")]
     assert [(r["id"], r["answer_type"], r["parent"], r["part"], r["label"], r["family"]) for r in rows] == [
         ("tc", "composite", None, None, None, "catch-up"),
@@ -280,6 +283,55 @@ def test_composite(tmp_path):
         and released.messages == stated
         and [p["label"] for p in released.reference()["parts"]] == ["who called it", "who answered it"]
     ), "a request's answer is its parts', each under its label, and its evidence theirs together"
+    gold, cases = failure_cases(world, "tc", [])
+    named = dict(cases)
+    assert gold == f"who called it: {caller}.\nwho answered it: Owen Sato.", (
+        "its gold is each part's, under its label"
+    )
+    assert (
+        named["who answered it: left out"] == f"who called it: {caller}."
+        and named["who called it: declining to answer"]
+        == "who called it: I can't find that in anything you can see.\nwho answered it: Owen Sato."
+        and "a bare opener" in named
+        and "who called it: a bare opener" not in named
+    ), "each part's wrong answers inside an answer otherwise right, and each part left out"
+    shape = features(world, "tc", [])
+    assert len(shape["parts"]) == 2 and bucket(shape) == "parts:" + "|".join(
+        sorted(map(bucket, shape["parts"]))
+    )
+
+    def tried(*parts, coverage=(1.0, 0.5), crashed=False):
+        grades = [
+            {
+                "label": "x",
+                "correct": c,
+                "abstained": a,
+                "committed": [],
+                "missing": [] if c or a else ["y"],
+                "extra": [],
+            }
+            for c, a in parts
+        ]
+        return {
+            "correct": all(c for c, _ in parts),
+            "crashed": crashed,
+            "parts": grades,
+            "part_coverage": list(coverage),
+        }
+
+    results = [
+        tried((True, False), (True, False)),
+        tried((True, False), (False, False)),  # the second part missed, with half its evidence seen
+        tried((False, True), (True, False)),  # the first declined
+        tried((False, False), (False, False), crashed=True),  # a crashed try tells nothing
+    ]
+    assert miss_classes(world, "tc", results) == {"search": 1, "abstained": 1}, "a wrong part's own class"
+    assert right_by_part(world, "tc", results) == {"who called it": 2 / 3, "who answered it": 2 / 3}
+    assert right_by_part(world, "t1", results) is None, "a task with no parts"
+    measured = Store.difficulty(SimpleNamespace(world=world, state=SimpleNamespace(task_reviews={})))
+    assert set(measured["tc"]["parts"]) == {"tc-p1", "tc-p2"} and "tc-p1" not in measured, (
+        "a request's measures are its parts', and a part is no task of the summary's"
+    )
     with world.trial() as copy:  # else two parts that ask for one thing were kept
         refused("two parts give the same answer", forge_task, copy, request(called, called), settings, ["tc"])
     with world.trial() as copy:  # else a request that tells its own answer was kept
