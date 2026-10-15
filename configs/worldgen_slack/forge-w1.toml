@@ -1,9 +1,9 @@
 # One forge: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-w1.toml [--dry-run]
-# FW1: tasks on W1 (data/v8-01/w1), solved by the student, DeepSeek V4.1 flash. W1 has no brief, so its board is
+# FW1: tasks on W1 (data/v8-02/w1), solved by the student, DeepSeek V4.1 flash. W1 has no brief, so its board is
 # empty: the proposer finds its material in the world itself (world_profile) and probes it. A place holds every task
 # the rounds can give, so nothing valid is dropped for room; curating by place is left to a later forge.
-world = "data/v8-01/w1"
-output = "data/v8-01/forge-w1"
+world = "data/v8-02/w1"
+output = "data/v8-02/forge-w1"
 taxonomy = "configs/worldgen_slack/taxonomy.toml"
 tasks = 36                # the goal: every candidate the rounds write, kept if valid
 target = 36               # the tasks one place (a category and a measured level) holds: no room limit
@@ -30,14 +30,25 @@ model = "anthropic/claude-opus-5.5"
 [env.proposer.sampling]
 cache_control = { type = "ephemeral", ttl = "1h" }
 
+# The judge, the witness and the answer judge: GLM 5.3, thinking at "high", the middle of its three efforts (low,
+# high, max). OpenAI's models refuse this account.
 [env.judge]
-model = "openai/gpt-6-sol"
+model = "z-ai/glm-5.3"
+
+[env.judge.sampling]
+reasoning_effort = "high"
 
 [env.solver]
 model = "deepseek/deepseek-v4.1-flash"
 
 [env.witness]             # tries the tasks the solver rarely answers: hard, or broken?
-model = "openai/gpt-6-sol"
+model = "z-ai/glm-5.3"
+
+[env.witness.sampling]
+reasoning_effort = "high"
 
 [answer_judge]
-model = "openai/gpt-6-sol"
+model = "z-ai/glm-5.3"
+
+[answer_judge.sampling]
+reasoning_effort = "high"

@@ -3,8 +3,8 @@
 # A forge (FW1) writes its tasks on the finished world. Gates before the run: the tests, ruff, the smoke
 # (smoke-w1.toml) and a --dry-run.
 sector = "an online retailer of home goods: storefront and app releases, fulfillment and warehouse operations, and customer support"
-seed = 20261014
-output = "data/v8-01/w1"
+seed = 20261016
+output = "data/v8-02/w1"
 storylines = 4            # the plot the ledger plans before day 1
 
 # One author writes the world in time order.
@@ -52,5 +52,10 @@ model = "anthropic/claude-opus-5.5"  # blind judges rated its days 0.77 for real
 [env.author.sampling]
 cache_control = { type = "ephemeral", ttl = "1h" }
 
+# The judge: GLM 5.3, thinking at "high", the middle of its three efforts (low, high, max). OpenAI's models refuse
+# this account, so the first W1 (data/v8-01/w1) stopped at its day-10 review.
 [env.judge]
-model = "openai/gpt-6-sol"
+model = "z-ai/glm-5.3"
+
+[env.judge.sampling]
+reasoning_effort = "high"
