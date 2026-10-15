@@ -88,7 +88,7 @@ async def scripted_complete(self, messages, *, trace=None, schema=None, parse=No
     text = messages if isinstance(messages, str) else messages[0].content
     if not GRADER["on"] or not text.startswith("Grade a Slack answer"):
         return await offline()
-    fields = json.loads(text[text.rindex("reason.\n") + len("reason.\n") :])
+    fields = json.loads(text.rsplit("\n", 1)[1])  # the fields are the prompt's last line
     response, answers = (
         fields["response"],
         ", ".join(str(r.get("answer")) for r in fields["reference"]["rows"]),
@@ -1500,7 +1500,10 @@ async def run_flows(root):
     source.mkdir()
     forged.world.snapshot(source / "world.sqlite")
     (source / "state.json").write_bytes((forged.root / "state.json").read_bytes())
-    assert {r.task_id for r in load_release(plan.output / "release")[1]} == {"r01-01", "r02-01"}
+    assert {(r.task_id, r.family) for r in load_release(plan.output / "release")[1]} == {
+        ("r01-01", "status"),
+        ("r02-01", "status"),
+    }, "a release names each task's family"
     _, cases = failure_cases(
         forged.world,
         "r01-01",

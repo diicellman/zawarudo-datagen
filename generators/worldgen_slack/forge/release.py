@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 from collections import Counter
+from decimal import Decimal
 from pathlib import Path
 
 from worldgen_slack import slack
@@ -35,52 +36,85 @@ def miss_class(result: dict, answer_type: str) -> str:
     return "search" if coverage is not None and coverage < 1 else "saw_all"
 
 
-def release_rows(store, world_hash: str) -> tuple[list[PublicTask], dict[str, PrivateAnswer]]:
-    """Each task's public row and private answer: its gold rows, and the messages and people they rest on; a
-    refusal's truth out of its actor's sight goes apart, as `unseen`. The messages an answer rests on are its gold
-    rows' and those stating its answer facts: the task's facts its actor can read that are no decoy and that no
-    other of them supersedes. A stale value or a decoy beside them is not its evidence."""
-    rows, answers = [], {}
+def private_answer(store, task) -> PrivateAnswer:
+    """A task's private answer: its gold rows, and the messages and people they rest on; a refusal's truth out of
+    its actor's sight goes apart, as `unseen`. The messages an answer rests on are its gold rows' and those stating
+    its answer facts: the task's facts its actor can read that are no decoy and that no other of them supersedes. A
+    stale value or a decoy beside them is not its evidence. A composite request's answer is its parts', each under
+    its label."""
     db = store.world.db
-    for task in db.execute("SELECT * FROM tasks WHERE parent IS NULL ORDER BY id").fetchall():
-        gold = json.loads(task["gold_json"])
-        anchors = {
-            (f, m)
-            for f, m in db.execute(
-                """SELECT e.fact_id, e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id
-                WHERE tf.task_id = ?""",
-                (task["id"],),
-            )
-        }
-        stating = {m for _, m in anchors} | {r["message_id"] for r in gold if r.get("message_id") is not None}
-        marks = ", ".join("?" * len(stating))
-        reader = Workspace(store.world.path, actor=task["actor_id"])
-        readable = {
-            r[0] for r in reader.db.execute(f"SELECT id FROM messages WHERE id IN ({marks})", sorted(stating))
-        }
-        reader.close()
-        decoys = {
-            f
-            for (f,) in db.execute(
-                "SELECT f.id FROM task_facts tf JOIN facts f ON f.id = tf.fact_id WHERE tf.task_id = ? AND f.is_decoy = 1",
-                (task["id"],),
-            )
-        }
-        seen = {f for f, m in anchors if m in readable} - decoys
-        stale = {
-            d
-            for s, d in db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind = 'supersedes'")
-            if s in seen
-        }
-        ids = {m for f, m in anchors if f in seen - stale} | {
-            r["message_id"] for r in gold if r.get("message_id") is not None
-        }
-        stated = db.execute(
-            f"SELECT id, channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us",
-            sorted(stating),
-        ).fetchall()
-        messages = [[r["channel_id"], r["ts"]] for r in stated if r["id"] in readable and r["id"] in ids]
-        unseen = [[r["channel_id"], r["ts"]] for r in stated if r["id"] not in readable]
+    if task["answer_type"] == "composite":
+        parts = [
+            private_answer(store, p).model_copy(update={"label": p["label"]})
+            for p in db.execute(
+                "SELECT * FROM tasks WHERE parent = ? ORDER BY part", (task["id"],)
+            ).fetchall()
+        ]
+
+        def together(field: str) -> list:
+            return sorted({tuple(m) for p in parts for m in getattr(p, field)}, key=lambda m: Decimal(m[1]))
+
+        return PrivateAnswer(
+            answer_type="composite",
+            rows=[],
+            gold_sql="",
+            messages=[list(m) for m in together("messages")],
+            unseen=[list(m) for m in together("unseen")],
+            users=sorted({u for p in parts for u in p.users}),
+            parts=parts,
+        )
+    gold = json.loads(task["gold_json"])
+    anchors = {
+        (f, m)
+        for f, m in db.execute(
+            """SELECT e.fact_id, e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id
+            WHERE tf.task_id = ?""",
+            (task["id"],),
+        )
+    }
+    stating = {m for _, m in anchors} | {r["message_id"] for r in gold if r.get("message_id") is not None}
+    marks = ", ".join("?" * len(stating))
+    reader = Workspace(store.world.path, actor=task["actor_id"])
+    readable = {
+        r[0] for r in reader.db.execute(f"SELECT id FROM messages WHERE id IN ({marks})", sorted(stating))
+    }
+    reader.close()
+    decoys = {
+        f
+        for (f,) in db.execute(
+            "SELECT f.id FROM task_facts tf JOIN facts f ON f.id = tf.fact_id WHERE tf.task_id = ? AND f.is_decoy = 1",
+            (task["id"],),
+        )
+    }
+    seen = {f for f, m in anchors if m in readable} - decoys
+    stale = {
+        d
+        for s, d in db.execute("SELECT src_fact, dst_fact FROM fact_relations WHERE kind = 'supersedes'")
+        if s in seen
+    }
+    ids = {m for f, m in anchors if f in seen - stale} | {
+        r["message_id"] for r in gold if r.get("message_id") is not None
+    }
+    stated = db.execute(
+        f"SELECT id, channel_id, ts FROM messages WHERE id IN ({marks}) ORDER BY ts_us",
+        sorted(stating),
+    ).fetchall()
+    messages = [[r["channel_id"], r["ts"]] for r in stated if r["id"] in readable and r["id"] in ids]
+    unseen = [[r["channel_id"], r["ts"]] for r in stated if r["id"] not in readable]
+    return PrivateAnswer(
+        answer_type=task["answer_type"],
+        rows=gold,
+        gold_sql=task["gold_sql"],
+        messages=messages,
+        unseen=unseen,
+        users=sorted({r["user_id"] for r in gold if r.get("user_id") is not None}),
+    )
+
+
+def release_rows(store, world_hash: str) -> tuple[list[PublicTask], dict[str, PrivateAnswer]]:
+    """Each task's public row, with how hard it measured, and its private answer (`private_answer`)."""
+    rows, answers = [], {}
+    for task in store.world.db.execute("SELECT * FROM tasks WHERE parent IS NULL ORDER BY id").fetchall():
         review, env = store.state.task_reviews.get(task["id"]), store.settings.get("env", {})
         measured = (
             {}
@@ -123,17 +157,11 @@ def release_rows(store, world_hash: str) -> tuple[list[PublicTask], dict[str, Pr
                 answer_type=task["answer_type"],
                 world_hash=world_hash,
                 intent=task["intent"],
+                family=task["family"],
                 **measured,
             )
         )
-        answers[task["id"]] = PrivateAnswer(
-            answer_type=task["answer_type"],
-            rows=gold,
-            gold_sql=task["gold_sql"],
-            messages=messages,
-            unseen=unseen,
-            users=sorted({r["user_id"] for r in gold if r.get("user_id") is not None}),
-        )
+        answers[task["id"]] = private_answer(store, task)
     return rows, answers
 
 

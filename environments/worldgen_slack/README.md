@@ -16,13 +16,16 @@ uv run eval @ configs/worldgen_slack/eval.toml -n 1 -r 2 --no-push --plain
 Set `--env.taskset.task.release_dir` to the generated release to evaluate (it is required). Public rows and the
 world's hash are validated before execution; private answers stay host-side.
 
-A release (format `worldgen-slack.v10`) carries, with each public task, how hard it measured when it was generated:
+A release (format `worldgen-slack.v11`) carries, with each public task, how hard it measured when it was generated:
 the solver model and its tries (`tries`; `crashed`, and `unanswered` for those that ended without an answer), its
 share of right answers (`right_rate`, the difficulty, with its 90% interval `right_interval`), of right and grounded
 ones (`strict_rate`, the reward's +1) and of answers it declined (`abstain_rate`), the
 share of the gold evidence its tries saw (`coverage`), and, for a task the solver rarely answered, a stronger
-witness's share of right answers (`witness`, `witness_right`). A curriculum can filter on them. Only v10 releases
-load; older ones are read from git.
+witness's share of right answers (`witness`, `witness_right`). A curriculum can filter on them. Each task names its
+`family`, the request it is: catch-up, decisions & why, commitments, or who-knows & status. A `composite` task is one
+request in 2-4 parts, each with its own gold rows (its private answer's `parts`, each under its `label`); it is graded
+part by part and settled by code, all or nothing: +1 only when every part is right and grounded, -1 when any part is
+wrong, 0 when it declined what it could not tell. Only v11 releases load; older ones are read from git.
 
 ## The solver's tools
 
@@ -36,7 +39,7 @@ carries the messages around it. Cursors are the server's and name a place, not a
 thread page back from a message (`next_ts`), a search by page number (`CURRENT_PAGE`), a list by its last item. The
 system prompt says who the actor is and when it is, as a Slack client does; a profile with no `user_id` is the
 actor's own. Each call keeps a record of what it showed (`slack.py`), which grading reads; the solver reads the
-text. Release v10 records the surface and turn limit each task was measured on.
+text. A release records the surface and turn limit each task was measured on.
 
 Public channels are readable by everyone in the workspace; private channels and DMs need membership, which a
 member who left no longer has. Deleted messages are excluded. There are no writes.

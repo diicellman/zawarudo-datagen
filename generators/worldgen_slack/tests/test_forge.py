@@ -13,6 +13,7 @@ from worldgen_slack.world import SHADOWED, SHOWN
 from ..evidence import measures
 from ..forge import tries as tries_module
 from ..forge.config import ForgeSeats
+from ..forge.release import private_answer
 from ..forge.tasks import Part, Task, answer_of, check_task, forge_task, forget
 from ..forge.tries import Tries
 from ..workspace import Workspace, asked
@@ -265,6 +266,20 @@ def test_composite(tmp_path):
     assert world.db.execute(f"SELECT COUNT(*) FROM tasks WHERE {asked(world.db)}").fetchone()[0] == 2, (
         "a request is asked once, its parts never"
     )
+    released = private_answer(SimpleNamespace(world=world), rows[0])
+    stated = [
+        list(r)
+        for r in world.db.execute("SELECT channel_id, ts FROM messages WHERE id IN (1, 2) ORDER BY ts_us")
+    ]
+    assert (
+        [(p.label, p.rows) for p in released.parts]
+        == [
+            ("who called it", [{"answer": caller, "message_id": 1}]),
+            ("who answered it", [{"answer": "Owen Sato", "message_id": 2}]),
+        ]
+        and released.messages == stated
+        and [p["label"] for p in released.reference()["parts"]] == ["who called it", "who answered it"]
+    ), "a request's answer is its parts', each under its label, and its evidence theirs together"
     with world.trial() as copy:  # else two parts that ask for one thing were kept
         refused("two parts give the same answer", forge_task, copy, request(called, called), settings, ["tc"])
     with world.trial() as copy:  # else a request that tells its own answer was kept

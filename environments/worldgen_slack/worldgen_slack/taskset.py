@@ -106,7 +106,7 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         trace.info["grading_started"] = True
         observations = trace.info.get("observations", [])
         reference = self.config.reference
-        expected = {"answer_type": reference.answer_type, "rows": reference.rows}
+        expected = reference.reference()
         if (trace.last_reply or "").strip():
             result = await AnswerJudge(self.config.judge).evaluate(
                 trace=trace,
@@ -125,9 +125,18 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         needed = len(reference.messages) + len(reference.users)
         found = len({tuple(m) for m in reference.messages} & seen) + len(set(reference.users) & users)
         coverage = found / needed if needed else None
+
         # Grounded by message, not by topic alone: an answer whose gold rests on messages is grounded only if its
-        # tries were shown one of them (a stale message is topically just as close).
-        grade = grade.model_copy(update={"grounded": grade.grounded and (found > 0 or not needed)})
+        # tries were shown one of them (a stale message is topically just as close); a composite request's, only if
+        # each part's was.
+        def shown_one(answer) -> bool:
+            return not (answer.messages or answer.users) or bool(
+                {tuple(m) for m in answer.messages} & seen or set(answer.users) & users
+            )
+
+        grade = grade.model_copy(
+            update={"grounded": grade.grounded and all(map(shown_one, reference.answers()))}
+        )
         score = reward(grade)
         trace.info["evaluation"] = {
             "task_id": self.data.task_id,

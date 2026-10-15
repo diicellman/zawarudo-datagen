@@ -15,7 +15,7 @@ from ..judge.task import review, review_payload
 from ..judge.verdict import Issue, Verdict, accepted_task, combined, read_one_way
 from ..session import observable
 from .difficulty import failure_cases
-from .release import release_rows
+from .release import private_answer, release_rows
 
 
 def wilson(right: int, n: int, z: float = 1.645) -> list[float]:
@@ -304,12 +304,10 @@ class Tries:
         those it accepted, and its gold if it rejected that. Kept with the task's key, so a task is screened once."""
         state = self.store.state
         for t in [t for t in due if state.screens.get(t, {}).get("key") != keys[t]]:
-            row = self.world.db.execute(
-                "SELECT question, answer_type, gold_json FROM tasks WHERE id = ?", (t,)
-            ).fetchone()
+            row = self.world.db.execute("SELECT * FROM tasks WHERE id = ?", (t,)).fetchone()
             rows = json.loads(row["gold_json"])
             gold, cases = failure_cases(self.world, t, rows)
-            reference = {"answer_type": row["answer_type"], "rows": rows}
+            reference = private_answer(self.store, row).reference()
             graded = await asyncio.gather(
                 *(self.grade(row["question"], reference, r) for r in [gold, *(r for _, r in cases)])
             )

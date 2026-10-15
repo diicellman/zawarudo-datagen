@@ -5,7 +5,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from worldgen_slack.judge import EMPTY, AnswerGrade, AnswerJudge
+from worldgen_slack.judge import EMPTY, AnswerGrade, AnswerJudge, PartGrade
 from worldgen_slack.release import PrivateAnswer, PublicTask, load_release
 from worldgen_slack.slack import compact, people_shown, shown
 from worldgen_slack.taskset import SolverTask
@@ -357,9 +357,9 @@ async def test_reviews(tmp_path):
     write_release(tmp_path / "release", tmp_path / "solver.sqlite", [task], {"t1": answer})
     assert load_release(tmp_path / "release")[1:] == ([task], {"t1": answer})
     manifest = json.loads((tmp_path / "release" / "manifest.json").read_text())
-    assert manifest["format"] == "worldgen-slack.v10"
+    assert manifest["format"] == "worldgen-slack.v11"
     (tmp_path / "release" / "manifest.json").write_text(
-        json.dumps(manifest | {"format": "worldgen-slack.v9"})
+        json.dumps(manifest | {"format": "worldgen-slack.v10"})
     )
     fails(load_release, tmp_path / "release")  # a release of another format
     (tmp_path / "release" / "manifest.json").write_text(json.dumps(manifest))
@@ -390,3 +390,145 @@ async def test_reviews(tmp_path):
         [task],
         {"t1": answer.model_copy(update={"unseen": answer.messages})},
     )
+
+
+async def test_composite_grade(tmp_path, monkeypatch):
+    """A composite request's answer is its parts', each under its label; the answer judge grades each part, and code
+    settles the whole, all or nothing: right only when every part is, declined when no part is wrong and one was
+    declined, grounded only when each part was shown what it rests on. A release carries it whole (v11)."""
+    world, at, message = world_fixture(tmp_path / "world.sqlite")
+    world.solver_copy(tmp_path / "solver.sqlite")
+    ts = dict(world.db.execute("SELECT id, ts FROM messages").fetchall())
+
+    def part(label, answer, mid, kind="text"):
+        return PrivateAnswer(
+            answer_type=kind,
+            rows=[{"answer": answer}],
+            gold_sql="SELECT 1",
+            messages=[["C1", ts[mid]]],
+            users=[],
+            label=label,
+        )
+
+    parts = [part("who called it", "Alicia Rao", 1), part("who posted the notes", "Owen Sato", 3)]
+    answer = PrivateAnswer(
+        answer_type="composite",
+        rows=[],
+        gold_sql="",
+        messages=[["C1", ts[1]], ["C1", ts[3]]],
+        users=[],
+        parts=parts,
+    )
+    assert (
+        answer.reference()
+        == {
+            "answer_type": "composite",
+            "parts": [
+                {"answer_type": "text", "rows": [{"answer": "Alicia Rao"}], "label": "who called it"},
+                {"answer_type": "text", "rows": [{"answer": "Owen Sato"}], "label": "who posted the notes"},
+            ],
+        }
+        and answer.answers() == parts
+    )
+    whole = answer.model_dump()
+    for broken in (
+        whole
+        | {
+            "parts": whole["parts"][:1],
+            "messages": whole["parts"][0]["messages"],
+        },  # one part is no composite
+        whole | {"rows": [{"answer": "x"}]},  # its rows are its parts'
+        whole | {"gold_sql": "SELECT 1"},
+        whole | {"messages": whole["messages"][:1]},  # its evidence is its parts' together
+        whole | {"parts": [whole["parts"][0], whole["parts"][0]]},  # each part under a label of its own
+        whole | {"parts": [whole["parts"][0], whole["parts"][1] | {"label": None}]},
+        whole["parts"][0] | {"parts": whole["parts"]},  # a single answer has no parts
+        whole["parts"][0] | {"gold_sql": ""},
+    ):
+        fails(PrivateAnswer.model_validate, broken)
+    task = PublicTask(
+        task_id="t1",
+        question="Catch me up on 4.2: who called the rollback, and who posted the notes?",
+        actor_id="U2",
+        category="composite",
+        level=2,
+        answer_type="composite",
+        world_hash=file_hash(tmp_path / "solver.sqlite"),
+        family="catch-up",
+    )
+    solve = SolverTask.create(task, tmp_path / "solver.sqlite", answer, network_policy=False)
+    asks = AnswerJudge(solve.config.judge).build_messages(
+        question="q", reference={}, response="r", observations=[]
+    )
+    assert "grade each part on its own by the rules above" in asks[0].content
+
+    def read(*ids):
+        return [
+            {"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C1", "ts": ts[i]}]}}
+            for i in ids
+        ]
+
+    def grade(*parts, correct=True, grounded=True):
+        return AnswerGrade(
+            correct=correct,  # the grader's word on the whole, which code does not read
+            abstained=False,
+            grounded=grounded,
+            unsupported_asides=0,
+            committed=[],
+            missing=[],
+            extra=[],
+            reason="r",
+            parts=[
+                PartGrade(
+                    label=f"part {n}",
+                    correct=right,
+                    abstained=declined,
+                    committed=[] if declined else ["x"],
+                    missing=[] if right else ["y"],
+                    extra=[],
+                )
+                for n, (right, declined) in enumerate(parts, 1)
+            ],
+        )
+
+    async def scored(graded, observations, reply="Alicia Rao called it; Owen Sato posted the notes."):
+        async def complete(self, messages, **kwargs):
+            return SimpleNamespace(parsed=graded)
+
+        monkeypatch.setattr(AnswerJudge, "complete", complete)
+        trace = SimpleNamespace(
+            info={"observations": observations}, last_reply=reply, id="try", record_metrics=lambda m: None
+        )
+        return await SolverTask.semantic_correctness(solve, trace), trace.info["evaluation"]
+
+    score, evaluation = await scored(grade((True, False), (True, False)), read(1, 3))
+    assert score == 1.0 and [p["label"] for p in evaluation["parts"]] == [
+        "who called it",
+        "who posted the notes",
+    ], "every part right and grounded; the labels are the reference's"
+    score, evaluation = await scored(grade((True, False), (False, False), correct=True), read(1, 3))
+    assert (
+        score == -1.0 and not evaluation["correct"] and evaluation["missing"] == ["who posted the notes: y"]
+    ), "one part wrong is the whole wrong, whatever the grader says of the whole"
+    score, evaluation = await scored(grade((True, False), (False, True), correct=False), read(1, 3))
+    assert score == 0.0 and evaluation["abstained"], "what it could not tell, declined, costs nothing"
+    score, evaluation = await scored(grade((False, False), (False, True), correct=False), read(1, 3))
+    assert score == -1.0 and not evaluation["abstained"], "a wrong part is not undone by a declined one"
+    score, evaluation = await scored(grade((True, False), (True, False)), read(1))
+    assert score == 0.0 and not evaluation["grounded"], "each part grounded by its own messages"
+    with pytest.raises(ValueError, match="each of its 2 parts"):
+        await scored(grade((True, False)), read(1, 3))
+    score, evaluation = await scored(grade(), read(1, 3), reply=" ")
+    assert score == -1.0 and [p["missing"] for p in evaluation["parts"]] == [["Alicia Rao"], ["Owen Sato"]], (
+        "an empty response lacks every part's rows"
+    )
+    write_release(tmp_path / "release", tmp_path / "solver.sqlite", [task], {"t1": answer})
+    assert load_release(tmp_path / "release")[1:] == ([task], {"t1": answer})
+    assert json.loads((tmp_path / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v11"
+    fails(
+        write_release,
+        tmp_path / "release2",
+        tmp_path / "solver.sqlite",
+        [task.model_copy(update={"answer_type": "text"})],
+        {"t1": answer},
+    )  # its question and its answer say what it is alike

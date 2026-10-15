@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from .world import World, canonical, file_hash
 
@@ -17,6 +17,7 @@ class StrictModel(BaseModel):
 
 SafeId = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
 NonEmptyText = Annotated[str, Field(min_length=1)]
+Evidence = Annotated[list[str], Field(min_length=2, max_length=2)]  # [channel, ts]
 
 
 def atomic_json(path: Path, value) -> None:
@@ -49,14 +50,15 @@ class PublicTask(StrictModel):
     """A task as a solver gets it, with how hard it measured: the solver model's tries at the release (those that
     crashed, and those that never answered), its share of right answers (with its 90% interval), of right and
     grounded ones, and of those that declined to answer, the gold evidence the tries saw, and the witness's share of
-    right answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns."""
+    right answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns. A
+    composite request (v11) is one question in 2-4 parts, right only when every part is."""
 
     task_id: SafeId
     question: NonEmptyText
     actor_id: SafeId
     category: NonEmptyText
     level: int
-    answer_type: Literal["text", "set", "number", "refusal", "status"]
+    answer_type: Literal["text", "set", "number", "refusal", "status", "composite"]
     world_hash: str
     solver: str | None = None
     tries: int | None = None
@@ -77,22 +79,62 @@ class PublicTask(StrictModel):
     turns: int | None = None
     miss_classes: dict[str, int] | None = None
     intent: str | None = None  # v10: the request it is, a person's to an assistant
+    family: str | None = None  # v11: the request it is, of four (catch-up, decisions, commitments, status)
 
 
 class PrivateAnswer(StrictModel):
     """The gold rows of a task, the messages (channel, ts) and people its answer rests on, and, for a refusal, the
-    truth out of its actor's sight (`unseen`)."""
+    truth out of its actor's sight (`unseen`). A composite request's answer (v11) is its parts', each such an answer
+    under its label, in the request's order: it has no rows or query of its own, and its messages, people and unseen
+    are its parts' together."""
 
-    answer_type: Literal["text", "set", "number", "refusal", "status"]
+    answer_type: Literal["text", "set", "number", "refusal", "status", "composite"]
     rows: list[dict[str, JsonValue]]
-    gold_sql: NonEmptyText
-    messages: list[Annotated[list[str], Field(min_length=2, max_length=2)]]  # [channel, ts]
-    unseen: list[Annotated[list[str], Field(min_length=2, max_length=2)]] = []
+    gold_sql: str
+    messages: list[Evidence]
+    unseen: list[Evidence] = []
     users: list[str]
+    label: NonEmptyText | None = None  # v11: a part's, what of its request it answers
+    parts: list["PrivateAnswer"] = []  # v11: a composite request's
+
+    @model_validator(mode="after")
+    def shaped(self):
+        if self.answer_type != "composite":
+            if self.parts or not self.gold_sql:
+                raise ValueError("an answer has its gold query and no parts")
+            return self
+        labels = [p.label for p in self.parts]
+        if not 2 <= len(self.parts) <= 4 or self.rows or self.gold_sql:
+            raise ValueError("a composite answer is its 2-4 parts', with no rows or query of its own")
+        if (
+            None in labels
+            or len(set(labels)) < len(labels)
+            or any(p.answer_type == "composite" for p in self.parts)
+        ):
+            raise ValueError("a composite answer's parts are answers, each under a label of its own")
+        for field in ("messages", "unseen", "users"):
+            own = {json.dumps(v) for v in getattr(self, field)}
+            if own != {json.dumps(v) for p in self.parts for v in getattr(p, field)}:
+                raise ValueError(f"a composite answer's {field} are its parts' together")
+        return self
+
+    def answers(self) -> list["PrivateAnswer"]:
+        """What its grade decides on: its parts, or itself."""
+        return self.parts or [self]
+
+    def reference(self) -> dict:
+        """What the answer judge grades a response against: the answer type and gold rows, or each part's under its
+        label."""
+        if self.parts:
+            return {
+                "answer_type": "composite",
+                "parts": [p.reference() | {"label": p.label} for p in self.parts],
+            }
+        return {"answer_type": self.answer_type, "rows": self.rows}
 
 
 class Manifest(StrictModel):
-    format: Literal["worldgen-slack.v10"] = "worldgen-slack.v10"
+    format: Literal["worldgen-slack.v11"] = "worldgen-slack.v11"
     world_hash: str
     files: dict[str, str]
 
@@ -117,6 +159,8 @@ def load_release(root: Path) -> tuple[Path, list[PublicTask], dict[str, PrivateA
         if row.world_hash != manifest.world_hash:
             raise ValueError("a task references another world")
         reader, answer = World(root / "world.sqlite", actor=row.actor_id), answers[row.task_id]
+        if answer.answer_type != row.answer_type or answer.label is not None:
+            raise ValueError(f"{row.task_id}: its answer is another kind than its question")
         for channel, ts in answer.messages + answer.unseen:
             readable = reader.db.execute(
                 "SELECT 1 FROM messages WHERE channel_id = ? AND ts = ?", (channel, ts)
