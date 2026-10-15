@@ -390,6 +390,21 @@ def answer_of(world, task_id: str) -> list:
     return sorted(str(r.get("answer")) for r in json.loads(row["gold_json"]))
 
 
+def reference_of(db, task_id: str) -> dict:
+    """What the answer judge grades a task against, from its world's rows: its answer type and gold rows; a
+    composite request's, each part's under its label (as its release's `PrivateAnswer.reference`)."""
+    row = db.execute("SELECT answer_type, gold_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row[0] != "composite":
+        return {"answer_type": row[0], "rows": json.loads(row[1])}
+    parts = db.execute(
+        "SELECT answer_type, gold_json, label FROM tasks WHERE parent = ? ORDER BY part", (task_id,)
+    ).fetchall()
+    return {
+        "answer_type": "composite",
+        "parts": [{"answer_type": k, "rows": json.loads(g), "label": label} for k, g, label in parts],
+    }
+
+
 def forget(world, task_id: str) -> None:
     """A task taken off the world, its parts with it."""
     for t in [r[0] for r in world.db.execute("SELECT id FROM tasks WHERE parent = ?", (task_id,))] + [

@@ -62,6 +62,13 @@ def main():
     # level and rates, each of its probes and the witness's tries.
     tasks = {t["id"]: t for t in forge["catalog"]["tasks"]}
     assert tasks and all(t["gold_sql"] for t in tasks.values()), "every task shows its gold query"
+    joined = tasks["r09-07"]
+    assert (
+        not any(t.startswith("r09-07-p") for t in tasks)
+        and [c.split(":")[0] for c in joined["answer"]["required_claims"]] == ["the newest", "the two newest"]
+        and joined["gold_sql"].startswith("-- the newest\n")
+        and joined["reasoning"].startswith("catch-up · composite")
+    ), "a composite request is one task, its parts its labelled claims"
     anchored = [t for t in forge["bindings"] if tasks[t]["fact_ids"]]
     assert anchored and all(forge["bindings"][t]["claims"][0]["message_ids"] for t in anchored), (
         "ledger tasks show the messages their facts are stated in"
@@ -86,7 +93,7 @@ def main():
     html = render({"runs": [], "probe": attack})
     assert attack not in html and "__VIEWER_DATA__" not in html and "\\u003c/script\\u003e" in html
     print(
-        "Viewer checks passed: attempt order, snapshots, conversations, cast, reactions, mentions, facts, gold queries, rates, probes, witness, chapter, board, escaping."
+        "Viewer checks passed: attempt order, snapshots, conversations, cast, reactions, mentions, facts, gold queries, composites, rates, probes, witness, chapter, board, escaping."
     )
 
 

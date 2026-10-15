@@ -15,7 +15,8 @@ from ..judge.task import review, review_payload
 from ..judge.verdict import Issue, Verdict, accepted_task, combined, read_one_way
 from ..session import observable
 from .difficulty import failure_cases
-from .release import private_answer, release_rows
+from .release import release_rows
+from .tasks import reference_of
 
 
 def wilson(right: int, n: int, z: float = 1.645) -> list[float]:
@@ -307,7 +308,7 @@ class Tries:
             row = self.world.db.execute("SELECT * FROM tasks WHERE id = ?", (t,)).fetchone()
             rows = json.loads(row["gold_json"])
             gold, cases = failure_cases(self.world, t, rows)
-            reference = private_answer(self.store, row).reference()
+            reference = reference_of(self.world.db, t)
             graded = await asyncio.gather(
                 *(self.grade(row["question"], reference, r) for r in [gold, *(r for _, r in cases)])
             )

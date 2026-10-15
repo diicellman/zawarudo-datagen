@@ -1892,18 +1892,18 @@ async def run_flows(root):
     with forged.world.trial() as copy:
         forge_task(
             copy,
-            newest.model_copy(update={"id": "r09-06", "question": "Who joined last, r09-06?"}),
+            newest.model_copy(update={"id": "r09-08", "question": "Who joined last, r09-08?"}),
             plan,
-            ["r09-06"],
+            ["r09-08"],
         )
-    forged.state.solves["r09-06"] = tried_once("r09-06", False)
-    assert weigher.place("r09-06", {"right_rate": 0.625, "witness_right": None}, None, "x")["verdict"] == (
+    forged.state.solves["r09-08"] = tried_once("r09-08", False)
+    assert weigher.place("r09-08", {"right_rate": 0.625, "witness_right": None}, None, "x")["verdict"] == (
         "dropped: no try reached its gold from Slack, right and grounded"
     )
     # A composite request is placed by its family; its structure is its parts', and the archive shows which part the
     # solver misses.
     joined = Task(
-        id="r09-05",
+        id="r09-07",
         category="composite",
         level=1,
         actor_id=actor,
@@ -1916,7 +1916,7 @@ async def run_flows(root):
         ],
     )
     with forged.world.trial() as copy:
-        forge_task(copy, joined, plan, ["r09-05"])
+        forge_task(copy, joined, plan, ["r09-07"])
 
     def part_tried(second: bool) -> dict:
         grades = [
@@ -1934,12 +1934,12 @@ async def run_flows(root):
             {"grounded": True, "semantic_correctness": 1.0, "response": "Ann; Ann and Bo."} if second else {}
         )
 
-    forged.state.solves["r09-05"] = tried_once("r09-05", True) | {
+    forged.state.solves["r09-07"] = tried_once("r09-07", True) | {
         "results": [part_tried(s) for s in (True, False, False, True)],
-        "traces": ["try-r09-05"] * 4,
+        "traces": ["try-r09-07"] * 4,
     }
-    forged.state.forged["r09-05"] = placed = weigher.place(
-        "r09-05", {"right_rate": 0.5, "witness_right": None}, None, "x"
+    forged.state.forged["r09-07"] = placed = weigher.place(
+        "r09-07", {"right_rate": 0.5, "witness_right": None}, None, "x"
     )
     assert (
         placed["verdict"].startswith("kept in catch-up·L2 as parts:")

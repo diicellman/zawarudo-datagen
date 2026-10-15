@@ -17,7 +17,7 @@ from ..forge.config import ForgeSeats
 from ..forge.difficulty import failure_cases, features
 from ..forge.env import bucket
 from ..forge.release import miss_classes, private_answer, right_by_part
-from ..forge.tasks import Part, Task, answer_of, check_task, forge_task, forget
+from ..forge.tasks import Part, Task, answer_of, check_task, forge_task, forget, reference_of
 from ..forge.tries import Tries
 from ..judge.task import JudgeTask, review_payload
 from ..store import Store
@@ -321,6 +321,10 @@ async def test_composite(tmp_path):
         and released.messages == stated
         and [p["label"] for p in released.reference()["parts"]] == ["who called it", "who answered it"]
     ), "a request's answer is its parts', each under its label, and its evidence theirs together"
+    assert reference_of(world.db, "tc") == released.reference() and reference_of(world.db, "t1") == {
+        "answer_type": "text",
+        "rows": json.loads(world.db.execute("SELECT gold_json FROM tasks WHERE id = 't1'").fetchone()[0]),
+    }, "the screen and a regrade grade against the reference a release ships"
     gold, cases = failure_cases(world, "tc", [])
     named = dict(cases)
     assert gold == f"who called it: {caller}.\nwho answered it: Owen Sato.", (

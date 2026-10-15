@@ -127,20 +127,46 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
     facts = [dict(r) for r in db.execute("SELECT * FROM facts ORDER BY day, id")]
     storyline_of = {f["id"]: f["storyline"] for f in facts}
     tasks, bindings = [], {}
-    for t in db.execute("SELECT * FROM tasks ORDER BY id").fetchall():
+    rows = db.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+    # A composite request (v3) is one task on the page, its parts its claims; a world before v3 has no parts.
+    parted = bool(rows) and "parent" in rows[0].keys()
+    parts = {}
+    for t in rows:
+        if parted and t["parent"]:
+            parts.setdefault(t["parent"], []).append(t)
+
+    def claims_of(t) -> list[str]:
         gold = json.loads(t["gold_json"])
-        fact_ids = [r[0] for r in db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (t["id"],))]
-        evidence = {str(r["message_id"]) for r in gold if r.get("message_id") is not None}
-        evidence |= {
-            str(r[0])
-            for r in db.execute(
-                "SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id WHERE tf.task_id = ? AND e.role = 'anchor'",
-                (t["id"],),
-            )
-        }
-        claims = [
+        return [
             str(r.get("answer")) + (" (not settled)" if t["answer_type"] == "status" else "") for r in gold
         ] or ["(refusal: nothing to find)"]
+
+    for t in rows:
+        if parted and t["parent"]:
+            continue
+        own = sorted(parts.get(t["id"], []), key=lambda p: p["part"]) or [t]
+        fact_ids = [
+            r[0]
+            for p in own
+            for r in db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (p["id"],))
+        ]
+        evidence = {
+            str(r["message_id"])
+            for p in own
+            for r in json.loads(p["gold_json"])
+            if r.get("message_id") is not None
+        }
+        evidence |= {
+            str(r[0])
+            for p in own
+            for r in db.execute(
+                "SELECT e.message_id FROM task_facts tf JOIN evidence e ON e.fact_id = tf.fact_id WHERE tf.task_id = ? AND e.role = 'anchor'",
+                (p["id"],),
+            )
+        }
+        composite = t["answer_type"] == "composite"
+        claims = [f"{p['label']}: {', '.join(claims_of(p))}" for p in own] if composite else claims_of(t)
+        family = t["family"] if parted else None
         tasks.append(
             {
                 "id": t["id"],
@@ -148,8 +174,13 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
                 "question": t["question"],
                 "actor_id": t["actor_id"],
                 "fact_ids": fact_ids,
-                "reasoning": f"{t['category']} · level {t['level']} · {t['answer_type']}",
-                "gold_sql": t["gold_sql"],
+                "reasoning": " · ".join(
+                    [*([family] if family else []), t["category"], f"level {t['level']}", t["answer_type"]]
+                    + ([f"{len(own)} parts"] if composite else [])
+                ),
+                "gold_sql": "\n\n".join(f"-- {p['label']}\n{p['gold_sql']}" for p in own)
+                if composite
+                else t["gold_sql"],
                 "category": t["category"],
                 "level": t["level"],
                 "answer": {"canonical_answer": "; ".join(claims), "required_claims": claims},

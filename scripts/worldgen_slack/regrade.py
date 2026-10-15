@@ -24,7 +24,14 @@ import verifiers.v1 as vf
 from worldgen_slack.judge import AnswerJudge
 
 from generators.worldgen_slack.forge.difficulty import failure_cases
+from generators.worldgen_slack.forge.tasks import reference_of
 from generators.worldgen_slack.workspace import Workspace
+
+
+def r_part(row) -> bool:
+    """A composite request's part: graded with its request, never asked alone (a world before v3 has none)."""
+    return bool(row["parent"]) if "parent" in row.keys() else False
+
 
 # $ per million input, output and cached input tokens (list prices)
 PRICES = {"z-ai/glm-5.3": (1.4, 4.4, 0.26)}
@@ -144,20 +151,17 @@ async def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    # A task the run dropped is gone from its world; its gold is in the round's review snapshots.
-    tasks, kept = {}, set()
+    # A task the run dropped is gone from its world; its gold is in the round's review snapshots. A composite
+    # request's reference is its parts', from the same snapshot.
+    tasks, kept, reference = {}, set(), {}
     for path in [*sorted(args.run.glob("attempts/round-*/review-tasks-*.sqlite")), args.run / "world.sqlite"]:
         db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
-        rows = {
-            r["id"]: dict(r) for r in db.execute("SELECT id, question, answer_type, gold_json FROM tasks")
-        }
+        rows = {r["id"]: dict(r) for r in db.execute("SELECT * FROM tasks") if not r_part(r)}
         tasks |= rows
+        reference |= {t: reference_of(db, t) for t in rows}
         kept = set(rows)
         db.close()
-    reference = {
-        t: {"answer_type": r["answer_type"], "rows": json.loads(r["gold_json"])} for t, r in tasks.items()
-    }
     work = [t for t in tries(args.run) if t["task"] in tasks]
     if args.tries is not None and args.tries < len(work):
         wrong = [t for t in work if not t["recorded"]["correct"]]
@@ -167,7 +171,7 @@ async def main() -> None:
     if args.screen:
         world = Workspace(args.run / "world.sqlite")
         for t in sorted(kept):
-            gold, failures = failure_cases(world, t, reference[t]["rows"])
+            gold, failures = failure_cases(world, t, reference[t].get("rows", []))
             cases += [dict(task=t, case="gold", response=gold, expect=True)]
             cases += [dict(task=t, case=name, response=response, expect=False) for name, response in failures]
         world.close()
