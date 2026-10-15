@@ -18,9 +18,10 @@ from ..forge.env import bucket
 from ..forge.release import miss_classes, private_answer, right_by_part
 from ..forge.tasks import Part, Task, answer_of, check_task, forge_task, forget
 from ..forge.tries import Tries
+from ..judge.task import JudgeTask, review_payload
 from ..store import Store
 from ..workspace import Workspace, asked
-from .support import contracts_settings, fails, forge_of, refused, world_fixture
+from .support import contracts_settings, fails, forge_of, refused, with_state, world_fixture
 
 
 def test_tasks(tmp_path):
@@ -215,7 +216,7 @@ async def test_tries_cut_and_kept(monkeypatch):
     )
 
 
-def test_composite(tmp_path):
+async def test_composite(tmp_path):
     """A composite request (2 to 4 parts, each with its own gold) is recorded as its request and its parts, each part a
     task of its own under it, checked as a task is; its parts answer different things, its request gives none of them
     away, a part's fault names the part, and taking it off takes its parts with it."""
@@ -328,6 +329,31 @@ def test_composite(tmp_path):
     assert miss_classes(world, "tc", results) == {"search": 1, "abstained": 1}, "a wrong part's own class"
     assert right_by_part(world, "tc", results) == {"who called it": 2 / 3, "who answered it": 2 / 3}
     assert right_by_part(world, "t1", results) is None, "a task with no parts"
+    # Its review sees its parts, each with its label and gold, and checks each part's gold and facts.
+    payload = review_payload(world, "task", ["tc"])
+    (reviewed,) = payload["tasks"]
+    assert (
+        reviewed["family"] == "catch-up"
+        and "gold_sql" not in reviewed
+        and [(p["label"], p["gold"]) for p in reviewed["parts"]]
+        == [(p.label, p.rows) for p in released.parts]
+    )
+    with world.batch():  # a fact its second part needs, which no message states
+        fact = dict(id="f9", storyline="r", subject="c", attribute="d", value="v", summary="s", day=2)
+        world.insert("facts", [fact | dict(channel_id="C1", author_id="U1")])
+        world.insert("task_facts", [dict(task_id="tc-p2", fact_id="f9")])
+    world.snapshot(tmp_path / "review.sqlite")
+    (tools,) = (judge := JudgeTask.create(payload, tmp_path / "review.sqlite", "x", 5)).toolsets(judge.config)
+    await tools.setup()
+    with_state(tools)
+    checked = await tools._with_state(tools.check)()
+    assert set(checked["tasks"]["tc"]["parts"]) == {"who called it", "who answered it"} and checked["tasks"][
+        "tc"
+    ]["parts"]["who answered it"]["rows"] == [{"answer": "Owen Sato", "message_id": 2}]
+    assert any(v.startswith("unstated_fact: fact f9, which task tc-p2") for v in checked["violations"]), (
+        "a part's facts are checked with its request"
+    )
+    world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
     measured = Store.difficulty(SimpleNamespace(world=world, state=SimpleNamespace(task_reviews={})))
     assert set(measured["tc"]["parts"]) == {"tc-p1", "tc-p2"} and "tc-p1" not in measured, (
         "a request's measures are its parts', and a part is no task of the summary's"

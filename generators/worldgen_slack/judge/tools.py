@@ -58,18 +58,24 @@ class ReviewTools(vf.Toolset[ReviewToolsConfig, ReviewState]):
         (how many read_channel pages deep its evidence sits for its actor, the tables its gold query reads, its
         evidence's search rank for the question's own words), and report each author's style."""
         world = Workspace(self.config.db_path)
-        tasks = {}
-        for task_id in self.config.task_ids:
-            row = world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+        def measured(row) -> dict:
             try:
                 gold = world.gold(row["actor_id"], row["gold_sql"], max_rows=self.config.max_rows)
-                tasks[task_id] = {"rows": gold["rows"]} | measures(
-                    world, task_id, gold["rows"], gold["tables"]
-                )
+                return {"rows": gold["rows"]} | measures(world, row["id"], gold["rows"], gold["tables"])
             except ValueError as error:
-                tasks[task_id] = {"error": str(error)}
-        result = {
-            "violations": world.violations(complete=self.config.task_ids),
+                return {"error": str(error)}
+
+        tasks, parts = {}, []
+        for task_id in self.config.task_ids:
+            row = world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            own = world.db.execute(
+                "SELECT * FROM tasks WHERE parent = ? ORDER BY part", (task_id,)
+            ).fetchall()
+            tasks[task_id] = {"parts": {p["label"]: measured(p) for p in own}} if own else measured(row)
+            parts += [p["id"] for p in own]
+        result = {  # a composite request's facts are its parts'
+            "violations": world.violations(complete=[*self.config.task_ids, *parts]),
             "tasks": tasks,
             "style": style(world, frozen_before(world)),
         }

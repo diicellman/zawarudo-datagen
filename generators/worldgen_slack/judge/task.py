@@ -87,20 +87,34 @@ class JudgeTask(vf.Task[WorldTaskData, ReviewState, JudgeConfig]):
 
 
 def review_payload(world: Workspace, phase: str, task_ids: list[str], taxonomy=None, **extra) -> dict:
-    """What a review covers: its phase, the world's version, and the requested tasks with their gold and, given
-    the taxonomy, what their category and level mean."""
+    """What a review covers: its phase, the world's version, and the requested tasks with their gold, their family
+    and, given the taxonomy, what their category and level mean; a composite request with its parts, each one's label
+    and gold."""
+
+    def gold(row) -> dict:
+        facts = [
+            r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (row["id"],))
+        ]
+        return {"gold_sql": row["gold_sql"], "gold": json.loads(row["gold_json"]), "facts": facts}
+
     tasks = []
     for task_id in task_ids:
         row = dict(world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
-        facts = [
-            r[0] for r in world.db.execute("SELECT fact_id FROM task_facts WHERE task_id = ?", (task_id,))
-        ]
+        parts = world.db.execute("SELECT * FROM tasks WHERE parent = ? ORDER BY part", (task_id,)).fetchall()
         tasks.append(
-            {
-                k: row[k]
-                for k in ("id", "category", "level", "actor_id", "question", "answer_type", "gold_sql")
-            }
-            | {"gold": json.loads(row["gold_json"]), "facts": facts}
+            {k: row[k] for k in ("id", "category", "level", "actor_id", "question", "answer_type")}
+            | {"family": row.get("family")}
+            | (
+                {
+                    "parts": [
+                        {"label": p["label"], "category": p["category"], "answer_type": p["answer_type"]}
+                        | gold(p)
+                        for p in parts
+                    ]
+                }
+                if parts
+                else gold(row)
+            )
             | (
                 {
                     "means": f"{spec.definition} Level {row['level']}: {spec.levels[row['level'] - 1]}. Concept: {row['concept']}"

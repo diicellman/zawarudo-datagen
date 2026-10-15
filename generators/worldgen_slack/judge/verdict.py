@@ -10,6 +10,8 @@ from ..config import Ids
 
 # A task the judge finds a second reading of: one of its wrong answers is right as its question can also be read.
 READING = "another reading of its question makes a wrong answer right: "
+# A task no colleague would ask for: a question about colleagues' activity, a database exercise.
+UNREALISTIC = "not a request a colleague makes: "
 
 
 class Issue(StrictModel):
@@ -29,13 +31,15 @@ class Issue(StrictModel):
 
 class TaskReview(StrictModel):
     """One task's review. `misread` quotes a wrong solve's answer that a reading the question's own words allow makes
-    right, with that reading: such a task is not valid, and goes back to be reworded, not kept as hard."""
+    right, with that reading: such a task is not valid, and goes back to be reworded, not kept as hard.
+    `unrealistic` says why no colleague would make its request: such a task is not valid, however hard."""
 
     task_id: SafeId
     valid: bool
     reason: NonEmptyText
     level_fit: int | None = Field(default=None, ge=0, le=4)
     misread: NonEmptyText | None = None
+    unrealistic: NonEmptyText | None = None
 
     @model_validator(mode="after")
     def read_one_way(self) -> Self:
@@ -43,6 +47,8 @@ class TaskReview(StrictModel):
             raise ValueError(
                 "a task whose wrong answer another reading of its question makes right is not valid"
             )
+        if self.unrealistic and self.valid:
+            raise ValueError("a task no colleague would ask for is not valid")
         return self
 
 
@@ -91,8 +97,8 @@ def verdict_schema(phase: str, task_ids: list[str]) -> dict:
     if phase in PHASE_CRITERIA:
         schema["properties"]["criteria"]["required"] = list(names)
         schema["required"].append("criteria")
-    if phase == "task":
-        schema["$defs"]["TaskReview"]["required"].append("level_fit")
+    if phase == "task":  # each task's level and realism, ruled on every one
+        schema["$defs"]["TaskReview"]["required"] += ["level_fit", "unrealistic"]
     return schema
 
 
@@ -111,6 +117,10 @@ def validate_verdict(verdict: Verdict, payload: dict) -> None:
         raise ValueError("judge must review every requested task exactly once")
     if payload["phase"] == "task" and any(r.level_fit is None for r in verdict.tasks):
         raise ValueError("a task review scores each task's level_fit from 0 to 4")
+    if payload["phase"] == "task" and any("unrealistic" not in r.model_fields_set for r in verdict.tasks):
+        raise ValueError(
+            "a task review rules on each task's realism: unrealistic says why no colleague would ask it, or is null"
+        )
     if payload["phase"] == "task" and any(i.blocking and not i.task_ids for i in verdict.issues):
         raise ValueError(
             "a blocking issue in a task review names the tasks it blocks (task_ids); a defect that blocks no task "
@@ -137,7 +147,8 @@ def accepted_task(verdict: Verdict, task_id: str) -> bool:
 
 
 def read_one_way(verdict: Verdict) -> Verdict:
-    """A second reading the judge found is code's issue too: it blocks its task, and sends it back to be reworded."""
+    """A second reading the judge found is code's issue too: it blocks its task, and sends it back to be reworded. So
+    is a request no colleague would make: it blocks its task, which is dropped."""
     return verdict.model_copy(
         update={
             "issues": verdict.issues
@@ -151,6 +162,17 @@ def read_one_way(verdict: Verdict) -> Verdict:
                 )
                 for r in verdict.tasks
                 if r.misread
+            ]
+            + [
+                Issue(
+                    artifact="tasks",
+                    task_ids=[r.task_id],
+                    defect=UNREALISTIC + r.unrealistic,
+                    requested_change="write a request its asker needs answered, of the four families, in their own words",
+                    blocking=True,
+                )
+                for r in verdict.tasks
+                if r.unrealistic
             ]
         }
     )

@@ -16,10 +16,12 @@ from ..judge.task import PHASE_GUIDES, JudgeTask, review_payload
 from ..judge.tools import ReviewState
 from ..judge.verdict import (
     PHASE_CRITERIA,
+    UNREALISTIC,
     Issue,
     TaskReview,
     Verdict,
     accepted_task,
+    read_one_way,
     validate_verdict,
     verdict_schema,
 )
@@ -50,7 +52,9 @@ async def test_reviews(tmp_path):
     def verdict(approved=True, issues=(), tasks=(("t1", True),), criteria=None):
         return Verdict(
             approved=approved,
-            tasks=[TaskReview(task_id=t, valid=v, reason="r", level_fit=3) for t, v in tasks],
+            tasks=[
+                TaskReview(task_id=t, valid=v, reason="r", level_fit=3, unrealistic=None) for t, v in tasks
+            ],
             issues=list(issues),
             criteria=criteria if criteria is not None else dict.fromkeys(PHASE_CRITERIA["task"], 1.0),
             summary="s",
@@ -61,7 +65,30 @@ async def test_reviews(tmp_path):
     fails(validate_verdict, verdict(tasks=()), payload)
     unscored = verdict().model_copy(update={"tasks": [TaskReview(task_id="t1", valid=True, reason="r")]})
     fails(validate_verdict, unscored, payload)  # a task review scores each task's level_fit
-    assert "level_fit" in verdict_schema("task", ["t1"])["$defs"]["TaskReview"]["required"]
+    assert {"level_fit", "unrealistic"} <= set(
+        verdict_schema("task", ["t1"])["$defs"]["TaskReview"]["required"]
+    )
+    unruled = verdict().model_copy(
+        update={"tasks": [TaskReview(task_id="t1", valid=True, reason="r", level_fit=3)]}
+    )
+    fails(
+        validate_verdict, unruled, payload
+    )  # a task review rules on each task's realism, null when it is real
+    # A request no colleague would make is not valid, however hard; code blocks it with the judge's reason.
+    fails(TaskReview, task_id="t1", valid=True, reason="r", unrealistic="audits who stayed quiet")
+    audit = TaskReview(
+        task_id="t1", valid=False, reason="r", level_fit=3, unrealistic="audits who stayed quiet"
+    )
+    blocked = read_one_way(
+        Verdict.model_construct(approved=False, tasks=[audit], issues=[], criteria={}, summary="s")
+    )
+    assert [i.defect for i in blocked.issues] == [
+        UNREALISTIC + "audits who stayed quiet"
+    ] and not accepted_task(blocked, "t1")
+    assert (
+        "Realism, on each task's review" in PHASE_GUIDES["task"]
+        and "who stayed quiet after an event" in (PHASE_GUIDES["task"])
+    ), "the reviewer is told what a colleague asks, from the user's labels"
     workspace = Issue(artifact="workspace", defect="d", requested_change="c")
     fails(
         validate_verdict, verdict(approved=False, issues=[workspace]), payload
