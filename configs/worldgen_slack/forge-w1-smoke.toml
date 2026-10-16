@@ -14,6 +14,9 @@ spend_limit = 10.0
 [env.proposer]
 model = "z-ai/glm-5.3-flash"
 
+[env.proposer.harness]    # the budget the smoke started with (an author's), kept so it resumes; a forge's is 1.5M
+max_total_tokens = 600000
+
 [env.verifier]            # reaches each task's answer from Slack, or the task is dropped
 model = "z-ai/glm-5.3"
 

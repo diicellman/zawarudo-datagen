@@ -1452,9 +1452,15 @@ async def test_tools(tmp_path):
         with pytest.raises(ValueError):
             await call(day1, "sql", **bad)
     assert (await call(day1, "read", actor_id=c, tool="read_channel", arguments={"channel_id": ops}))["items"]
-    # else a read with unknown arguments went through
-    with pytest.raises(TypeError):
+    # else a read with unknown arguments went through, or its refusal did not name the arguments the tool takes
+    with pytest.raises(TypeError, match=r"read_channel takes channel_id, oldest, .*; not nope"):
         await call(day1, "read", actor_id=c, tool="read_channel", arguments={"nope": 1})
+    with pytest.raises(ValueError, match="the tools are search_public, "):
+        await call(day1, "read", actor_id=c, tool="search", arguments={})
+    described = type(day1).read.__doc__
+    assert "search_public(keywords: list[str], filters: str, natural_language_query: str" in described and (
+        "read_thread(channel_id: str (required), message_ts: str (required)" in described
+    ), "its description names each tool's arguments, as the solver's own tool takes them"
     while today(world) == 1:
         await call(day1, "advance", to=onward(world))
     # else day 1's tools posted on day 2

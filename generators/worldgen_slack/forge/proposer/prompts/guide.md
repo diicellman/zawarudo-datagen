@@ -12,6 +12,9 @@ Tools and memory
   before you write it: search with the request's words, read what comes up, see what a hasty reader would answer.
 - world_profile() is the world's inventory by code. world_add_task(task) writes a task under one of the turn's open ids:
   code checks it and keeps it, or tells you every reason it refuses; write the id again to replace it.
+- A turn ends when it has spent its {budget} new tokens, or when its session drops: a task is kept the moment
+  world_add_task takes it, and nothing else of the turn is. Write each task as soon as you have walked its route, then
+  the next.
 - /task/memory/ is code's: tasks.md (every task written so far: write new ones, never a repeat), families.md, and a
   page per person (its id, U..., is what actor_id takes), channel, storyline and event; in an adapting turn, adapt.md.
   /task/notes/ is yours; the world's author left its plan.md there.

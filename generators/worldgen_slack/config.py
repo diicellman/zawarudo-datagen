@@ -128,13 +128,14 @@ def load_taxonomy(path: Path) -> Taxonomy:
 # ---------------------------------------------------------------------- seats
 
 
-def vm_seat(model: str) -> vf.AgentConfig:
+def vm_seat(model: str, tokens: int = 600_000) -> vf.AgentConfig:
     """An rlm coding agent in one VM for the whole run (the world's author, the forge's proposer), with one interaction
-    per block of work; each interaction gets these turn, token and time budgets."""
+    per block of work; each interaction gets these turn, token (new tokens: completion and uncached prompt) and time
+    budgets."""
     base = role(model, author=True)
     return base.model_copy(
         update={
-            "harness": base.harness.model_copy(update={"max_total_tokens": 600_000}),
+            "harness": base.harness.model_copy(update={"max_total_tokens": tokens}),
             # Idle between interactions only while the judge or the solver works; a VM left behind ends in 30 min.
             "runtime": base.runtime.model_copy(update={"idle_timeout": 1800}),
             "max_turns": 200,

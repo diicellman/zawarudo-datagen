@@ -15,9 +15,10 @@ GUIDE = prompt(__file__, "guide.md")
 
 
 def forge_guide(settings: dict) -> str:
-    """The proposer's guide, with the forge's own numbers. It names no model: the proposer knows the student by its
-    tries."""
-    return render(GUIDE, tries=str(settings["tries"]))
+    """The proposer's guide, with the forge's own numbers: the student's tries and its own turn's budget. It names no
+    model: the proposer knows the student by its tries."""
+    budget = settings["env"]["proposer"]["harness"]["max_total_tokens"]
+    return render(GUIDE, tries=str(settings["tries"]), budget=f"{budget:,}")
 
 
 class ProposerConfig(vf.TaskConfig):

@@ -118,6 +118,9 @@ def test_prompts(tmp_path):
     guide = forge_guide(forge.model_dump(mode="json"))
     assert "tries it 8 times" in guide, "the forge's own numbers"
     assert "tries it 3 times" in forge_guide(forge.model_copy(update={"tries": 3}).model_dump(mode="json"))
+    # It knows its own turn's budget, and that only what add_task took outlives the turn.
+    budget = f"spent its {forge.env.proposer.harness.max_total_tokens:,} new tokens"
+    assert budget in " ".join(guide.split()) and "kept the moment" in guide
     # The proposer writes requests a colleague would make, by the judge's own test, and gets its middle rates from
     # composite requests along the four skills, not from tool tedium; its answers are what its parts ask, no more; a
     # hedge is wrong.

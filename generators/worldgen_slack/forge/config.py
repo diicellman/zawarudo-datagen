@@ -33,8 +33,9 @@ def thinking(model: str) -> vf.AgentConfig:
 
 class ForgeSeats(Seats):
     # The proposer: an rlm agent in a VM, one interaction per turn. A smaller model than the judges', so no model
-    # judges its own writing.
-    proposer: vf.AgentConfig = vm_seat("z-ai/glm-5.3-flash")
+    # judges its own writing. It reasons at length and reads whole query results: an author's 600k tokens ran out in 6
+    # minutes on 4 versions, before it wrote one (the W1 smoke, 2026-10-16); 1.5M costs it about $0.50.
+    proposer: vf.AgentConfig = vm_seat("z-ai/glm-5.3-flash", tokens=1_500_000)
     # The student whose pass rates select the tasks: no code (its Slack tools are host-side servers), a local process.
     solver: vf.AgentConfig = role("deepseek/deepseek-v4.1-flash", solver=True).model_copy(
         update={"runtime": vf.SubprocessConfig(), "timeout": TRY_TIMEOUT}

@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import io
 import json
+import re
 import tarfile
 import time
 import typing
@@ -22,6 +23,7 @@ from verifiers.v1.errors import SandboxError
 from verifiers.v1.utils.decorators import discover_decorated
 from verifiers.v1.utils.interrupt import cleaning_up
 from worldgen_slack import slack
+from worldgen_slack.toolset import SlackToolset
 from worldgen_slack.world import file_hash
 
 from .config import Seats
@@ -226,6 +228,32 @@ class SessionEnv(vf.Env[Seats]):
 
 
 # ---------------------------------------------------------------------- the world tools both agents in a VM share
+
+
+def read_arguments() -> dict[str, dict[str, str]]:
+    """Each Slack read tool's arguments and their types, as the solver's own tool takes them (required ones so marked)."""
+
+    def kind(hint) -> str:
+        text = (
+            hint.__name__
+            if isinstance(hint, type)
+            else str(hint).replace("typing.", "").removesuffix(" | None")
+        )
+        return re.sub(r"^Optional\[(.*)\]$", r"\1", text)
+
+    out = {}
+    for tool in slack.TOOLS:
+        method = getattr(SlackToolset, tool)
+        hints = typing.get_type_hints(method)
+        out[tool] = {
+            name: kind(hints[name]) + (" (required)" if p.default is inspect.Parameter.empty else "")
+            for name, p in inspect.signature(method).parameters.items()
+            if name != "self"
+        }
+    return out
+
+
+READS = read_arguments()
 
 
 class AuthoringToolsConfig(vf.ToolsetConfig):
@@ -451,11 +479,21 @@ class WorldReads:
 
     @vf.tool
     async def read(self, actor_id: str, tool: str, arguments: dict[str, JsonValue]) -> dict:
-        """A Slack read tool as any person, by the solver's own tool names without slack_: search_public,
-        search_public_and_private, search_channels, search_users, read_channel, read_thread, read_user_profile,
-        get_reactions, list_channel_members or list_user_channels. Returns what it showed, structured."""
-        return self._logged(
-            "read",
-            {"actor_id": actor_id, "tool": tool, "arguments": arguments},
-            lambda: slack.read(Workspace(self.config.db_path, actor=actor_id), tool, arguments),
+        def act():
+            if tool not in READS:
+                raise ValueError(f"no read tool {tool!r}: the tools are {', '.join(READS)}")
+            if unknown := sorted(set(arguments) - set(READS[tool])):
+                raise TypeError(f"{tool} takes {', '.join(READS[tool])}; not {', '.join(unknown)}")
+            return slack.read(Workspace(self.config.db_path, actor=actor_id), tool, arguments)
+
+        return self._logged("read", {"actor_id": actor_id, "tool": tool, "arguments": arguments}, act)
+
+    read.__doc__ = (
+        "A Slack read tool as any person, by the solver's own tool names without slack_, with the arguments each "
+        "takes as the solver's own tool does: "
+        + "; ".join(
+            f"{tool}({', '.join(f'{a}: {kind}' for a, kind in takes.items())})"
+            for tool, takes in READS.items()
         )
+        + ". Returns what it showed, structured."
+    )
