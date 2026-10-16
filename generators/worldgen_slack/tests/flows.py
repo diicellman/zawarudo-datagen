@@ -2025,7 +2025,13 @@ async def run_flows(root):
     with forged.world.trial() as copy:
         forge_task(copy, readable, plan, ["r09-05"])
     forged.state.task_issues["r09-05"] = [i for i in ruled.issues if "r09-05" in i.task_ids]
+    forged.state.solves["r09-05"] = {
+        "key": "k",
+        "results": [{"correct": True}, {"correct": False}],
+        "traces": [],
+    }
     sent = weigher.place("r09-05", None, None, "x")
+    assert (sent["right"], sent["tries"]) == (0.5, 2), "a candidate sent back keeps how its tries went"
     gold_answer = [
         r["answer"]
         for r in forged.world.db.execute("SELECT real_name AS answer FROM users ORDER BY id DESC LIMIT 1")

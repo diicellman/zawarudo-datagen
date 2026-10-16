@@ -15,7 +15,7 @@ from ..evidence import measures
 from ..forge import tries as tries_module
 from ..forge.config import ForgeSeats
 from ..forge.difficulty import failure_cases, features
-from ..forge.env import bucket, heard_page, said
+from ..forge.env import bucket, heard_page, measured, said
 from ..forge.release import miss_classes, miss_shape, miss_shapes, private_answer, right_by_part
 from ..forge.tasks import Part, Task, answer_of, check_task, forge_task, forget, reference_of
 from ..forge.tries import Tries
@@ -177,6 +177,16 @@ def test_archive_feedback():
         "\n  shown its evidence, the solver answered (wrong): 'Cy.'"
         "\n  the judge: 'fair'"
     )
+    # A family and category whose only candidate was sent back before any try counted is still reported (FW2 stopped
+    # on a division by zero there).
+    back = {
+        "family": "status",
+        "category": "composite",
+        "verdict": "sent back: its question can be read another way",
+    }
+    assert measured({"r": back}) == [
+        "- status·composite: 1 tried, 0 kept, 1 sent back; no tries measured; wrong tries: none"
+    ]
     assert [
         miss_shape(r) for r in ({"missing": ["a"]}, {"extra": ["b"]}, {"missing": ["a"], "extra": ["b"]}, {})
     ] == [

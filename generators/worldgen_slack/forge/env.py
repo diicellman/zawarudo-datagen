@@ -53,7 +53,9 @@ def measured(forged: dict) -> list[str]:
             cell["right"].append(o["right"])
         cell["misses"].update(o.get("miss_classes") or {})
     return [
-        f"- {c}·{i}: {x['tried']} tried, {x['kept']} kept, {x['back']} sent back; right {sum(x['right']) / len(x['right']):.2f} on average; wrong tries: {dict(x['misses']) or 'none'}"
+        f"- {c}·{i}: {x['tried']} tried, {x['kept']} kept, {x['back']} sent back; "
+        + (f"right {sum(x['right']) / len(x['right']):.2f} on average" if x["right"] else "no tries measured")
+        + f"; wrong tries: {dict(x['misses']) or 'none'}"
         for (c, i), x in sorted(cells.items())
         if x["right"] or x["back"]
     ]
@@ -314,6 +316,15 @@ class ForgeEnv(SessionEnv):
             "features": shape,
         }
         if review is None:
+            # Its tries ran before the review: how the solver did on it is the forge's own number all the same.
+            tried = [r for r in state.solves.get(task_id, {}).get("results", []) if r]
+            if any(not r.get("crashed") for r in tried):
+                measure = rates(tried)
+                out |= {
+                    "right": measure["right_rate"],
+                    "interval": measure["right_interval"],
+                    "tries": measure["tries"],
+                }
             issues = [i.defect for i in state.task_issues.get(task_id, [])] + state.screens.get(
                 task_id, {}
             ).get("failed", [])
