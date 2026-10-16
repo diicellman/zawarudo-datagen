@@ -385,7 +385,11 @@ async def test_reviews(tmp_path):
     write_release(tmp_path / "release", tmp_path / "solver.sqlite", [task], {"t1": answer})
     assert load_release(tmp_path / "release")[1:] == ([task], {"t1": answer})
     manifest = json.loads((tmp_path / "release" / "manifest.json").read_text())
-    assert manifest["format"] == "worldgen-slack.v11"
+    assert manifest["format"] == "worldgen-slack.v12"
+    (tmp_path / "release" / "manifest.json").write_text(
+        json.dumps(manifest | {"format": "worldgen-slack.v11"})
+    )
+    assert load_release(tmp_path / "release")[1:] == ([task], {"t1": answer}), "a v11 release still loads"
     (tmp_path / "release" / "manifest.json").write_text(
         json.dumps(manifest | {"format": "worldgen-slack.v10"})
     )
@@ -478,7 +482,6 @@ async def test_composite_grade(tmp_path, monkeypatch):
         whole | {"parts": [whole["parts"][0], whole["parts"][0]]},  # each part under a label of its own
         whole | {"parts": [whole["parts"][0], whole["parts"][1] | {"label": None}]},
         whole["parts"][0] | {"parts": whole["parts"]},  # a single answer has no parts
-        whole["parts"][0] | {"gold_sql": ""},
         whole
         | {
             "parts": [whole["parts"][0] | {"solution": solved}, whole["parts"][1]]
@@ -568,7 +571,14 @@ async def test_composite_grade(tmp_path, monkeypatch):
     assert load_release(tmp_path / "release")[2]["t1"].solution.calls == solved["calls"], (
         "it ships how it was solved"
     )
-    assert json.loads((tmp_path / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v11"
+    assert json.loads((tmp_path / "release" / "manifest.json").read_text())["format"] == "worldgen-slack.v12"
+    # A verified text answer (v12) needs no gold query; an answer with neither rows nor a query is a refusal or nothing.
+    spoken = part("who called it", "Alicia Rao", 1).model_copy(update={"gold_sql": "", "label": None})
+    assert PrivateAnswer.model_validate(spoken.model_dump()).rows == [{"answer": "Alicia Rao"}]
+    fails(PrivateAnswer.model_validate, spoken.model_dump() | {"rows": []})
+    assert (
+        PrivateAnswer.model_validate(spoken.model_dump() | {"rows": [], "answer_type": "refusal"}).rows == []
+    )
     fails(
         write_release,
         tmp_path / "release2",

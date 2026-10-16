@@ -16,7 +16,7 @@ uv run eval @ configs/worldgen_slack/eval.toml -n 1 -r 2 --no-push --plain
 Set `--env.taskset.task.release_dir` to the generated release to evaluate (it is required). Public rows and the
 world's hash are validated before execution; private answers stay host-side.
 
-A release (format `worldgen-slack.v11`) carries, with each public task, how hard it measured when it was generated:
+A release (format `worldgen-slack.v12`; v11 still loads) carries, with each public task, how hard it measured when it was generated:
 the solver model and its tries (`tries`; `crashed`, and `unanswered` for those that ended without an answer), its
 share of right answers (`right_rate`, the difficulty, with its 90% interval `right_interval`), of right and grounded
 ones (`strict_rate`, the reward's +1) and of answers it declined (`abstain_rate`), the
@@ -27,7 +27,9 @@ request in 2-4 parts, each with its own gold rows (its private answer's `parts`,
 part by part and settled by code, all or nothing: +1 only when every part is right and grounded, -1 when any part is
 wrong, 0 when it declined what it could not tell. Each private answer carries its `solution`: a try that reached
 its gold from Slack alone, right and grounded (the solver's, or else the witness's), with its answer and its calls;
-a task no try reached is not released. Only v11 releases load; older ones are read from git.
+a task no try reached is not released. A forged task's gold (v12) is the answer the forge's verifier reached
+from Slack, with no query; its public row names the set it came from (initial, or a harder, easier or repaired
+version of a task) and the solver's rate by part. Older releases are read from git.
 
 ## The solver's tools
 

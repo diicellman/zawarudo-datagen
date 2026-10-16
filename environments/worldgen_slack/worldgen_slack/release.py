@@ -51,7 +51,9 @@ class PublicTask(StrictModel):
     crashed, and those that never answered), its share of right answers (with its 90% interval), of right and
     grounded ones, and of those that declined to answer, the gold evidence the tries saw, and the witness's share of
     right answers when it tried. Training can filter a curriculum on them, as prime-envs filters on avg@k columns. A
-    composite request (v11) is one question in 2-4 parts, right only when every part is."""
+    composite request (v11) is one question in 2-4 parts, right only when every part is. A forged task (v12) names the
+    set it came from (the initial set, or a harder, easier or repaired version of one: `variant_of`), the verifier's
+    share of right answers, and the solver's by part."""
 
     task_id: SafeId
     question: NonEmptyText
@@ -80,6 +82,11 @@ class PublicTask(StrictModel):
     miss_classes: dict[str, int] | None = None
     intent: str | None = None  # v10: the request it is, a person's to an assistant
     family: str | None = None  # v11: the request it is, of four (catch-up, decisions, commitments, status)
+    set: Literal["initial", "harder", "easier", "repaired"] | None = None  # v12
+    variant_of: SafeId | None = None  # v12: the task it is a version of
+    verifier: str | None = None  # v12: the model that verified its gold, and its share of right answers
+    verifier_right: float | None = None
+    part_rates: dict[str, float] | None = None  # v12: the solver's share of right answers, by part
 
 
 class Solution(StrictModel):
@@ -87,7 +94,7 @@ class Solution(StrictModel):
     with its arguments, in order. It shows its gold is reached by reading Slack, in an agent's words, and not only by
     the ledger's query."""
 
-    seat: Literal["solver", "witness"]
+    seat: Literal["solver", "witness", "verifier"]
     model: str | None = None
     trace_id: NonEmptyText
     answer: NonEmptyText
@@ -96,13 +103,14 @@ class Solution(StrictModel):
 
 class PrivateAnswer(StrictModel):
     """The gold rows of a task, the messages (channel, ts) and people its answer rests on, and, for a refusal, the
-    truth out of its actor's sight (`unseen`). A composite request's answer (v11) is its parts', each such an answer
+    truth out of its actor's sight (`unseen`). Its rows come from a gold query, or (v12) are the answer an agent's
+    tries verified, with no query. A composite request's answer (v11) is its parts', each such an answer
     under its label, in the request's order: it has no rows or query of its own, and its messages, people and unseen
     are its parts' together. `solution` is a right and grounded try of it."""
 
     answer_type: Literal["text", "set", "number", "refusal", "status", "composite"]
     rows: list[dict[str, JsonValue]]
-    gold_sql: str
+    gold_sql: str = ""
     messages: list[Evidence]
     unseen: list[Evidence] = []
     users: list[str]
@@ -115,8 +123,8 @@ class PrivateAnswer(StrictModel):
         if any(p.solution for p in self.parts):
             raise ValueError("a composite answer's solution is the request's, not a part's")
         if self.answer_type != "composite":
-            if self.parts or not self.gold_sql:
-                raise ValueError("an answer has its gold query and no parts")
+            if self.parts or not (self.gold_sql or self.rows or self.answer_type == "refusal"):
+                raise ValueError("an answer has its rows (or its gold query, or is a refusal) and no parts")
             return self
         labels = [p.label for p in self.parts]
         if not 2 <= len(self.parts) <= 4 or self.rows or self.gold_sql:
@@ -149,7 +157,7 @@ class PrivateAnswer(StrictModel):
 
 
 class Manifest(StrictModel):
-    format: Literal["worldgen-slack.v11"] = "worldgen-slack.v11"
+    format: Literal["worldgen-slack.v12", "worldgen-slack.v11"] = "worldgen-slack.v12"  # v11 still reads
     world_hash: str
     files: dict[str, str]
 
