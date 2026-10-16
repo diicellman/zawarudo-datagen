@@ -1,45 +1,35 @@
 # One forge: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge.toml [--dry-run]
-# F1 (2026-10-10): tasks on S3's finished world (data/v7-05/software: 953 messages, 59 facts, a board of 20 planned
-# tasks), which stays frozen. The forge proposes, tries and keeps toward a goal of 40 tasks, at most 2 per category and
-# level (24 places), with every board entry covered; it stops there, after 12 rounds, or after two rounds that place
-# nothing. S3's own 40 tasks, re-measured the same way (measure-s3.toml), are the baseline. A new forge needs a new
-# `output`; one resumes only with the configuration it started with.
-world = "data/v7-05/software"
-output = "data/v7-05/forge-01"
-taxonomy = "configs/worldgen_slack/taxonomy.toml"
-tasks = 40                # the goal: kept tasks
-target = 3                # the tasks one place (a family and a measured level) holds: 4 families x 4 levels x 3 reach the goal
-rounds = 12               # the most rounds toward the goal
-candidates = 12           # one round's candidates, tried 8 times each
+# Tasks on a finished world, as three sets (Synthetic Data RL, 2505.17063): the proposer writes `tasks` of them; each is
+# verified, measured by the student and judged; then a harder version of each the student always answers, an easier
+# one of each it never does, and a repaired one of each the judge refused are written and labelled too.
+world = "data/v8-02/w1"
+output = "data/v8-04/forge"
+tasks = 36                # the initial set
+batch = 12                # tasks per proposer turn
+adapt = 1                 # adapting passes
+tries = 8                 # the student's tries of a task
+verify = 2                # the verifier's (a third on a split)
+spend_limit = 40.0        # dollars, reported or at list prices
 
-# Per level, the band of the solver's right-answer rate a task of that level measures in: level 1 anchors that most
-# tries get right; level 4 tasks the solver rarely answers, and the witness must.
-bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5], [0.0, 0.25]]
-max_answer_rows = 12      # exhaustive sets: a set of n is right about p^n of the time (WideSearch)
-tries = 8                 # the solver's tries of a candidate, sampled at temperature 1
-keepalive = 600           # seconds between pings of the proposer's VM while the solver and the judge work
-
-# One model per seat. Unset fields (harness, runtime, sampling) keep the seat defaults in config.py.
-[env.timeout]
-episode = 43200
-finalize = 300
-
-# The proposer: the world author's model, its prompt cached for an hour, as a round keeps it waiting while the solver
-# tries the candidates.
+# One model per seat. The proposer is smaller than the models that check its tasks, so none judges its own writing;
+# the student, whose pass rates select the tasks, is of another family; unset fields keep the seat defaults.
 [env.proposer]
-model = "anthropic/claude-opus-5.5"
-
-[env.proposer.sampling]
-cache_control = { type = "ephemeral", ttl = "1h" }
-
-[env.judge]
-model = "openai/gpt-6-sol"
-
-[env.solver]
 model = "z-ai/glm-5.3-flash"
 
-[env.witness]             # tries the tasks the solver rarely answers: hard, or broken?
-model = "openai/gpt-6-sol"
+[env.verifier]            # reaches each task's answer from Slack, or the task is dropped
+model = "z-ai/glm-5.3"
 
-[answer_judge]
-model = "openai/gpt-6-sol"
+[env.solver]              # the student
+model = "deepseek/deepseek-v4.1-flash"
+
+[judge]                   # the task judge: realistic, one reading, exact, supported
+model = "z-ai/glm-5.3"
+
+[judge.sampling]
+reasoning_effort = "high"
+
+[answer_judge]            # grades every try against a task's answer
+model = "z-ai/glm-5.3"
+
+[answer_judge.sampling]
+reasoning_effort = "high"

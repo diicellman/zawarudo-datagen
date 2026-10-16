@@ -45,28 +45,27 @@ the earlier days as written and frozen.
 
 ## The forge
 
-`ForgeEnv` (`forge/env.py`) writes tasks on a finished world and leaves the world as it is. It starts from the
-world's final file with its tasks emptied, its board and ledger kept, and the author's last notes.
+`ForgeEnv` (`forge/env.py`) writes tasks on a finished world and leaves the world as it is, as the paper's three
+sets (Synthetic Data RL, arXiv 2505.17063, 4.1-4.3). It starts from the world's final file and the author's last
+notes; its tasks live in its own state, never in the world file.
 
-- **Round 0, when `measure` is set:** the world's own tasks, imported as written and measured as any candidate is.
-- **Each round:** the proposer (`forge/proposer/`), an rlm agent in its own VM and seat, writes a candidate for each
-  of the round's open ids with `world_add_task`, of the category and level it chooses. It reads the world as any
-  person sees it, the world's inventory (`world_profile`), and tries a candidate on a copy that writes nothing
-  (`world_probe`); `world_annotate` registers a fact the world already states, on its messages. It never posts,
-  revises or moves the workspace, so no task goes stale under it.
-- **Each candidate:** code checks its gold query and builds the wrong answers its grade must reject (the screen: a
-  task whose grade accepts one is dropped); the solver tries it `tries` times; the witness tries one the solver
-  answers right less often than its band's floor (one it answers is hard, not broken); one the solver misses half the
-  time or more is tried twice more with the messages its answer rests on, which tells a task hard to find from one
-  hard to reason or broken; the judge reviews it, with the tries.
-- **The archive:** a candidate's tries give its level (the first band whose floor its right rate reaches; the lowest
-  band also needs the witness to answer it). What the judge approves takes a place: its category and measured
-  level, which holds up to `target` tasks (MAP-Elites over task features). A newcomer to a full place replaces a
-  holder when it brings a structure the place lacks while two holders share one, or when the solver's tries are more
-  mixed on it. `memory/archive.md` tells the proposer, each round, what each place holds, which board entries no kept
-  task rests on, and how each recent candidate fared and how the solver went wrong. A candidate whose question the
-  judge reads two ways is sent back, for the next round to reword with the same asker and gold.
-- **The end:** the forge stops at its goal (`tasks` kept and every board entry covered), when its rounds run out,
-  or after two rounds that keep nothing. Its archive is the release, when it kept any task.
+- **The initial set:** the proposer (`forge/proposer/`), an rlm agent in its own VM, writes `tasks` requests with
+  `world_add_task`, `batch` a turn: each of a family (catch-up, decisions, commitments, status), in 1 to 4 parts, each
+  part with its answer and the messages it rests on. Code refuses at once, with every reason, what it can tell is wrong:
+  an asker who is no person, a message out of the asker's sight, an answer of the wrong shape, two parts alike, a
+  question that gives its answer away, a repeat.
+- **Labelling** (no VM; every task side by side, each step kept as it lands): the verifier, a stronger model with the
+  student's Slack tools, must reach the task's answer in 2 tries (a third on a split), or the task is dropped; the
+  student tries it `tries` times; the judge (`forge/judge.py`, one structured call) rules whether a colleague would
+  ask it, whether its words allow another reading, whether each answer is exactly what its part asks, and whether its
+  messages state it. A task is rejected, solved (right `solved` of the time or more), unsolved (never), or in the
+  window.
+- **Adapting** (`adapt` passes): the proposer writes a harder version of each solved task, an easier one of each
+  unsolved task, and a repaired one of each verified task the judge refused, which are labelled in turn.
+- **The release:** every approved task, with its set, its rates (by part), and the verifier's try that reached its
+  answer; `report.json` says where the world ran short, for whoever writes the next chapter.
 
-A forge resumes like a run, with its own configuration and the world's hash.
+A forge carries on by itself: a lost proposer session is taken up again after a pause (`max_losses` times a turn), a
+failed model call is asked again, a task whose steps fail is marked failed while the others go on, and the CLI resumes
+the run after an infrastructure stop (`max_resumes`), until it has spent `spend_limit`. It resumes like a run, with
+its own configuration and the world's hash.

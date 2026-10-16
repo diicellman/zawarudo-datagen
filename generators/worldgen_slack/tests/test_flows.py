@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from worldgen_slack.taskset import EvaluationConfig, SlackEnv, SlackEnvConfig, SlackTasksetConfig
 from worldgen_slack.toolset import SlackToolset
 
-from .flows import GRADER, run_flows
+from .flows import GRADER, gold_text, run_flows
 from .support import with_state
 
 
@@ -34,7 +34,7 @@ class Solver:
         )()  # its own profile: an answer rests on what was read
         for channel, _ in reference.messages[:1]:
             await tools._with_state(tools.read_channel)(channel_id=channel)
-        answer = ", ".join(str(r.get("answer")) for r in reference.rows) if self.right else "nobody knows"
+        answer = gold_text(reference.reference()) if self.right else "nobody knows"
         trace = SimpleNamespace(
             id="solve", info={}, state=stored["state"], last_reply=answer + ".", record_metrics=lambda m: None
         )

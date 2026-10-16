@@ -5,9 +5,8 @@ import re
 from pathlib import Path
 
 from ..config import ROOT
+from ..forge.judge import PROMPT as JUDGE_PROMPT
 from ..forge.proposer.task import ProposerTask, forge_guide
-from ..forge.tasks import Task
-from ..judge.task import PHASE_GUIDES
 from ..workspace import Workspace
 from ..world.author.task import AUTHOR_GUIDE, CHAPTER_GUIDE, CRAFT_GUIDE, AuthorTask
 from ..world.clock import PARTS
@@ -68,7 +67,9 @@ def test_prompts(tmp_path):
         settings.env.author.model,
         settings.env.judge.model,
         forge.env.solver.model,
-        forge.env.witness.model,
+        forge.env.verifier.model,
+        forge.env.proposer.model,
+        forge.judge.model,
         forge.answer_judge.model,
         "deepseek/deepseek-v4.1-flash",
     ]
@@ -115,26 +116,24 @@ def test_prompts(tmp_path):
     ]
     assert not found, "model or run names in what a model reads: " + "; ".join(found)
     guide = forge_guide(forge.model_dump(mode="json"))
-    assert "tries each one 8 times" in guide and "right in 25%-75% of its tries" in guide, (
-        "the forge's own numbers"
-    )
-    other = forge.model_copy(update={"tries": 3, "bands": [(0.8, 1.0), (0.2, 0.8), (0.0, 0.2)]})
-    guide = forge_guide(other.model_dump(mode="json"))
-    assert "tries each one 3 times" in guide and "right in 20%-80% of its tries" in guide, guide[:600]
+    assert "tries it 8 times" in guide, "the forge's own numbers"
+    assert "tries it 3 times" in forge_guide(forge.model_copy(update={"tries": 3}).model_dump(mode="json"))
     # The proposer writes requests a colleague would make, by the judge's own test, and gets its middle rates from
-    # composite requests along the four skills, not from tool tedium; a hedge is wrong.
-    flat, review = " ".join(guide.split()), " ".join(PHASE_GUIDES["task"].split())
+    # composite requests along the four skills, not from tool tedium; its answers are what its parts ask, no more; a
+    # hedge is wrong.
+    flat, review = " ".join(guide.split()), " ".join(JUDGE_PROMPT.split())
     assert all(
         phrase in flat
         for phrase in (
             "Ask what the asker would do with the answer",
             "Name its family",
             "Pick the asker whose work needs the answer",
-            "A composite request is the main lever for the middle levels",
+            "A composite request is the main lever",
             "calibrated abstention",
             "tool mechanics and tedium",
+            "the shortest complete answer to the label",
+            "with world_sql as the asker",
             "A hedge is wrong",
-            "right and grounded",
         )
     ), "the guide's rules"
     assert (
@@ -142,12 +141,8 @@ def test_prompts(tmp_path):
     ), "the proposer aims at the judge's own test of a request"
     assert "intent" not in flat, "a task is a family, not one of the seven intents"
     parts = ", ".join(f"{p} {a:02d}-{b:02d}" for p, (a, b) in PARTS.items())
-    assert (
-        parts in " ".join(AUTHOR_GUIDE.split())
-        and "PARTS_OF_THE_DAY" not in AUTHOR_GUIDE
-        and "NEAR_SQL" not in guide
-    )
-    assert f"up to {Task.model_fields['near_sql'].metadata[0].max_length} queries" in guide
+    assert parts in " ".join(AUTHOR_GUIDE.split()) and "PARTS_OF_THE_DAY" not in AUTHOR_GUIDE
+    assert "nothing more specific" in review, "the judge holds each answer to what its part asks"
     assert "written and frozen" in CHAPTER_GUIDE and "No tasks are written in a chapter" in CHAPTER_GUIDE
     # The world's author writes with the craft page (voice lab 02); the proposer has its own guide, and a chapter's
     # author has the chapter's too.

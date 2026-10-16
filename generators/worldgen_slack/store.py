@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Literal
 
@@ -41,7 +42,19 @@ def used_names(corpus: Path, exclude: Path) -> dict[str, list[str]]:
 
 
 class RunState(StrictModel):
-    phase: Literal["premise", "organization", "plan", "day", "review", "tasks", "final", "done"] = "premise"
+    phase: Literal[
+        "premise",
+        "organization",
+        "plan",
+        "day",
+        "review",
+        "tasks",
+        "final",
+        "generate",
+        "label",
+        "adapt",
+        "done",
+    ] = "premise"
     premise: Premise | None = None
     cast: list[SeedPersona] = Field(default_factory=list)
     quota: list[Slot] = Field(default_factory=list)  # the board's entries: a chapter's brief
@@ -70,7 +83,10 @@ class RunState(StrictModel):
     # Each task's screen: the wrong answers its grade accepted, with its key. The forge: each candidate's outcome,
     # and the archive's places (category and measured level), each holding its tasks.
     screens: dict[str, dict] = Field(default_factory=dict)
-    forged: dict[str, dict] = Field(default_factory=dict)
+    forged: dict[str, dict] = Field(default_factory=dict)  # the forge: each task, its set and its labels
+    verifier: dict[str, dict] = Field(
+        default_factory=dict
+    )  # the forge: the verifier's tries of each task, with its key
     archive: dict[str, list[dict]] = Field(default_factory=dict)
 
 
@@ -283,6 +299,10 @@ class Store:
                 e["event"] == "candidate_finished" and not e["approved"] for e in events
             ),
         }
+        if self.state.forged:  # a forge: its tasks by label
+            summary["labels"] = dict(
+                Counter(r.get("label", "unlabelled") for r in self.state.forged.values())
+            )
         if status != "running":
             summary["difficulty"] = self.difficulty()
         atomic_json(self.root / "summary.json", summary)

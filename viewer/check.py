@@ -58,29 +58,23 @@ def main():
     marks = {(m, f["fact"], f["role"]) for m, fs in world["fact_marks"].items() for f in fs}
     assert marks and marks == stated, "every message marks the facts it states"
     assert all("decoy" in f for fs in world["fact_marks"].values() for f in fs)
-    # The forge's tasks on it: each shows its gold query, a ledger task the messages its facts are stated in, its
-    # level and rates, each of its probes and the witness's tries.
+    # The forge's tasks on it, from its state: each with its set, its label, its answer and the messages it rests on.
     tasks = {t["id"]: t for t in forge["catalog"]["tasks"]}
-    assert tasks and all(t["gold_sql"] for t in tasks.values()), "every task shows its gold query"
-    joined = tasks["r09-07"]
+    assert {"i001", "h101", "e102", "r103"} <= set(tasks), sorted(tasks)
     assert (
-        not any(t.startswith("r09-07-p") for t in tasks)
-        and [c.split(":")[0] for c in joined["answer"]["required_claims"]] == ["the newest", "the two newest"]
-        and joined["gold_sql"].startswith("-- the newest\n")
-        and joined["reasoning"].startswith("catch-up · composite")
-    ), "a composite request is one task, its parts its labelled claims"
-    anchored = [t for t in forge["bindings"] if tasks[t]["fact_ids"]]
-    assert anchored and all(forge["bindings"][t]["claims"][0]["message_ids"] for t in anchored), (
-        "ledger tasks show the messages their facts are stated in"
+        tasks["h101"]["reasoning"].startswith("status · harder") and "2 parts" in tasks["h101"]["reasoning"]
     )
-    rates = forge["summary"]["rates"]
-    assert rates and all("level" in r and "right_rate" in r for r in rates.values()), rates
-    assert set(rates) <= {e["task_id"] for e in forge["events"] if e["event"] == "task_reviewed"}, (
-        "every task's probes"
+    assert [c.split(":")[0] for c in tasks["h101"]["answer"]["required_claims"]] == [
+        "who posted it",
+        "who answered it",
+    ]
+    assert all(forge["bindings"][t]["claims"][0]["message_ids"] for t in tasks), (
+        "each task shows its messages"
     )
-    assert any(
-        t["role"] == "witness" and t["evaluation"] and t["task_id"] in rates for t in forge["traces"]
-    ), "the witness"
+    assert (
+        tasks["i001"]["gold_sql"].startswith("rests on m") and "verifier agreed" in tasks["i001"]["gold_sql"]
+    )
+    assert any(t["role"] == "verifier" and t["evaluation"] for t in forge["traces"]), "the verifier's tries"
     # A chapter: the version it writes, from its first day, and its brief, each entry with the facts the board plants.
     brief = chapter["chapter"]["brief"]
     assert chapter["chapter"]["first_day"] == 5 and brief and all(b["facts"] for b in brief), chapter[
@@ -93,7 +87,7 @@ def main():
     html = render({"runs": [], "probe": attack})
     assert attack not in html and "__VIEWER_DATA__" not in html and "\\u003c/script\\u003e" in html
     print(
-        "Viewer checks passed: attempt order, snapshots, conversations, cast, reactions, mentions, facts, gold queries, composites, rates, probes, witness, chapter, board, escaping."
+        "Viewer checks passed: attempt order, snapshots, conversations, cast, reactions, mentions, facts, forge tasks, verifier, chapter, board, escaping."
     )
 
 

@@ -1,87 +1,73 @@
-"""The proposer's tools: the reads it shares with the world author, and its own on the frozen world: a candidate
-checked and written (add_task) or tried on a copy that writes nothing (probe), the world's inventory (profile), and a
-fact the world already states registered in the ledger (annotate). The workspace is never written."""
+"""The proposer's tools: the reads it shares with the world author, the world's inventory (profile), and add_task, a
+task checked by code and kept for the forge to label. The world is never written: a task is kept as a file in the
+run (candidates/<id>.json), which the forge reads when the turn ends."""
 
 import json
 from pathlib import Path
 
 import verifiers.v1 as vf
+from worldgen_slack.release import atomic_json
 from worldgen_slack.toolset import watch_parent
 
 from ...session import AuthoringToolsConfig, WorldReads
 from ..config import ForgeConfig
-from ..difficulty import failure_cases
 from ..profile import profile
-from ..tasks import Annotation, Task, annotate, forge_task
+from ..tasks import Task, answer_text, check
 
 
 class ProposerTools(WorldReads, vf.Toolset[AuthoringToolsConfig, vf.State]):
-    """The proposer's tools. It works in one turn, the forge's, writing the ids its round allows."""
+    """The proposer's tools, for the ids its turn opens."""
 
     TOOL_PREFIX = "world"
     settings_model = ForgeConfig
 
     def allowed(self) -> dict:
-        """What the env allows the proposer's turn at hand, read per call: the ids it may write, and the tasks sent
-        back for another reading."""
+        """What the turn at hand opens, read per call: its ids, and for a version of a task, which task and why."""
         path = Path(self.context.get("writable_file") or "")
-        return json.loads(path.read_text()) if path.is_file() else {"ids": []}
+        return json.loads(path.read_text()) if path.is_file() else {"ids": [], "versions": {}}
+
+    def _kept(self) -> Path:
+        return Path(self.context["writable_file"]).parent / "candidates"
+
+    def _written(self) -> list[Task]:
+        return [Task.model_validate_json(p.read_bytes()) for p in sorted(self._kept().glob("*.json"))]
 
     @vf.tool
     async def add_task(self, task: Task) -> dict:
-        """Write a candidate for one of the round's open ids, of the category and level you choose: checked, then its
-        gold rows and code's measures returned."""
+        """Write one task under one of this turn's open ids. Code checks its asker, that each answer's messages exist and
+        its asker can read them, each answer's shape, that the request gives no answer away and repeats no request of
+        its asker, and keeps it, or refuses it with every reason. Writing an id again replaces its task."""
 
-        def act(copy):
-            return forge_task(
-                copy, task, self.settings, self.allowed().get("ids", []), rework=self.allowed().get("rework")
-            )
+        def act():
+            allowed = self.allowed()
+            if task.id not in allowed.get("ids", []):
+                raise ValueError(
+                    f"{task.id} is not open this turn; the open ids are {allowed.get('ids', [])}"
+                )
+            version = allowed.get("versions", {}).get(task.id)
+            wanted = (version["variant_of"], version["why"]) if version else (None, None)
+            if (task.variant_of, task.why) != wanted:
+                raise ValueError(
+                    f"{task.id} is a {wanted[1]} version of {wanted[0]}: set variant_of and why so"
+                    if version
+                    else f"{task.id} is a task of the initial set, a version of none: leave variant_of and why empty"
+                )
+            world = self._world()
+            try:
+                check(world, task, self._written())
+            finally:
+                world.close()
+            atomic_json(self._kept() / f"{task.id}.json", task.model_dump(mode="json"))
+            return {"task": task.id, "kept": True, "answer": answer_text(task)}
 
-        return self._logged("add_task", {"task": task.model_dump(mode="json")}, lambda: self._write(act))
+        return self._logged("add_task", {"task": task.model_dump(mode="json")}, act)
 
     @vf.tool
     async def profile(self) -> dict:
         """The finished world's inventory, by code: its value groups (values, chains, decoys, where each value sits and
-        who can read it), threads, recurring conversations, people, its apps, promises, artifacts and groups, and what
-        kept tasks and the board rest on. Read it to find where a hard, fair task can be."""
+        who can read it), threads, recurring conversations, people, its apps, promises, artifacts and groups. Read it
+        to find where a request's answers are."""
         return self._logged("profile", {}, lambda: profile(self._world()))
-
-    @vf.tool
-    async def probe(self, task: Task) -> dict:
-        """A candidate tried on a copy and written nowhere: its gold rows, code's measures, the lazy panel, its features
-        and the wrong answers the screen will grade. Shape a task with it, then write it with world_add_task."""
-
-        def act():
-            world, out = self._world(), {}
-            try:
-                with world.trial() as copy:
-                    result = forge_task(
-                        copy,
-                        task,
-                        self.settings,
-                        self.allowed().get("ids", []),
-                        rework=self.allowed().get("rework"),
-                    )
-                    _, cases = failure_cases(copy, task.id, result["gold"])
-                    out = result | {"failure_cases": [name for name, _ in cases]}
-                    raise LookupError("a probe writes nothing")
-            except LookupError as dropped:
-                if out:
-                    return out
-                raise ValueError(str(dropped)) from None
-
-        return self._logged("probe", {"task": task.model_dump(mode="json")}, act)
-
-    @vf.tool
-    async def annotate(self, fact: Annotation) -> dict:
-        """Register a fact the world already states, on the messages that state it (each contains its anchor; the
-        first is its first statement): the ledger grows, the workspace stays as it is. supersedes names a fact it
-        replaces, stated earlier."""
-        return self._logged(
-            "annotate",
-            {"fact": fact.model_dump(mode="json")},
-            lambda: self._write(lambda copy: annotate(copy, fact)),
-        )
 
 
 if __name__ == "__main__":

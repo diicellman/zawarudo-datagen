@@ -111,15 +111,20 @@ async def run_chapter(plan: chapter.ChapterConfig, settings: WorldConfig) -> dic
 
 
 async def run_forge(config: ForgeConfig) -> dict:
-    """A forge: its one episode is task 0, as it draws nothing at random."""
-
-    def release(store: Store) -> None:
-        # an archive that kept nothing has no release
-        if store.world.db.execute("SELECT 1 FROM tasks").fetchone():
-            publish(store)
-
-    origin = forge.provenance(config)
-    return await run("forge", config.output, origin, 0, lambda store: forge.ForgeEnv(config, store), release)
+    """A forge: its one episode is task 0, as it draws nothing at random. It carries on by itself after a stop that is
+    infrastructure's (a provider's, a sandbox's), from where its state says, up to `max_resumes` times; a stop in the
+    same place for the same reason twice is a bug, and ends it."""
+    origin, stops = forge.provenance(config), []
+    for _ in range(config.max_resumes + 1):
+        summary = await run(
+            "forge", config.output, origin, 0, lambda store: forge.ForgeEnv(config, store), publish
+        )
+        where = (summary["phase"], summary["reason"][:160])
+        if summary["status"] != "infrastructure_error" or where in stops:
+            return summary
+        stops.append(where)
+        print(json.dumps({"event": "forge_resumed", "phase": where[0], "reason": where[1]}), flush=True)
+    return summary
 
 
 def main() -> int:

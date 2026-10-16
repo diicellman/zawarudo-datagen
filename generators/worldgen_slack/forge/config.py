@@ -1,88 +1,81 @@
-"""A forge's settings, configured in one file: the finished world it writes tasks on, the taxonomy its tasks are
-placed in, its goal and rounds, how a candidate is tried and kept, and its seats. A forge inherits nothing from the
-configuration its world was written with."""
+"""A forge's settings, configured in one file: the finished world it writes tasks on, the size of its initial set and
+how a task is labelled (verified, measured, judged) and adapted, its seats, and how far a run carries on by itself. A
+forge inherits nothing from the configuration its world was written with."""
 
 import tomllib
 from pathlib import Path
-from typing import Annotated
 
 import verifiers.v1 as vf
-from pydantic import BeforeValidator, Field, model_validator
+from pydantic import Field
 from verifiers.v1.configs.agent import TimeoutConfig
 from worldgen_slack.config import role
 
-from ..config import Categories, RootedPath, Seats, Section, load_taxonomy, vm_seat
+from ..config import RootedPath, Seats, Section, vm_seat
 
-
-def categories(value):
-    """The taxonomy a config names by its file, read into its categories; categories as they are."""
-    return load_taxonomy(Path(value)).categories if isinstance(value, str | Path) else value
-
-
-# A try's time. Tries take seconds (FC1's 293: 25 s at the median, 7 min at most; the witness's 42 s at most); the
-# model client has no read timeout, so a request that hangs holds its try to the rollout's end, and the round with it.
-# At 15 min a hung try is cut and tried once more, and its grade gets 5 min.
+# A try's time. Tries take seconds (FC1's 293: 25 s at the median, 7 min at most); the model client has no read timeout,
+# so a request that hangs holds its try to the rollout's end. At 15 min a hung try is cut and tried again; its grade
+# gets 5 min.
 TRY_TIMEOUT = TimeoutConfig(setup=600, rollout=900, finalize=120, scoring=300)
+GLM = "z-ai/glm-5.3"
 
 
-class ForgeSeats(Seats):
-    # The proposer: an rlm agent in one VM, one interaction per round, as a world's author is.
-    proposer: vf.AgentConfig = vm_seat("z-ai/glm-5.3")
-    # The solver executes no code (null harness; its Slack tools are host-side servers), so a local process
-    # replaces the VM.
-    solver: vf.AgentConfig = role("z-ai/glm-5.2", solver=True).model_copy(
-        update={"runtime": vf.SubprocessConfig(), "timeout": TRY_TIMEOUT}
-    )
-    # A stronger solver with the same tools, for the tasks GLM rarely answers: hard, or broken?
-    # It thinks hard (at its default effort it took 2-5 calls and lost tasks the solver answered): it shows a task
-    # can be answered.
-    witness: vf.AgentConfig = role("openai/gpt-6-sol", solver=True).model_copy(
+def thinking(model: str) -> vf.AgentConfig:
+    """A seat that answers with the Slack tools and no code (null harness, a local process), thinking hard."""
+    seat = role(model, solver=True)
+    return seat.model_copy(
         update={
             "runtime": vf.SubprocessConfig(),
-            "sampling": role("openai/gpt-6-sol", solver=True).sampling.model_copy(
-                update={"reasoning_effort": "high"}
-            ),
+            "sampling": seat.sampling.model_copy(update={"reasoning_effort": "high"}),
             "timeout": TRY_TIMEOUT,
         }
     )
 
 
+class ForgeSeats(Seats):
+    # The proposer: an rlm agent in a VM, one interaction per turn. A smaller model than the judges', so no model
+    # judges its own writing.
+    proposer: vf.AgentConfig = vm_seat("z-ai/glm-5.3-flash")
+    # The student whose pass rates select the tasks: no code (its Slack tools are host-side servers), a local process.
+    solver: vf.AgentConfig = role("deepseek/deepseek-v4.1-flash", solver=True).model_copy(
+        update={"runtime": vf.SubprocessConfig(), "timeout": TRY_TIMEOUT}
+    )
+    # The verifier: a stronger model with the same tools, whose tries must reach a task's gold for it to count. Never
+    # the student's family: it would drop tasks exactly where the student is blind.
+    verifier: vf.AgentConfig = thinking(GLM)
+    # The world runs' agentic judge seat, which a forge never runs (its task judge is one call: `judge` below).
+    judge: vf.AgentConfig = role(GLM)
+
+
+def high(model: str = GLM) -> vf.JudgeConfig:
+    return vf.JudgeConfig(model=model, sampling=vf.SamplingConfig(reasoning_effort="high"))
+
+
 class ForgeConfig(Section):
-    """One forge. `tasks` is its goal, the tasks the archive holds when it is done; `rounds` the most rounds it runs
-    toward it; `candidates` the candidates one round writes; `target` the tasks a place (a family and a level)
-    holds; `measure` has round 0 measure the finished run's own tasks, as written, before any proposer round."""
+    """One forge, as the paper's three sets (Synthetic Data RL, 2505.17063, 4.1-4.3): `tasks` is the size of the initial
+    set the proposer writes, `batch` at a time; each task is labelled (verified, then measured by the student's `tries`,
+    then judged), and `adapt` passes write a harder version of each solved task, an easier one of each unsolved task
+    and a repaired one of each verified task the judge refused. A run carries on by itself through `max_losses` lost
+    sessions a turn and `max_resumes` stops, until it has spent `spend_limit` dollars."""
 
-    world: RootedPath  # the finished run: its final world.sqlite, with the ledger and the board
+    world: RootedPath  # the finished run: its final world.sqlite and its notes
     output: RootedPath
-    taxonomy: Annotated[Categories, BeforeValidator(categories)]  # taxonomy.toml, by its path
-    tasks: int = Field(default=40, ge=1, le=10_000)
-    rounds: int = Field(default=12, ge=0, le=100)
-    candidates: int = Field(default=12, ge=1, le=50)
-    target: int = Field(default=3, ge=1, le=100)
-    measure: bool = False
-    # Per level, the band of the solver's right-answer rate a task of that level measures in.
-    bands: list[tuple[float, float]] = Field(min_length=1)
-    max_answer_rows: int = Field(default=5, ge=1, le=50)
-    # The solver's tries of a task (8: at 4, a task right 80% of the time shows 4 of 4 in 41% of probes); the tasks
-    # in one judge review (a round's reviews run side by side); the solver's tries at once; the witness's tries of a
-    # task below its band's floor; seconds between pings of the proposer's VM while the solver and the judge work.
-    tries: int = Field(default=8, ge=1, le=16)
-    review_chunk: int = Field(default=5, ge=1, le=50)
-    solvers: int = Field(default=8, ge=1, le=64)
-    witness_tries: int = Field(default=2, ge=0, le=8)
-    keepalive: float = Field(default=600, gt=0, le=1700)
+    tasks: int = Field(default=36, ge=1, le=2_000)
+    batch: int = Field(default=12, ge=1, le=50)
+    adapt: int = Field(default=1, ge=0, le=3)
+    tries: int = Field(
+        default=8, ge=2, le=16
+    )  # the student's (at 8, a task right half the time rarely shows 0 or 8)
+    verify: int = Field(default=2, ge=1, le=5)  # the verifier's; a third on a split
+    solved: float = Field(
+        default=0.875, gt=0, le=1
+    )  # a pass rate at or above it is solved: write a harder version
+    solvers: int = Field(default=8, ge=1, le=64)  # tries at once
+    max_losses: int = Field(default=5, ge=0, le=20)
+    max_resumes: int = Field(default=3, ge=0, le=20)
+    spend_limit: float = Field(default=50.0, gt=0)
     env: ForgeSeats = Field(default_factory=ForgeSeats)
-    answer_judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
-
-    @model_validator(mode="after")
-    def works(self):
-        if self.rounds == 0 and not self.measure:
-            raise ValueError("a forge with no rounds only measures: set measure = true")
-        if any(not 0 <= lo <= hi <= 1 for lo, hi in self.bands):
-            raise ValueError("a band is [low, high] within 0 to 1")
-        if short := [n for n, c in self.taxonomy.items() if len(c.levels) > len(self.bands)]:
-            raise ValueError(f"bands has one band for each level of {short}")
-        return self
+    judge: vf.JudgeConfig = Field(default_factory=high)  # the task judge: one structured call a task
+    answer_judge: vf.JudgeConfig = Field(default_factory=high)
 
 
 def load_forge(path: Path) -> ForgeConfig:

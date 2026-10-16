@@ -141,6 +141,44 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
             str(r.get("answer")) + (" (not settled)" if t["answer_type"] == "status" else "") for r in gold
         ] or ["(refusal: nothing to find)"]
 
+    # The simple forge keeps its tasks in its state, each with its answer and the messages it rests on.
+    for task_id, record in (state.get("forged") or {}).items():
+        if "task" not in record:
+            continue
+        task = record["task"]
+        evidence = sorted({m for p in task["parts"] for m in p.get("evidence", [])})
+        many = len(task["parts"]) > 1
+        claims = [
+            (f"{p['label']}: " if many else "") + (", ".join(p.get("answer") or []) or "(nothing to find)")
+            for p in task["parts"]
+        ]
+        rates = record.get("rates") or {}
+        tasks.append(
+            {
+                "id": task_id,
+                "group_id": "tasks",
+                "question": task["question"],
+                "actor_id": task["actor_id"],
+                "fact_ids": [],
+                "reasoning": " · ".join(
+                    [task["family"], record.get("set", "initial"), record.get("label") or "unlabelled"]
+                    + ([f"{len(task['parts'])} parts"] if many else [])
+                    + ([f"right {rates['right_rate']:.2f}"] if rates.get("right_rate") is not None else [])
+                ),
+                "gold_sql": "rests on "
+                + ", ".join(f"m{m}" for m in evidence)
+                + (f"; the verifier agreed {record['agree']} times" if "agree" in record else ""),
+                "category": task["family"],
+                "level": record.get("pass", 0),
+                "answer": {"canonical_answer": "; ".join(claims), "required_claims": claims},
+            }
+        )
+        bindings[task_id] = {
+            "claims": [
+                {"claim_index": k, "message_ids": [str(m) for m in evidence], "user_ids": []}
+                for k in range(len(claims))
+            ]
+        }
     for t in rows:
         if parted and t["parent"]:
             continue

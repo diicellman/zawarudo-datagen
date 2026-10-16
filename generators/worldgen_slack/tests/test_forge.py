@@ -1,479 +1,258 @@
-"""The task contract: gold as its actor, the reads it may make, its rank and its trial."""
+"""The forge's parts, each on its own: a task's contract and code's checks, its private answer, the tries (kept as they
+land, a split decided by a third), the judge's hearing, the spend, the labels and the release rows."""
 
-import asyncio
 import json
-import sqlite3
 from types import SimpleNamespace
 
 import pytest
-import verifiers.v1 as vf
-from worldgen_slack.judge import AnswerJudge
-from worldgen_slack.slack import PAGE
-from worldgen_slack.world import SHADOWED, SHOWN
 
-from ..evidence import measures
 from ..forge import tries as tries_module
-from ..forge.config import ForgeSeats
-from ..forge.difficulty import failure_cases, features
-from ..forge.env import bucket, heard_page, measured, said
-from ..forge.release import miss_classes, miss_shape, miss_shapes, private_answer, right_by_part
-from ..forge.tasks import Part, Task, answer_of, check_task, forge_task, forget, reference_of
-from ..forge.tries import Tries
-from ..judge.task import JudgeTask, review_payload
-from ..store import Store
-from ..workspace import Workspace, asked
-from .support import contracts_settings, fails, forge_of, refused, with_state, world_fixture
+from ..forge.env import ForgeEnv, label_of, priced, spent
+from ..forge.judge import Ruling, hearing, rule
+from ..forge.release import level, release_rows, report
+from ..forge.tasks import Part, Task, answer_text, check, key, private_answer
+from ..forge.tries import Tries, agreeing, by_part, patient, rates
+from .support import contracts_settings, forge_of, refused, world_fixture
 
 
-def test_tasks(tmp_path):
-    """Gold queries run as their actor: what the actor cannot see does not exist for them, nothing but a single
-    read is allowed, returned evidence must be readable, and a document is applied on a trial copy."""
+def part(label="who called it", answer=("Alicia Rao",), evidence=(1,), kind="text", unseen=()):
+    return Part(
+        label=label, answer_type=kind, answer=list(answer), evidence=list(evidence), unseen=list(unseen)
+    )
+
+
+def request(*parts, id="t9", actor="U2", question="Catch me up on the 4.2 release: who called the rollback?"):
+    return Task(id=id, family="catch-up", actor_id=actor, question=question, parts=list(parts) or [part()])
+
+
+def test_contract(tmp_path):
+    """A task is a request of 1 to 4 parts; code refuses, with every reason, what it can tell is wrong (its asker, its
+    messages out of their sight, an answer of the wrong shape, two parts alike, a question that gives an answer away, a
+    repeat); its private answer is each part's rows and the messages they rest on."""
     world, at, message = world_fixture(tmp_path / "world.sqlite")
-
-    def answers(actor, sql, **kwargs):
-        return [r["answer"] for r in world.gold(actor, sql, **kwargs)["rows"]]
-
-    every = "SELECT text AS answer FROM messages ORDER BY ts_us"
-    assert "private: rollback budget approved" not in answers("U2", every)
-    assert "private: rollback budget approved" in answers("U1", every)
-    assert "deleted rollback note" not in answers("U1", every)
-    assert answers("U1", "SELECT text AS answer FROM commitments WHERE status = 'open'") == [], (
-        "what was promised is gold's to read"
-    )
-    assert answers("U2", "SELECT COUNT(*) AS answer FROM members WHERE channel_id = 'G1'") == [0]
-    assert answers("U3", "SELECT reply_count AS answer FROM thread_stats") == [1]
-    assert answers("U2", "SELECT local(ts_us) AS answer FROM messages WHERE id = 1") == [
-        "2026-06-15 10:00 CDT"
-    ]
-    assert answers("U2", "SELECT local(ts_us, 'UTC') AS answer FROM messages WHERE id = 1") == [
-        "2026-06-15 15:00 UTC"
-    ]
-    assert world.gold("U2", "SELECT value AS answer FROM facts WHERE id = 'f1'")["tables"] == ["facts"]
-    assert "messages" in world.gold("U2", every)["tables"]
-    assert set(SHOWN) == {*SHADOWED, "users"} and all(
-        shown <= {r[1] for r in world.db.execute(f"PRAGMA table_xinfo({t})")} for t, shown in SHOWN.items()
-    ), "SHOWN names the workspace's own columns"
-    assert world.gold("U2", "SELECT emoji AS answer FROM reactions WHERE created_us > 0")["reads"] == [
-        "reactions.created_us",
-        "reactions.emoji",
-    ], "a gold query's own columns are read off"
-    assert len(world.gold("U1", every, max_rows=2)["rows"]) == 3, "one row past the cap shows the cap was hit"
-    settings = forge_of(contracts_settings(tmp_path))
-    who = "SELECT u.real_name AS answer, m.id AS message_id FROM messages m JOIN users u ON u.id = m.user_id"
-
-    def lookup(sql):
-        return Task(
-            id="tw",
-            category="lookup",
-            level=1,
-            actor_id="U2",
-            question="Who answered the decision?",
-            answer_type="text",
-            gold_sql=sql,
-        )
-
-    with world.renumbered() as again:
-        assert check_task(world, lookup(who + " WHERE m.text LIKE 'ack%'"), settings, again) == [
-            {"answer": "Owen Sato", "message_id": 2}
-        ]
-        for pinned in (who + " WHERE m.id = 2", who + " WHERE m.channel_id = 'C1' ORDER BY m.id LIMIT 1"):
-            fails(check_task, world, lookup(pinned), settings, again)  # T7: a message found by its id
-    assert measures(world, "t1", [], ["facts"])["evidence_pages"] == 1
-    try:
-        with (
-            world.trial() as copy
-        ):  # a page of newer top-level messages pushes the evidence to read_channel's second page
-            with copy.batch():
-                copy.insert(
-                    "messages",
-                    [
-                        dict(
-                            channel_id="C1",
-                            ts_us=at(1, 11, 7) + 1009 * (i + 1),
-                            user_id="U1",
-                            text=f"note {i}",
-                        )
-                        for i in range(PAGE)
-                    ],
-                )
-            assert measures(copy, "t1", [], ["facts"])["evidence_pages"] == 2
-            raise LookupError("drop the trial")
-    except LookupError:
-        pass
-    for bad in (
-        "SELECT text AS answer FROM main.messages",
-        "SELECT * FROM main.members",
-        "DELETE FROM facts",
-        "SELECT 1; SELECT 2",
-        "SELECT * FROM tasks",
-        "SELECT * FROM scenes",
-        "SELECT docid FROM messages_fts",
-        "SELECT 'U9' AS user_id",
-        "PRAGMA table_info(tasks)",
-        "ATTACH DATABASE ':memory:' AS other",
+    single = request()
+    check(world, single, [])
+    assert answer_text(single) == ["Alicia Rao"] and key(single) == key(single.model_copy())
+    with pytest.raises(ValueError):
+        Task.model_validate(single.model_dump() | {"parts": []})
+    with pytest.raises(ValueError):
+        Task.model_validate(single.model_dump() | {"variant_of": "t1"})  # a version names why too
+    world.db.execute("UPDATE users SET is_bot = 1 WHERE id = 'U3'")
+    for wrong, why in (
+        (request(actor="U3"), "no person in the workspace"),
+        (request(part(evidence=[4])), "its asker cannot read message 4"),  # #exec is out of U2's sight
+        (request(part(evidence=[6])), "message 6 is no message"),  # deleted
+        (request(part(evidence=[])), "name the messages its answer rests on"),
+        (request(part(answer=["Alicia Rao", "Owen Sato"])), "a text answer has 1-1 values"),
+        (request(part(kind="set")), "a set answer has 2-50 values"),
+        (request(part(kind="status")), "a status names the message out of the asker's sight"),
+        (request(part(kind="status", unseen=[3])), "its asker can read message 3"),
+        (request(part(), part(label="who called it ")), "each part asks for something of its own"),
+        (request(question="Did Alicia Rao call the rollback?"), "gives away its answer"),
     ):
-        fails(world.gold, "U2", bad)
-    # Unscoped, as the world's author reads it: every table, still one read-only statement, on the company clock.
-    assert world.select("SELECT COUNT(*) AS n FROM tasks JOIN scenes")["rows"] == [{"n": 1}]
-    assert world.select("SELECT local(ts_us) AS t FROM messages WHERE id = 1")["rows"] == [
-        {"t": "2026-06-15 15:00 UTC"}
+        refused(why, check, world, wrong, [])
+    refused("its asker already asks the same", check, world, single, [single.model_copy(update={"id": "t8"})])
+    check(world, request(part(kind="status", unseen=[4])), [])  # the settling message, out of sight
+    check(world, request(part(kind="refusal", answer=[], evidence=[])), [])
+    composite = request(
+        part(),
+        part(label="who answered", answer=["Owen Sato"], evidence=[2]),
+        question="Catch me up on the 4.2 rollback: who called it, and who answered?",
+    )
+    check(world, composite, [])
+    answer = private_answer(world, composite)
+    ts = dict(world.db.execute("SELECT id, ts FROM messages").fetchall())
+    assert answer.answer_type == "composite" and [p.label for p in answer.parts] == [
+        "who called it",
+        "who answered",
     ]
-    for bad in ("DELETE FROM tasks", "SELECT 1; SELECT 2", "PRAGMA table_info(tasks)"):
-        fails(world.select, bad)
-    world.insert("evidence", [dict(fact_id="f1", message_id=4, role="supporting")])
-    world.insert("reactions", [dict(message_id=4, user_id="U1", emoji="eyes", created_us=at(1, 12))])
-    world.insert("message_mentions", [dict(message_id=4, user_id="U2")])
-    for table in ("reactions", "message_mentions"):
-        assert (
-            answers("U2", f"SELECT COUNT(*) AS answer FROM {table}")
-            == [0]
-            != answers("U1", f"SELECT COUNT(*) AS answer FROM {table}")
-        )
-    fails(world.gold, "U2", "SELECT message_id FROM evidence WHERE fact_id = 'f1'")
-    assert len(world.gold("U1", "SELECT message_id FROM evidence WHERE fact_id = 'f1'")["rows"]) == 2
-    fails(
-        world.gold,
-        "U2",
-        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT COUNT(*) FROM c",
-        seconds=0.2,
-    )
-    fails(Workspace(world.path, actor="U1").checks)
-
-    scoped = Workspace(world.path, actor="U2")
-    assert scoped.rank("rollback release", [1]) == 1 and scoped.rank("zebra", [1]) is None
-
-
-def test_archive_feedback():
-    """A candidate's archive entry says how its wrong tries went wrong (by class, by shape, and how much of its
-    evidence they saw), the wrong answer two or more of them agree on, what the witness (on this version of the task)
-    and the hinted solver answered, and the judge's own words."""
-    wrong = [{"committed": ["Ann"]}, {"committed": ["Ann"]}, {"committed": ["Bo"]}, {"committed": []}]
-    state = SimpleNamespace(
-        witness={
-            "t": {
-                "key": "k",
-                "results": [None, {"crashed": True, "response": ""}, {"response": "Cy", "correct": True}],
-            }
-        },
-        solves={"t": {"key": "k"}},
-    )
-    heard = said(state, "t", wrong, [({"response": "Cy.", "correct": False, "crashed": False}, None)])
-    assert heard == {
-        "modal": {"answer": "Ann", "tries": 2, "of": 4},
-        "witness_said": {"answer": "Cy", "right": True},
-        "hint_said": {"answer": "Cy.", "right": False},
+    assert answer.messages == [["C1", ts[1]], ["C1", ts[2]]] and answer.parts[1].rows == [
+        {"answer": "Owen Sato"}
+    ]
+    assert answer.reference()["parts"][0] == {
+        "answer_type": "text",
+        "rows": [{"answer": "Alicia Rao"}],
+        "label": "who called it",
     }
-    state.witness["t"]["key"] = "an older version"
-    assert said(state, "t", wrong[2:], None) == {}, (
-        "no agreement of one, no witness of another version, no hint"
-    )
-    page = heard_page(
-        heard | {"miss_classes": {"saw_all": 4}, "shapes": {"wrong": 3}, "coverage": 0.0, "judge": "fair"}
-    )
-    assert page == (
-        "\n  its wrong tries: saw_all 4; wrong 3; they saw 0% of its evidence"
-        "\n  the wrong answer 2 of its 4 wrong tries gave: 'Ann'"
-        "\n  the witness answered (right): 'Cy'"
-        "\n  shown its evidence, the solver answered (wrong): 'Cy.'"
-        "\n  the judge: 'fair'"
-    )
-    # A family and category whose only candidate was sent back before any try counted is still reported (FW2 stopped
-    # on a division by zero there).
-    back = {
-        "family": "status",
-        "category": "composite",
-        "verdict": "sent back: its question can be read another way",
-    }
-    assert measured({"r": back}) == [
-        "- status·composite: 1 tried, 0 kept, 1 sent back; no tries measured; wrong tries: none"
-    ]
-    assert [
-        miss_shape(r) for r in ({"missing": ["a"]}, {"extra": ["b"]}, {"missing": ["a"], "extra": ["b"]}, {})
-    ] == [
-        "short",
-        "extra",
-        "wrong",
-        None,
-    ]
+    assert answer_text(composite) == ["who called it: Alicia Rao", "who answered: Owen Sato"]
+    assert private_answer(world, single).rows == [{"answer": "Alicia Rao"}]
 
 
-async def test_witness_tries(monkeypatch):
-    """The witness tries a task its band's floor is above, one at a band starting at 0, and one GLM answered right
-    but never grounded: its try shows the gold is reached from Slack. A task GLM reached, right and grounded, in its
-    band, it leaves."""
-    db = sqlite3.connect(":memory:")
-    db.execute("CREATE TABLE tasks (id TEXT, level INTEGER)")
-    db.executemany(
-        "INSERT INTO tasks VALUES (?, ?)", [("fine", 1), ("short", 1), ("bottom", 2), ("ungrounded", 1)]
-    )
-
-    def tries_of(right: int, grounded: bool) -> dict:
-        return {"results": [{"correct": i < right, "grounded": grounded} for i in range(4)]}
-
-    state = SimpleNamespace(
-        solves={
-            "fine": tries_of(4, True),
-            "short": tries_of(1, True),
-            "bottom": tries_of(4, True),
-            "ungrounded": tries_of(4, False),
-        },
-        witness={},
-    )
-    tries = Tries(
-        SimpleNamespace(solvers=2, bands=[(0.5, 1.0), (0.0, 0.5)], witness_tries=1),
-        SimpleNamespace(state=state, world=SimpleNamespace(db=db)),
-    )
-    asked = []
-
-    async def tried(agents, book, due, keys, attempt, n, seat):
-        asked.extend(due)
-
-    monkeypatch.setattr(tries, "tried", tried)
-    await tries.witness(None, list(state.solves), {t: "k" for t in state.solves}, "a")
-    assert asked == ["short", "bottom", "ungrounded"]
-
-
-async def test_tries_cut_and_kept(monkeypatch):
-    """A try cut off (a hung request, at its seat's rollout time) runs once more and says why; a round cut off tops
-    its tasks up when it resumes, only the empty places tried and each saved as it lands; a changed task is tried
-    afresh; a hung screen grade is cut and asked once more. The forge's tries are held to 15 minutes, its grades to 5."""
+async def test_tries(tmp_path):
+    """Each try is kept the moment it lands: a run cut off tops its task up, and a changed task is tried afresh; a
+    verifier split is decided by a third try; a call that fails is asked again, and its last failure raised."""
     saved = []
-    state = SimpleNamespace(solves={}, witness={})
-    tries = Tries(SimpleNamespace(solvers=2), SimpleNamespace(state=state, trace=lambda trace: None))
-    tries.store.save = lambda: saved.append(json.dumps(state.solves))
-    monkeypatch.setattr(tries, "copy", lambda attempt, seat: (None, {}))
-    monkeypatch.setattr(
-        tries, "solver_task", lambda t, copy, release, hint: SimpleNamespace(data=SimpleNamespace(task_id=t))
+    state = SimpleNamespace(solves={}, verifier={})
+    store = SimpleNamespace(
+        state=state, trace=lambda trace: None, save=lambda: saved.append(1), root=tmp_path
     )
+    tries = Tries(SimpleNamespace(solvers=2, verify=2, tries=3), store)
+    tries.copy = lambda: None
+    tries.solver_task = lambda task, world: SimpleNamespace(data=SimpleNamespace(task_id=task.id))
+    # None crashes: the student's second try crashes all 3 of its attempts
+    plan = {"verifier": [True, False, True], "solver": [True, None, None, None, False]}
+    made = {"verifier": 0, "solver": 0}
 
-    class Solver:
-        calls = 0
+    class Seat:
+        def __init__(self, seat):
+            self.seat = seat
 
         async def run(self, task):
-            Solver.calls += 1
-            if Solver.calls == 1:
-                return SimpleNamespace(
-                    id="hung",
-                    ok=False,
-                    info={},
-                    task=task,
-                    last_reply="",
-                    stop_condition=None,
-                    errors=[SimpleNamespace(message="agent timeout: rollout exceeded its 900s budget")],
-                )
-            graded = {"task_id": task.data.task_id, "correct": True, "reason": "r", "response": "an answer"}
+            made[self.seat] += 1
+            right = plan[self.seat][(made[self.seat] - 1) % len(plan[self.seat])]
+            evaluation = {"correct": right, "semantic_correctness": 1.0 if right else -1.0, "response": "r"}
             return SimpleNamespace(
-                id=f"t{Solver.calls}",
-                ok=True,
-                info={"evaluation": graded},
-                task=task,
-                errors=[],
-                last_reply="an answer",
+                id=f"{self.seat}-{made[self.seat]}",
+                ok=right is not None,
+                info={"evaluation": evaluation} if right is not None else {},
+                errors=[SimpleNamespace(message="stream ended")] if right is None else [],
+                last_reply="r",
                 stop_condition=None,
+                task=task,
             )
 
-    kept = {"correct": True, "crashed": False}
-    state.solves["t1"] = {"key": "k", "results": [kept, None, None], "traces": ["kept", None, None]}
-    await tries.tried(SimpleNamespace(solver=Solver()), state.solves, ["t1"], {"t1": "k"}, "a", 3, "solver")
-    results = state.solves["t1"]["results"]
-    assert Solver.calls == 3 and results[0] is kept, "only the empty places are tried"
-    assert [r.get("rerun", "")[:13] for r in results[1:]].count("agent timeout") == 1 and not any(
-        r["crashed"] for r in results[1:]
-    ), "the hung try ran once more, and says why"
-    assert len(saved) == 2 and "null" not in saved[-1], "each try is saved as it lands"
-    await tries.tried(SimpleNamespace(solver=Solver()), state.solves, ["t1"], {"t1": "k2"}, "a", 3, "solver")
-    assert Solver.calls == 6 and state.solves["t1"]["key"] == "k2", "a changed task is tried afresh"
-
-    hangs = [True, False]
-
-    async def evaluate(self, **kwargs):
-        if hangs.pop(0):
-            await asyncio.sleep(60)
-        return "graded"
-
-    monkeypatch.setattr(tries_module, "GRADE_TIMEOUT", 0.05)
-    monkeypatch.setattr(AnswerJudge, "evaluate", evaluate)
-    tries.settings = SimpleNamespace(solvers=2, answer_judge=vf.JudgeConfig(model="z-ai/glm-5.3"))
-    assert await asyncio.wait_for(tries.grade("q", {}, "r"), 5) == "graded", "a hung grade is asked once more"
-    hangs[:] = [True, True]
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(tries.grade("q", {}, "r"), 5)
-
-    forge = ForgeSeats()
-    assert (forge.solver.timeout.rollout, forge.solver.timeout.scoring, forge.witness.timeout.rollout) == (
-        900,
-        300,
-        900,
+    agents = SimpleNamespace(verifier=Seat("verifier"), solver=Seat("solver"))
+    task = request()
+    verified = await tries.verify(agents, task, "k")
+    assert len(verified) == 3 and len(agreeing(verified)) == 2, "a split is decided by a third try"
+    measured = await tries.measure(agents, task, "k")
+    assert [r["crashed"] for r in measured] == [False, True, False], (
+        "a try that crashes runs again, up to 3 times"
     )
+    assert rates(measured)["right_rate"] == 0.5 and rates(measured)["crashed"] == 1
+    assert len(saved) == 6, "each try is saved as it lands"
+    state.solves["t9"]["results"][2] = None  # a run cut off before its last try
+    before = made["solver"]
+    await tries.measure(agents, task, "k")
+    assert made["solver"] == before + 1, "a resume tries only the empty places"
+    await tries.measure(agents, task, "k2")
+    assert made["solver"] > before + 3 and state.solves["t9"]["key"] == "k2", "a changed task is tried afresh"
+    composite = request(part(), part(label="who answered", answer=["Owen Sato"], evidence=[2]))
+    graded = [{"parts": [{"correct": True}, {"correct": c}]} for c in (True, False)]
+    assert (
+        by_part(composite, graded) == {"who called it": 1.0, "who answered": 0.5}
+        and by_part(task, graded) is None
+    )
+    calls = []
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("unavailable")
+        return "ok"
+
+    assert await patient(flaky, timeout=5) == "ok" and len(calls) == 3
+    with pytest.raises(RuntimeError):
+        await patient(lambda: (_ for _ in ()).throw(RuntimeError("down")), timeout=5)
+    assert tries_module.WAITS == (0, 0, 0), "the checks wait for no provider"
 
 
-async def test_composite(tmp_path):
-    """A composite request (2 to 4 parts, each with its own gold) is recorded as its request and its parts, each part a
-    task of its own under it, checked as a task is; its parts answer different things, its request gives none of them
-    away, a part's fault names the part, and taking it off takes its parts with it."""
+async def test_judge(tmp_path):
+    """The judge reads a task as its asker would and the tries' answers, and rules on four things; all four make it
+    approved, and its call's cost is kept."""
     world, at, message = world_fixture(tmp_path / "world.sqlite")
-    settings = forge_of(contracts_settings(tmp_path))
-    who = "SELECT u.real_name AS answer, m.id AS message_id FROM messages m JOIN users u ON u.id = m.user_id"
-    called, answered = who + " WHERE m.text LIKE '%rollback decided%'", who + " WHERE m.text LIKE 'ack%'"
+    world.db.execute("INSERT OR REPLACE INTO world_meta (key, value) VALUES ('zone', 'America/Chicago')")
+    task = request()
+    heard = hearing(
+        world,
+        task,
+        [{"response": "Alicia Rao called it"}],
+        [{"correct": False, "response": "Owen", "reason": "x"}],
+    )
+    assert heard["asker"].startswith("Owen Sato") and heard["parts"][0]["messages"][0]["from"] == "Alicia Rao"
+    assert heard["student_wrong_answers"] == [{"answer": "Owen", "grade": "x"}] and heard["verifier_answers"]
+    ruling, usage = await rule(forge_of(contracts_settings(tmp_path)).judge, world, task, [], [])
+    assert ruling.approved and usage == {}
+    precise = request(question="Who precisely called the 4.2 rollback?")
+    ruling, _ = await rule(forge_of(contracts_settings(tmp_path)).judge, world, precise, [], [])
+    assert not ruling.exact and not ruling.approved, "an answer that asks more than its part"
+    assert not Ruling(realistic=False, one_reading=True, exact=True, supported=True, reason="r").approved
 
-    def request(
-        *sqls, question="Catch me up on the 4.2 rollback: who called it, and who answered?", **changes
-    ):
-        labels = ("who called it", "who answered it", "who else")
-        return Task(
-            id="tc",
-            category="composite",
-            level=1,
-            actor_id="U2",
-            question=question,
-            answer_type="composite",
-            family="catch-up",
-            parts=[
-                Part(label=label, category="lookup", answer_type="text", gold_sql=sql)
-                for label, sql in zip(labels, sqls)
-            ],
-            **changes,
+
+def test_spend_and_labels(tmp_path):
+    """What a forge spent (reported, or else list prices), how a labelled task is labelled, and its release row."""
+    (tmp_path / "traces").mkdir()
+    (tmp_path / "traces" / "a.json").write_text(
+        json.dumps(
+            {"agent": {"name": "solver"}, "usage": {"cost": 0.5}, "extra_usage": [{"prompt_tokens": 1e6}]}
         )
-
-    for shape in (
-        lambda: request(called),  # one part is no composite
-        lambda: request(called, answered, gold_sql="SELECT 1 AS answer"),  # its gold is its parts'
-        lambda: request(called, answered)
-        .model_copy(update={"category": "lookup"})
-        .model_validate(request(called, answered).model_dump() | {"category": "lookup"}),
-        lambda: Task(id="t", category="lookup", level=1, actor_id="U2", question="q?", answer_type="text"),
-    ):
-        fails(shape)
-    caller = world.db.execute("SELECT real_name FROM users WHERE id = 'U1'").fetchone()[0]
-    with world.trial() as copy:
-        forged = forge_task(copy, request(called, answered), settings, ["tc"])
-        assert [p["gold"] for p in forged["parts"]] == [
-            [{"answer": caller, "message_id": 1}],
-            [{"answer": "Owen Sato", "message_id": 2}],
-        ] and len(forged["features"]["parts"]) == 2
-    rows = [dict(r) for r in world.db.execute("SELECT * FROM tasks WHERE id LIKE 'tc%' ORDER BY id")]
-    assert [(r["id"], r["answer_type"], r["parent"], r["part"], r["label"], r["family"]) for r in rows] == [
-        ("tc", "composite", None, None, None, "catch-up"),
-        ("tc-p1", "text", "tc", 1, "who called it", None),
-        ("tc-p2", "text", "tc", 2, "who answered it", None),
-    ] and (rows[0]["gold_sql"], rows[0]["gold_source"]) == ("", "composite")
-    assert answer_of(world, "tc") == [f"who called it: {caller}", "who answered it: Owen Sato"]
-    assert world.db.execute(f"SELECT COUNT(*) FROM tasks WHERE {asked(world.db)}").fetchone()[0] == 2, (
-        "a request is asked once, its parts never"
     )
-    released = private_answer(SimpleNamespace(world=world), rows[0])
-    stated = [
-        list(r)
-        for r in world.db.execute("SELECT channel_id, ts FROM messages WHERE id IN (1, 2) ORDER BY ts_us")
-    ]
-    assert (
-        [(p.label, p.rows) for p in released.parts]
-        == [
-            ("who called it", [{"answer": caller, "message_id": 1}]),
-            ("who answered it", [{"answer": "Owen Sato", "message_id": 2}]),
-        ]
-        and released.messages == stated
-        and [p["label"] for p in released.reference()["parts"]] == ["who called it", "who answered it"]
-    ), "a request's answer is its parts', each under its label, and its evidence theirs together"
-    assert reference_of(world.db, "tc") == released.reference() and reference_of(world.db, "t1") == {
-        "answer_type": "text",
-        "rows": json.loads(world.db.execute("SELECT gold_json FROM tasks WHERE id = 't1'").fetchone()[0]),
-    }, "the screen and a regrade grade against the reference a release ships"
-    gold, cases = failure_cases(world, "tc", [])
-    named = dict(cases)
-    assert gold == f"who called it: {caller}.\nwho answered it: Owen Sato.", (
-        "its gold is each part's, under its label"
+    (tmp_path / "traces" / "b.json").write_text(
+        json.dumps({"agent": {"name": "verifier"}, "usage": {"prompt_tokens": 1e6, "completion_tokens": 1e6}})
     )
-    assert (
-        named["who answered it: left out"] == f"who called it: {caller}."
-        and named["who called it: declining to answer"]
-        == "who called it: I can't find that in anything you can see.\nwho answered it: Owen Sato."
-        and "a bare opener" in named
-        and "who called it: a bare opener" not in named
-    ), "each part's wrong answers inside an answer otherwise right, and each part left out"
-    shape = features(world, "tc", [])
-    assert len(shape["parts"]) == 2 and bucket(shape) == "parts:" + "|".join(
-        sorted(map(bucket, shape["parts"]))
+    settings = {
+        "env": {"solver": {"model": "deepseek/deepseek-v4.1-flash"}, "verifier": {"model": "z-ai/glm-5.3"}},
+        "answer_judge": {"model": "z-ai/glm-5.3"},
+        "judge": {"model": "z-ai/glm-5.3"},
+    }
+    state = SimpleNamespace(forged={"t": {"usage": {"completion_tokens": 1e6}}})
+    assert spent(SimpleNamespace(root=tmp_path, settings=settings, state=state)) == pytest.approx(
+        0.5 + 1.4 + 5.8 + 4.4
     )
-
-    def tried(*parts, coverage=(1.0, 0.5), crashed=False):
-        grades = [
-            {
-                "label": "x",
-                "correct": c,
-                "abstained": a,
-                "committed": [],
-                "missing": [] if c or a else ["y"],
-                "extra": [],
-            }
-            for c, a in parts
-        ]
-        return {
-            "correct": all(c for c, _ in parts),
-            "crashed": crashed,
-            "parts": grades,
-            "part_coverage": list(coverage),
-        }
-
-    results = [
-        tried((True, False), (True, False)),
-        tried((True, False), (False, False)),  # the second part missed, with half its evidence seen
-        tried((False, True), (True, False)),  # the first declined
-        tried((False, False), (False, False), crashed=True),  # a crashed try tells nothing
-    ]
-    assert miss_classes(world, "tc", results) == {"search": 1, "abstained": 1}, "a wrong part's own class"
-    assert miss_shapes(world, "tc", results) == {"short": 1}, (
-        "the missed part lacks its row; a declined one has no shape"
+    assert priced({"prompt_tokens": 1e6}, "a model of no list") == 4.0, (
+        "an unlisted model at the dearest price"
     )
-    assert right_by_part(world, "tc", results) == {"who called it": 2 / 3, "who answered it": 2 / 3}
-    assert right_by_part(world, "t1", results) is None, "a task with no parts"
-    # Its review sees its parts, each with its label and gold, and checks each part's gold and facts.
-    payload = review_payload(world, "task", ["tc"])
-    (reviewed,) = payload["tasks"]
-    assert (
-        reviewed["family"] == "catch-up"
-        and "gold_sql" not in reviewed
-        and [(p["label"], p["gold"]) for p in reviewed["parts"]]
-        == [(p.label, p.rows) for p in released.parts]
-    )
-    with world.batch():  # a fact its second part needs, which no message states
-        fact = dict(id="f9", storyline="r", subject="c", attribute="d", value="v", summary="s", day=2)
-        world.insert("facts", [fact | dict(channel_id="C1", author_id="U1")])
-        world.insert("task_facts", [dict(task_id="tc-p2", fact_id="f9")])
-    world.snapshot(tmp_path / "review.sqlite")
-    (tools,) = (judge := JudgeTask.create(payload, tmp_path / "review.sqlite", "x", 5)).toolsets(judge.config)
-    await tools.setup()
-    with_state(tools)
-    checked = await tools._with_state(tools.check)()
-    assert set(checked["tasks"]["tc"]["parts"]) == {"who called it", "who answered it"} and checked["tasks"][
-        "tc"
-    ]["parts"]["who answered it"]["rows"] == [{"answer": "Owen Sato", "message_id": 2}]
-    assert any(v.startswith("unstated_fact: fact f9, which task tc-p2") for v in checked["violations"]), (
-        "a part's facts are checked with its request"
-    )
-    world.db.execute("DELETE FROM task_facts WHERE fact_id = 'f9'")
-    measured = Store.difficulty(SimpleNamespace(world=world, state=SimpleNamespace(task_reviews={})))
-    assert set(measured["tc"]["parts"]) == {"tc-p1", "tc-p2"} and "tc-p1" not in measured, (
-        "a request's measures are its parts', and a part is no task of the summary's"
-    )
-    with world.trial() as copy:  # else two parts that ask for one thing were kept
-        refused("two parts give the same answer", forge_task, copy, request(called, called), settings, ["tc"])
-    with world.trial() as copy:  # else a request that tells its own answer was kept
-        refused(
-            "gives away its answer",
-            forge_task,
-            copy,
-            request(
-                called,
-                answered,
-                question="Did Owen Sato or someone else answer the 4.2 rollback, and who called it?",
-            ),
-            settings,
-            ["tc"],
+    measured = {"right_rate": 0.5}
+    assert [
+        label_of(r, 0.875)
+        for r in (
+            {"verified": False},
+            {"verified": True, "approved": False, "rates": measured},
+            {"verified": True, "approved": True, "rates": {"right_rate": 1.0}},
+            {"verified": True, "approved": True, "rates": {"right_rate": 0.0}},
+            {"verified": True, "approved": True, "rates": measured},
         )
-    with world.trial() as copy:  # a part's fault is the part's: its id names it
-        refused("tc-p2:", forge_task, copy, request(called, who + " WHERE m.id = 2"), settings, ["tc"])
-    forget(world, "tc")
-    assert not world.db.execute("SELECT 1 FROM tasks WHERE id LIKE 'tc%'").fetchone(), (
-        "a request goes with its parts"
+    ] == ["rejected", "rejected", "solved", "unsolved", "window"]
+    assert [level(r) for r in (1.0, 0.75, 0.25, 0.0)] == [1, 2, 3, 4]
+
+
+def test_release(tmp_path):
+    """An approved task's row names its set, its rates (by part) and the verifier's; its answer carries the verifier's
+    try that reached it; the report counts each family's tasks, and names those short of material."""
+    world, at, message = world_fixture(tmp_path / "world.sqlite")
+    (tmp_path / "traces").mkdir()
+    (tmp_path / "traces" / "v1.json").write_text(
+        json.dumps({"info": {"observations": [{"tool": "read_channel", "arguments": {"channel_id": "C1"}}]}})
     )
+    task = request()
+    right = {
+        "correct": True,
+        "grounded": True,
+        "semantic_correctness": 1.0,
+        "response": "Alicia Rao called it",
+    }
+    state = SimpleNamespace(
+        forged={
+            "t9": {
+                "task": task.model_dump(mode="json"),
+                "set": "harder",
+                "label": "window",
+                "verified": True,
+            },
+            "t8": {
+                "task": task.model_dump(mode="json") | {"id": "t8"},
+                "set": "initial",
+                "label": "rejected",
+            },
+        },
+        solves={"t9": {"results": [right, {"correct": False}], "traces": [None, None]}},
+        verifier={"t9": {"results": [right, right], "traces": ["v1", "v2"]}},
+    )
+    store = SimpleNamespace(
+        world=world, root=tmp_path, state=state, settings={"env": {"verifier": {"model": "z-ai/glm-5.3"}}}
+    )
+    rows, answers = release_rows(store, "h")
+    (row,) = rows
+    assert (row.task_id, row.set, row.right_rate, row.level, row.verifier_right) == (
+        "t9",
+        "harder",
+        0.5,
+        2,
+        1.0,
+    )
+    assert answers["t9"].solution.calls == [{"tool": "read_channel", "arguments": {"channel_id": "C1"}}]
+    found = report(store)
+    assert found["families"]["catch-up"]["written"] == 2 and found["short"] == sorted(
+        ["catch-up", "decisions", "commitments", "status"]
+    ), "a family with fewer than 2 approved tasks is short"
+    assert ForgeEnv.WHY["repaired"].startswith("The judge refused it")

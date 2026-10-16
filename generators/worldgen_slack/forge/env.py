@@ -1,139 +1,96 @@
-"""The task forge: tasks proposed on a finished, frozen world, kept when their tries say they land.
+"""The task forge: tasks written on a finished, frozen world, as the paper's three sets (Synthetic Data RL, 2505.17063).
 uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge.toml [--dry-run]
 
-A world run writes the workspace and its ledger (a chapter's brief plants its entries' facts on the board before its
-first day); the forge then writes tasks on that world, in rounds: the proposer writes candidates, the solver tries
-each, and code keeps what lands. The world is never written again, so no task goes stale under it."""
+The proposer writes the initial set; every task is labelled (the verifier must reach its answer from Slack, the student
+tries it, the judge rules on it); then the proposer writes a harder version of each task the student always gets right,
+an easier one of each it never gets, and a repaired one of each verified task the judge refused, and those are
+labelled too. The release is every approved task, with the set it came from and how hard it measured."""
 
+import asyncio
 import json
 import shutil
-from collections import Counter
 
 from worldgen_slack.release import atomic_json
 from worldgen_slack.world import file_hash
 
 from ..config import pinned
-from ..judge.verdict import READING
-from ..session import SETUP_FILES, SessionEnv, keep_awake, require_session
-from ..store import Store
-from ..workspace import Workspace, asked, reset_tasks
-from ..world.author.memory import task_page
-from ..world.board import brief
+from ..session import SETUP_FILES, SessionEnv, require_session
+from ..store import ReviewLimit, Store
+from ..workspace import Workspace, reset_tasks
 from .config import ForgeConfig
-from .difficulty import features
-from .proposer.task import ProposerTask, forge_prompt
-from .release import miss_classes, miss_shapes, release_rows, right_by_part, solution
-from .tasks import FAMILIES, Task, answer_of, forge_task, forget
-from .tries import Tries, rates
+from .judge import rule
+from .proposer.task import ProposerTask, adapt_prompt, initial_prompt
+from .release import KEPT
+from .tasks import FAMILIES, Task, answer_text, check, key
+from .tries import Tries, agreeing, by_part, rates
+
+# $ per million fresh input, cached input and output tokens (`prime inference models`, 2026-10-16), for a call its
+# provider leaves unpriced; a model not listed is priced as the dearest.
+PRICES = {
+    "z-ai/glm-5.3": (1.4, 0.26, 4.4),
+    "z-ai/glm-5.3-flash": (0.15, 0.15, 0.5),
+    "deepseek/deepseek-v4.1-flash": (0.3, 0.03, 1.2),
+    "anthropic/claude-opus-5.5": (4.0, 4.0, 20.0),
+}
+DEAREST = (4.0, 4.0, 20.0)
+
+
+def priced(usage: dict, model: str | None) -> float:
+    if usage.get("cost") is not None:
+        return usage["cost"]
+    fresh, cached, out = PRICES.get(model or "", DEAREST)
+    return (
+        (usage.get("prompt_tokens") or 0) * fresh
+        + (usage.get("cached_input_tokens") or 0) * cached
+        + (usage.get("completion_tokens") or 0) * out
+    ) / 1e6
+
+
+def spent(store) -> float:
+    """What a forge has spent: each trace's calls (its own and its answer judge's), and the task judge's rulings, at
+    their reported cost or else list prices: an estimate that errs high."""
+    env, judges = store.settings.get("env", {}), store.settings.get("answer_judge", {}).get("model")
+    total = 0.0
+    for path in (store.root / "traces").glob("*.json"):
+        try:
+            trace = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        total += priced(trace.get("usage") or {}, env.get(trace["agent"]["name"], {}).get("model"))
+        total += sum(priced(u, judges) for u in trace.get("extra_usage") or [])
+    judge = store.settings.get("judge", {}).get("model")
+    return total + sum(priced(r.get("usage") or {}, judge) for r in store.state.forged.values())
 
 
 def provenance(config: ForgeConfig) -> dict:
-    """Everything a resumed forge must share with its start: its configuration (its taxonomy as read), the world it
-    writes on (by hash), the pinned framework and the lock file."""
+    """Everything a resumed forge must share with its start: its configuration, the world it writes on (by hash), the
+    pinned framework and the lock file."""
     return {
         "config": config.model_dump(mode="json"),
         "world_hash": file_hash(config.world / "world.sqlite"),
     } | pinned()
 
 
-def measured(forged: dict) -> list[str]:
-    """This forge's own numbers, by family and category (a task with no family: by category and intent):
-    candidates tried, kept, sent back for another reading, the mean share of right answers of those tried, and how
-    the wrong tries went wrong. Steering comes from these, not from lore about any solver."""
-    cells: dict[tuple, dict] = {}
-    for o in forged.values():
-        cell = cells.setdefault(
-            (o["family"], o["category"]) if o.get("family") else (o["category"], o.get("intent") or "-"),
-            {"tried": 0, "kept": 0, "back": 0, "right": [], "misses": Counter()},
-        )
-        cell["tried"] += 1
-        cell["kept"] += o["verdict"].startswith("kept")
-        cell["back"] += o["verdict"].startswith("sent back")
-        if o.get("right") is not None:
-            cell["right"].append(o["right"])
-        cell["misses"].update(o.get("miss_classes") or {})
-    return [
-        f"- {c}·{i}: {x['tried']} tried, {x['kept']} kept, {x['back']} sent back; "
-        + (f"right {sum(x['right']) / len(x['right']):.2f} on average" if x["right"] else "no tries measured")
-        + f"; wrong tries: {dict(x['misses']) or 'none'}"
-        for (c, i), x in sorted(cells.items())
-        if x["right"] or x["back"]
-    ]
-
-
-def said(state, task_id: str, wrong: list[dict], hinted) -> dict:
-    """What a candidate's tries said, for its archive entry: the wrong answer its solver's tries agree on most (when
-    two or more do), and the first answer of the witness (its tries of this version of the task) and of the solver
-    shown its evidence (the hint), each with whether it was right."""
-    out = {}
-    common = Counter("; ".join(r["committed"]) for r in wrong if r.get("committed")).most_common(1)
-    if common and common[0][1] > 1:
-        out["modal"] = {"answer": common[0][0][:240], "tries": common[0][1], "of": len(wrong)}
-    witness = state.witness.get(task_id, {})
-    tried = (
-        witness.get("results", []) if witness.get("key") == state.solves.get(task_id, {}).get("key") else []
-    )
-    for name, results in (("witness_said", tried), ("hint_said", [o for o, _ in hinted or []])):
-        if first := next((r for r in results if r and not r.get("crashed")), None):
-            out[name] = {"answer": (first.get("response") or "")[:240], "right": bool(first.get("correct"))}
-    return out
-
-
-def heard_page(o: dict) -> str:
-    """A candidate's feedback lines in archive.md: its rate by part, how its wrong tries went wrong (by class and by
-    shape, and how much of its evidence they saw), the wrong answer they agree on, the witness's and the hint's
-    answers, and the judge's own words."""
-    out = ""
-    if o.get("parts"):
-        out += "\n  right by part: " + ", ".join(f"{label} {r:.2f}" for label, r in o["parts"].items())
-    if o.get("miss_classes"):
-        out += "\n  its wrong tries: " + ", ".join(f"{k} {v}" for k, v in sorted(o["miss_classes"].items()))
-        out += "; " + ", ".join(f"{k} {v}" for k, v in sorted(o["shapes"].items())) if o.get("shapes") else ""
-        out += f"; they saw {o['coverage']:.0%} of its evidence" if o.get("coverage") is not None else ""
-    if m := o.get("modal"):
-        out += f"\n  the wrong answer {m['tries']} of its {m['of']} wrong tries gave: {m['answer']!r}"
-    for key, who in (("witness_said", "the witness"), ("hint_said", "shown its evidence, the solver")):
-        if w := o.get(key):
-            out += f"\n  {who} answered ({'right' if w['right'] else 'wrong'}): {w['answer']!r}"
-    if o.get("judge"):
-        out += f"\n  the judge: {o['judge']!r}"
-    return out
-
-
-def bucket(shape: dict) -> str:
-    """A task's structure, as one of the archive's coordinates: how many values its asker can see, where its answer
-    sits, a set, another asker's other answer, an answer to work out, a status; a composite request's, its parts'."""
-    if "parts" in shape:
-        return "parts:" + "|".join(sorted(map(bucket, shape["parts"])))
-    parts = [f"k{min(shape['changes'], 3)}"] if shape["changes"] else []
-    if shape["last_link"] and not shape["last_link"].startswith("channel"):
-        parts.append(shape["last_link"].split("·")[0])
-    parts += ["set"] * (shape["rows"] > 1) + [k for k in ("perspective", "derived", "status") if shape[k]]
-    return "+".join(parts) or "plain"
-
-
-def measured_level(right: float, bands) -> int:
-    """The level a task's tries put it at: the first band, from level 1 down, whose floor its right rate reaches."""
-    return next(i for i, (low, _) in enumerate(bands, 1) if right >= low)
+def label_of(record: dict, solved: float) -> str:
+    """A labelled task's label: rejected (its answer not verified, or the judge refused it), else by its pass rate:
+    solved, unsolved (never right), or in the window."""
+    if not record.get("verified") or not record.get("approved"):
+        return "rejected"
+    right = record["rates"]["right_rate"]
+    return "solved" if right >= solved else "unsolved" if right == 0 else "window"
 
 
 class ForgeEnv(SessionEnv):
     seat = "proposer"
-    seats = ("proposer", "judge", "solver", "witness")
+    seats = ("proposer", "solver", "verifier", "judge")
 
     def __init__(self, settings: ForgeConfig, store: Store):
-        places = len(FAMILIES) * len(settings.bands)
-        if settings.tasks > settings.target * places:
-            raise ValueError(
-                f"a goal of {settings.tasks} tasks is more than the archive's {places} places hold at {settings.target} each"
-            )
         super().__init__(settings, store)
         self.tries = Tries(settings, store)
 
-    def allow(self, ids, rework: dict | None = None) -> None:
-        """The ids the proposer's next turn may write, and the tasks sent back for another reading, each with its asker
-        and gold answer: its tools read them per call."""
-        atomic_json(self.store.root / "writable.json", {"ids": list(ids), "rework": rework or {}})
+    @property
+    def plan(self) -> dict:
+        return self.store.state.plans.setdefault("forge", {})
 
     def provision_task(self) -> ProposerTask:
         """The proposer's own task: no persona file is read to provision its VM."""
@@ -143,61 +100,20 @@ class ForgeEnv(SessionEnv):
         state = self.store.state
         if state.phase == "premise":
             self.adopt()
-        if self.settings.measure and not state.plans.get("forge", {}).get("measured"):
-            await self.measure(agents)
-        if state.phase == "tasks":  # a forge that only measures needs no proposer, and no VM
-            await self.work_in_vm(agents)
-
-    async def measure(self, agents) -> None:
-        """Round 0: the finished run's own tasks, under their own ids, checked for validity only (T1-T7, the columns
-        the tools show) and not by the forge's own gates, then measured as any candidate is: the screen, 8 tries, the
-        witness, the hint, the judge. A run's own tasks and the forge's are then read with one measuring stick."""
-        state = self.store.state
-        attempt = self.store.reserve("measure", 2)
-        source = Workspace(self.settings.world / "world.sqlite")
-        rows = source.db.execute(f"SELECT * FROM tasks WHERE {asked(source.db)} ORDER BY id").fetchall()
-        ids = [r["id"] for r in rows]
-        for row in rows:
-            facts = [
-                f
-                for (f,) in source.db.execute(
-                    "SELECT fact_id FROM task_facts WHERE task_id = ?", (row["id"],)
-                )
-            ]
-            task = Task(
-                id=row["id"],
-                category=row["category"],
-                level=row["level"],
-                actor_id=row["actor_id"],
-                question=row["question"],
-                answer_type=row["answer_type"],
-                gold_sql=row["gold_sql"],
-                facts=facts,
-            )
-            try:
-                with self.world.trial() as copy:
-                    forge_task(copy, task, self.settings, ids, gates=False)
-            except ValueError as error:  # a task the world's rules now refuse is itself a finding
-                state.forged[row["id"]] = {
-                    "round": 0,
-                    "category": row["category"],
-                    "declared": row["level"],
-                    "question": row["question"],
-                    "features": {},
-                    "verdict": f"not imported: {error}",
-                }
-        source.close()
-        self.store.event("tasks_imported", attempt=attempt, tasks=len(self.written(ids)), of=len(ids))
-        await self.weigh(agents, attempt, self.written(ids))
-        state.plans.setdefault("forge", {})["measured"] = True
-        if self.settings.rounds == 0:
-            state.phase = "done"
-        self.store.finish_attempt(True)
-        self.store.save()
+        while state.phase != "done":
+            if spent(self.store) >= self.settings.spend_limit:
+                raise ReviewLimit(f"the forge has spent its limit, ${self.settings.spend_limit:.2f}")
+            if state.phase in ("generate", "adapt"):
+                await self.work_in_vm(
+                    agents
+                )  # the proposer writes the phase's tasks, then the phase is "label"
+            elif state.phase == "label":
+                await self.label(agents)
+                self.next_pass()
 
     def adopt(self) -> None:
-        """The finished world, frozen: its final file with no tasks (their tables as the schema now has them), its board
-        and ledger, and the world author's last notes for the proposer to start from."""
+        """The finished world, frozen (its tables as the schema now has them, no tasks), and the world author's last
+        notes for the proposer to start from."""
         source = Workspace(self.settings.world / "world.sqlite")
         source.db.backup(self.world.db)
         source.close()
@@ -207,7 +123,12 @@ class ForgeEnv(SessionEnv):
         notes = self.settings.world / "attempts" / state.get("restore_point", "") / "notes"
         if state.get("restore_point") and notes.is_dir():
             shutil.copytree(notes, self.store.path("source", "notes"), dirs_exist_ok=True)
-        self.store.state.phase, self.store.state.batch, self.store.state.restore_point = "tasks", 0, "source"
+        self.store.state.phase, self.store.state.batch, self.store.state.restore_point = (
+            "generate",
+            0,
+            "source",
+        )
+        self.plan["planned"] = {f"i{n:03d}": {} for n in range(1, self.settings.tasks + 1)}
         self.store.event(
             "world_adopted",
             world=str(self.settings.world),
@@ -215,348 +136,223 @@ class ForgeEnv(SessionEnv):
         )
         self.store.save()
 
+    # ------------------------------------------------------------------ writing: the initial set, then its versions
+
+    def open_ids(self) -> list[str]:
+        return [t for t in self.plan["planned"] if t not in self.store.state.forged]
+
     async def blocks(self, agents, runtime, setup) -> None:
+        """The proposer's turns in one VM until the phase's tasks are written, or two turns in a row write none."""
         await runtime.run(["rm", "-f", *(f"/task/{name}" for name in SETUP_FILES)], {})
-        while self.store.state.phase == "tasks":
-            await self.forge_round(agents, runtime)
+        state = self.store.state
+        while state.phase in ("generate", "adapt"):
+            if not (ids := self.open_ids()) or self.plan.get("empty", 0) >= 2:
+                state.phase, self.plan["empty"] = "label", 0
+                self.store.save()
+                return
+            await self.turn(agents, runtime, ids[: self.settings.batch])
 
-    def written(self, ids: list[str]) -> list[str]:
-        return [t for t in ids if self.world.db.execute("SELECT 1 FROM tasks WHERE id = ?", (t,)).fetchone()]
-
-    async def forge_round(self, agents, runtime) -> None:
-        """One round: the proposer writes a candidate for each open id in a fresh interaction that starts from the last
-        round's notes; then the solver tries them, and what the judge approves is kept."""
-        state, cfg = self.store.state, self.settings
-        number = state.batch + 1
-        attempt = self.store.reserve("round", 2 * cfg.rounds)  # a round cut off is written again once
-        ids = [f"r{number:02d}-{n:02d}" for n in range(1, cfg.candidates + 1)]
-        self.allow(
-            ids,
-            rework={
-                t: o["rework"]
-                for t, o in state.forged.items()
-                if o.get("rework") and o["round"] == number - 1
-            },
-        )
+    async def turn(self, agents, runtime, ids: list[str]) -> None:
+        state = self.store.state
+        n = self.plan["turn"] = self.plan.get("turn", 0) + 1
+        attempt = self.store.begin(f"{'initial' if state.batch == 0 else f'adapt{state.batch}'}-{n:02d}")
+        versions = {t: v for t, v in self.plan["planned"].items() if t in ids and v}
+        self.allow(ids, versions)
         await self.bring_notes(runtime, state.restore_point)
         task = ProposerTask.create(self.world.path, self.tools_context(), attempt)
+        if state.batch == 0:
+            written = len(state.forged)
+            prompt = initial_prompt(
+                ids, written, self.settings.tasks, list(FAMILIES)[(n - 1) % len(FAMILIES)]
+            )
+        else:
+            prompt = adapt_prompt(ids)
         async with agents.proposer.interaction(task, runtime=runtime) as interaction:
-            for n in range(2):
-                if not (missing := [t for t in ids if t not in self.written(ids)]):
-                    break
-                held = self.world.db.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE parent IS NULL AND id NOT IN ("
-                    + ", ".join("?" * len(ids))
-                    + ")",
-                    ids,
-                ).fetchone()[0]
-                prompt = (
-                    forge_prompt(number, cfg.rounds, ids, held, cfg.tasks)
-                    if n == 0
-                    else f"These open ids have no candidate yet: {missing}. Write them with world_add_task, then end your turn."
-                )
-                await self.take_turn(interaction, runtime, prompt, attempt, "forge", self.pages())
+            await self.take_turn(interaction, runtime, prompt, attempt, "forge", self.pages(ids))
         self.store.trace(interaction.trace)
         require_session(interaction.trace)
         await self.keep_notes(runtime, attempt)
-        async with keep_awake(runtime, self.settings.keepalive):
-            added = await self.weigh(agents, attempt, self.written(ids))
-        state.batch, state.restore_point = number, attempt
-        counts = state.plans.setdefault("forge", {})
-        counts["idle"] = idle = 0 if added else counts.get("idle", 0) + 1
-        # It stops at its goal, when its rounds run out, or after two rounds that place nothing.
-        if number == cfg.rounds or self.done() or idle >= 2:
-            state.phase = "done"
-        self.store.finish_attempt(True)
-        self.store.save()
+        added = self.take(ids)
+        self.plan["empty"] = 0 if added else self.plan.get("empty", 0) + 1
+        state.restore_point = attempt
+        self.store.finish_attempt(bool(added))
 
-    async def weigh(self, agents, attempt: str, ids: list[str]) -> int:
-        """The round's candidates tried and reviewed (the screen, the solver's tries, the witness, the judge); those
-        the solver misses half the time or more are tried twice more with the messages their answer rests on. Each approved
-        one is placed in the archive. Returns how many it kept."""
-        state = self.store.state
-        if not ids:
-            return 0
-        self.tries.refresh_gold()
-        keys = {t: self.tries.task_key(t) for t in ids}
-        await self.tries.judge_tasks(agents, ids, keys, attempt, self.settings.tries)
-        approved = [t for t in ids if state.task_reviews.get(t, {}).get("key") == keys[t]]
-        low = [t for t in approved if state.task_reviews[t]["right_rate"] <= 0.5 and self.answers_on(t)]
-        hinted = await self.tries.solves(agents, low, attempt, 2, hint=True) if low else {}
-        for t in ids:
-            state.forged[t] = self.place(
-                t, state.task_reviews[t] if t in approved else None, hinted.get(t), attempt
-            )
-        self.store.save()
-        return sum(state.forged[t]["verdict"].startswith("kept") for t in ids)
+    def allow(self, ids: list[str], versions: dict) -> None:
+        """The ids the proposer's turn may write, and which task each version is of and why: its tools read them per
+        call."""
+        atomic_json(self.store.root / "writable.json", {"ids": list(ids), "versions": versions})
 
-    def answers_on(self, task_id: str) -> bool:
-        """Whether a task's answer rests on messages a hint can show."""
-        return bool(release_rows(self.store, "hint")[1][task_id].messages)
-
-    def place(self, task_id: str, review: dict | None, hinted, attempt: str) -> dict:
-        """One candidate's outcome. Its tries give its level; the lowest band also needs the witness to answer it
-        (hard, not broken), and every kept task needs a try that reached its gold from Slack, right and grounded
-        (`solution`). Its place is its family (a task with none: its category) and that level, which holds up
-        to `target` tasks (MAP-Elites over task features, as OMNI-EPIC keeps its archive). A newcomer to a full place
-        replaces a holder when it brings a structure the place lacks while two holders share one, or when the
-        solver's tries are more mixed on it than on the weakest holder, by 4p(1-p), the shorter question winning a
-        tie. A composite request's misses and right rates are counted by part."""
-        state, bands = self.store.state, self.settings.bands
-        row = self.world.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        gold = json.loads(row["gold_json"])
-        shape = features(self.world, task_id, gold)
-        out = {
-            "round": state.batch + 1,
-            "category": row["category"],
-            "intent": row["intent"],
-            "family": row["family"],
-            "declared": row["level"],
-            "question": row["question"],
-            "features": shape,
-        }
-        if review is None:
-            # Its tries ran before the review: how the solver did on it is the forge's own number all the same.
-            tried = [r for r in state.solves.get(task_id, {}).get("results", []) if r]
-            if any(not r.get("crashed") for r in tried):
-                measure = rates(tried)
-                out |= {
-                    "right": measure["right_rate"],
-                    "interval": measure["right_interval"],
-                    "tries": measure["tries"],
-                }
-            issues = [i.defect for i in state.task_issues.get(task_id, [])] + state.screens.get(
-                task_id, {}
-            ).get("failed", [])
-            readings = [i.removeprefix(READING) for i in issues if i.startswith(READING)]
-            # Another reading is the question's fault, not the solver's: the next round may reword it, for the same
-            # asker and gold answer; it is never kept as hard.
-            rework = (
-                {"answer": answer_of(self.world, task_id), "actor": row["actor_id"], "reading": readings[0]}
-                if readings
-                else None
-            )
-            self.drop(task_id, attempt, "another reading" if readings else "not approved")
-            if rework:
-                return out | {
-                    "verdict": "sent back: its question can be read another way",
-                    "issues": issues[:3],
-                    "rework": rework,
-                }
-            return out | {"verdict": "dropped: the judge did not approve it", "issues": issues[:3]}
-        right, witness = review["right_rate"], review.get("witness_right")
-        hint = rates([o for o, _ in hinted])["right_rate"] if hinted else None
-        level = measured_level(right, bands)
-        wrong = [r for r in state.solves[task_id]["results"] if not r.get("correct") and not r.get("crashed")]
-        misses = [{"answer": r.get("response", "")[:240], "why": r.get("reason", "")[:240]} for r in wrong][
-            :2
-        ]
-        classes = dict(miss_classes(self.world, task_id, state.solves[task_id]["results"]))
-        parts = right_by_part(self.world, task_id, state.solves[task_id]["results"])
-        heard = said(state, task_id, wrong, hinted) | {
-            k: v
-            for k, v in (
-                ("shapes", dict(miss_shapes(self.world, task_id, state.solves[task_id]["results"]))),
-                ("coverage", review.get("coverage")),
-                ("judge", review.get("reason")),
-            )
-            if v not in (None, {}, "")  # a coverage of 0 says the most
-        }
-        # tries that were cut (a hung request) or crashed and ran again: a rate resting on them is less sure
-        reruns = sum(1 for r in state.solves[task_id]["results"] if r.get("rerun"))
-        out |= (
-            {
-                "right": right,
-                "interval": review.get("right_interval"),
-                "tries": review.get("tries"),
-                "witness": witness,
-                "hint": hint,
-                "level": level,
-                "misses": misses,
-                "miss_classes": classes,
+    def take(self, ids: list[str]) -> int:
+        """The turn's tasks into the run: each kept file checked again (the world is the one it was checked on), with
+        its set and pass. Returns how many it took."""
+        state, taken = self.store.state, 0
+        written = [Task.model_validate(r["task"]) for r in state.forged.values()]
+        for task_id in ids:
+            path = self.store.root / "candidates" / f"{task_id}.json"
+            if not path.exists():
+                continue
+            task = Task.model_validate_json(path.read_bytes())
+            try:
+                check(self.world, task, written)
+            except (
+                ValueError
+            ) as error:  # its tool checked it: only another task of the turn can make it a repeat
+                self.store.event("task_refused", task_id=task_id, error=str(error)[:500])
+                continue
+            state.forged[task_id] = {
+                "task": task.model_dump(mode="json"),
+                "set": "initial" if task.why is None else task.why,
+                "pass": state.batch,
+                "key": key(task),
             }
-            | ({"reruns": reruns} if reruns else {})
-            | ({"parts": parts} if parts else {})
-            | heard
-        )
-        if bands[level - 1][0] == 0 and not witness:
-            self.drop(task_id, attempt, "neither solver answers it")
-            return out | {"verdict": "dropped: the witness does not answer it either: hard, or broken"}
-        if solution(self.store, task_id) is None:  # its gold rests on the ledger's word alone
-            self.drop(task_id, attempt, "no right and grounded try")
-            return out | {"verdict": "dropped: no try reached its gold from Slack, right and grounded"}
-        where, shaped = (
-            f"{row['family'] or row['category']}·L{level}",
-            bucket(shape) + (f"·{row['intent']}" if row["intent"] else ""),
-        )
-        mine = {
-            "task": task_id,
-            "score": 4 * right * (1 - right),
-            "words": len(row["question"].split()),
-            "right": right,
-            "bucket": shaped,
+            written.append(task)
+            taken += 1
+        self.store.event("tasks_taken", attempt=state.active_attempt, tasks=taken, of=len(ids))
+        self.store.save()
+        return taken
+
+    def pages(self, ids: list[str]) -> dict[str, str]:
+        """The forge's own memory pages: the tasks written, the families, and in an adapting turn what to write."""
+        state = self.store.state
+        tasks = ["# Tasks written (write new requests, never a repeat)", ""]
+        for task_id, record in state.forged.items():
+            task = Task.model_validate(record["task"])
+            tasks.append(
+                f"- {task_id} ({record['set']}, {task.family}, asked by {task.actor_id}): {task.question}\n  answer: "
+                + " | ".join(answer_text(task))
+            )
+        out = {
+            "memory/tasks.md": "\n".join(tasks) + "\n",
+            "memory/families.md": "# Families: the request a task is\n\n"
+            + "\n".join(f"- {k}: {v}" for k, v in FAMILIES.items())
+            + "\n",
         }
-        holders = state.archive.setdefault(where, [])
-        if len(holders) >= self.settings.target:
+        if state.batch:
+            out["memory/adapt.md"] = self.adapt_page(ids)
+        return out
 
-            def weakest(hs):
-                return min(hs, key=lambda h: (h["score"], -h["words"]))
+    WHY = {
+        "harder": "The student answered it right {right} of {tries}. Write a harder version: add a part the request "
+        "needs, ask for the answer as of a moment, ask for every item where a reader would stop at one place, or ask "
+        "for what is not settled. Its difficulty comes from what the request needs, not from tool tedium.",
+        "easier": "The student never answered it ({right} of {tries}), though the verifier did. Write an easier version: "
+        "a sub-question, fewer parts, or the part it missed, asked alone.",
+        "repaired": "The judge refused it: {reason} Rewrite it so the judge's point is met: a request a colleague would "
+        "make, with one reading, each answer exactly what its part asks, resting on messages that state it.",
+    }
 
-            shared = [h for h in holders if [g["bucket"] for g in holders].count(h["bucket"]) > 1]
-            if shaped not in {h["bucket"] for h in holders} and shared:
-                out_ = weakest(shared)
-            elif (mine["score"], -mine["words"]) > (weakest(holders)["score"], -weakest(holders)["words"]):
-                out_ = weakest(holders)
-            else:
-                held = ", ".join(h["task"] for h in holders)
-                self.drop(task_id, attempt, f"{where} is full")
-                return out | {
-                    "verdict": f"dropped: {where} is full ({held}), with tasks as mixed or more and its structure"
-                }
-            holders.remove(out_)
-            self.drop(out_["task"], attempt, f"replaced by {task_id}")
-            state.forged[out_["task"]]["verdict"] = f"replaced by {task_id}"
-        self.world.db.execute("UPDATE tasks SET level = ? WHERE id = ?", (level, task_id))
-        holders.append(mine)
-        return out | {"verdict": f"kept in {where} as {shaped}"}
-
-    def covered(self) -> tuple[dict, list[str]]:
-        """What the archive covers: its tasks per place (family, or category for a task with none) and level, and the
-        board's entries no kept task rests on (a kept task, or a part of one, of the entry's category on one of its
-        facts)."""
-        kept = {
-            (c, lvl): n
-            for c, lvl, n in self.world.db.execute(
-                "SELECT COALESCE(family, category), level, COUNT(*) FROM tasks WHERE parent IS NULL GROUP BY 1, 2"
-            )
-        }
-        rests = {
-            (c, f)
-            for c, f in self.world.db.execute(
-                "SELECT t.category, tf.fact_id FROM tasks t JOIN task_facts tf ON tf.task_id = t.id"
-            )
-        }
-        # A chapter's world: its brief is the board, and an earlier version's entries were covered by that version's
-        # own tasks, which stay with it.
-        ours = brief(self.world) or None
-        open_ = [
-            slot
-            for slot, facts in self.world.db.execute(
-                "SELECT slot, group_concat(fact_id) FROM board GROUP BY slot"
-            )
-            if (ours is None or slot in ours)
-            and not any((slot.split("-l")[0], f) in rests for f in facts.split(","))
-        ]
-        return kept, sorted(open_)
-
-    def done(self) -> bool:
-        """The forge is at its goal: the archive holds `tasks` tasks, and every board entry is covered."""
-        kept, open_ = self.covered()
-        return not open_ and sum(kept.values()) >= self.settings.tasks
-
-    def drop(self, task_id: str, attempt: str, why: str) -> None:
-        forget(self.world, task_id)
-        self.store.event("candidate_dropped", attempt=attempt, task_id=task_id, why=why)
-
-    def pages(self) -> dict[str, str]:
-        """The forge's own memory pages, beside the world's: the tasks written, the taxonomy, the board the world was
-        planned for, and the archive:
-        what each category and level holds against its target, the board's open entries, each kept task, and every
-        candidate of the last two rounds with its tries, its traps and how the solver went wrong (SENTINEL's failure-driven
-        proposer, 2606.12908)."""
-        kept, open_ = self.covered()
-        board = ["# Board: the tasks the world was planned for, and the facts each rests on", ""]
-        for slot, facts in self.world.db.execute(
-            "SELECT slot, group_concat(fact_id, ', ') FROM board GROUP BY slot ORDER BY slot"
-        ):
-            board.append(f"- {slot}: {facts}" + ("  (open)" if slot in open_ else "  (covered)"))
-        lines = [
-            "# Archive",
-            "",
-            f"Goal: {self.settings.tasks} kept tasks, at most {self.settings.target} per family and level, and every board entry covered. It holds {sum(kept.values())}. The solver tries each candidate {self.settings.tries} times.",
-            "",
-        ]
-        older = sorted({c for c, _ in kept if c not in FAMILIES})  # tasks with no family, placed by category
-        for place in [*FAMILIES, *older]:
-            lines.append(
-                f"- {place}{'' if place in FAMILIES else ' (no family)'}: "
-                + " · ".join(
-                    f"L{lvl} {kept.get((place, lvl), 0)}/{self.settings.target}"
-                    for lvl in range(1, len(self.settings.bands) + 1)
-                )
-            )
-        lines += [
-            "",
-            f"Board entries no kept task rests on: {', '.join(open_) or 'none'}",
-            "",
-            "## Kept (a full place takes a newcomer only if the solver's tries are more mixed on it, or it brings a new structure)",
-        ]
-        for where, holders in sorted(self.store.state.archive.items()):
-            full = " (full)" if len(holders) >= self.settings.target else ""
-            for held in holders:
-                question = self.world.db.execute(
-                    "SELECT question FROM tasks WHERE id = ?", (held["task"],)
-                ).fetchone()
-                lines.append(
-                    f"- {where}{full}: {held['task']}, right {held['right']:.2f}, structure {held['bucket']}: {question[0] if question else ''}"
-                )
-        last = [t for t, o in self.store.state.forged.items() if o["round"] >= self.store.state.batch - 1]
-        lines += ["", "## The last rounds' candidates"]
-        for t in last:
-            o = self.store.state.forged[t]
-            tried = (
-                f"right {o['right']:.2f} of {o['tries']} {o.get('interval')}, witness {o.get('witness')}, hint {o.get('hint')}"
-                + (f", {o['reruns']} tried again after a cut or a crash" if o.get("reruns") else "")
-                if "right" in o
-                else ""
-            )
-            lines.append(
-                f"- {t} ({o.get('family') or '-'}, {o['category']}, written as L{o['declared']}): {o['question']}\n  {tried} → {o['verdict']}; structure {bucket(o['features']) if o['features'] else '-'}"
-                + heard_page(o)
-                + "".join(
-                    f"\n  the solver answered: {m['answer']!r}; the grade: {m['why']!r}"
-                    for m in o.get("misses", [])
-                )
-                + "".join(f"\n  issue: {i}" for i in o.get("issues", []))
-            )
-            if o.get("rework") and o["round"] == self.store.state.batch:
-                lines.append(
-                    f'  reword it this round: world_add_task with rewords="{t}", asked by {o["rework"]["actor"]}, whose gold answer stays {o["rework"]["answer"]}'
-                )
-        lines += ["", "## What this forge has measured (its own tries, by family and category)"]
-        lines += measured(self.store.state.forged) or ["- nothing yet"]
-        taxonomy = ["# Taxonomy: the categories and levels a candidate takes", ""]
-        for category, spec in self.settings.taxonomy.items():
-            taxonomy += [
-                f"## {category}",
-                spec.definition,
-                f"gold: {spec.gold}; answer types: {', '.join(spec.answer_types)}",
+    def adapt_page(self, ids: list[str]) -> str:
+        """What each open version is of, how its source went, and what to write."""
+        state, lines = self.store.state, ["# Versions to write", ""]
+        for task_id in ids:
+            version = self.plan["planned"][task_id]
+            record = state.forged[version["variant_of"]]
+            task = Task.model_validate(record["task"])
+            measured = record.get("rates") or {}
+            wrong = [
+                (r.get("response") or "")[:300]
+                for r in state.solves.get(task.id, {}).get("results", [])
+                if r and not r.get("crashed") and not r.get("correct")
             ]
-            taxonomy += [
-                f"- level {lvl}: {text} (for example: {'; '.join(spec.concepts[lvl - 1])})"
-                for lvl, text in enumerate(spec.levels, 1)
+            lines += [
+                f"## {task_id}: {'an' if version['why'] == 'easier' else 'a'} {version['why']} version of {task.id} "
+                f"(variant_of={task.id}, why={version['why']})",
+                f"- its request ({task.family}, asked by {task.actor_id}): {task.question}",
+                "- its answer: " + " | ".join(answer_text(task)),
+                f"- the student: right {measured.get('right_rate')} of {measured.get('tries')} tries"
+                + (
+                    "; by part: " + ", ".join(f"{k} {v:.2f}" for k, v in record["parts"].items())
+                    if record.get("parts")
+                    else ""
+                ),
             ]
-            taxonomy.append("")
-        taxonomy += [
-            "# Families: the request a task is, a person's to a colleague who reads Slack for them (name one on each "
-            "candidate)",
-            "",
+            lines += [f"- a wrong answer: {w!r}" for w in wrong[:2]]
+            lines.append(
+                "- what to write: "
+                + self.WHY[version["why"]].format(
+                    right=round((measured.get("right_rate") or 0) * (measured.get("tries") or 0)),
+                    tries=measured.get("tries"),
+                    reason=(record.get("ruling") or {}).get("reason", ""),
+                )
+            )
+            lines.append("")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ labelling: verify, measure, judge
+
+    async def label(self, agents) -> None:
+        """Every task of the pass labelled side by side, each step kept as it lands. A task whose step fails is marked
+        failed and the others go on; most of them failing is the run's stop."""
+        state = self.store.state
+        due = [t for t, r in state.forged.items() if r["pass"] == state.batch and "label" not in r]
+        outcomes = await asyncio.gather(*(self.label_one(agents, t) for t in due), return_exceptions=True)
+        failed = {t: o for t, o in zip(due, outcomes) if isinstance(o, BaseException)}
+        for task_id, error in failed.items():
+            if isinstance(error, asyncio.CancelledError):
+                raise error
+            state.forged[task_id]["failed"] = f"{type(error).__name__}: {error}"[:500]
+            self.store.event("task_failed", task_id=task_id, error=state.forged[task_id]["failed"])
+        self.store.save()
+        if failed and len(failed) * 2 > len(due):
+            raise RuntimeError(
+                f"labelling failed for {len(failed)} of {len(due)} tasks: {next(iter(failed.values()))}"
+            )
+
+    async def label_one(self, agents, task_id: str) -> None:
+        record = self.store.state.forged[task_id]
+        record.pop("failed", None)
+        task, task_key = Task.model_validate(record["task"]), record["key"]
+        verified = await self.tries.verify(agents, task, task_key)
+        record["agree"] = len(agreeing(verified))
+        record["verified"] = record["agree"] >= 2
+        if record["verified"]:
+            measured = await self.tries.measure(agents, task, task_key)
+            record["rates"] = rates(measured)
+            if record["rates"]["right_rate"] is None:
+                raise RuntimeError("every one of the student's tries crashed")
+            record["parts"] = by_part(task, measured)
+            if "ruling" not in record:
+                ruling, usage = await rule(self.settings.judge, self.world, task, verified, measured)
+                record["ruling"], record["usage"] = ruling.model_dump(), usage
+            record["approved"] = all(
+                record["ruling"][k] for k in ("realistic", "one_reading", "exact", "supported")
+            )
+        record["label"] = label_of(record, self.settings.solved)
+        self.store.event("task_labelled", task_id=task_id, label=record["label"], agree=record["agree"])
+        self.store.save()
+
+    # ------------------------------------------------------------------ the next pass
+
+    def next_pass(self) -> None:
+        """After a labelled pass: an adapting pass when one is left and it has tasks to write (a harder version of each
+        solved task, an easier one of each unsolved task, a repaired one of each verified task the judge refused), else
+        done."""
+        state = self.store.state
+        sources = [
+            (t, why)
+            for t, r in state.forged.items()
+            if r["pass"] == state.batch
+            for why in [
+                {"solved": "harder", "unsolved": "easier"}.get(r.get("label"))
+                or ("repaired" if r.get("label") == "rejected" and r.get("verified") else None)
+            ]
+            if why
         ]
-        taxonomy += [f"- {k}: {v}" for k, v in FAMILIES.items()]
-        tasks = [
-            task_page(dict(t))
-            for t in self.world.db.execute("SELECT * FROM tasks WHERE parent IS NULL ORDER BY id")
-        ]
-        return {
-            "memory/tasks.md": "# Tasks\n" + "\n".join(tasks) + "\n",
-            "memory/board.md": "\n".join(board) + "\n",
-            "memory/archive.md": "\n".join(lines) + "\n",
-            "memory/taxonomy.md": "\n".join(taxonomy) + "\n",
-        }
+        if state.batch >= self.settings.adapt or not sources:
+            state.phase = "done"
+        else:
+            state.batch += 1
+            self.plan["planned"] = {
+                f"{why[0]}{state.batch}{n:02d}": {"variant_of": t, "why": why}
+                for n, (t, why) in enumerate(sources, 1)
+            }
+            self.plan["turn"], state.phase = 0, "adapt"
+        self.store.event("pass_labelled", passed=state.batch, next=state.phase, versions=len(sources))
+        self.store.save()
 
 
 def dry_run(config: ForgeConfig) -> dict:
-    """What a forge would start from, spending nothing: the world, its board, its goal, and the rounds."""
+    """What a forge would start from, spending nothing."""
     world = Workspace(config.world / "world.sqlite")
 
     def count(table):
@@ -566,14 +362,16 @@ def dry_run(config: ForgeConfig) -> dict:
         "world": str(config.world),
         "world_hash": file_hash(config.world / "world.sqlite"),
         "messages": count("messages"),
-        "facts": count("facts"),
-        "board": dict(world.db.execute("SELECT slot, group_concat(fact_id, ', ') FROM board GROUP BY slot")),
+        "people": count("users"),
         "tasks": config.tasks,
-        "target": config.target,
-        "measure": config.measure,
-        "rounds": config.rounds,
-        "candidates": config.candidates,
+        "batch": config.batch,
+        "adapt": config.adapt,
         "tries": config.tries,
+        "verify": config.verify,
         "proposer": config.env.proposer.model,
+        "verifier": config.env.verifier.model,
         "solver": config.env.solver.model,
+        "judge": config.judge.model,
+        "spend_limit": config.spend_limit,
+        "labels": list(KEPT) + ["rejected"],
     }

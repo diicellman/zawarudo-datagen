@@ -1,53 +1,32 @@
-# One forge: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-w1.toml [--dry-run]
-# FW1: tasks on W1 (data/v8-02/w1), solved by the student, DeepSeek V4.1 flash. W1 has no brief, so its board is
-# empty: the proposer finds its material in the world itself (world_profile) and probes it. A place holds every task
-# the rounds can give, so nothing valid is dropped for room; curating by place is left to a later forge.
+# The pilot of the forge on W1: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-w1.toml
+# 36 initial tasks, then their harder, easier and repaired versions: about 65 tasks, for the user to label.
 world = "data/v8-02/w1"
-output = "data/v8-02/forge-w1"
-taxonomy = "configs/worldgen_slack/taxonomy.toml"
-tasks = 36                # the goal: every candidate the rounds write, kept if valid
-target = 36               # the tasks one place (a family and a measured level) holds: no room limit
-rounds = 3
-candidates = 12           # one round's candidates, tried 8 times each
+output = "data/v8-04/forge-w1"
+tasks = 36
+batch = 12
+adapt = 1
+tries = 8
+verify = 2
+spend_limit = 40.0
 
-# Per level, the band of the solver's right-answer rate a task of that level measures in: level 1 anchors that most
-# tries get right; level 4 tasks the solver rarely answers, and the witness must.
-bands = [[0.75, 1.0], [0.5, 0.75], [0.25, 0.5], [0.0, 0.25]]
-max_answer_rows = 12      # exhaustive sets: a set of n is right about p^n of the time (WideSearch)
-tries = 8                 # the solver's tries of a candidate, sampled at temperature 1
-keepalive = 600           # seconds between pings of the proposer's VM while the solver and the judge work
-
-# One model per seat. Unset fields (harness, runtime, sampling) keep the seat defaults in config.py.
-[env.timeout]
-episode = 43200
-finalize = 300
-
-# The proposer: the world author's model, its prompt cached for an hour, as a round keeps it waiting while the solver
-# tries the candidates.
+# One model per seat. The proposer is smaller than the models that check its tasks, so none judges its own writing;
+# the student, whose pass rates select the tasks, is of another family; unset fields keep the seat defaults.
 [env.proposer]
-model = "anthropic/claude-opus-5.5"
+model = "z-ai/glm-5.3-flash"
 
-[env.proposer.sampling]
-cache_control = { type = "ephemeral", ttl = "1h" }
-
-# The judge, the witness and the answer judge: GLM 5.3, thinking at "high", the middle of its three efforts (low,
-# high, max). OpenAI's models refuse this account.
-[env.judge]
+[env.verifier]            # reaches each task's answer from Slack, or the task is dropped
 model = "z-ai/glm-5.3"
 
-[env.judge.sampling]
-reasoning_effort = "high"
-
-[env.solver]
+[env.solver]              # the student
 model = "deepseek/deepseek-v4.1-flash"
 
-[env.witness]             # tries the tasks the solver rarely answers: hard, or broken?
+[judge]                   # the task judge: realistic, one reading, exact, supported
 model = "z-ai/glm-5.3"
 
-[env.witness.sampling]
+[judge.sampling]
 reasoning_effort = "high"
 
-[answer_judge]
+[answer_judge]            # grades every try against a task's answer
 model = "z-ai/glm-5.3"
 
 [answer_judge.sampling]

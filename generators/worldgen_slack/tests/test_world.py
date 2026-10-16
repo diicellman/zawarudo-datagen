@@ -16,9 +16,8 @@ from worldgen_slack import slack
 from ..config import Category, Needs
 from ..evidence import IDENTIFIER
 from ..forge.config import ForgeConfig, load_forge
-from ..forge.difficulty import failure_cases, features, panel
 from ..forge.proposer.task import ProposerTask
-from ..forge.tasks import Task, record_task
+from ..forge.tasks import Part, Task, check
 from ..workspace import Workspace
 from ..world import integrations
 from ..world.author.memory import files, ledger_digest
@@ -91,7 +90,6 @@ from ..world.writing import (
     today_line,
 )
 from .support import (
-    BANDS,
     TAXONOMY,
     author_context,
     contracts_settings,
@@ -111,20 +109,17 @@ from .support import (
 
 
 def test_contracts(tmp_path):
-    """Documents become rows only through deterministic rules: the cast, the premise, the organization, the tasks
-    on a planned ledger (T2-T7), the agenda of everyday conversations; no literal times."""
+    """Documents become rows only through deterministic rules: the cast, the premise, the organization, the planned
+    ledger, the agenda of everyday conversations; no literal times."""
     settings = contracts_settings(tmp_path)
-    tasks = forge_of(settings)
     for wrong in ({"concepts": [["x"]]}, {"needs": [{}]}, {"concepts": [["x"], [], ["y"]]}):
         fails(Category.model_validate, settings.taxonomy["semantic"].model_dump() | wrong)
     toml = tmp_path / "forge.toml"
-    toml.write_text(
-        f'world = "{tmp_path}"\noutput = "{tmp_path / "forge"}"\ntaxonomy = "{TAXONOMY}"\nbands = {json.dumps(BANDS)}\n'
-    )
-    assert load_forge(toml).taxonomy == tasks.taxonomy, "a forge reads the taxonomy its config names"
-    whole = tasks.model_dump(mode="json")
-    fails(ForgeConfig.model_validate, whole | {"bands": whole["bands"][:2]})  # 3 levels
-    fails(ForgeConfig.model_validate, whole | {"bands": [[0.5, 0.25]] * len(whole["bands"])})
+    toml.write_text(f'world = "{tmp_path}"\noutput = "{tmp_path / "forge"}"\ntasks = 4\n')
+    assert load_forge(toml).tasks == 4, "a forge reads its config"
+    whole = forge_of(settings).model_dump(mode="json")
+    fails(ForgeConfig.model_validate, whole | {"tries": 1})  # one try measures nothing
+    fails(ForgeConfig.model_validate, whole | {"taxonomy": str(TAXONOMY)})  # a forge has no taxonomy
     jobs = ["software_developer"] * 3 + ["accountant_or_auditor"] * 2 + ["manager"]
     people = [seed_person(i).model_copy(update={"occupation": job}) for i, job in enumerate(jobs)]
     (tmp_path / "p.jsonl").write_text("".join(p.model_dump_json() + "\n" for p in people))
@@ -233,444 +228,6 @@ def test_contracts(tmp_path):
         start_clock(copy)
         record_plan(copy, ledger_plan(ops, leads, a, b), settings)
 
-    def slot(category, level, id="t1"):
-        return Slot(id=id, category=category, level=level, concept="a concept", style="a style")
-
-    def task(
-        id="t1",
-        category="search",
-        sql="SELECT value AS answer FROM facts WHERE id = 'f1'",
-        facts=("f1",),
-        **extra,
-    ):
-        return Task(
-            id=id,
-            category=category,
-            level=1,
-            actor_id=c,
-            question="Which way did the release go?",
-            answer_type="text",
-            gold_sql=sql,
-            facts=list(facts),
-        ).model_copy(update=extra)
-
-    def recorded(task_, slot_, settings_=None, setup=lambda copy: None):
-        """The tasks once this one is recorded into its slot, on a dropped trial."""
-        try:
-            with world.trial() as copy:
-                setup(copy)
-                record_task(copy, task_, settings_ or tasks, slot_)
-                raise LookupError([r[0] for r in copy.db.execute("SELECT id FROM tasks ORDER BY id")])
-        except LookupError as out:
-            return out.args[0]
-
-    search, found = task(), slot("search", 1)
-    rejected = {
-        "T6 its slot's cell": (search, slot("search", 2)),
-        "T6 its slot's id": (search, slot("search", 1, id="t2")),
-        "T2 sql reads facts": (task(category="lookup"), slot("lookup", 1)),
-        "T2 ledger reads no facts": (task(sql="SELECT real_name AS answer FROM users LIMIT 1"), found),
-        "T2 hybrid reads no workspace": (task(category="hybrid"), slot("hybrid", 1)),
-        "T4 no facts": (task(facts=()), found),
-        "T3 refusal with rows": (
-            task(category="robustness", answer_type="refusal", sql="SELECT 1 AS answer", facts=()),
-            slot("robustness", 1),
-        ),
-        "T3 too many rows": (task(answer_type="set", sql="SELECT value AS answer FROM facts"), found),
-        "T3 text answer of 2 rows": (task(sql="SELECT value AS answer FROM facts LIMIT 2"), found),
-        "T3 no answer column": (task(sql="SELECT value FROM facts WHERE id = 'f1'"), found),
-        "T5 giveaway": (task(question="Was it a rollback for the release?"), found),
-        "unreadable fact": (
-            task(sql="SELECT value AS answer FROM facts WHERE id = 'f3'", facts=("f3",)),
-            found,
-        ),
-    }
-    for name, (task_, slot_) in rejected.items():
-        # else task accepted: {name}
-        with pytest.raises(ValueError):
-            recorded(task_, slot_)
-    directory = task(
-        category="lookup", sql=f"SELECT real_name AS answer FROM users WHERE id = '{d}'", facts=()
-    )
-    assert "t1" in recorded(directory, slot("lookup", 1)), "a task may rest on no facts"
-    # A gold query asks only about what the tools show: who reacted, never when (S3's reactions "made on Aug 18").
-    for unshown in (
-        "SELECT u.real_name AS answer FROM reactions r JOIN users u ON u.id = r.user_id WHERE r.created_us > 0",
-        "SELECT real_name AS answer FROM users WHERE created_us > 0 LIMIT 1",
-        "SELECT name AS answer FROM channels WHERE creator_id IS NOT NULL LIMIT 1",
-    ):
-        refused(
-            "which no Slack tool shows",
-            recorded,
-            task(category="lookup", sql=unshown, facts=()),
-            slot("lookup", 1),
-        )
-    nobody = task(
-        category="robustness",
-        answer_type="refusal",
-        sql="SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'",
-        facts=(),
-    )
-    assert "t1" in recorded(nobody, slot("robustness", 1)), "nor a refusal"
-    with world.trial() as copy:
-        record_task(copy, search, tasks, found)
-    assert json.loads(world.db.execute("SELECT gold_json FROM tasks").fetchone()[0]) == [
-        {"answer": "rollback"}
-    ]
-    assert world.db.execute("SELECT concept FROM tasks").fetchone()[0] == "a concept", (
-        "the slot's concept is stored"
-    )
-    fails(record_task, world, task(id="t2"), tasks, slot("search", 1, id="t2"))  # t1 asks it
-    refused(
-        "its answer differs for them",
-        record_task,
-        world,
-        task(id="t2", actor_id=d),
-        tasks,
-        slot("search", 1, id="t2"),
-    )  # d asks it too, and gets t1's answer
-
-    def count(id, actor):
-        return Task(
-            id=id,
-            category="lookup",
-            level=1,
-            actor_id=actor,
-            question="How many private channels am I in?",
-            answer_type="number",
-            gold_sql="SELECT COUNT(*) AS answer FROM channels WHERE type = 'private'",
-        )
-
-    assert "t3" in recorded(
-        count("t3", c),
-        slot("lookup", 1, id="t3"),
-        setup=lambda copy: record_task(copy, count("t2", a), tasks, slot("lookup", 1, id="t2")),
-    ), "a perspective twin: another asker, another answer"
-
-    def settled(facts):  # a level-3 semantic task needs its facts first stated in 2 channels
-        sql = f"SELECT value AS answer FROM facts WHERE id = '{facts[-1]}'"
-        return Task(
-            id="t9",
-            category="semantic",
-            level=3,
-            actor_id=a,
-            question="What did the review settle?",
-            answer_type="text",
-            gold_sql=sql,
-            facts=facts,
-        )
-
-    # A level's needs, those its facts give: f1, f2 and f4 are first stated in #ops, f3 in #leads; f2 comes after f1,
-    # f4 after and over f3; a decoy counts where the task's actor can read it.
-    nine = slot("semantic", 3, id="t9")
-
-    def decoy(channel, id="f5", day=3, attribute="owner"):
-        return lambda copy: copy.insert(
-            "facts",
-            [
-                dict(
-                    id=id,
-                    storyline="s2",
-                    subject="Audit",
-                    attribute=attribute,
-                    value="Ines",
-                    channel_id=channel,
-                    author_id=a,
-                    day=day,
-                    summary="s",
-                    is_decoy=1,
-                )
-            ],
-        )
-
-    def retracted(channel, by="f4"):  # a decoy that a fact stated in `by`'s channel supersedes
-        def setup(copy):
-            decoy(channel)(copy)
-            copy.insert("fact_relations", [dict(src_fact=by, dst_fact="f5", kind="supersedes")])
-
-        return setup
-
-    def corrected_unseen(
-        copy,
-    ):  # the decoy's correction, another decoy, is only in #leads, which c cannot read
-        decoy(ops)(copy)
-        decoy(leads, id="f6")(copy)
-        copy.insert("fact_relations", [dict(src_fact="f6", dst_fact="f5", kind="supersedes")])
-
-    def measured_of(task_, slot_, setup=lambda copy: None):
-        """A task's measures once it is recorded into its slot, on a dropped trial."""
-        try:
-            with world.trial() as copy:
-                setup(copy)
-                raise LookupError(record_task(copy, task_, tasks, slot_))
-        except LookupError as out:
-            return out.args[0]
-
-    for facts, actor, setup, measure, want in (
-        (["f1", "f4"], a, None, "channels", 1),
-        (["f1", "f3"], a, None, "channels", 2),
-        (["f3", "f4"], a, None, "relations", 2),
-        (["f2", "f4"], c, decoy(ops), "decoys", 1),
-        (
-            ["f2", "f4"],
-            c,
-            corrected_unseen,
-            "decoys",
-            1,
-        ),  # its correction is out of c's sight: it still misleads
-        (["f2", "f4"], c, decoy(leads), "decoys", 0),  # c is not in #leads
-        (["f2", "f4"], c, retracted(ops), "decoys", 0),  # f4 corrects it in plain sight
-        (["f2", "f4"], c, decoy(ops, attribute="budget"), "decoys", 0),  # another attribute
-        (["f4", "f3"], a, decoy(ops), "decoys", 0),  # it answers f3's window, not the owner
-    ):
-        asked = settled(facts).model_copy(update={"actor_id": actor})
-        assert measured_of(asked, nine, setup or (lambda copy: None))[measure] == want, (facts, measure, want)
-    asked = settled(["f2", "f4"]).model_copy(update={"actor_id": c})
-
-    # A refusal rests on the truth its actor cannot see (f3, in #leads) beside the stale value it can (f7, in #ops).
-    def stale(copy):
-        return (
-            copy.insert(
-                "facts",
-                [
-                    dict(
-                        id="f7",
-                        storyline="s2",
-                        subject="Audit",
-                        attribute="window",
-                        value="full test",
-                        channel_id=ops,
-                        author_id=a,
-                        day=3,
-                        summary="s",
-                    )
-                ],
-            ),
-            copy.insert("fact_relations", [dict(src_fact="f3", dst_fact="f7", kind="supersedes")]),
-        )
-
-    unseen = Task(
-        id="t9",
-        category="robustness",
-        level=4,
-        actor_id=c,
-        question="When is the audit's full test?",
-        answer_type="refusal",
-        gold_sql="SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'",
-        facts=["f3", "f7"],
-    )
-    four = slot("robustness", 4, id="t9")
-    assert measured_of(unseen, four, stale)["decoys"] == 1, "its near-miss misleads"
-    assert measured_of(unseen.model_copy(update={"facts": ["f3"]}), four)["decoys"] == 0, (
-        "no stale value in sight"
-    )
-
-    # A status answer gives the latest value its actor can see (f7, in #ops), which a fact out of their sight settles
-    # (f3, in #leads): the useful answer gives it as not settled, where a refusal said nothing.
-    status = Task(
-        id="t9",
-        category="robustness",
-        level=3,
-        actor_id=c,
-        question="What is the audit's window?",
-        answer_type="status",
-        gold_sql="SELECT value AS answer FROM facts WHERE id = 'f7'",
-        facts=["f3", "f7"],
-    )
-    three = slot("robustness", 3, id="t9")
-    assert "t9" in recorded(status, three, tasks, stale)
-    refused(
-        "out of its actor's sight, that supersedes the value it gives",
-        recorded,
-        status.model_copy(update={"facts": ["f7"]}),
-        three,
-        tasks,
-        stale,
-    )  # nothing settles it
-    refused(
-        "which supersede the value it gives",
-        recorded,
-        status.model_copy(update={"actor_id": a}),
-        three,
-        tasks,
-        stale,
-    )  # a reads #leads: f3 is the answer
-    refused(
-        "gold gives the value of one of its facts its actor can read",
-        recorded,
-        status.model_copy(update={"gold_sql": "SELECT value AS answer FROM facts WHERE id = 'f3'"}),
-        three,
-        tasks,
-        stale,
-    )
-    refused(
-        "gold query reads the facts it answers from",
-        recorded,
-        status.model_copy(update={"gold_sql": "SELECT real_name AS answer FROM users LIMIT 1"}),
-        three,
-        tasks,
-        stale,
-    )
-
-    # The wrong answers a task's grade must reject: the near-miss its actor can read, and a hedge with it.
-    try:
-        with world.trial() as copy:
-            decoy(ops)(copy)
-            copy.insert(
-                "facts",
-                [
-                    dict(
-                        id="f6",
-                        storyline="s2",
-                        subject="Audit",
-                        attribute="owner",
-                        value="Mia",
-                        channel_id=leads,
-                        author_id=a,
-                        day=3,
-                        summary="s",
-                        is_decoy=1,
-                    )
-                ],
-            )  # out of c's sight
-            record_task(copy, asked, tasks, nine)
-            raise LookupError(failure_cases(copy, "t9", [{"answer": "Owen"}]))
-    except LookupError as out:
-        gold, cases = out.args[0]
-    assert (
-        gold == "Owen."
-        and ("the near-miss 'Ines'", "Ines.") in cases
-        and ("a hedge", "Either Owen or Ines; I can't tell which.") in cases
-    ), cases
-    assert not [c for c in cases if "Mia" in c[1]], "a value its actor cannot see is no near-miss"
-
-    # Lazy solvers over a chain: "full test" (f7, #ops) is settled as "dry run" (f3, #leads), then a decoy repeats
-    # "rehearsal" in #ops. Taking the first or the latest value is wrong; the truth sits in a private channel, later.
-    def chain(copy):
-        stale(copy)
-        copy.insert(
-            "facts",
-            [
-                dict(
-                    id="f8",
-                    storyline="s2",
-                    subject="Audit",
-                    attribute="window",
-                    value="rehearsal",
-                    channel_id=ops,
-                    author_id=b,
-                    day=3,
-                    summary="s",
-                    is_decoy=1,
-                )
-            ],
-        )
-        (day3,) = copy.db.execute("SELECT start_us FROM calendar WHERE day = 3").fetchone()
-        copy.db.execute("UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(day3 + 14_400_000_000),))
-        said = copy.insert(
-            "messages",
-            [
-                dict(channel_id=ch, ts_us=day3 + h * 3_600_000_000, user_id=u, text=t)
-                for h, ch, u, t in (
-                    (1, ops, a, "full test it is"),
-                    (2, leads, a, "dry run it is"),
-                    (3, ops, b, "rehearsal it is"),
-                )
-            ],
-        )
-        copy.insert(
-            "evidence",
-            [dict(fact_id=f, message_id=m, role="anchor") for f, m in zip(("f7", "f3", "f8"), said)],
-        )
-
-    window = Task(
-        id="t9",
-        category="semantic",
-        level=3,
-        actor_id=a,
-        question="What is the audit's window?",
-        answer_type="text",
-        gold_sql="SELECT value AS answer FROM facts WHERE id = 'f3'",
-        facts=["f3", "f7"],
-    )
-    try:
-        with world.trial() as copy:
-            chain(copy)
-            record_task(copy, window, tasks, nine)
-            count = Task(
-                id="t8",
-                category="lookup",
-                level=1,
-                actor_id=a,
-                question="How many messages are there?",
-                answer_type="number",
-                gold_sql="SELECT COUNT(*) AS answer FROM messages",
-            )
-            counted = record_task(copy, count, tasks, slot("lookup", 1, id="t8"))["gold"]
-            who = window.model_copy(
-                update={
-                    "id": "t7",
-                    "question": "Who settled the audit's window?",
-                    "gold_sql": "SELECT u.real_name AS answer FROM facts f JOIN users u ON u.id = f.author_id WHERE f.id = 'f3'",
-                }
-            )
-            settler = record_task(copy, who, tasks, slot("semantic", 3, id="t7"))["gold"]
-            raise LookupError(
-                (
-                    panel(copy, "t9", [{"answer": "dry run"}]),
-                    features(copy, "t9", [{"answer": "dry run"}]),
-                    features(copy, "t8", counted),
-                    features(copy, "t7", settler),
-                )
-            )
-    except LookupError as out:
-        lazy, shape, counting, settled_by = out.args[0]
-    assert settled_by["last_link"] == "private·later", "a person's answer is placed by the fact it is about"
-    assert (
-        {k: lazy["guesses"][k] for k in ("first", "latest", "top")}
-        == {"first": "full test", "latest": "rehearsal", "top": "rehearsal"}
-        and {"first", "latest", "top"} <= set(lazy["traps"])
-        and not lazy["shortcut"]
-    ), lazy
-    assert (shape["changes"], shape["last_link"], shape["perspective"]) == (3, "private·later", False), shape
-    assert counting["perspective"] and counting["derived"], (
-        "a count differs by who asks, and no message states it"
-    )
-
-    def stated_unseen(copy):  # the truth, f3, is stated in #leads on day 3, where c cannot read it
-        stale(copy)
-        (day3,) = copy.db.execute("SELECT start_us FROM calendar WHERE day = 3").fetchone()
-        copy.db.execute("UPDATE world_meta SET value = ? WHERE key = 'now_us'", (str(day3 + 7_200_000_000),))
-        (truth,) = copy.insert(
-            "messages", [dict(channel_id=leads, ts_us=day3 + 3_600_000_000, user_id=a, text="dry run it is")]
-        )
-        copy.insert("evidence", [dict(fact_id="f3", message_id=truth, role="anchor", anchor_token="dry run")])
-
-    assert "t9" in recorded(status, three, tasks, stated_unseen), (
-        "a status rests on its truth stated out of sight"
-    )
-    try:
-        with world.trial() as copy:
-            stated_unseen(copy)
-            raise LookupError(record_task(copy, unseen, tasks, four))
-    except LookupError as out:
-        measured = out.args[0]
-    assert (measured["unseen"], measured["evidence_pages"], measured["decoys"]) == (1, None, 1), (
-        "evidence its actor cannot read is counted, and measured from no view"
-    )
-    hybrid = dict(
-        category="hybrid",
-        level=1,
-        actor_id=c,
-        answer_type="number",
-        gold_sql="SELECT COUNT(*) AS answer FROM messages m, facts f WHERE f.id = 'f1'",
-    )
-    unread = Task(
-        id="h1", question="How many messages surround the decision?", facts=["f3"], **hybrid
-    )  # in leads
-    fails(record_task, world, unread, tasks, slot("hybrid", 1, id="h1"))  # its actor cannot read its fact
-    read = Task(id="h1", question="How many messages surround the rollback?", facts=["f1"], **hybrid)
-    assert "h1" in recorded(read, slot("hybrid", 1, id="h1"))
     small = settings.activity.model_copy(update={"conversation_lines": 4})
     plan = background_plan(world, org(), small, 7, 2, 12)  # a day's agenda: 12 messages of everyday talk
     members = {(r[0], r[1]) for r in world.db.execute("SELECT channel_id, user_id FROM members")}
@@ -705,7 +262,7 @@ def test_contracts(tmp_path):
         "v2",
     ]
     # Every seat that runs code needs an immutable VM with no egress: the world's author, and the forge's proposer.
-    for config, seat in ((settings, "author"), (tasks, "proposer")):
+    for config, seat in ((settings, "author"), (forge_of(settings), "proposer")):
         agent = getattr(config.env, seat)
         loose = agent.model_copy(
             update={"runtime": agent.runtime.model_copy(update={"image": "python:3.12-slim"})}
@@ -855,21 +412,14 @@ def test_apps(tmp_path):
     ), "no quota counts a bot"
     drawn = background_plan(world, org, settings.activity, 3, 2, 40)
     assert not {p for s in drawn for p in s.participants} & set(apps_), "no scene draws a bot"
-    fails(
-        record_task,
-        world,
-        Task(
-            id="t9",
-            category="lookup",
-            level=1,
-            actor_id=bot,
-            question="q?",
-            answer_type="number",
-            gold_sql="SELECT COUNT(*) AS answer FROM messages",
-        ),
-        settings,
-        Slot(id="t9", category="lookup", level=1, concept="c", style="s"),
+    asked_by_bot = Task(
+        id="t9",
+        family="status",
+        actor_id=bot,
+        question="How many builds went out?",
+        parts=[Part(label="how many", answer_type="number", answer=["3"], evidence=[1])],
     )
+    refused("no person in the workspace", check, world, asked_by_bot, [])  # an app asks nothing
     reader = Workspace(world.path, actor=c)
     assert (
         not slack.read(reader, "search_public_and_private", {"keywords": ["production"]})["items"]
@@ -1394,30 +944,6 @@ def test_clock(tmp_path):
         pass
     rng = random.Random(5)
 
-    slots = [
-        Slot(id="t1", category="semantic", level=3, concept="a concept", style="a style"),
-        Slot(id="t2", category="lookup", level=1, concept="a concept", style="a style"),
-    ]
-    owner = Task(
-        id="t1",
-        category="semantic",
-        level=3,
-        actor_id=a,
-        question="Who owns the audit after the dry run?",
-        answer_type="text",
-        gold_sql="SELECT value AS answer FROM facts WHERE id = 'f4'",
-        facts=["f3", "f4"],
-    )
-
-    def tasked(task, setup=lambda copy: None):
-        """A task written into its slot of the closed world, as the forge writes one: it replaces the slot's task."""
-        slot = next(s for s in slots if s.id == task.id)
-        with world.trial() as copy:
-            setup(copy)
-            copy.db.execute("DELETE FROM task_facts WHERE task_id = ?", (task.id,))
-            copy.db.execute("DELETE FROM tasks WHERE id = ?", (task.id,))
-            return record_task(copy, task, forge_of(settings), slot)
-
     def posted_(conversation):
         with world.trial() as copy:
             return post(copy, conversation, settings, rng, gaps)
@@ -1769,51 +1295,6 @@ def test_clock(tmp_path):
         e == f"{promises_made(world, 1)} promises made today; the day holds at least 2 (a line's commits)"
         for e in close_day(world, promising, 1)
     ), "a day makes its promises"
-    refused("t1 is a semantic level 3 task", tasked, owner.model_copy(update={"level": 2}))
-    result = tasked(owner)
-    assert result["gold"] == [{"answer": "Owen"}] and result["bm25_rank"] and result["channels"] == 2, result
-    assert "depth_share" in result and result["hidden"] is False, "rank and depth are measured, and reported"
-    # What its messages give: where its answer is stated beside its near-misses, what the question names.
-    assert tasked(owner.model_copy(update={"facts": ["f1", "f4"]}))["channels"] == 1, "both in #ops"
-
-    def earlier(copy):
-        return copy.insert(
-            "facts",
-            [
-                dict(
-                    id="f8",
-                    storyline="s2",
-                    subject="Audit",
-                    attribute="owner",
-                    value="Ines",
-                    channel_id=ops,
-                    author_id=a,
-                    day=2,
-                    summary="s",
-                    is_decoy=1,
-                )
-            ],
-        )
-
-    assert tasked(owner, earlier)["hidden"], "stated after every near-miss"
-    leads_named = owner.model_copy(update={"question": "Who owns the audit after the dry run in #leads?"})
-    assert tasked(leads_named)["named"] == 1
-    tasked(owner)
-    replier = Task(
-        id="t2",
-        category="lookup",
-        level=1,
-        actor_id=c,
-        question="Who said thanks in #ops?",
-        answer_type="text",
-        gold_sql="SELECT u.real_name AS answer FROM messages m JOIN users u ON u.id = m.user_id WHERE m.text = 'thanks'",
-    )
-    tasked(replier.model_copy(update={"question": "Who said thanks?"}))
-    tasked(replier)  # the slot's task is replaced
-    assert [tuple(r) for r in world.db.execute("SELECT id, question FROM tasks ORDER BY id")] == [
-        ("t1", owner.question),
-        ("t2", replier.question),
-    ]
     thanks = world.db.execute("SELECT id FROM messages WHERE text = 'thanks'").fetchone()[0]
     stated = world.db.execute("SELECT message_id FROM evidence WHERE fact_id = 'f4'").fetchone()[0]
 
@@ -2020,17 +1501,14 @@ async def test_tools(tmp_path):
     (proposing,) = proposer.toolsets(proposer.config)
     with_state(proposing)
     proposed = await served_tools(proposing)
-    assert (
-        set(proposed) == reads | {"add_task", "profile", "probe", "annotate"}
-        and proposing.server_name == "world"
-    )
+    assert set(proposed) == reads | {"add_task", "profile"} and proposing.server_name == "world"
     assert {t: described[t] for t in reads} == {t: proposed[t] for t in reads}
     # help() in an agent's IPython shows a tool's description alone: it names every field of every document a call
     # takes, nested ones too, with ? when optional.
     for tools, tool, models in (
         (described, "post", (Conversation, PostLine, Reaction, Commit, Close)),
         (described, "plan", (Plan, PlanFact, Event, Storyline)),
-        (proposed, "add_task", (Task,)),
+        (proposed, "add_task", (Task, Part)),
     ):
         for model in models:
             for field, info in model.model_fields.items():

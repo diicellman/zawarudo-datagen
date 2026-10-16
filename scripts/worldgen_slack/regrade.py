@@ -2,36 +2,27 @@
 calibration before a grader takes over (P1).
 
 uv run --frozen python scripts/worldgen_slack/regrade.py --run data/v7-06/forge-c1 --model z-ai/glm-5.3 \
-    --out runs/regrade-glm.jsonl [--view compact|raw] [--tries N] [--screen] [--dry-run]
+    --out runs/regrade-glm.jsonl [--view compact|raw] [--tries N] [--dry-run]
 
 Reads each solver trace (`traces/*.json`: the question, the response, the observations and the recorded grade) and
-each task's gold from the run's `world.sqlite`. Writes every new grade beside the recorded one, then prints the
+each task's gold from the forge's state (its answer, each part's; a forge before the simple one is read at its tag). Writes every new grade beside the recorded one, then prints the
 agreement on right, abstained and wrong: overall, on the tries the run graded wrong, Cohen's kappa, and every
 disagreement. Each grade is written to --out as it lands, and a request that takes longer than --timeout seconds
 counts as failed and is tried once more. `--view raw` sends the raw outputs, as the recorded grades had them, to tell the grader from the view.
-`--screen` also regrades each task's failure cases, which a grader must all judge wrong, and its gold, which it must
-judge right. `--tries N` takes a seeded sample that keeps every try the run graded wrong. A dry run spends nothing."""
+`--tries N` takes a seeded sample that keeps every try the run graded wrong. A dry run spends nothing."""
 
 import argparse
 import asyncio
 import json
 import random
-import sqlite3
 from collections import Counter
 from pathlib import Path
 
 import verifiers.v1 as vf
 from worldgen_slack.judge import AnswerJudge
 
-from generators.worldgen_slack.forge.difficulty import failure_cases
-from generators.worldgen_slack.forge.tasks import reference_of
+from generators.worldgen_slack.forge.tasks import Task, private_answer
 from generators.worldgen_slack.workspace import Workspace
-
-
-def r_part(row) -> bool:
-    """A composite request's part: graded with its request, never asked alone (a world before v3 has none)."""
-    return bool(row["parent"]) if "parent" in row.keys() else False
-
 
 # $ per million input, output and cached input tokens (list prices)
 PRICES = {"z-ai/glm-5.3": (1.4, 4.4, 0.26)}
@@ -144,43 +135,34 @@ async def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--view", choices=["compact", "raw"], default="compact")
     parser.add_argument("--tries", type=int, default=None)
-    parser.add_argument("--screen", action="store_true")
     parser.add_argument("--jobs", type=int, default=6)
     parser.add_argument("--timeout", type=float, default=300, help="seconds one grading request may take")
     parser.add_argument("--seed", type=int, default=20261014)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    # A task the run dropped is gone from its world; its gold is in the round's review snapshots. A composite
-    # request's reference is its parts', from the same snapshot.
-    tasks, kept, reference = {}, set(), {}
-    for path in [*sorted(args.run.glob("attempts/round-*/review-tasks-*.sqlite")), args.run / "world.sqlite"]:
-        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        db.row_factory = sqlite3.Row
-        rows = {r["id"]: dict(r) for r in db.execute("SELECT * FROM tasks") if not r_part(r)}
-        tasks |= rows
-        reference |= {t: reference_of(db, t) for t in rows}
-        kept = set(rows)
-        db.close()
+    # Each task's reference, as the forge's tries were graded against it: its answer, a composite request's by part.
+    state, world = json.loads((args.run / "state.json").read_text()), Workspace(args.run / "world.sqlite")
+    tasks, reference = {}, {}
+    for task_id, record in state.get("forged", {}).items():
+        if "task" in record:
+            task = Task.model_validate(record["task"])
+            tasks[task_id], reference[task_id] = (
+                {"question": task.question},
+                private_answer(world, task).reference(),
+            )
+    world.close()
     work = [t for t in tries(args.run) if t["task"] in tasks]
     if args.tries is not None and args.tries < len(work):
         wrong = [t for t in work if not t["recorded"]["correct"]]
         rest = [t for t in work if t["recorded"]["correct"]]
         work = wrong + random.Random(args.seed).sample(rest, max(0, args.tries - len(wrong)))
-    cases = []
-    if args.screen:
-        world = Workspace(args.run / "world.sqlite")
-        for t in sorted(kept):
-            gold, failures = failure_cases(world, t, reference[t].get("rows", []))
-            cases += [dict(task=t, case="gold", response=gold, expect=True)]
-            cases += [dict(task=t, case=name, response=response, expect=False) for name, response in failures]
-        world.close()
     views = [
         len(json.dumps(recorded_view(t["observations"]) if args.view == "compact" else t["observations"]))
         for t in work
     ]
     print(
-        f"{len(work)} tries ({sum(not t['recorded']['correct'] for t in work)} graded wrong) and {len(cases)} screen cases for {args.model}, {args.view} view: {sum(views) / max(len(views), 1):,.0f} characters of observations a try"
+        f"{len(work)} tries ({sum(not t['recorded']['correct'] for t in work)} graded wrong) for {args.model}, {args.view} view: {sum(views) / max(len(views), 1):,.0f} characters of observations a try"
     )
     if args.dry_run:
         return
@@ -215,10 +197,6 @@ async def main() -> None:
         new, usage = await grade(t["question"], reference[t["task"]], t["response"], view)
         return t | {"new": new, "usage": usage}
 
-    async def rescreen(c):
-        new, usage = await grade(tasks[c["task"]]["question"], reference[c["task"]], c["response"], [])
-        return c | {"new": new, "usage": usage}
-
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w") as stream:
 
@@ -230,7 +208,6 @@ async def main() -> None:
             return row
 
         graded = await asyncio.gather(*(kept(regrade(t)) for t in work))
-        screened = await asyncio.gather(*(kept(rescreen(c)) for c in cases))
 
     done = [g for g in graded if g["new"] and "error" not in g["new"]]
     failed = [g for g in graded if g["new"] and "error" in g["new"]]
@@ -249,13 +226,7 @@ async def main() -> None:
             print(
                 f"  {g['task']} {g['trace'][:8]} {outcome(g['recorded'])}→{outcome(g['new'])}: {g['new']['reason'][:220]}"
             )
-    if screened:
-        lost = [s for s in screened if "error" in s["new"]]
-        flips = [s for s in screened if "error" not in s["new"] and s["new"]["correct"] != s["expect"]]
-        print(f"\nscreen: {len(screened)} cases, {len(lost)} failed, {len(flips)} judged against expectation")
-        for s in flips:
-            print(f"  {s['task']} {s['case']}: {s['new']['reason'][:220]}")
-    spend = sum(cost(args.model, g["usage"]) for g in [*graded, *screened])
+    spend = sum(cost(args.model, g["usage"]) for g in graded)
     print(f"\nspend ${spend:.2f} ({args.model}, list prices where the gateway gave no cost)")
 
 

@@ -14,7 +14,6 @@ from verifiers.v1.mcp.launch import serve
 
 from ..config import Needs, load_taxonomy
 from ..forge.config import ForgeConfig
-from ..forge.tasks import Task
 from ..session import context_of
 from ..workspace import Workspace
 from ..world.board import Slot
@@ -225,17 +224,14 @@ def contracts_settings(root) -> WorldConfig:
 
 
 def forge_of(settings: WorldConfig, **changes) -> ForgeConfig:
-    """A forge on a world with these settings: their taxonomy, the checks' bands, gold of at most 2 rows, and the
-    world's seats, its proposer seated as its author is (as each forge config states it)."""
+    """A forge on a world with these settings, its proposer seated as the world's author is (as each forge config
+    states it)."""
     seats = settings.env.model_dump(mode="json")
     return ForgeConfig.model_validate(
         {
             "world": str(settings.output),
             "output": str(settings.output),
-            "taxonomy": settings.model_dump(mode="json")["taxonomy"],
-            "bands": BANDS,
-            "max_answer_rows": 2,
-            "env": {k: v for k, v in seats.items() if k != "author"} | {"proposer": seats["author"]},
+            "env": {"proposer": seats["author"], "judge": seats["judge"]},
         }
         | changes
     )
@@ -413,33 +409,3 @@ def with_state(toolset):
 
     toolset._pull_state, toolset._push_state = pull, push
     return stored
-
-
-def scripted_task(settings, slot, actor):
-    """A valid task for any slot of the scripted world: its gold follows the category's source."""
-    category, level = slot["category"], slot["level"]
-    gold, spec = settings.taxonomy[category].gold, settings.taxonomy[category]
-    question = f"Question {slot['id']} about the {category} level {level} work?"
-    if category == "robustness":
-        sql, kind, facts = "SELECT id AS answer FROM users WHERE real_name = 'Nobody Here'", "refusal", []
-    elif gold == "ledger":
-        sql, kind, facts = "SELECT value AS answer FROM facts WHERE id = 'f4'", "text", ["f3", "f4"]
-    elif gold == "hybrid":
-        sql, kind, facts = (
-            "SELECT COUNT(*) AS answer FROM messages m JOIN evidence e ON e.message_id = m.id WHERE e.fact_id = 'f1'",
-            "number",
-            ["f1"],
-        )
-    else:
-        sql, kind, facts = "SELECT COUNT(*) AS answer FROM messages", "number", []
-    assert kind in spec.answer_types
-    return Task(
-        id=slot["id"],
-        category=category,
-        level=level,
-        actor_id=actor,
-        question=question,
-        answer_type=kind,
-        gold_sql=sql,
-        facts=facts,
-    )
