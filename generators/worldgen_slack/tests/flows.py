@@ -1229,6 +1229,8 @@ async def forge_flow(root, world_dir, settings):
             id=task_id, family=family, actor_id=asker, question=question, parts=parts, **(version or {})
         )
 
+    turns = Counter()
+
     async def propose(prompt, tools, runtime):
         def call(name, **kwargs):
             return tools._with_state(getattr(tools, name))(**kwargs)
@@ -1241,9 +1243,7 @@ async def forge_flow(root, world_dir, settings):
             assert ("a harder version of i001" in page) == ("h101" in allowed["ids"]) and (
                 "The judge refused it" in page
             ) == ("r103" in allowed["ids"]), page
-            if FAULTS["session"]:
-                FAULTS["session"] -= 1
-                raise SessionLost("the proposer's sandbox dropped its stream")
+            turns["adapt"] += 1
         for task_id in allowed["ids"]:
             task = written(task_id, allowed["versions"].get(task_id))
             if task_id == "i001" and hidden:  # its first try rests on a message out of its asker's sight
@@ -1253,6 +1253,9 @@ async def forge_flow(root, world_dir, settings):
                 with pytest.raises(ValueError, match="its asker cannot read message"):
                     await call("add_task", task=wrong)
             await call("add_task", task=task)
+        if allowed["versions"] and FAULTS["session"]:  # cut off after it wrote its versions
+            FAULTS["session"] -= 1
+            raise SessionLost("the proposer's sandbox dropped its stream")
 
     # The student's tries, right by a schedule per task; i005's always crash. The verifier reaches every answer, but
     # splits on i003 (its second try wrong), so a third decides.
@@ -1333,6 +1336,9 @@ async def forge_flow(root, world_dir, settings):
     events = [json.loads(line) for line in (root / "progress.jsonl").read_text().splitlines()]
     kinds = Counter(e["event"] for e in events)
     assert kinds["session_lost"] == 1, "a lost session is taken up again"
+    assert turns["adapt"] == 2, (
+        "the versions a turn cut off had kept are taken, not written again: r103 alone is left for a turn"
+    )
     assert kinds["task_failed"] == 5 + 1, (
         "the first pass failed on the judge (and i005 on its tries), then went on"
     )

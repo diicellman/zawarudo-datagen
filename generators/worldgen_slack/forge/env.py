@@ -142,9 +142,13 @@ class ForgeEnv(SessionEnv):
         return [t for t in self.plan["planned"] if t not in self.store.state.forged]
 
     async def blocks(self, agents, runtime, setup) -> None:
-        """The proposer's turns in one VM until the phase's tasks are written, or two turns in a row write none."""
+        """The proposer's turns in one VM until the phase's tasks are written, or two turns in a row write none. A turn
+        cut off with its session keeps what it wrote: a fresh VM takes those tasks before it opens a turn."""
         await runtime.run(["rm", "-f", *(f"/task/{name}" for name in SETUP_FILES)], {})
         state = self.store.state
+        kept = [t for t in self.open_ids() if (self.store.root / "candidates" / f"{t}.json").exists()]
+        if kept and self.take(kept):
+            self.plan["empty"] = 0
         while state.phase in ("generate", "adapt"):
             if not (ids := self.open_ids()) or self.plan.get("empty", 0) >= 2:
                 state.phase, self.plan["empty"] = "label", 0
