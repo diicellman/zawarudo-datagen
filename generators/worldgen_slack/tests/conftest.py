@@ -6,6 +6,7 @@ import inspect
 
 import pytest
 
+from .. import session
 from .flows import scripted_judges
 
 
@@ -13,6 +14,12 @@ from .flows import scripted_judges
 def no_model():
     with scripted_judges():
         yield
+
+
+@pytest.fixture(autouse=True)
+def no_pause(monkeypatch):
+    """A lost session is taken up again at once: the checks wait for no sandbox."""
+    monkeypatch.setattr(session, "LOSS_WAITS", (0,))
 
 
 @pytest.hookimpl(tryfirst=True)

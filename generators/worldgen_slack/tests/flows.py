@@ -1439,6 +1439,15 @@ async def run_flows(root):
         raise AssertionError("a block that lost its session twice went on")
     except SessionLost:
         assert blocks[2:] == ["gone-01", "gone-02"] and store.state.lost["gone"] == 2, blocks
+    settings_ = env.settings  # a run that allows more losses (a forge's 5) takes a block up again each time
+    env.settings = settings_.model_copy()
+    object.__setattr__(env.settings, "max_losses", 3)
+    blocks.clear()
+    dropping = Dropping("many", 3)
+    dropping.settings = env.settings
+    await dropping.work_in_vm(agents)
+    assert blocks == ["many-01", "many-02", "many-03", "many-04"] and store.state.lost["many"] == 3, blocks
+    env.settings = settings_
     # The world the forge, the measure and the chapter start from: one with no tasks of its own.
     world_dir, world_settings = await world_run(
         root, settings, lambda **seats: SimpleNamespace(**(vars(agents) | seats))

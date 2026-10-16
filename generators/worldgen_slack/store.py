@@ -133,6 +133,14 @@ class Store:
         self.event("candidate_started", attempt=attempt, round=used + 1)
         return attempt
 
+    def begin(self, attempt: str) -> str:
+        """An attempt by its own name, with no cap (the forge's turns: initial-03, adapt-01): what one costs is what it
+        writes, and a turn that writes nothing ends the phase."""
+        self.state.active_attempt = attempt
+        self.save()
+        self.event("candidate_started", attempt=attempt)
+        return attempt
+
     def path(self, attempt: str, name: str) -> Path:
         path = self.root / "attempts" / attempt / name
         path.parent.mkdir(parents=True, exist_ok=True)

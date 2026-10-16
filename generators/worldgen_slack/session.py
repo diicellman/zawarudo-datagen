@@ -33,6 +33,9 @@ from .world.config import WorldConfig
 from .world.organization import channel_id
 
 ARCHIVE = "/tmp/task-files.tgz"
+# Seconds to wait before taking a lost session up again, by how many it has lost in the block: Prime's dropped streams
+# come in bursts, so a fresh VM at once often meets the same burst.
+LOSS_WAITS = (30, 60, 120, 240, 240)
 # What verifiers tells every agent on a restricted network, on the first user message of each request: by default,
 # "do not retry the blocked provider-side operation", even when nothing was removed (to fix upstream: only when a
 # capability was). Our VMs block every host and reach their tools through a tunnel, where the true thing to say is
@@ -190,10 +193,11 @@ class SessionEnv(vf.Env[Seats]):
 
     async def work_in_vm(self, agents) -> None:
         """One agent and one VM for the whole run; one interaction per block of work. A session lost to its sandbox,
-        tunnel or provider (or a VM gone mid-run) is none of the agent's limits: a fresh VM takes the run up where its
-        state says, as a resume does, and the attempt it cut off spends no round. A second loss in the same block
-        stops the run."""
-        state, last = self.store.state, None
+        tunnel or provider (or a VM gone mid-run) is none of the agent's limits: after a pause, a fresh VM takes the
+        run up where its state says, as a resume does, and the attempt it cut off spends no round. A block may lose
+        its session `max_losses` times (the run's setting; a world's 1); one more stops the run."""
+        state, losses = self.store.state, {}
+        allowed = getattr(self.settings, "max_losses", 1)
         setup = self.provision_task()
         while True:
             try:
@@ -203,13 +207,12 @@ class SessionEnv(vf.Env[Seats]):
                 if cleaning_up():  # a stop cancels the session's streams: it is a stop, not a loss
                     raise
                 where = (state.phase, state.day, state.batch)
+                losses[where] = n = losses.get(where, 0) + 1
                 attempt = self.store.lose()
-                self.store.event(
-                    "session_lost", attempt=attempt, error=str(error)[:2000], again=where != last
-                )
-                if where == last:
+                self.store.event("session_lost", attempt=attempt, error=str(error)[:2000], again=n <= allowed)
+                if n > allowed:
                     raise
-                last = where
+                await asyncio.sleep(LOSS_WAITS[min(n, len(LOSS_WAITS)) - 1])
 
     async def run(self, task, agents):
         return await self.work_in_vm(agents)
