@@ -62,7 +62,7 @@ def main():
     tasks = {t["id"]: t for t in forge["catalog"]["tasks"]}
     assert {"i001", "h101", "e102", "r103"} <= set(tasks), sorted(tasks)
     assert (
-        tasks["h101"]["reasoning"].startswith("status · harder") and "2 parts" in tasks["h101"]["reasoning"]
+        tasks["h101"]["reasoning"].startswith("catch-up · harder") and "2 parts" in tasks["h101"]["reasoning"]
     )
     assert [c.split(":")[0] for c in tasks["h101"]["answer"]["required_claims"]] == [
         "who posted it",

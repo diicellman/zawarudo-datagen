@@ -1189,7 +1189,7 @@ async def forge_flow(root, world_dir, settings):
         """Each open id's task: a request of a family, its answer and the messages it rests on."""
         who = one("who posted it", [first["real_name"]], [first["id"]])
         tasks = {
-            "i001": ("status", "Who posted the first update I can see?", [who]),
+            "i001": ("catch-up", "Who posted the first update I can see?", [who]),
             "i002": (
                 "decisions",
                 "Catch me up: who posted the first update, and who answered?",
@@ -1201,17 +1201,17 @@ async def forge_flow(root, world_dir, settings):
                 [one("who posted", names[:2], [first["id"], second["id"]], "set")],
             ),
             "i004": (
-                "catch-up",
+                "status",
                 "Who precisely wrote the second update?",
                 [one("who wrote it", [second["real_name"]], [second["id"]])],
             ),
             "i005": (
-                "status",
+                "catch-up",
                 "Who wrote the second update I can see?",
                 [one("who wrote it", [second["real_name"]], [second["id"]])],
             ),
             "h101": (
-                "status",
+                "catch-up",
                 "Before I report: who posted the first update, and who answered it?",
                 [who, one("who answered it", [second["real_name"]], [second["id"]])],
             ),
@@ -1221,7 +1221,7 @@ async def forge_flow(root, world_dir, settings):
                 [one("who answered it", [second["real_name"]], [second["id"]])],
             ),
             "r103": (
-                "catch-up",
+                "status",
                 "Who wrote the update after the first?",
                 [one("who wrote it", [second["real_name"]], [second["id"]])],
             ),
@@ -1252,6 +1252,9 @@ async def forge_flow(root, world_dir, settings):
             turns["adapt"] += 1
         for task_id in allowed["ids"]:
             task = written(task_id, allowed["versions"].get(task_id))
+            if task_id == "i002":  # first as a request of another family than its id asks for
+                with pytest.raises(ValueError, match="i002 asks for a decisions request"):
+                    await call("add_task", task=task.model_copy(update={"family": "status"}))
             if task_id == "i001" and hidden:  # its first try rests on a message out of its asker's sight
                 wrong = task.model_copy(
                     update={"parts": [one("who posted it", [first["real_name"]], [hidden[0]])]}
@@ -1259,6 +1262,7 @@ async def forge_flow(root, world_dir, settings):
                 with pytest.raises(ValueError, match="its asker cannot read message"):
                     await call("add_task", task=wrong)
             await call("add_task", task=task)
+        await runtime.write("/task/notes/forge.md", b"looked for a date the audit closes: none in Slack")
         if allowed["versions"] and FAULTS["session"]:  # cut off after it wrote its versions
             FAULTS["session"] -= 1
             raise SessionLost("the proposer's sandbox dropped its stream")
@@ -1393,7 +1397,12 @@ async def forge_flow(root, world_dir, settings):
         "who answered": 0.0,
     }
     report = json.loads((root / "report.json").read_text())
-    assert report["families"]["status"]["written"] == 3 and "harder" in report["families"]["status"]
+    assert report["families"]["status"]["written"] == 2 and report["families"]["status"]["repaired"] == 1, (
+        "each initial id asks for its family in turn, and a version keeps its source's"
+    )
+    assert report["proposer_notes"].startswith("looked for a date"), (
+        "the proposer's notes, as its last turn kept them"
+    )
     assert summary["labels"]["window"] == 4
     store.close()
 

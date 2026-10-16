@@ -83,6 +83,7 @@ def label_of(record: dict, solved: float) -> str:
 class ForgeEnv(SessionEnv):
     seat = "proposer"
     seats = ("proposer", "solver", "verifier", "judge")
+    notes = ("plan.md", "recap.md", "forge.md")  # the world author's, then the proposer's own
 
     def __init__(self, settings: ForgeConfig, store: Store):
         super().__init__(settings, store)
@@ -128,7 +129,12 @@ class ForgeEnv(SessionEnv):
             0,
             "source",
         )
-        self.plan["planned"] = {f"i{n:03d}": {} for n in range(1, self.settings.tasks + 1)}
+        # Each initial id asks for a family in turn, so every family is written whatever the turns' sizes.
+        families = list(FAMILIES)
+        self.plan["planned"] = {
+            f"i{n:03d}": {"family": families[(n - 1) % len(families)]}
+            for n in range(1, self.settings.tasks + 1)
+        }
         self.store.event(
             "world_adopted",
             world=str(self.settings.world),
@@ -160,15 +166,14 @@ class ForgeEnv(SessionEnv):
         state = self.store.state
         n = self.plan["turn"] = self.plan.get("turn", 0) + 1
         attempt = self.store.begin(f"{'initial' if state.batch == 0 else f'adapt{state.batch}'}-{n:02d}")
-        versions = {t: v for t, v in self.plan["planned"].items() if t in ids and v}
-        self.allow(ids, versions)
+        versions = {t: v for t, v in self.plan["planned"].items() if t in ids and "variant_of" in v}
+        families = {t: self.family_of(t) for t in ids}
+        self.allow(ids, versions, families)
         await self.bring_notes(runtime, state.restore_point)
         task = ProposerTask.create(self.world.path, self.tools_context(), attempt)
         if state.batch == 0:
             written = len(state.forged)
-            prompt = initial_prompt(
-                ids, written, self.settings.tasks, list(FAMILIES)[(n - 1) % len(FAMILIES)]
-            )
+            prompt = initial_prompt(families, written, self.settings.tasks)
         else:
             prompt = adapt_prompt(ids)
         async with agents.proposer.interaction(task, runtime=runtime) as interaction:
@@ -181,10 +186,20 @@ class ForgeEnv(SessionEnv):
         state.restore_point = attempt
         self.store.finish_attempt(bool(added))
 
-    def allow(self, ids: list[str], versions: dict) -> None:
-        """The ids the proposer's turn may write, and which task each version is of and why: its tools read them per
-        call."""
-        atomic_json(self.store.root / "writable.json", {"ids": list(ids), "versions": versions})
+    def family_of(self, task_id: str) -> str | None:
+        """The family an open id asks for: an initial task's by its place, a version's its source's (a run begun
+        before ids had families leaves its initial ones free)."""
+        planned = self.plan["planned"][task_id]
+        if "variant_of" in planned:
+            return self.store.state.forged[planned["variant_of"]]["task"]["family"]
+        return planned.get("family")
+
+    def allow(self, ids: list[str], versions: dict, families: dict) -> None:
+        """The ids the proposer's turn may write, the family each asks for, and which task each version is of and
+        why: its tools read them per call."""
+        atomic_json(
+            self.store.root / "writable.json", {"ids": list(ids), "versions": versions, "families": families}
+        )
 
     def take(self, ids: list[str]) -> int:
         """The turn's tasks into the run: each kept file checked again (the world is the one it was checked on), with

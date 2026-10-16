@@ -17,7 +17,8 @@ Tools and memory
   the next.
 - /task/memory/ is code's: tasks.md (every task written so far: write new ones, never a repeat), families.md, and a
   page per person (its id, U..., is what actor_id takes), channel, storyline and event; in an adapting turn, adapt.md.
-  /task/notes/ is yours; the world's author left its plan.md there.
+  /task/notes/ is yours: keep your notes in forge.md (what you looked for and could not find goes to whoever writes
+  the world's next chapter); the world's author left its plan.md there.
 
 A request a colleague would make
 - Every task is one: a person at work asking a colleague who reads Slack for them, in their own words, for what their

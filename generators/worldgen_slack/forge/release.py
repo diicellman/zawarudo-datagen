@@ -113,14 +113,15 @@ def report(store) -> dict:
         counts[family]["approved"] += label in KEPT
         counts[family]["window"] += label == "window"
         counts[family][record["set"]] += 1
-    notes = sorted((store.root / "attempts").glob("*/notes/plan.md"))
+    # The proposer's notes as its last clean turn kept them.
+    notes = store.root / "attempts" / store.state.restore_point / "notes" / "forge.md"
     return {
         "families": {
             f: {k: c[k] for k in ("written", "verified", "approved", "window", *SETS)}
             for f, c in counts.items()
         },
         "short": sorted(f for f, c in counts.items() if c["approved"] < 2),
-        "proposer_notes": notes[-1].read_text()[-4000:] if notes else "",
+        "proposer_notes": notes.read_text()[-4000:] if notes.is_file() else "",
     }
 
 

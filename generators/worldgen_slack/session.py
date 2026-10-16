@@ -120,9 +120,6 @@ def observable(record: dict) -> dict:
     return record
 
 
-NOTES = ("plan.md", "recap.md")  # the world author's own files in /task/notes
-
-
 SETUP_FILES = (
     "input.json",
     "guide.md",
@@ -142,6 +139,7 @@ class SessionEnv(vf.Env[Seats]):
 
     seat = "author"  # the seat whose agent works in the VM
     seats = ("author", "judge")  # every seat of the run, none trained
+    notes = ("plan.md", "recap.md")  # the agent's own files in /task/notes, kept with each attempt
 
     def __init__(self, settings, store: Store):
         """`settings` is the run's (a world's or a forge's), whose `env` holds its seats."""
@@ -182,7 +180,7 @@ class SessionEnv(vf.Env[Seats]):
 
     async def keep_notes(self, runtime, attempt: str) -> None:
         """The agent's notes as the attempt left them, kept with its world."""
-        for name in NOTES:
+        for name in self.notes:
             if (text := await self.note(runtime, name)) is not None:
                 self.store.path(attempt, "notes/" + name).write_text(text)
 
@@ -190,7 +188,7 @@ class SessionEnv(vf.Env[Seats]):
         """The notes an attempt kept, and only those, back in the agent's VM: a day (or a round) starts from where the
         last one ended, and a failed attempt's notes are gone."""
         kept = self.store.root / "attempts" / attempt / "notes"
-        notes = {f"notes/{name}": (kept / name).read_bytes() for name in NOTES if (kept / name).exists()}
+        notes = {f"notes/{name}": (kept / name).read_bytes() for name in self.notes if (kept / name).exists()}
         await upload(runtime, notes, "/task/notes")
 
     async def work_in_vm(self, agents) -> None:

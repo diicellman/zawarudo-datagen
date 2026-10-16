@@ -49,13 +49,13 @@ class ProposerTask(vf.Task[WorldTaskData, vf.State, ProposerConfig]):
         return cls(data, ProposerConfig(tools=tools))
 
 
-def initial_prompt(ids: list[str], written: int, goal: int, family: str) -> str:
+def initial_prompt(families: dict[str, str | None], written: int, goal: int) -> str:
+    ids = ", ".join(f"{t} ({f})" if f else t for t, f in families.items())
     return (
-        f"The initial set holds {written} of its {goal} tasks. Write one task with world_add_task for each open id: "
-        f"{', '.join(ids)}. Lean this turn toward the {family} family, and spread the asks across people and "
-        "storylines; /task/memory/tasks.md lists what is written, so write new requests, never a repeat. Walk each "
-        "one's route as its asker first. Write in /task/notes/plan.md what you looked for and could not find, then end "
-        "your turn."
+        f"The initial set holds {written} of its {goal} tasks. Write one task with world_add_task for each open id, of "
+        f"the family it names: {ids}. Spread the asks across people and storylines; /task/memory/tasks.md lists what "
+        "is written, so write new requests, never a repeat. Walk each one's route as its asker first. Write in "
+        "/task/notes/forge.md what you looked for and could not find, then end your turn."
     )
 
 
@@ -64,5 +64,5 @@ def adapt_prompt(ids: list[str]) -> str:
         "/task/memory/adapt.md gives, for each open id, the task it is a version of, how it went, and the version to "
         f"write: harder, easier or repaired. Write each with world_add_task, its variant_of and why as the page says: "
         f"{', '.join(ids)}. A version stays a request a colleague would make, of its family. Walk each one's route as "
-        "its asker first. Write in /task/notes/plan.md what you looked for and could not find, then end your turn."
+        "its asker first. Write in /task/notes/forge.md what you looked for and could not find, then end your turn."
     )

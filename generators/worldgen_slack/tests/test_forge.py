@@ -237,7 +237,11 @@ def test_release(tmp_path):
         },
         solves={"t9": {"results": [right, {"correct": False}], "traces": [None, None]}},
         verifier={"t9": {"results": [right, right], "traces": ["v1", "v2"]}},
+        restore_point="adapt1-02",
     )
+    for attempt, text in (("adapt1-02", "no owner named for the audit"), ("source", "the author's plan")):
+        (tmp_path / "attempts" / attempt / "notes").mkdir(parents=True)
+        (tmp_path / "attempts" / attempt / "notes" / "forge.md").write_text(text)
     store = SimpleNamespace(
         world=world, root=tmp_path, state=state, settings={"env": {"verifier": {"model": "z-ai/glm-5.3"}}}
     )
@@ -255,4 +259,7 @@ def test_release(tmp_path):
     assert found["families"]["catch-up"]["written"] == 2 and found["short"] == sorted(
         ["catch-up", "decisions", "commitments", "status"]
     ), "a family with fewer than 2 approved tasks is short"
+    assert found["proposer_notes"] == "no owner named for the audit", (
+        "the notes of the proposer's last clean turn"
+    )
     assert ForgeEnv.WHY["repaired"].startswith("The judge refused it")

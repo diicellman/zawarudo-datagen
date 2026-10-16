@@ -34,9 +34,10 @@ class ProposerTools(WorldReads, vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def add_task(self, task: Task) -> dict:
-        """Write one task under one of this turn's open ids. Code checks its asker, that each answer's messages exist and
-        its asker can read them, each answer's shape, that the request gives no answer away and repeats no request of
-        its asker, and keeps it, or refuses it with every reason. Writing an id again replaces its task."""
+        """Write one task under one of this turn's open ids, of the family the id asks for. Code checks its asker, that
+        each answer's messages exist and its asker can read them, each answer's shape, that the request gives no answer
+        away and repeats no request of its asker, and keeps it, or refuses it with every reason. Writing an id again
+        replaces its task."""
 
         def act():
             allowed = self.allowed()
@@ -52,6 +53,9 @@ class ProposerTools(WorldReads, vf.Toolset[AuthoringToolsConfig, vf.State]):
                     if version
                     else f"{task.id} is a task of the initial set, a version of none: leave variant_of and why empty"
                 )
+            family = allowed.get("families", {}).get(task.id)
+            if family and task.family != family:
+                raise ValueError(f"{task.id} asks for a {family} request: write one of that family")
             world = self._world()
             try:
                 check(world, task, self._written())
