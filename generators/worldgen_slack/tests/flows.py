@@ -24,7 +24,9 @@ from worldgen_slack.release import load_release
 from worldgen_slack.taskset import SolverTask
 from worldgen_slack.world import file_hash
 
+from .. import session
 from ..cli import failure, run_forge, run_label, run_world
+from ..forge import tries as forge_tries
 from ..forge.config import ForgeConfig
 from ..forge.env import provenance as forge_provenance
 from ..forge.judge import Ruling
@@ -1237,6 +1239,10 @@ async def forge_flow(root, world_dir, settings):
 
         assert "/task/memory/tasks.md" in runtime.files and "/task/memory/families.md" in runtime.files
         allowed = tools.allowed()
+        if FAULTS["stop"]:  # a Ctrl-C mid-turn reaches the run as the proposer's stream cancelled
+            FAULTS["stop"] -= 1
+            verifiers.v1.utils.interrupt._cleaning_up = True
+            raise SessionLost("process stream RPC failed (canceled): Request was cancelled")
         if allowed["versions"]:  # an adapting turn reads what to write
             page = runtime.files["/task/memory/adapt.md"].decode()
             assert all(f"## {t}: " in page for t in allowed["ids"]), page
@@ -1330,8 +1336,16 @@ async def forge_flow(root, world_dir, settings):
         1,
         16,
     )  # the judge fails all 4 attempts of the first pass's 4 rulings
+    FAULTS["stop"] = 1
     with episodes(agents):
-        summary = await run_forge(plan)
+        try:
+            summary = await run_forge(plan)
+        finally:
+            verifiers.v1.utils.interrupt._cleaning_up = False
+        assert summary["status"] == "interrupted", (
+            "a stop is never resumed, though its stream ended as a loss"
+        )
+        summary = await run_forge(plan)  # rerun, as its person would
     assert summary["status"] == "complete", summary
     events = [json.loads(line) for line in (root / "progress.jsonl").read_text().splitlines()]
     kinds = Counter(e["event"] for e in events)
@@ -1385,7 +1399,7 @@ async def forge_flow(root, world_dir, settings):
 
 
 # The forge flow's faults, each spent once.
-FAULTS = {"session": 0}
+FAULTS = {"session": 0, "stop": 0}
 
 
 async def chapter_flow(root, parent, settings):
@@ -1818,9 +1832,10 @@ async def chapter_flow(root, parent, settings):
 @contextmanager
 def scripted_judges():
     """No judge reaches a model while the checks run: the answer judge is played by code (GRADER), and any other judge
-    call fails."""
-    saved, vf.Judge.complete = vf.Judge.complete, scripted_complete
+    call fails; and nothing waits for a provider or a sandbox to come back."""
+    saved = vf.Judge.complete, session.LOSS_WAITS, forge_tries.WAITS
+    vf.Judge.complete, session.LOSS_WAITS, forge_tries.WAITS = scripted_complete, (0,), (0, 0, 0)
     try:
         yield
     finally:
-        vf.Judge.complete = saved
+        vf.Judge.complete, session.LOSS_WAITS, forge_tries.WAITS = saved

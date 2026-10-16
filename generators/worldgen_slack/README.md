@@ -67,5 +67,6 @@ notes; its tasks live in its own state, never in the world file.
 
 A forge carries on by itself: a lost proposer session is taken up again after a pause (`max_losses` times a turn), a
 failed model call is asked again, a task whose steps fail is marked failed while the others go on, and the CLI resumes
-the run after an infrastructure stop (`max_resumes`), until it has spent `spend_limit`. It resumes like a run, with
-its own configuration and the world's hash.
+the run after an infrastructure stop (`max_resumes`), until it has spent `spend_limit`. A turn cut off keeps the tasks
+it wrote. A Ctrl-C is a stop, never resumed, even when it reaches the run as a cancelled stream. It resumes like a run,
+with its own configuration and the world's hash.

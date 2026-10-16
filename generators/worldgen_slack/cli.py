@@ -16,7 +16,7 @@ from pathlib import Path
 import verifiers.v1 as vf
 from verifiers.v1.clients import EvalClientConfig, ModelContext
 from verifiers.v1.runtimes.prime import set_base_sandbox_labels
-from verifiers.v1.utils.interrupt import install_interrupt
+from verifiers.v1.utils.interrupt import cleaning_up, install_interrupt
 from worldgen_slack.release import atomic_json
 
 from .forge import env as forge
@@ -79,8 +79,14 @@ async def run(
                 store.trace(trace)
             atomic_json(store.root / f"episode-{episode.id}.json", episode.to_record())
             if (reason := failure(store.state.phase, episode)) is not None:
+                # A stop (Ctrl-C, SIGTERM) that reached the run as its streams cancelled is a stop, never resumed.
                 return store.summary(
-                    "incomplete" if "ReviewLimit" in reason else "infrastructure_error", reason
+                    "interrupted"
+                    if cleaning_up()
+                    else "incomplete"
+                    if "ReviewLimit" in reason
+                    else "infrastructure_error",
+                    reason,
                 )
         summary = store.summary("complete")
         finish(store)
@@ -163,6 +169,8 @@ def main() -> int:
     try:
         result = asyncio.run(going())
     except KeyboardInterrupt:
+        result = {"status": "interrupted"}
+    if result["status"] == "interrupted":
         name = PARTS[args.command or "world"][1]
         print(
             f"interrupted: the {name} is stopped and its sandboxes deleted; rerun to resume", file=sys.stderr
