@@ -3,17 +3,22 @@
 world = "data/v8-02/w1"
 output = "data/v8-04/forge-w1"
 tasks = 36
-batch = 4                 # a turn's ids, one of each family: flash surveys the world before it writes, and at 12 ids
-                          # its 1.5M tokens ran out before the first (the W1 pilot, 2026-10-17)
+batch = 4                 # a turn's ids, one of each family: a turn of 12 had GLM 5.3 flash survey the world until its
+                          # 1.5M tokens ran out, before it wrote one (the W1 pilot, 2026-10-17)
 adapt = 1
 tries = 8
 verify = 2
-spend_limit = 80.0          # a guard against a runaway, not a budget: the smoke labelled a task for about $0.50
+spend_limit = 150.0        # a guard against a runaway, not a budget: Opus turns ran $2.60-5 in forge v1
 
-# One model per seat. The proposer is smaller than the models that check its tasks, so none judges its own writing;
-# the student, whose pass rates select the tasks, is of another family; unset fields keep the seat defaults.
+# One model per seat. The proposer, the models that check its tasks and the student, whose pass rates select them,
+# are of three families, so none checks its own family's writing; unset fields keep the seat defaults.
 [env.proposer]
-model = "z-ai/glm-5.3-flash"
+model = "anthropic/claude-opus-5.5"
+
+# Anthropic caches a prompt only when asked: each step then pays for its new tail alone. The cache lives an hour, as
+# the proposer's VM waits while a pass is labelled.
+[env.proposer.sampling]
+cache_control = { type = "ephemeral", ttl = "1h" }
 
 [env.verifier]            # reaches each task's answer from Slack, or the task is dropped
 model = "z-ai/glm-5.3"
