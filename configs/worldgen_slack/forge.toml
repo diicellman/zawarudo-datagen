@@ -5,7 +5,8 @@
 world = "data/v8-02/w1"
 output = "data/v8-04/forge"
 tasks = 36                # the initial set
-batch = 12                # tasks per proposer turn
+batch = 4                 # a turn's ids, one of each family: flash surveys the world before it writes, and at 12 ids
+                          # its 1.5M tokens ran out before the first (the W1 pilot, 2026-10-17)
 adapt = 1                 # adapting passes
 tries = 8                 # the student's tries of a task
 verify = 2                # the verifier's (a third on a split)
