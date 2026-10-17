@@ -7,7 +7,7 @@ batch = 12
 adapt = 1
 tries = 8
 verify = 2
-spend_limit = 40.0
+spend_limit = 80.0          # a guard against a runaway, not a budget: the smoke labelled a task for about $0.50
 
 # One model per seat. The proposer is smaller than the models that check its tasks, so none judges its own writing;
 # the student, whose pass rates select the tasks, is of another family; unset fields keep the seat defaults.

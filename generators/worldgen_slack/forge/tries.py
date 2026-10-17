@@ -60,8 +60,9 @@ def by_part(task: Task, results: list[dict]) -> dict[str, float] | None:
 
 
 def agreeing(results: list[dict]) -> list[dict]:
-    """The verifier's tries that reached the gold: right, and grounded in what its calls showed."""
-    return [r for r in results if r and r.get("semantic_correctness") == 1.0]
+    """The verifier's tries that reached the gold: right on every part. A claim of its own that no message states makes
+    a try ungrounded, not the gold wrong, so grounding is the student's measure, not the verifier's."""
+    return [r for r in results if r and not r.get("crashed") and r.get("correct")]
 
 
 WAITS = (5, 30, 120)  # seconds before a call is asked again

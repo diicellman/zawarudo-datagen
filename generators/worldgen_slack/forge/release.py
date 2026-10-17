@@ -49,20 +49,24 @@ def level(right: float) -> int:
 
 
 def solution(store, task_id: str) -> Solution | None:
-    """The verifier's first try that reached the task's gold, with its answer and calls, from its saved trace."""
+    """The verifier's first try that reached the task's gold (a grounded one before any other), with its answer and
+    calls, from its saved trace."""
     book = store.state.verifier.get(task_id, {})
-    for result, trace_id in zip(book.get("results", []), book.get("traces", [])):
-        if result in agreeing([result]):
-            record = trace_record(store, trace_id) or {}
-            calls = (record.get("info") or {}).get("observations", [])
-            return Solution(
-                seat="verifier",
-                model=store.settings.get("env", {}).get("verifier", {}).get("model"),
-                trace_id=trace_id,
-                answer=result["response"],
-                calls=[{"tool": c["tool"], "arguments": c["arguments"]} for c in calls],
-            )
-    return None
+    reached = [(r, t) for r, t in zip(book.get("results", []), book.get("traces", [])) if r in agreeing([r])]
+    if not reached:
+        return None
+    result, trace_id = min(
+        reached, key=lambda pair: not pair[0].get("grounded")
+    )  # the first grounded, else the first
+    record = trace_record(store, trace_id) or {}
+    calls = (record.get("info") or {}).get("observations", [])
+    return Solution(
+        seat="verifier",
+        model=store.settings.get("env", {}).get("verifier", {}).get("model"),
+        trace_id=trace_id,
+        answer=result["response"],
+        calls=[{"tool": c["tool"], "arguments": c["arguments"]} for c in calls],
+    )
 
 
 def release_rows(store, world_hash: str) -> tuple[list[PublicTask], dict[str, PrivateAnswer]]:

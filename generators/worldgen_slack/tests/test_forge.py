@@ -115,6 +115,10 @@ async def test_tries(tmp_path):
     task = request()
     verified = await tries.verify(agents, task, "k")
     assert len(verified) == 3 and len(agreeing(verified)) == 2, "a split is decided by a third try"
+    stray = {"correct": True, "grounded": False, "semantic_correctness": 0.0}
+    assert agreeing([stray, {"correct": True, "crashed": True}]) == [stray], (
+        "a try right on every part reaches the gold, though a claim of its own is ungrounded"
+    )
     measured = await tries.measure(agents, task, "k")
     assert [r["crashed"] for r in measured] == [False, True, False], (
         "a try that crashes runs again, up to 3 times"
@@ -236,7 +240,7 @@ def test_release(tmp_path):
             },
         },
         solves={"t9": {"results": [right, {"correct": False}], "traces": [None, None]}},
-        verifier={"t9": {"results": [right, right], "traces": ["v1", "v2"]}},
+        verifier={"t9": {"results": [right | {"grounded": False}, right], "traces": ["v0", "v1"]}},
         restore_point="adapt1-02",
     )
     for attempt, text in (("adapt1-02", "no owner named for the audit"), ("source", "the author's plan")):
@@ -254,7 +258,9 @@ def test_release(tmp_path):
         2,
         1.0,
     )
-    assert answers["t9"].solution.calls == [{"tool": "read_channel", "arguments": {"channel_id": "C1"}}]
+    assert answers["t9"].solution.trace_id == "v1" and answers["t9"].solution.calls == [
+        {"tool": "read_channel", "arguments": {"channel_id": "C1"}}
+    ], "the solution is a grounded try, though an ungrounded one came first"
     found = report(store)
     assert found["families"]["catch-up"]["written"] == 2 and found["short"] == sorted(
         ["catch-up", "decisions", "commitments", "status"]
