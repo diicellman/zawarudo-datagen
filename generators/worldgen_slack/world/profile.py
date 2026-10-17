@@ -2,16 +2,18 @@
 uv run --frozen worldgen-slack profile --world data/v7-05/software
 
 The value groups (a subject and attribute, the values it took, how they supersede each other, its decoys, where its
-current value is stated and who can read it), threads, recurring conversations, people, and what the world's tasks
-and board already rest on. A chapter's brief is written from it, and what a chapter planted is measured by it."""
+current value is stated and how many can read it), threads, recurring conversations, people, and what the world's
+tasks and board already rest on: counts for a person, who writes a chapter's brief from it and measures by it what a
+chapter planted. A forge's proposer reads the same world as its task material (forge/material.py): the messages each
+value rests on and who can read them."""
 
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
 from ..workspace import Workspace, asked
-from ..world.board import answer_facts, readable
-from ..world.clock import meta
+from .board import answer_facts, readable
+from .clock import meta
 
 
 def chains(world) -> dict[str, int]:

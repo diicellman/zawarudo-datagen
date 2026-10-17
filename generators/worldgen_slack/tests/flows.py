@@ -30,7 +30,6 @@ from ..forge import tries as forge_tries
 from ..forge.config import ForgeConfig
 from ..forge.env import provenance as forge_provenance
 from ..forge.judge import Ruling
-from ..forge.profile import profile
 from ..forge.proposer.task import ProposerTask
 from ..forge.tasks import Part, Task
 from ..forge.tries import rates
@@ -57,6 +56,7 @@ from ..world.config import WorldConfig
 from ..world.env import WorldEnv, provenance
 from ..world.ledger import BoardEntry, Event, Plan, PlanFact, Storyline, front_loaded, record_plan, unplanned
 from ..world.organization import Channel, Organization, Person, Routine, channel_id
+from ..world.profile import profile
 from ..world.style import style
 from ..world.writing import Close, Commit, Conversation, PostLine, Reaction, post, quotas, revise
 from .support import (
@@ -1238,6 +1238,12 @@ async def forge_flow(root, world_dir, settings):
             return tools._with_state(getattr(tools, name))(**kwargs)
 
         assert "/task/memory/tasks.md" in runtime.files and "/task/memory/families.md" in runtime.files
+        # The world's task material: each value with the messages an answer names, the current one marked.
+        found = await call("material")
+        assert all(v["messages"] for g in found["groups"] for v in g["values"]) and any(
+            v.get("current") for g in found["groups"] for v in g["values"]
+        ), found
+        assert any(first["real_name"] in person for person in found["people"]), found["people"]
         allowed = tools.allowed()
         if FAULTS["stop"]:  # a Ctrl-C mid-turn reaches the run as the proposer's stream cancelled
             FAULTS["stop"] -= 1

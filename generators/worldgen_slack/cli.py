@@ -20,11 +20,10 @@ from verifiers.v1.utils.interrupt import cleaning_up, install_interrupt
 from worldgen_slack.release import atomic_json
 
 from .forge import env as forge
-from .forge import profile
 from .forge.config import ForgeConfig, load_forge
 from .forge.release import publish
 from .store import Store
-from .world import chapter
+from .world import chapter, profile
 from .world.config import WorldConfig, load_world
 from .world.env import WorldEnv, dry_run, provenance
 

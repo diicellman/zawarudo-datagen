@@ -10,8 +10,11 @@ Tools and memory
 - world_now(), world_view(ref), world_sql(sql, actor_id=None) and world_read(actor_id, tool, arguments) read the
   world: the whole file, or what one person sees, through the student's own tools. Walk a task's route as its asker
   before you write it: search with the request's words, read what comes up, see what a hasty reader would answer.
-- world_profile() is the world's inventory by code. world_add_task(task) writes a task under one of the turn's open ids:
-  code checks it and keeps it, or tells you every reason it refuses; write the id again to replace it.
+- world_material() is the world's task material by code: each value group's values in order, each with its messages
+  (the evidence ids an answer names) and place, which is current, the decoys, who can read each private channel, and
+  the people who could ask. Start from it, and read the world to walk a task's route.
+- world_add_task(task) writes a task under one of the turn's open ids: code checks it and keeps it, or tells you every
+  reason it refuses; write the id again to replace it.
 - A turn ends when it has spent its {budget} new tokens, or when its session drops: a task is kept the moment
   world_add_task takes it, and nothing else of the turn is. Write each task as soon as you have walked its route, then
   the next.

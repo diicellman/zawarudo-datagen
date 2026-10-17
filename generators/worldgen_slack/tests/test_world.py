@@ -1507,7 +1507,7 @@ async def test_tools(tmp_path):
     (proposing,) = proposer.toolsets(proposer.config)
     with_state(proposing)
     proposed = await served_tools(proposing)
-    assert set(proposed) == reads | {"add_task", "profile"} and proposing.server_name == "world"
+    assert set(proposed) == reads | {"add_task", "material"} and proposing.server_name == "world"
     assert {t: described[t] for t in reads} == {t: proposed[t] for t in reads}
     # help() in an agent's IPython shows a tool's description alone: it names every field of every document a call
     # takes, nested ones too, with ? when optional.

@@ -75,11 +75,12 @@ uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge.toml 
 uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge.toml > runs/forge.log 2>&1   # paid
 ```
 
-A forge config is self-contained: the finished world (`world`), the taxonomy, a new `output`, its goal and rounds
-(`tasks`, `rounds`, `candidates`, `target`), each level's band of solver right-answer rates, how a candidate is tried,
-and one model per seat (`[env.proposer]`, `[env.judge]`, `[env.solver]`, `[env.witness]`, `[answer_judge]`).
-`measure = true` with `rounds = 0` measures a finished run's own tasks instead of proposing new ones.
-`uv run --frozen worldgen-slack profile --world data/<run>` prints a world's material for tasks.
+A forge config is self-contained: the finished world (`world`), a new `output`, the initial set's size and turn
+(`tasks`, `batch`), its adapting passes (`adapt`), how a task is labelled (`verify`, `tries`, `solved`), how far a
+run carries on by itself (`max_losses`, `max_resumes`, `spend_limit`), and one model per seat (`[env.proposer]`,
+`[env.verifier]`, `[env.solver]`, the task `[judge]`, `[answer_judge]`).
+`uv run --frozen worldgen-slack profile --world data/<run>` measures a world for a person (`world/profile.py`):
+its value groups, threads and people, as counts, for whoever writes its next chapter.
 
 ### Running notes
 

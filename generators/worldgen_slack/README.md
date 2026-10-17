@@ -50,8 +50,10 @@ sets (Synthetic Data RL, arXiv 2505.17063, 4.1-4.3). It starts from the world's 
 notes; its tasks live in its own state, never in the world file.
 
 - **The initial set:** the proposer (`forge/proposer/`), an rlm agent in its own VM, writes `tasks` requests with
-  `world_add_task`, `batch` a turn: each of a family (catch-up, decisions, commitments, status), in 1 to 4 parts, each
-  part with its answer and the messages it rests on. Code refuses at once, with every reason, what it can tell is wrong:
+  `world_add_task`, `batch` a turn: each of the family its id asks for (catch-up, decisions, commitments, status), in 1
+  to 4 parts, each part with its answer and the messages it rests on. It starts from the world's task material
+  (`forge/material.py`, `world_material`: each value's messages and who can read them) and reads the world to walk a
+  task's route. Code refuses at once, with every reason, what it can tell is wrong:
   an asker who is no person, a message out of the asker's sight, an answer of the wrong shape, two parts alike, a
   question that gives its answer away, a repeat.
 - **Labelling** (no VM; every task side by side, each step kept as it lands): the verifier, a stronger model with the

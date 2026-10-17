@@ -1,4 +1,4 @@
-"""The proposer's tools: the reads it shares with the world author, the world's inventory (profile), and add_task, a
+"""The proposer's tools: the reads it shares with the world author, the world's task material, and add_task, a
 task checked by code and kept for the forge to label. The world is never written: a task is kept as a file in the
 run (candidates/<id>.json), which the forge reads when the turn ends."""
 
@@ -11,7 +11,7 @@ from worldgen_slack.toolset import watch_parent
 
 from ...session import AuthoringToolsConfig, WorldReads
 from ..config import ForgeConfig
-from ..profile import profile
+from ..material import material
 from ..tasks import Task, answer_text, check
 
 
@@ -67,11 +67,13 @@ class ProposerTools(WorldReads, vf.Toolset[AuthoringToolsConfig, vf.State]):
         return self._logged("add_task", {"task": task.model_dump(mode="json")}, act)
 
     @vf.tool
-    async def profile(self) -> dict:
-        """The finished world's inventory, by code: its value groups (values, chains, decoys, where each value sits and
-        who can read it), threads, recurring conversations, people, its apps, promises, artifacts and groups. Read it
-        to find where a request's answers are."""
-        return self._logged("profile", {}, lambda: profile(self._world()))
+    async def material(self) -> dict:
+        """The world's task material, by code: each value group (a subject and attribute) with every value it took in
+        order, each value's day, place and messages (m123, the evidence an answer names), and where so that it is a
+        decoy, what it supersedes and that it is current; who can read each private channel (a public one, everyone; a
+        DM, the people it names); and the people who could ask (name, id, title, clock). A dict: look at the part you
+        need."""
+        return self._logged("material", {}, lambda: material(self._world()))
 
 
 if __name__ == "__main__":
