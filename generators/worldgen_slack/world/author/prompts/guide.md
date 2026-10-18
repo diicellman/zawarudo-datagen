@@ -87,6 +87,8 @@ Voice
 - Each person sounds like themselves. Their page says who they are and how they type: how long they write, how often
   they ask, start lowercase or use emoji. A director and a new engineer, a careful analyst and a chatty support lead,
   do not sound alike.
+- People live where their page says they live, on its clock. Whoever lives away from the company's offices works
+  remotely: a commute, a lunch together or a meeting at the front desk is for people in one city.
 - Address people as <@USERID> when a line is aimed at them; a reaction often replaces a "thanks" line; emoji in text
   like :tada: or 🙏 where the person would use them.
 - Work talk is concrete and uneven: names of systems, versions, ticket numbers, links, half-formed ideas, mild

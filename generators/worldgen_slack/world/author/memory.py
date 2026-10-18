@@ -232,7 +232,7 @@ def person_page(world, user_id: str, context: dict) -> str:
         out += [
             "",
             "## Who they are",
-            f"- {self['age']}, from {self['home']}; {self['education']}",
+            f"- {self['age']}, lives in {self['home']}; {self['education']}",
             f"- as a person (any job named here was before this one): {self['persona']}",
             f"- background: {self['background']}",
             f"- outside work: {', '.join(self['hobbies'])}",
