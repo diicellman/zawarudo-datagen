@@ -4,6 +4,7 @@ forge inherits nothing from the configuration its world was written with."""
 
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 import verifiers.v1 as vf
 from pydantic import Field
@@ -72,6 +73,12 @@ class ForgeConfig(Section):
         default=0.875, gt=0, le=1
     )  # a pass rate at or above it is solved: write a harder version
     solvers: int = Field(default=8, ge=1, le=64)  # tries at once
+    # The skills code deals the initial ids, in turn (none: no id aims at one): crossed with the four families, a cycle
+    # of 5 meets every family with every skill within 20 ids. A version aims at its source's.
+    skills: list[Literal["aggregation", "temporal", "abstention", "synthesis"]] = Field(default_factory=list)
+    offers: int = Field(
+        default=3, ge=1, le=10
+    )  # turns an id is offered unwritten before it is dropped, short of material
     max_losses: int = Field(default=5, ge=0, le=20)
     max_resumes: int = Field(default=3, ge=0, le=20)
     spend_limit: float = Field(default=50.0, gt=0)

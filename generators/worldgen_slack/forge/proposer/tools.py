@@ -34,10 +34,11 @@ class ProposerTools(WorldReads, vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def add_task(self, task: Task) -> dict:
-        """Write one task under one of this turn's open ids, of the family the id asks for. Code checks its asker, that
-        each answer's messages exist and its asker can read them, each answer's shape, that the request gives no answer
-        away and repeats no request of its asker, and keeps it, or refuses it with every reason. Writing an id again
-        replaces its task."""
+        """Write one task under one of this turn's open ids, of the family the id asks for, aiming at the skill it names.
+        Code checks its asker, that each answer's messages exist and its asker can read them, each answer's shape, that
+        the request gives no answer away and repeats no request of its asker, and the shape of its skill (aggregation:
+        a set part of 3 or more answers from 2 or more places; abstention: a status or refusal part; synthesis: 2 or
+        more parts), and keeps it, or refuses it with every reason. Writing an id again replaces its task."""
 
         def act():
             allowed = self.allowed()
@@ -58,7 +59,7 @@ class ProposerTools(WorldReads, vf.Toolset[AuthoringToolsConfig, vf.State]):
                 raise ValueError(f"{task.id} asks for a {family} request: write one of that family")
             world = self._world()
             try:
-                check(world, task, self._written())
+                check(world, task, self._written(), allowed.get("skills", {}).get(task.id))
             finally:
                 world.close()
             atomic_json(self._kept() / f"{task.id}.json", task.model_dump(mode="json"))
@@ -68,11 +69,13 @@ class ProposerTools(WorldReads, vf.Toolset[AuthoringToolsConfig, vf.State]):
 
     @vf.tool
     async def material(self) -> dict:
-        """The world's task material, by code: each value group (a subject and attribute) with every value it took in
-        order, each value's day, place and messages (m123, the evidence an answer names), and where so that it is a
-        decoy, what it supersedes and that it is current; who can read each private channel (a public one, everyone; a
-        DM, the people it names); and the people who could ask (name, id, title, clock). A dict: look at the part you
-        need."""
+        """The world's task material, by code: a summary (the material counted, by storyline, and how the promises
+        went); each value group (a subject and attribute) with every value it took in order, each value's day, place,
+        read_channel page and messages (m123, the evidence an answer names), and where so that it is a decoy, what it
+        supersedes and that it is current; the collections, sets of items each stated where it came up; every promise,
+        its owner, due day and how it went (kept, kept late, changed, dropped, slipped); who can read each private
+        channel (a public one, everyone; a DM, the people it names); and the people who could ask (name, id, title,
+        clock). A dict: keep it in a variable and look at the part you need."""
         return self._logged("material", {}, lambda: material(self._world()))
 
 

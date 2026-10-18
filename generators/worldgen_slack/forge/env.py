@@ -129,10 +129,12 @@ class ForgeEnv(SessionEnv):
             0,
             "source",
         )
-        # Each initial id asks for a family in turn, so every family is written whatever the turns' sizes.
-        families = list(FAMILIES)
+        # Each initial id asks for a family in turn, so every family is written whatever the turns' sizes, and aims at
+        # a skill in turn, when the config deals them.
+        families, skills = list(FAMILIES), self.settings.skills
         self.plan["planned"] = {
             f"i{n:03d}": {"family": families[(n - 1) % len(families)]}
+            | ({"skill": skills[(n - 1) % len(skills)]} if skills else {})
             for n in range(1, self.settings.tasks + 1)
         }
         self.store.event(
@@ -145,7 +147,18 @@ class ForgeEnv(SessionEnv):
     # ------------------------------------------------------------------ writing: the initial set, then its versions
 
     def open_ids(self) -> list[str]:
-        return [t for t in self.plan["planned"] if t not in self.store.state.forged]
+        """The ids still to write, those offered least first: an id no turn could fill stops heading every turn, and
+        one offered `offers` times is dropped, short of material."""
+        offered, dropped = self.plan.get("offered", {}), set(self.plan.get("dropped", []))
+        ids = [t for t in self.plan["planned"] if t not in self.store.state.forged and t not in dropped]
+        return sorted(ids, key=lambda t: offered.get(t, 0))
+
+    def drop_stuck(self) -> None:
+        offered = self.plan.get("offered", {})
+        if stuck := [t for t in self.open_ids() if offered.get(t, 0) >= self.settings.offers]:
+            self.plan.setdefault("dropped", []).extend(stuck)
+            self.store.event("ids_dropped", ids=stuck, offered=self.settings.offers)
+            self.store.save()
 
     async def blocks(self, agents, runtime, setup) -> None:
         """The proposer's turns in one VM until the phase's tasks are written, or two turns in a row write none. A turn
@@ -156,6 +169,7 @@ class ForgeEnv(SessionEnv):
         if kept and self.take(kept):
             self.plan["empty"] = 0
         while state.phase in ("generate", "adapt"):
+            self.drop_stuck()
             if not (ids := self.open_ids()) or self.plan.get("empty", 0) >= 2:
                 state.phase, self.plan["empty"] = "label", 0
                 self.store.save()
@@ -167,21 +181,25 @@ class ForgeEnv(SessionEnv):
         n = self.plan["turn"] = self.plan.get("turn", 0) + 1
         attempt = self.store.begin(f"{'initial' if state.batch == 0 else f'adapt{state.batch}'}-{n:02d}")
         versions = {t: v for t, v in self.plan["planned"].items() if t in ids and "variant_of" in v}
-        families = {t: self.family_of(t) for t in ids}
-        self.allow(ids, versions, families)
+        families, skills = {t: self.family_of(t) for t in ids}, {t: self.skill_of(t) for t in ids}
+        self.allow(ids, versions, families, skills)
         await self.bring_notes(runtime, state.restore_point)
         task = ProposerTask.create(self.world.path, self.tools_context(), attempt)
         if state.batch == 0:
             written = len(state.forged)
-            prompt = initial_prompt(families, written, self.settings.tasks)
+            prompt = initial_prompt(families, skills, written, self.settings.tasks)
         else:
-            prompt = adapt_prompt(ids)
+            prompt = adapt_prompt(ids, skills)
         async with agents.proposer.interaction(task, runtime=runtime) as interaction:
             await self.take_turn(interaction, runtime, prompt, attempt, "forge", self.pages(ids))
         self.store.trace(interaction.trace)
         require_session(interaction.trace)
         await self.keep_notes(runtime, attempt)
         added = self.take(ids)
+        offered = self.plan.setdefault("offered", {})  # a turn that ended, lost sessions aside
+        for t in ids:
+            if t not in state.forged:
+                offered[t] = offered.get(t, 0) + 1
         self.plan["empty"] = 0 if added else self.plan.get("empty", 0) + 1
         state.restore_point = attempt
         self.store.finish_attempt(bool(added))
@@ -194,11 +212,19 @@ class ForgeEnv(SessionEnv):
             return self.store.state.forged[planned["variant_of"]]["task"]["family"]
         return planned.get("family")
 
-    def allow(self, ids: list[str], versions: dict, families: dict) -> None:
+    def skill_of(self, task_id: str) -> str | None:
+        """The skill an open id aims at: an initial task's as code dealt it, a version's its source's."""
+        planned = self.plan["planned"][task_id]
+        if "variant_of" in planned:
+            return self.store.state.forged[planned["variant_of"]].get("skill")
+        return planned.get("skill")
+
+    def allow(self, ids: list[str], versions: dict, families: dict, skills: dict) -> None:
         """The ids the proposer's turn may write, the family each asks for, and which task each version is of and
         why: its tools read them per call."""
         atomic_json(
-            self.store.root / "writable.json", {"ids": list(ids), "versions": versions, "families": families}
+            self.store.root / "writable.json",
+            {"ids": list(ids), "versions": versions, "families": families, "skills": skills},
         )
 
     def take(self, ids: list[str]) -> int:
@@ -212,7 +238,7 @@ class ForgeEnv(SessionEnv):
                 continue
             task = Task.model_validate_json(path.read_bytes())
             try:
-                check(self.world, task, written)
+                check(self.world, task, written, self.skill_of(task_id))
             except (
                 ValueError
             ) as error:  # its tool checked it: only another task of the turn can make it a repeat
@@ -223,7 +249,7 @@ class ForgeEnv(SessionEnv):
                 "set": "initial" if task.why is None else task.why,
                 "pass": state.batch,
                 "key": key(task),
-            }
+            } | ({"skill": skill} if (skill := self.skill_of(task_id)) else {})
             written.append(task)
             taken += 1
         self.store.event("tasks_taken", attempt=state.active_attempt, tasks=taken, of=len(ids))
@@ -374,7 +400,7 @@ class ForgeEnv(SessionEnv):
                 f"{why[0]}{state.batch}{n:02d}": {"variant_of": t, "why": why}
                 for n, (t, why) in enumerate(sources, 1)
             }
-            self.plan["turn"], state.phase = 0, "adapt"
+            self.plan["turn"], self.plan["offered"], state.phase = 0, {}, "adapt"
         self.store.event("pass_labelled", passed=state.batch, next=state.phase, versions=len(sources))
         self.store.save()
 

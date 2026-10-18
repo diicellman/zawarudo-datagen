@@ -22,6 +22,18 @@ FAMILIES = {
     "status": "who handles something now, where it stands, or who to ask about it",
 }
 SETS = ("initial", "harder", "easier", "repaired")
+# What a request needs of whoever answers it, where a solver goes wrong: each initial id aims at one, as code deals
+# them, and code checks the shape it can tell (`skill_problems`).
+SKILLS = {
+    "aggregation": "every item, across channels, threads and days (every open blocker, every change, everyone who "
+    "still owes something): a part answered by the whole set, gathered from 2 or more places",
+    "temporal": "the answer as of a moment, a value that changed more than once, how long something ran or how far "
+    "it moved",
+    "abstention": "what is asked is not there, not settled, or out of the asker's sight, and the right answer says so: "
+    "a status or a refusal part",
+    "synthesis": "what is stated apart, joined: a decision and its reason, an owner handed over, a promise and whether "
+    "it was kept: a request of 2 or more parts",
+}
 
 
 class Part(StrictModel):
@@ -69,12 +81,39 @@ def tokens(value: str) -> set[str]:
 COUNTS = {"text": (1, 1), "number": (1, 1), "status": (1, 1), "set": (2, 50), "refusal": (0, 0)}
 
 
-def check(world, task: Task, written: list[Task]) -> None:
+def skill_problems(world, task: Task, skill: str | None) -> list[str]:
+    """Why a task lacks the shape of the skill its id aims at, as far as code can tell: aggregation, a set part of 3 or
+    more answers resting on messages in 2 or more places (channels, or threads of one); abstention, a status or a
+    refusal part; synthesis, 2 or more parts. Temporal has no shape code can tell."""
+    if skill == "aggregation":
+        for part in task.parts:
+            if part.answer_type != "set" or len(part.answer) < 3 or not part.evidence:
+                continue
+            marks = ", ".join("?" * len(part.evidence))
+            places = world.db.execute(
+                "SELECT COUNT(DISTINCT CASE WHEN parent_id IS NULL THEN channel_id ELSE channel_id || ':' || parent_id "
+                f"END) FROM messages WHERE id IN ({marks})",  # a channel, or a thread in it
+                part.evidence,
+            ).fetchone()[0]
+            if places >= 2:
+                return []
+        return [
+            "it aims at aggregation: give it a set part of 3 or more answers, gathered from messages in 2 or more "
+            "places (channels, or threads)"
+        ]
+    if skill == "abstention" and not any(p.answer_type in ("status", "refusal") for p in task.parts):
+        return ["it aims at abstention: give it a status or a refusal part"]
+    if skill == "synthesis" and len(task.parts) < 2:
+        return ["it aims at synthesis: join what is stated apart, in 2 or more parts"]
+    return []
+
+
+def check(world, task: Task, written: list[Task], skill: str | None = None) -> None:
     """Everything wrong with a task that code can tell, refused at once with every reason: its asker is a person still
     in the workspace; each part's answer has the shape of its type; its evidence exists, is no deleted message, and its
     asker can read it (a status's and a refusal's `unseen` they cannot); its parts ask different things; its question
-    gives no answer away; and its asker asked nothing the same before."""
-    problems = []
+    gives no answer away; its asker asked nothing the same before; and it has the shape of the skill its id aims at."""
+    problems = skill_problems(world, task, skill)
     who = world.db.execute("SELECT is_bot, is_deleted FROM users WHERE id = ?", (task.actor_id,)).fetchone()
     if who is None or who["is_bot"] or who["is_deleted"]:
         problems.append(f"its asker {task.actor_id} is no person in the workspace")

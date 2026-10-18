@@ -1161,7 +1161,7 @@ async def forge_flow(root, world_dir, settings):
     the release of every approved task. Along the way: a task code refuses and the proposer fixes; a verifier split
     tried a third time; a task whose student tries all crash, failed while the others go on; a proposer session lost
     and taken up again; and a judge down for a whole pass, which stops the run, and the CLI takes it up again."""
-    plan = flow_forge(settings, world=world_dir, output=root)
+    plan = flow_forge(settings, world=world_dir, output=root, skills=["temporal"])
     world = Workspace(world_dir / "world.sqlite")
     people = [r[0] for r in world.db.execute("SELECT id FROM users WHERE is_bot = 0 ORDER BY id")]
 
@@ -1251,6 +1251,11 @@ async def forge_flow(root, world_dir, settings):
             v["page"] >= 1 for g in found["groups"] for v in g["values"]
         ), found["summary"]
         allowed = tools.allowed()
+        assert all(allowed["skills"][t] == "temporal" for t in allowed["ids"]) and (
+            "temporal, the answer as of a moment" in prompt
+        ), (
+            "each id aims at the skill code dealt it, a version at its source's, and the prompt says what it needs"
+        )
         if FAULTS["stop"]:  # a Ctrl-C mid-turn reaches the run as the proposer's stream cancelled
             FAULTS["stop"] -= 1
             verifiers.v1.utils.interrupt._cleaning_up = True
@@ -1387,6 +1392,7 @@ async def forge_flow(root, world_dir, settings):
     assert "crashed" in forged["i005"]["failed"], "its tries all crashed: it fails, the others go on"
     assert len(store.state.verifier["i003"]["results"]) == 3, "a split is decided by a third try"
     assert forged["i004"]["verified"] and not forged["i004"]["ruling"]["exact"], "verified, but over-specific"
+    assert {r.get("skill") for r in forged.values()} == {"temporal"}, "each kept with the skill it aimed at"
     assert [(forged[t]["set"], forged[t]["task"]["variant_of"]) for t in ("h101", "e102", "r103")] == [
         ("harder", "i001"),
         ("easier", "i002"),

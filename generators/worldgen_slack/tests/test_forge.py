@@ -90,6 +90,34 @@ def test_material(tmp_path):
     assert found["summary"]["facts"] == 5 and found["summary"]["promises"]["slipped"] == 1, found["summary"]
 
 
+def test_offers():
+    """The ids still open, those offered least first; one offered `offers` times unwritten is dropped, short of
+    material, and stays dropped."""
+    events = []
+    env = ForgeEnv.__new__(ForgeEnv)
+    env.settings = SimpleNamespace(offers=2)
+    env.store = SimpleNamespace(
+        state=SimpleNamespace(
+            plans={
+                "forge": {
+                    "planned": dict.fromkeys(("i001", "i002", "i003"), {}),
+                    "offered": {"i001": 2, "i002": 1},
+                }
+            },
+            forged={"i003": {}},
+        ),
+        event=lambda name, **fields: events.append((name, fields)),
+        save=lambda: None,
+    )
+    assert env.open_ids() == ["i002", "i001"], "the least offered first; a written id is not open"
+    env.drop_stuck()
+    assert (
+        env.open_ids() == ["i002"]
+        and env.plan["dropped"] == ["i001"]
+        and events == [("ids_dropped", {"ids": ["i001"], "offered": 2})]
+    )
+
+
 def test_contract(tmp_path):
     """A task is a request of 1 to 4 parts; code refuses, with every reason, what it can tell is wrong (its asker, its
     messages out of their sight, an answer of the wrong shape, two parts alike, a question that gives an answer away, a
@@ -125,6 +153,24 @@ def test_contract(tmp_path):
         question="Catch me up on the 4.2 rollback: who called it, and who answered?",
     )
     check(world, composite, [])
+    # The skill an id aims at, by its shape as far as code can tell: aggregation, a set of 3 or more from 2 or more
+    # places (a channel, or a thread in one); abstention, a status or a refusal; synthesis, 2 or more parts.
+    many = part(label="who took part", answer=["Alicia Rao", "Owen Sato", "Mia Chen"], kind="set")
+    for task, skill in (
+        (request(many.model_copy(update={"evidence": [1, 3]})), "aggregation"),  # two posts, one channel
+        (request(part(kind="set", answer=["Alicia Rao", "Owen Sato"], evidence=[1, 5])), "aggregation"),
+        (single, "abstention"),
+        (single, "synthesis"),
+    ):
+        refused(f"it aims at {skill}", check, world, task, [], skill)
+    for task, skill in (
+        (request(many.model_copy(update={"evidence": [1, 2]})), "aggregation"),  # a post and its thread
+        (request(many.model_copy(update={"evidence": [1, 5]})), "aggregation"),  # a channel and a DM
+        (request(part(kind="refusal", answer=[], evidence=[])), "abstention"),
+        (composite, "synthesis"),
+        (single, "temporal"),  # no shape code can tell
+    ):
+        check(world, task, [], skill)
     answer = private_answer(world, composite)
     ts = dict(world.db.execute("SELECT id, ts FROM messages").fetchall())
     assert answer.answer_type == "composite" and [p.label for p in answer.parts] == [
