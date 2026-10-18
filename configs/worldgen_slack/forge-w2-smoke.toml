@@ -1,0 +1,45 @@
+# The forge's smoke on W2's smoke world: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-w2-smoke.toml
+# Eight initial tasks and one adapting pass, through every path with the real models: the skills dealt and checked, a
+# stuck id dropped, the material's collections and promises, the coverage page and the report.
+world = "data/v8-05/smoke-w2"
+output = "data/v8-05/forge-smoke-w2"
+tasks = 8
+batch = 4                 # a turn's ids, one of each family: a turn of 12 had GLM 5.3 flash survey the world until its
+                          # 1.5M tokens ran out, before it wrote one (the W1 pilot, 2026-10-17)
+adapt = 1
+tries = 8
+verify = 2
+# The skills code deals the initial ids, in turn: aggregation twice in 5 (the research's surest near-miss for a fast
+# model, and W1's rarest), then temporal, abstention and synthesis. Crossed with the 4 families, every pair occurs
+# within 20 ids.
+skills = ["aggregation", "temporal", "aggregation", "abstention", "synthesis"]
+offers = 3                # turns an id is offered unwritten before it is dropped, short of material
+spend_limit = 40.0        # a guard against a runaway, not a budget
+
+# One model per seat. The proposer, the models that check its tasks and the student, whose pass rates select them,
+# are of three families, so none checks its own family's writing; unset fields keep the seat defaults.
+[env.proposer]
+model = "anthropic/claude-opus-5.5"
+
+# Anthropic caches a prompt only when asked: each step then pays for its new tail alone. The cache lives an hour, as
+# the proposer's VM waits while a pass is labelled.
+[env.proposer.sampling]
+cache_control = { type = "ephemeral", ttl = "1h" }
+
+[env.verifier]            # reaches each task's answer from Slack, or the task is dropped
+model = "z-ai/glm-5.3"
+
+[env.solver]              # the student
+model = "deepseek/deepseek-v4.1-flash"
+
+[judge]                   # the task judge: realistic, one reading, exact, supported
+model = "z-ai/glm-5.3"
+
+[judge.sampling]
+reasoning_effort = "high"
+
+[answer_judge]            # grades every try against a task's answer
+model = "z-ai/glm-5.3"
+
+[answer_judge.sampling]
+reasoning_effort = "high"
