@@ -83,6 +83,17 @@ def fact_line(world, fact: dict, who: dict) -> str:
     )
 
 
+def slipping(promise, now: int) -> str:
+    """How an open promise that slips stands: past its due day with nothing said, or still to slip."""
+    if not promise["slips"]:
+        return ""
+    return (
+        "; slipped: overdue, nothing said"
+        if promise["due_us"] <= now
+        else "; slips: its due day passes with nothing said"
+    )
+
+
 def now_page(world, settings, context: dict) -> str:
     """The one-pager: everything the author needs at the present, on one page."""
     who, total = people(world), world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0]
@@ -114,8 +125,15 @@ def now_page(world, settings, context: dict) -> str:
             (day,),
         ):
             out.append(f"- to state today: {fact_line(world, dict(f), who)[2:]}")
-        for c in world.db.execute("SELECT * FROM commitments WHERE status = 'open' AND due_us <= ?", (end,)):
-            out.append(f"- due by today's end: [[{c['id']}]] {who[c['owner_id']]['real_name']}: {c['text']}")
+        for c in world.db.execute(
+            "SELECT * FROM commitments WHERE status = 'open' AND due_us <= ? AND due_us > ?", (end, start)
+        ):
+            due = (
+                "slips today (no line keeps, changes or drops it today)"
+                if c["slips"]
+                else "due by today's end"
+            )
+            out.append(f"- {due}: [[{c['id']}]] {who[c['owner_id']]['real_name']}: {c['text']}")
         drawn = context.get("agenda", {}).get(str(day), [])
         if drawn:
             out.append("- everyday conversations code drew for today:")
@@ -145,7 +163,7 @@ def now_page(world, settings, context: dict) -> str:
         out += ["", "## Open promises"]
         out += [
             f"- [[{c['id']}]] {who[c['owner_id']]['real_name']}: {c['text']}; due by {clock(world, c['due_us'] - 1)[:14]} "
-            f"(made in [[m{c['message_id']}]])"
+            f"(made in [[m{c['message_id']}]]){slipping(c, now)}"
             for c in promises
         ]
     if context.get("slots"):
@@ -207,7 +225,7 @@ def person_page(world, user_id: str, context: dict) -> str:
         "SELECT * FROM commitments WHERE owner_id = ? AND status = 'open'", (user_id,)
     )
     out += [
-        f"- open promise [[{c['id']}]]: {c['text']}; due by {clock(world, c['due_us'] - 1)[:14]}"
+        f"- open promise [[{c['id']}]]: {c['text']}; due by {clock(world, c['due_us'] - 1)[:14]}{slipping(c, now)}"
         for c in promises
     ]
     if self := context.get("selves", {}).get(user_id):
@@ -400,7 +418,8 @@ def ledger_document(world, slots=None) -> dict:
 
 
 def ledger_digest(world) -> dict:
-    """Events and facts with every moment rendered on the company clock, for a reviewer."""
+    """Events and facts with every moment rendered on the company clock, and the promises planned to slip, for a
+    reviewer."""
     who = people(world)
     return {
         "events": [
@@ -411,7 +430,21 @@ def ledger_digest(world) -> dict:
             fact_line(world, dict(f), who)[2:]
             for f in world.db.execute("SELECT * FROM facts ORDER BY day, id")
         ],
-    }
+    } | (
+        {
+            "slipping_promises": [
+                f"{c['id']}: {who[c['owner_id']]['real_name']}, {c['text']} (made in m{c['message_id']}, due by "
+                f"{clock(world, c['due_us'] - 1)[:14]})"
+                for c in slipped
+            ]
+        }
+        if (
+            slipped := world.db.execute(
+                "SELECT * FROM commitments WHERE slips = 1 ORDER BY due_us"
+            ).fetchall()
+        )
+        else {}
+    )
 
 
 def files(world, settings, context: dict) -> dict[str, str]:

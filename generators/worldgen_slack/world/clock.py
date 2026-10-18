@@ -144,7 +144,9 @@ FROZEN = {
     "facts": "SELECT f.* FROM facts f JOIN calendar c ON c.day = f.day WHERE c.start_us < :t",
     "fact_relations": "SELECT r.* FROM fact_relations r JOIN facts f ON f.id = r.src_fact JOIN calendar c ON c.day = f.day WHERE c.start_us < :t",
     "events": "SELECT * FROM events WHERE moment_us < :t",
-    "commitments": "SELECT x.* FROM commitments x JOIN messages m ON m.id = x.message_id WHERE m.ts_us < :t",
+    # a promise as it was made: one that slipped may be kept late or dropped in a later chapter
+    "commitments": "SELECT x.id, x.owner_id, x.text, x.message_id, x.due_us, x.slips FROM commitments x "
+    "JOIN messages m ON m.id = x.message_id WHERE m.ts_us < :t",
 }
 
 

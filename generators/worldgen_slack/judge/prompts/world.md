@@ -1,7 +1,8 @@
 World review: the workspace as a record of real work. Score each criterion of schemas.json from 0 to 1:
 - scenario_alignment: the messages tell the storylines.
 - world_coherence: messages agree with each other and with the facts; nothing is reported done or known before it
-  happens; promises are kept or explicitly changed.
+  happens; a promise is kept, changed or dropped in a message by its due day, or it slips: input.json's ledger lists
+  the promises planned to slip, whose due day passes with nothing said, as at real work, and one is no defect.
 - professional_realism: it reads as real work. inspect_check's style shows each author's messages beside their typing
   (people in input.json); different people writing in one register is a defect.
 Message times and order are code's; report text that contradicts them, not the times themselves. When input.json has

@@ -54,6 +54,9 @@ class ActivityConfig(Section):
     # Promises made per message, at least, each day ("I'll have it by Friday"): what was promised and is still open is
     # a request people bring to an assistant. Off unless a world's config sets it.
     promise_rate: float = Field(default=0.0, ge=0, le=0.2)
+    # The share of promises that slip (their due day passes with nothing said), change or are dropped, at least, of
+    # those made so far, checked as each is made: not every promise is kept, and "was it done?" is asked of those too.
+    promise_slips: float = Field(default=0.0, ge=0, le=1)
     # Each app's routine posts per workday (builds, alerts, staging deploys, tickets; a reminder posts once): code's,
     # never a person's. Off unless a world's config sets it, with the apps its organization lists.
     bot_posts: float = Field(default=0.0, ge=0, le=30)

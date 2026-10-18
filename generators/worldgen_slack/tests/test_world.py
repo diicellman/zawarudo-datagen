@@ -67,7 +67,7 @@ from ..world.organization import (
     direct_messages,
     organize,
 )
-from ..world.profile import counts
+from ..world.profile import counts, promises
 from ..world.text import TIME_LITERAL
 from ..world.writing import (
     Close,
@@ -1125,6 +1125,63 @@ def test_clock(tmp_path):
         "open",
         b,
     )
+    # A promise that slips lets its due day pass with nothing said: the day closes with it open, it cannot be closed
+    # on or before its due day, and a later day's line keeps it late. With promise_slips, of the promises made so far
+    # at least that share slip, change or are dropped, checked as each is made; a new one can always slip.
+    deck = Commit(id="c3", text="send the deck", due_day=1, slips=True)
+    try:
+        with world.trial() as copy:
+            post(
+                copy, talk(dict(author_id=a, text="I'll send the deck", commits=[deck])), settings, rng, gaps
+            )
+            assert not [e for e in close_day(copy, settings, 1) if "c3" in e], (
+                "a slip leaves the day closable"
+            )
+            with pytest.raises(ValueError, match="c3 slips: its due day passes with nothing said"):
+                post(
+                    copy,
+                    talk(dict(author_id=a, text="sent", closes=[Close(id="c3", status="kept")])),
+                    settings,
+                    rng,
+                    gaps,
+                )
+            assert "slips today" in files(copy, settings, {})["memory/now.md"]
+            advance(copy, settings, "night")
+            assert advance(copy, settings, "tomorrow")["closed_day"] == 1
+            assert "slipped: overdue, nothing said" in files(copy, settings, {})["memory/now.md"]
+            assert "c3:" in " ".join(ledger_digest(copy)["slipping_promises"]), (
+                "the judge knows it was planned"
+            )
+            post(
+                copy,
+                talk(dict(author_id=a, text="sent the deck, sorry", closes=[Close(id="c3", status="kept")])),
+                settings,
+                rng,
+                gaps,
+            )
+            assert promises(copy)["kept late"] == 1
+            raise LookupError("drop the trial")
+    except LookupError:
+        pass
+    slipping = settings.model_copy(
+        update={"activity": settings.activity.model_copy(update={"promise_slips": 0.5})}
+    )
+
+    def posted_under(cfg, conversation):
+        with world.trial() as copy:
+            post(copy, conversation, cfg, rng, gaps)
+            raise LookupError("drop the trial")
+
+    refused(
+        "of the 2 promises made so far, these among them, 0 slip, change or are dropped; at least 1 do (50%)",
+        posted_under,
+        slipping,
+        talk(
+            dict(author_id=a, text="I'll send the deck", commits=[deck.model_copy(update={"slips": False})])
+        ),
+    )
+    with pytest.raises(LookupError):  # posted, then dropped
+        posted_under(slipping, talk(dict(author_id=a, text="I'll send the deck", commits=[deck])))
     refused(
         "UNIQUE",
         posted_,

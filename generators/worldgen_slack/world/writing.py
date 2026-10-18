@@ -162,11 +162,14 @@ def insert_lines(
 
 
 class Commit(StrictModel):
-    """A promise the line makes, due by the end of a calendar day."""
+    """A promise the line makes, due by the end of a calendar day. One that `slips` lets its due day pass with nothing
+    said, as people forget, get busy or move on: it stays open, overdue, until a later line keeps it late or drops it,
+    if one ever does."""
 
     id: SafeId
     text: NonEmptyText
     due_day: int = Field(ge=1)
+    slips: bool = False
 
 
 class Close(StrictModel):
@@ -292,7 +295,8 @@ def owed(world, day: int) -> tuple[int, int]:
         (day,),
     ).fetchall()
     due = world.db.execute(
-        "SELECT 1 FROM commitments WHERE status = 'open' AND due_us <= ?", (bounds(world, day)[1],)
+        "SELECT 1 FROM commitments WHERE status = 'open' AND slips = 0 AND due_us <= ?",
+        (bounds(world, day)[1],),
     ).fetchone()
     in_dms = sum(g[0] for g in groups)
     return in_dms, len(groups) - in_dms + (1 if due and not groups else 0)
@@ -455,15 +459,24 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
                 first.add(f)
     if conversation.thread is not None and any(line.reply_to is not None for line in lines):
         errors.append("in a continued thread every line replies to it: leave reply_to empty")
-    promises = {r["id"]: r["status"] for r in world.db.execute("SELECT id, status FROM commitments")}
+    promises = {
+        r["id"]: dict(r) for r in world.db.execute("SELECT id, status, due_us, slips FROM commitments")
+    }
     days = {r[0] for r in world.db.execute("SELECT day FROM calendar")}
     for i, line in enumerate(lines):
         for c in line.commits:
             if c.due_day < day or c.due_day not in days:
                 errors.append(f"line {i}: {c.id} is due today or on a later day of the calendar")
         for c in line.closes:
-            if promises.get(c.id) != "open":
+            if (promise := promises.get(c.id)) is None or promise["status"] != "open":
                 errors.append(f"line {i}: {c.id} is no open commitment")
+            elif promise["slips"] and end <= promise["due_us"]:
+                errors.append(
+                    f"line {i}: {c.id} slips: its due day passes with nothing said, so it is closed, if ever, on a "
+                    "later day"
+                )
+    if short := slips_short(world, settings, [c for line in lines for c in line.commits]):
+        errors.append(short)
     if errors:
         raise ValueError("; ".join(errors))
     now, before = present(world), today_line(world, settings, day)
@@ -514,6 +527,7 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
                         text=c.text,
                         message_id=message,
                         due_us=bounds(world, c.due_day)[1],
+                        slips=int(c.slips),
                     )
                     for c in line.commits
                 ],
@@ -544,6 +558,26 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
     }
 
 
+def slips_short(world, settings, commits: list[Commit]) -> str | None:
+    """Why a conversation's promises leave too few that slip, change or are dropped, if they do: of the promises made
+    so far, its own among them, at least `promise_slips` of them. A new promise can always slip, so this always can
+    be met."""
+    share = settings.activity.promise_slips
+    if not commits or not share:
+        return None
+    made, missed = world.db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(slips = 1 OR status IN ('changed', 'dropped')), 0) FROM commitments"
+    ).fetchone()
+    made, missed = made + len(commits), missed + sum(c.slips for c in commits)
+    if missed < (least := math.floor(share * made)):
+        return (
+            f"of the {made} promises made so far, these among them, {missed} slip, change or are dropped; at least "
+            f"{least} do ({share:.0%}): mark one of these slips (its due day passes with nothing said), or change or "
+            "drop an open one"
+        )
+    return None
+
+
 def owed_moments(world, day: int) -> list[tuple[str, int]]:
     """The scheduled facts planned for `day` and not stated yet, with their moments: each must be told before it."""
     return world.db.execute(
@@ -567,7 +601,7 @@ def close_day(world, settings, day: int) -> list[str]:
     ):
         errors.append(f"{fact} is planned for today: its author states it in its channel")
     for (promise,) in world.db.execute(
-        "SELECT id FROM commitments WHERE status = 'open' AND due_us <= ?", (end,)
+        "SELECT id FROM commitments WHERE status = 'open' AND slips = 0 AND due_us <= ?", (end,)
     ):
         errors.append(f"{promise} is due by today's end: keep it, change it or drop it in a message")
     made, least = promises_made(world, day), math.floor(settings.activity.promise_rate * count)

@@ -52,8 +52,10 @@ Conversations (world_post)
   happened fact is stated only after it happens, a scheduled one before it happens; after and supersedes keep their
   order. Anyone may repeat a stated
   fact later, listing it in conveys.
-- commits opens a promise with the day it is due; closes ends one: kept, changed or dropped. Every promise ends by
-  its due day.
+- commits opens a promise with the day it is due; closes ends one: kept, changed or dropped. A promise ends by its
+  due day, unless it slips: a commit marked slips lets its due day pass with nothing said (its owner forgot, got
+  busy, or the work moved on), and it stays open, overdue, until a later day's line keeps it late or drops it, if one
+  ever does. Not every promise is kept: some slip, some change, some are dropped.
 - Each day holds about the number of messages now.md gives, spread by the parts' rhythm, and its own shares of thread
   replies, reacted messages and DMs. A weekend day is quiet, unless the first plan of its days puts an event on it: a day with
   an event gets a workday's messages; now.md's today line shows them, and what closing the day still takes. A

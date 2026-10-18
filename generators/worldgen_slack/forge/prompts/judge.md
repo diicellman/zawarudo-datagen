@@ -22,7 +22,7 @@ each true or false, and give one short reason that names what decided any false.
   answers wrong, and exact is false.
 - supported. The messages a part rests on state its answer, as its asker can read them; for a status, the visible
   value is not settled, as the unseen message shows; for a refusal, what is asked is not there to see, or its premise
-  is contradicted.
+  is contradicted; for whether a promise was done when it was not, the promise, with nothing after it that keeps it.
 
 The task, the messages, the verifier's and the student's answers:
 {task}
