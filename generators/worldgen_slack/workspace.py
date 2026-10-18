@@ -16,7 +16,7 @@ from worldgen_slack.world import SCHEMA, SHADOWED, World, words
 # The schema's version, and how a world of an older one comes forward to it: the columns each version added, and the
 # tables it changed in a way no ALTER can (a CHECK), remade from schema.sql with their rows (the tables it added are
 # made from schema.sql). A world adopted by a chapter or a forge is brought forward first.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 REBUILT = {3: ["tasks"]}  # v3: a task may be composite, its parts tasks of their own
 COLUMNS = {
     2: [
@@ -29,6 +29,15 @@ COLUMNS = {
         ),
         ("events", "post_by", "ALTER TABLE events ADD COLUMN post_by TEXT REFERENCES users(id)"),
         ("tasks", "intent", "ALTER TABLE tasks ADD COLUMN intent TEXT"),
+    ],
+    # v4: the set a fact's subject is an item of; a promise whose due day passes with nothing said
+    4: [
+        ("facts", "collection", "ALTER TABLE facts ADD COLUMN collection TEXT"),
+        (
+            "commitments",
+            "slips",
+            "ALTER TABLE commitments ADD COLUMN slips INTEGER NOT NULL DEFAULT 0 CHECK (slips IN (0, 1))",
+        ),
     ],
 }
 

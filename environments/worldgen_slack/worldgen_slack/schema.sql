@@ -223,6 +223,7 @@ CREATE TABLE facts (
   event_id    TEXT REFERENCES events(id),            -- the event whose moment it carries, if any
   is_decoy    INTEGER NOT NULL DEFAULT 0 CHECK (is_decoy IN (0, 1)),
   summary     TEXT NOT NULL,
+  collection  TEXT,                                  -- the set its subject is an item of, if any (v4)
   CHECK ((moment_us IS NULL) = (moment_kind IS NULL) AND (moment_us IS NULL) = (moment_zone IS NULL)),
   CHECK (event_id IS NULL OR moment_us IS NOT NULL)
 );
@@ -285,5 +286,6 @@ CREATE TABLE commitments (                           -- what someone promised in
   due_us     INTEGER NOT NULL,
   status     TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'kept', 'changed', 'dropped')),
   closed_by  INTEGER REFERENCES messages(id),        -- the message that kept, changed or dropped it
+  slips      INTEGER NOT NULL DEFAULT 0 CHECK (slips IN (0, 1)),  -- its due day passes with nothing said (v4)
   CHECK ((status = 'open') = (closed_by IS NULL))
 );

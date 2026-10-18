@@ -1446,6 +1446,8 @@ async def chapter_flow(root, parent, settings):
     assert set(same_schema(aged)) == {
         "artifacts",
         "channels",
+        "commitments",
+        "facts",
         "integrations",
         "messages",
         "queue",
@@ -1453,7 +1455,7 @@ async def chapter_flow(root, parent, settings):
         "usergroups",
         "users",
     }
-    assert (aged.migrate(), same_schema(aged), aged.migrate(), aged.violations()) == (1, [], 3, []), (
+    assert (aged.migrate(), same_schema(aged), aged.migrate(), aged.violations()) == (1, [], 4, []), (
         "forward, once"
     )
     assert aged.db.execute("SELECT COUNT(*), group_concat(text) FROM messages").fetchone()[:] == rows
@@ -1515,7 +1517,7 @@ async def chapter_flow(root, parent, settings):
     on_elder = chapter.model_copy(update={"world": elder, "output": root / "on-elder"})
     elder_store = TestStore(on_elder.output, chapter_provenance(on_elder, cfg))
     adopt(elder_store, on_elder, cfg, slots)
-    assert (meta(elder_store.world, "schema_version"), same_schema(elder_store.world)) == ("3", []), (
+    assert (meta(elder_store.world, "schema_version"), same_schema(elder_store.world)) == ("4", []), (
         "brought forward"
     )
     elder_store.close()

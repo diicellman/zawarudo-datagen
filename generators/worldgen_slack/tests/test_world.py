@@ -20,7 +20,7 @@ from ..forge.proposer.task import ProposerTask
 from ..forge.tasks import Part, Task, check
 from ..workspace import Workspace
 from ..world import integrations
-from ..world.author.memory import files, ledger_digest
+from ..world.author.memory import files, ledger_digest, ledger_document
 from ..world.author.setup import parse_premise
 from ..world.author.task import AuthorTask
 from ..world.board import Slot, needs_text
@@ -1221,6 +1221,17 @@ def test_clock(tmp_path):
     )
     recorded(plan(facts=[facts[0].model_copy(update={"summary": "decided early"}), *facts[1:]]))
     assert world.db.execute("SELECT summary FROM facts WHERE id = 'f1'").fetchone()[0] == "decided early"
+    # An item of a set: an unstated fact may join a collection, which the ledger document carries back; a stated
+    # fact's collection is fixed, as the rest of it is.
+    recorded(plan(facts=[*facts[:3], facts[3].model_copy(update={"collection": "launch blockers"})]))
+    assert [f.get("collection") for f in ledger_document(world)["facts"] if f["id"] == facts[3].id] == [
+        "launch blockers"
+    ]
+    refused(
+        "only its summary may change",
+        recorded,
+        plan(facts=[facts[0].model_copy(update={"collection": "launch blockers"}), *facts[1:]]),
+    )
     refused(
         "today (day 2) or later", recorded, plan(facts=[*facts[:3], facts[3].model_copy(update={"day": 1})])
     )

@@ -72,8 +72,10 @@ def fact_line(world, fact: dict, who: dict) -> str:
         if fact["event_id"]
         else ""
     )
-    extra = (" (decoy)" if fact["is_decoy"] else "") + (
-        f", anchor {fact['anchor']!r}" if fact["anchor"] else ""
+    extra = (
+        (" (decoy)" if fact["is_decoy"] else "")
+        + (f", an item of {fact['collection']!r}" if fact.get("collection") else "")
+        + (f", anchor {fact['anchor']!r}" if fact["anchor"] else "")
     )
     return (
         f"- [[{fact['id']}]] {fact['subject']}: {fact['attribute']} = {fact['value']}{extra}{about}; {status}"
@@ -388,6 +390,7 @@ def ledger_document(world, slots=None) -> dict:
                 "decoy": bool(f["is_decoy"]),
                 "summary": f["summary"],
             }
+            | ({"collection": f["collection"]} if f["collection"] else {})
             for f in world.db.execute("SELECT * FROM facts ORDER BY day, id")
         ],
     }

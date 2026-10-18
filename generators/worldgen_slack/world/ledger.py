@@ -67,6 +67,9 @@ class PlanFact(StrictModel):
     kind: Literal["happened", "scheduled"] | None = None
     decoy: bool = False
     summary: NonEmptyText
+    # The set its subject is an item of ("4.9 release blockers", "retailers on the new ship date"): an item each fact of
+    # the collection names, stated where it comes up, never listed whole in one place.
+    collection: NonEmptyText | None = None
 
     @model_validator(mode="after")
     def about_an_event(self) -> Self:
@@ -341,6 +344,7 @@ def fact_row(fact: PlanFact, events: dict[str, Event], moment: dict[str, int], z
             "author_id",
             "day",
             "summary",
+            "collection",
         }
     ) | {"event_id": fact.event, "is_decoy": int(fact.decoy)}
     if fact.event is None:
