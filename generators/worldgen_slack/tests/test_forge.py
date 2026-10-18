@@ -9,6 +9,7 @@ import pytest
 from ..forge import tries as tries_module
 from ..forge.env import ForgeEnv, label_of, priced, spent
 from ..forge.judge import Ruling, hearing, rule
+from ..forge.material import material
 from ..forge.release import level, release_rows, report
 from ..forge.tasks import Part, Task, answer_text, check, key, private_answer
 from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached
@@ -23,6 +24,70 @@ def part(label="who called it", answer=("Alicia Rao",), evidence=(1,), kind="tex
 
 def request(*parts, id="t9", actor="U2", question="Catch me up on the 4.2 release: who called the rollback?"):
     return Task(id=id, family="catch-up", actor_id=actor, question=question, parts=list(parts) or [part()])
+
+
+def test_material(tmp_path):
+    """The proposer's map: a collection's items with their current values and messages; each value's page depth in
+    its channel; every promise with how it went (one past due with nothing said has slipped); and the world's material
+    counted, by storyline."""
+    world, at, _ = world_fixture(tmp_path / "w.sqlite")
+    items = (
+        (1, "C1", 1, "U1", "blocked"),
+        (2, "G1", 4, "U1", "budget"),
+        (3, "D1", 5, "U2", "check"),
+        (4, "C1", 2, "U2", "ack"),
+    )
+    with world.batch():
+        world.insert(
+            "facts",
+            [
+                dict(
+                    id=f"b{n}",
+                    storyline="r",
+                    subject=f"blocker {n}",
+                    attribute="state",
+                    value="open",
+                    anchor=token,
+                    channel_id=channel,
+                    author_id=author,
+                    day=1,
+                    summary="s",
+                    collection="4.2 blockers",
+                )
+                for n, channel, _, author, token in items
+            ],
+        )
+        world.insert(
+            "evidence",
+            [
+                dict(fact_id=f"b{n}", message_id=m, role="anchor", anchor_token=token)
+                for n, _, m, _, token in items
+            ],
+        )
+        world.insert(
+            "commitments",
+            [dict(id="c1", owner_id="U2", text="send the notes", message_id=3, due_us=at(3, 0), slips=1)],
+        )
+    found = material(world)
+    (blockers,) = found["collections"]
+    assert (blockers["collection"], blockers["storyline"], len(blockers["items"])) == ("4.2 blockers", "r", 4)
+    assert {i["item"]: (i["current"], i["messages"]) for i in blockers["items"]}["blocker 4"] == (
+        ["open"],
+        ["m2 (reply to m1)"],
+    ), "a thread reply names its parent"
+    assert all(v["page"] == 1 for g in found["groups"] for v in g["values"]), "one page deep, every channel"
+    assert found["promises"] == [
+        {
+            "promise": "c1",
+            "owner": "Owen Sato (U2)",
+            "text": "send the notes",
+            "made": "m3",
+            "where": "#releases",
+            "due_day": 2,
+            "outcome": "slipped",
+        }
+    ]
+    assert found["summary"]["facts"] == 5 and found["summary"]["promises"]["slipped"] == 1, found["summary"]
 
 
 def test_contract(tmp_path):

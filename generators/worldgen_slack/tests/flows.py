@@ -1246,6 +1246,10 @@ async def forge_flow(root, world_dir, settings):
             v.get("current") for g in found["groups"] for v in g["values"]
         ), found
         assert any(first["real_name"] in person for person in found["people"]), found["people"]
+        # Where the world's material is, by storyline, how its promises went, and how deep each value sits.
+        assert {"chains", "collections", "by_storyline", "promises"} <= set(found["summary"]) and all(
+            v["page"] >= 1 for g in found["groups"] for v in g["values"]
+        ), found["summary"]
         allowed = tools.allowed()
         if FAULTS["stop"]:  # a Ctrl-C mid-turn reaches the run as the proposer's stream cancelled
             FAULTS["stop"] -= 1
