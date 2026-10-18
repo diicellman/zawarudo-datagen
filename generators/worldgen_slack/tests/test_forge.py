@@ -11,7 +11,7 @@ from ..forge.env import ForgeEnv, label_of, priced, spent
 from ..forge.judge import Ruling, hearing, rule
 from ..forge.release import level, release_rows, report
 from ..forge.tasks import Part, Task, answer_text, check, key, private_answer
-from ..forge.tries import Tries, agreeing, by_part, patient, rates
+from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached
 from .support import contracts_settings, forge_of, refused, world_fixture
 
 
@@ -149,6 +149,56 @@ async def test_tries(tmp_path):
     with pytest.raises(RuntimeError):
         await patient(lambda: (_ for _ in ()).throw(RuntimeError("down")), timeout=5)
     assert tries_module.WAITS == (0, 0, 0), "the checks wait for no provider"
+
+
+async def test_verifier_reach(tmp_path):
+    """A composite's answer holds when each part is reached by two of the verifier's tries, though no one try reached
+    them all: a split on a part is decided by a third. A verifier's try that ends with no answer (its turn cap, on calls
+    that lost their arguments) runs again, as a crash does; a student's is its own failure, and counted."""
+    state = SimpleNamespace(solves={}, verifier={})
+    store = SimpleNamespace(state=state, trace=lambda trace: None, save=lambda: None, root=tmp_path)
+    tries = Tries(SimpleNamespace(solvers=2, verify=2, tries=2), store)
+    tries.copy = lambda: None
+    tries.solver_task = lambda task, world: SimpleNamespace(data=SimpleNamespace(task_id=task.id))
+
+    def graded(*parts):
+        return {"correct": all(parts), "response": "r", "parts": [{"correct": c} for c in parts]}
+
+    silent = {"correct": False, "response": "", "parts": [{"correct": False}, {"correct": False}]}
+
+    class Seat:
+        def __init__(self, plan):
+            self.plan, self.made = list(plan), 0
+
+        async def run(self, task):
+            evaluation = self.plan[self.made]
+            self.made += 1
+            return SimpleNamespace(
+                id=f"t{self.made}",
+                ok=True,
+                info={"evaluation": evaluation},
+                errors=[],
+                last_reply=evaluation["response"],
+                stop_condition="max_turns" if evaluation is silent else None,
+                task=task,
+            )
+
+    composite = request(part(), part(label="who answered", answer=["Owen Sato"], evidence=[2]))
+    verifier = Seat([graded(True, False), silent, graded(False, True), graded(True, True)])
+    results = await tries.verify(SimpleNamespace(verifier=verifier), composite, "k")
+    assert verifier.made == 4 and len(results) == 3, (
+        "a silent try ran again, and a split on a part took a third"
+    )
+    assert reached(composite, results) == [2, 2] and not agreeing(results[:2]), (
+        "each part reached twice, apart"
+    )
+    assert results[1]["rerun"] == "no answer"
+    student = Seat([silent, graded(True, True)])
+    measured = await tries.measure(SimpleNamespace(solver=student), composite, "k")
+    assert student.made == 2 and measured[0]["unanswered"] and rates(measured)["right_rate"] == 0.5, (
+        "a student's silent try is counted wrong, not run again"
+    )
+    assert reached(request(), [{"correct": True}, None, {"correct": True, "crashed": True}]) == [1]
 
 
 async def test_judge(tmp_path):

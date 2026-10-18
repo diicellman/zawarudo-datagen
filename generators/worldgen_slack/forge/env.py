@@ -22,7 +22,7 @@ from .judge import rule
 from .proposer.task import ProposerTask, adapt_prompt, initial_prompt
 from .release import KEPT
 from .tasks import FAMILIES, Task, answer_text, check, key
-from .tries import Tries, agreeing, by_part, rates
+from .tries import Tries, agreeing, by_part, rates, reached
 
 # $ per million fresh input, cached input and output tokens (`prime inference models`, 2026-10-16), for a call its
 # provider leaves unpriced; a model not listed is priced as the dearest.
@@ -323,7 +323,10 @@ class ForgeEnv(SessionEnv):
         task, task_key = Task.model_validate(record["task"]), record["key"]
         verified = await self.tries.verify(agents, task, task_key)
         record["agree"] = len(agreeing(verified))
-        record["verified"] = record["agree"] >= 2
+        record["reached"] = reached(
+            task, verified
+        )  # by part: an answer holds when each part is reached twice
+        record["verified"] = min(record["reached"]) >= 2
         if record["verified"]:
             measured = await self.tries.measure(agents, task, task_key)
             record["rates"] = rates(measured)
@@ -337,7 +340,13 @@ class ForgeEnv(SessionEnv):
                 record["ruling"][k] for k in ("realistic", "one_reading", "exact", "supported")
             )
         record["label"] = label_of(record, self.settings.solved)
-        self.store.event("task_labelled", task_id=task_id, label=record["label"], agree=record["agree"])
+        self.store.event(
+            "task_labelled",
+            task_id=task_id,
+            label=record["label"],
+            agree=record["agree"],
+            reached=record["reached"],
+        )
         self.store.save()
 
     # ------------------------------------------------------------------ the next pass

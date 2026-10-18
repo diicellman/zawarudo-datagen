@@ -57,11 +57,11 @@ notes; its tasks live in its own state, never in the world file.
   an asker who is no person, a message out of the asker's sight, an answer of the wrong shape, two parts alike, a
   question that gives its answer away, a repeat.
 - **Labelling** (no VM; every task side by side, each step kept as it lands): the verifier, a stronger model with the
-  student's Slack tools, must reach the task's answer in 2 tries (a third on a split), or the task is dropped; the
-  student tries it `tries` times; the judge (`forge/judge.py`, one structured call) rules whether a colleague would
-  ask it, whether its words allow another reading, whether each answer is exactly what its part asks, and whether its
-  messages state it. A task is rejected, solved (right `solved` of the time or more), unsolved (never), or in the
-  window.
+  student's Slack tools, must reach each part's answer in 2 tries (a third on a split; a try that ends with no answer
+  runs again), or the task is dropped; the student tries it `tries` times; the judge (`forge/judge.py`, one structured
+  call) rules whether a colleague would ask it, whether its words allow another reading, whether each answer is
+  exactly what its part asks, and whether its messages state it. A task is rejected, solved (right `solved` of the
+  time or more), unsolved (never), or in the window.
 - **Adapting** (`adapt` passes): the proposer writes a harder version of each solved task, an easier one of each
   unsolved task, and a repaired one of each verified task the judge refused, which are labelled in turn.
 - **The release:** every approved task, with its set, its rates (by part), and the verifier's try that reached its

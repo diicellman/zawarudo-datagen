@@ -59,6 +59,22 @@ def by_part(task: Task, results: list[dict]) -> dict[str, float] | None:
     return {p.label: sum(g[n]["correct"] for g in graded) / len(graded) for n, p in enumerate(task.parts)}
 
 
+def reached(task: Task, results: list[dict]) -> list[int]:
+    """How many of the verifier's tries reached each part's answer: right on that part (a single question: right on
+    the whole). An answer holds when each of its parts is reached twice, though no one try reaches them all: a part is
+    a claim of its own, and the student is graded on the request whole."""
+    counts = [0] * len(task.parts)
+    for r in results:
+        if not r or r.get("crashed"):
+            continue
+        if len(task.parts) == 1:
+            counts[0] += bool(r.get("correct"))
+        elif len(r.get("parts") or []) == len(task.parts):
+            for n, part in enumerate(r["parts"]):
+                counts[n] += bool(part.get("correct"))
+    return counts
+
+
 def agreeing(results: list[dict]) -> list[dict]:
     """The verifier's tries that reached the gold: right on every part. A claim of its own that no message states makes
     a try ungrounded, not the gold wrong, so grounding is the student's measure, not the verifier's."""
@@ -127,15 +143,19 @@ class Tries:
 
     async def solve(self, agents, task: SolverTask, seat: str):
         """One independent solve by `seat`, graded for correctness and grounding. One that crashed runs again, and
-        says why in `rerun`; crashed every time, it is kept as crashed, and the task's rates leave it out."""
+        says why in `rerun`; crashed every time, it is kept as crashed, and the task's rates leave it out. So does a
+        verifier's that ends with no answer (stuck at its turn cap on calls that lost their arguments): it says nothing
+        of whether the answer can be reached. A student's unanswered try is its own failure, and counted."""
         first = None
         for _ in range(self.ATTEMPTS):
             async with self.gates[seat]:
                 trace = await getattr(agents, seat).run(task)
             self.store.trace(trace)
-            if not (outcome := SolverTask.outcome(trace))["crashed"]:
+            outcome = SolverTask.outcome(trace)
+            if not (outcome["crashed"] or (seat == "verifier" and outcome["unanswered"])):
                 break
-            first = outcome.get("reason") or "crashed" if first is None else first
+            if first is None:
+                first = outcome.get("reason") or ("crashed" if outcome["crashed"] else "no answer")
         return (outcome | {"rerun": first[:200]} if first is not None else outcome), trace
 
     async def tried(self, agents, book: dict, task: Task, key: str, n: int, seat: str) -> list[dict]:
@@ -159,10 +179,11 @@ class Tries:
         return entry["results"]
 
     async def verify(self, agents, task: Task, key: str) -> list[dict]:
-        """The verifier's tries: `verify` of them, and one more when they split; its gold holds when 2 agree."""
+        """The verifier's tries: `verify` of them, and one more when a part is reached once; its answer holds when
+        each part is reached twice."""
         n = self.settings.verify
         results = await self.tried(agents, self.store.state.verifier, task, key, n, "verifier")
-        if 0 < len(agreeing(results)) < 2:  # a split, or one try of one
+        if min(reached(task, results)) == 1:  # a split on some part
             results = await self.tried(agents, self.store.state.verifier, task, key, n + 1, "verifier")
         return results
 
