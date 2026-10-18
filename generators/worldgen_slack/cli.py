@@ -10,7 +10,7 @@ import asyncio
 import json
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import verifiers.v1 as vf
@@ -99,9 +99,27 @@ async def run(
         store.close()
 
 
+async def carry_on(kind: str, once: Callable[[], Awaitable[dict]], resumes: int) -> dict:
+    """A run that carries on by itself after a stop that is infrastructure's (a provider's, a sandbox's), from where
+    its state says, up to `resumes` times; a stop in the same place for the same reason twice is a bug, and ends it."""
+    stops = []
+    while True:
+        summary = await once()
+        where = (summary["phase"], summary.get("day"), summary["reason"][:160])
+        if summary["status"] != "infrastructure_error" or where in stops or len(stops) == resumes:
+            return summary
+        stops.append(where)
+        print(json.dumps({"event": f"{kind}_resumed", "phase": where[0], "reason": where[2]}), flush=True)
+
+
 async def run_world(config: WorldConfig) -> dict:
-    return await run(
-        "world", config.output, provenance(config), config.seed, lambda store: WorldEnv(config, store)
+    """A world, carrying on by itself after an infrastructure stop (a judge's sandbox lost twice in one review)."""
+    return await carry_on(
+        "world",
+        lambda: run(
+            "world", config.output, provenance(config), config.seed, lambda store: WorldEnv(config, store)
+        ),
+        config.max_resumes,
     )
 
 
@@ -112,24 +130,21 @@ async def run_chapter(plan: chapter.ChapterConfig, settings: WorldConfig) -> dic
         parent.close()
         return chapter.ChapterEnv(plan, settings, store, slots)
 
-    return await run("chapter", plan.output, chapter.provenance(plan, settings), settings.seed, start)
+    return await carry_on(
+        "chapter",
+        lambda: run("chapter", plan.output, chapter.provenance(plan, settings), settings.seed, start),
+        settings.max_resumes,
+    )
 
 
 async def run_forge(config: ForgeConfig) -> dict:
-    """A forge: its one episode is task 0, as it draws nothing at random. It carries on by itself after a stop that is
-    infrastructure's (a provider's, a sandbox's), from where its state says, up to `max_resumes` times; a stop in the
-    same place for the same reason twice is a bug, and ends it."""
-    origin, stops = forge.provenance(config), []
-    for _ in range(config.max_resumes + 1):
-        summary = await run(
-            "forge", config.output, origin, 0, lambda store: forge.ForgeEnv(config, store), publish
-        )
-        where = (summary["phase"], summary["reason"][:160])
-        if summary["status"] != "infrastructure_error" or where in stops:
-            return summary
-        stops.append(where)
-        print(json.dumps({"event": "forge_resumed", "phase": where[0], "reason": where[1]}), flush=True)
-    return summary
+    """A forge: its one episode is task 0, as it draws nothing at random. It carries on by itself as a world does."""
+    origin = forge.provenance(config)
+    return await carry_on(
+        "forge",
+        lambda: run("forge", config.output, origin, 0, lambda store: forge.ForgeEnv(config, store), publish),
+        config.max_resumes,
+    )
 
 
 def main() -> int:

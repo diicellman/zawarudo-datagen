@@ -128,6 +128,8 @@ class WorldConfig(Section):
     # lost sessions a block of work may take before the run stops (each a fresh VM after a pause): a long world loses
     # more (W1 lost 4 in 2.9 hours)
     max_losses: int = Field(default=1, ge=0, le=20)
+    # stops of infrastructure's the run carries on after by itself (a judge's sandbox lost on both tries of a review)
+    max_resumes: int = Field(default=3, ge=0, le=20)
     review_rounds: ReviewRounds = Field(default_factory=ReviewRounds)
     author: AuthorSettings = Field(default_factory=AuthorSettings)
     env: WorldSeats = Field(default_factory=WorldSeats)

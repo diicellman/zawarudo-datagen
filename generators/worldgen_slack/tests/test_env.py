@@ -17,8 +17,36 @@ from worldgen_slack import slack
 from worldgen_slack.taskset import system_prompt
 from worldgen_slack.toolset import SlackToolset, WorldToolsConfig, stage_world, watch_parent
 
+from ..cli import carry_on
 from ..workspace import ANSWER_KEY, Workspace
 from .support import fails, mcp_client, world_fixture
+
+
+async def test_carry_on(capsys):
+    """A run carries on by itself after an infrastructure stop, up to its resumes (a world as a forge: W2's smoke lost
+    its judge's sandbox on both tries of a review); the same stop in the same place twice ends it, and a stop of
+    another kind is never taken up again."""
+
+    def runs(*summaries):
+        given = iter(summaries)
+
+        async def once():
+            return next(given)
+
+        return once
+
+    def lost(reason, day=2):
+        return {"status": "infrastructure_error", "phase": "review", "day": day, "reason": reason}
+
+    done = {"status": "complete", "phase": "done", "day": 4, "reason": ""}
+    assert await carry_on("world", runs(lost("sandbox lost"), lost("sandbox lost", 3), done), 3) == done
+    assert (await carry_on("world", runs(lost("x"), lost("x"), done), 3))["status"] == "infrastructure_error"
+    assert (await carry_on("world", runs(lost("a"), lost("b"), done), 1))["reason"] == "b", (
+        "its resumes spent"
+    )
+    stopped = {"status": "interrupted", "phase": "day", "day": 2, "reason": "stop"}
+    assert await carry_on("world", runs(stopped, done), 3) == stopped
+    assert capsys.readouterr().out.count('"world_resumed"') == 4
 
 
 async def test_world(tmp_path):
