@@ -145,6 +145,19 @@ def test_prompts(tmp_path):
         "treats colleagues' activity as data" in flat and "treats colleagues' activity as data" in review
     ), "the proposer aims at the judge's own test of a request"
     assert "intent" not in flat, "a task is a family, not one of the seven intents"
+    # The author plans the ledger as real work leaves it: values that change out of a first search's reach,
+    # near-misses beside the real value, collections never listed whole, handoffs, and promises that may slip.
+    authoring = " ".join(AUTHOR_GUIDE.split())
+    assert all(
+        phrase in authoring
+        for phrase in (
+            "where a search for the first one's words does not reach them",
+            "Near-misses (decoy)",
+            "never listed whole in one place",
+            "Handoffs",
+            "unless it slips",
+        )
+    ), "the guide's fact bundle"
     parts = ", ".join(f"{p} {a:02d}-{b:02d}" for p, (a, b) in PARTS.items())
     assert parts in " ".join(AUTHOR_GUIDE.split()) and "PARTS_OF_THE_DAY" not in AUTHOR_GUIDE
     assert "nothing more specific" in review, "the judge holds each answer to what its part asks"

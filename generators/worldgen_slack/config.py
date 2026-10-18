@@ -72,7 +72,7 @@ class Needs(Section):
     plants is new. `hidden`, an answer stated where it is harder to see than its near-misses (a thread reply, a DM, or
     a later day), is checked when the answer is posted. `named`, at most how many of its evidence's channel names and
     identifiers (words with digits, as PWSQL-03) a question names, is shown to the author and checked nowhere. Search
-    rank and depth are measured and reported, not needed: at a world's size every channel reads in one page."""
+    rank and a channel's page depth are measured and reported (`world.profile`), not needed."""
 
     channels: int = Field(default=0, ge=0)
     relations: int = Field(default=0, ge=0)

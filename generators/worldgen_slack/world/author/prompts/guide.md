@@ -41,6 +41,23 @@ The ledger (world_plan)
   another's comes after it. A value said again is the same fact conveyed again, not a new fact. A fact about an event
   with no anchor is stated with its time, {at:...}.
 - A stated fact never changes; an unstated one may be re-planned for today or later.
+- Plan the ledger as real work leaves it for whoever reads the workspace later: in pieces, revised, partly wrong, in
+  more places than one.
+  - Values change: a date, a figure, an owner or a plan said again and again as the work moves (supersedes), its later
+    values where a search for the first one's words does not reach them: a thread reply under another post, a DM, a
+    later day, other words.
+  - Near-misses (decoy): a proposal nobody approved, an older value someone repeats, a figure in a channel later
+    archived, a similar thing with a similar name. The real value is stated too, by whoever decides it; its summary
+    says on whose authority.
+  - Collections: items of one set (blockers, affected orders, quotes, the retailers still to confirm), each a fact
+    whose subject is the item and whose collection names the set, raised one at a time by different people in
+    different channels and days, some later resolved or dropped, and never listed whole in one place.
+  - Handoffs: who owns something is a value that changes when the work moves to someone else, said where the handoff
+    happens.
+  - People leave and channels close: a move has someone leave the company, their work handed on, or archives a
+    channel the work outgrew, whose messages stay readable.
+- An anchor is distinctive: a few words of its value no other line would use by chance ("51-micron mono-PE", not
+  "approved").
 - The facts run through the days being written: each third of them first states at least half its share of the
   facts first stated in those days, as it holds of their messages, so the storylines unfold to the last day.
 

@@ -6,6 +6,8 @@ Phase organization: give the company's people their jobs, and choose its convers
   only by its members; an im is a direct message between exactly 2 people, an mpim a group DM of 3 or more. Public and
   private channels have a name of lowercase letters, digits, - and _, and a topic and purpose in `language`; DMs have
   no name. members are user_ids of chosen people. Code adds more direct messages between people who work together.
+  Some channels are for work that ends or moves on (a launch room, a project's channel), which the ledger can archive;
+  some workstreams have a code name people use in some places and plain words in others.
 - routines: for each public and private channel, 3 to 5 recurring kinds of conversation people have there, each with
   the probability that one of the channel's everyday conversations is of that kind. dm_routines: the same for direct
   messages. Code draws each everyday conversation's kind from them; the storylines are written apart.
