@@ -55,8 +55,9 @@ mkdir -p runs
 uv run --frozen worldgen-slack --config configs/worldgen_slack/smoke-w1.toml > runs/world.log 2>&1   # paid
 ```
 
-`smoke-w1.toml` is two days of W1's world, about $5; `w1.toml` is W1 itself and `worldgen.toml` S3's world. For a new
-world, copy one and set a new `seed` and `output`.
+`smoke-w1.toml` is two days of W1's world, about $5; `w1.toml` is W1 itself and `worldgen.toml` S3's world. `w2.toml`
+is W2: 40 days and 5,000 messages, its ledger held to `[ledger]` targets and its promises slipping (`promise_slips`);
+`smoke-w2.toml` is four of its days. For a new world, copy one and set a new `seed` (it picks day 1) and `output`.
 
 ### 3. Continue it with a chapter (optional)
 
@@ -76,15 +77,17 @@ uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge.toml 
 ```
 
 A forge config is self-contained: the finished world (`world`), a new `output`, the initial set's size and turn
-(`tasks`, `batch`), its adapting passes (`adapt`), how a task is labelled (`verify`, `tries`, `solved`), how far a
-run carries on by itself (`max_losses`, `max_resumes`, `spend_limit`), and one model per seat (`[env.proposer]`,
-`[env.verifier]`, `[env.solver]`, the task `[judge]`, `[answer_judge]`).
+(`tasks`, `batch`), the skills code deals its ids (`skills`) and how often an id is offered (`offers`), its adapting
+passes (`adapt`), how a task is labelled (`verify`, `tries`, `solved`), how far a run carries on by itself
+(`max_losses`, `max_resumes`, `spend_limit`), and one model per seat (`[env.proposer]`, `[env.verifier]`,
+`[env.solver]`, the task `[judge]`, `[answer_judge]`). `forge-w2.toml` forges 150 initial tasks on W2.
 `uv run --frozen worldgen-slack profile --world data/<run>` measures a world for a person (`world/profile.py`):
-its value groups, threads and people, as counts, for whoever writes its next chapter.
+its ledger's counts by storyline (what `[ledger]` holds a world to), its value groups, promises, threads, channel
+depth and people, for whoever writes its next chapter.
 
 ### Running notes
 
-- **Configs** (`configs/worldgen_slack/`): world configs (`worldgen.toml`, `w1.toml`, `smoke-w1.toml`) hold a world's
+- **Configs** (`configs/worldgen_slack/`): world configs (`worldgen.toml`, `w1.toml`, `w2.toml` and their smokes) hold a world's
   sections and two seats (`[env.author]`, `[env.judge]`); chapter and forge configs are described above;
   `taxonomy.toml` holds the task categories and the question styles; `eval.toml` evaluates a release.
   `configs/{eval,gepa,rl}` are Prime Lab templates.

@@ -14,15 +14,20 @@ present (`world_meta.now_us`), and nothing is written before it.
    titles, teams, channels with their members and everyday routines, and the apps that post in them. Code adds
    direct messages and the calendar.
 2. **Plan.** With `world_plan`, the author writes the ledger: storylines, events (a moment each, never moved once
-   planned) and facts (what is stated, by whom, in which channel, on which day, about which event). It also writes
-   `/task/notes/plan.md`: the arcs, day by day.
+   planned) and facts (what is stated, by whom, in which channel, on which day, about which event; the collection an
+   item belongs to). It also writes `/task/notes/plan.md`: the arcs, day by day. Code holds the ledger to `[ledger]`,
+   counted off the plan (`world/profile.py`'s `counts`): facts, chains (values superseded 3 deep across 2 or more
+   channels), deep chains, decoys beside a real value, private truths, collections (4 or more items across 3 or more
+   channels, one changed), archives and departures. A plan short of them is refused, before day 1 and on every
+   replan.
 3. **Days.** Each calendar day is one interaction. The author reads `/task/memory` (rendered by code before every
    turn: `now.md`, the ledger, a page per person, channel, storyline and event) and its own notes, then posts the
    day's conversations in time order with `world_post` and moves on with `world_advance`. Code times every line
    from real reply gaps, tags every line that contains a fact's anchor as a statement of it, and refuses what
    breaks a rule: a first statement by someone other than its planned author, a fact before what it follows, a
-   time written as a literal, a promise left open past its day. A day closes only when its quota, its facts and
-   its promises are settled. The author then writes `/task/notes/recap.md`; the world and the notes are kept with
+   time written as a literal, a promise left open past its day unless it slips (its due day passes with nothing
+   said; `promise_slips` of the promises made at least slip, change or are dropped). A day closes only when its
+   quota, its facts and its promises are settled. The author then writes `/task/notes/recap.md`; the world and the notes are kept with
    the day, and a day that fails is written again from where the last one closed.
 4. **Reviews.** After the days in `[author] review_days`, the judge reviews the world written so far; its issues
    open the author's next day, where `world_revise` rewrites a message in place.
@@ -30,8 +35,9 @@ present (`world_meta.now_us`), and nothing is written before it.
    turns, until the judge approves or `review_rounds.final` runs out. The run then ends: it writes no tasks.
 
 The judge cannot edit the world. Its scores are reported; blocking issues decide approval. An interrupted run
-resumes from its checkpoint and the last closed block. Spend is reported, never capped: the summary gives it per
-role.
+resumes from its checkpoint and the last closed block, and a lost session is taken up again in a fresh VM
+(`max_losses` times a block). Spend is reported, never capped: the summary gives it per role. `worldgen-slack
+profile` measures a finished world: its counts by storyline, how its promises went, how deep its channels page.
 
 ## A chapter
 
@@ -51,11 +57,14 @@ notes; its tasks live in its own state, never in the world file.
 
 - **The initial set:** the proposer (`forge/proposer/`), an rlm agent in its own VM, writes `tasks` requests with
   `world_add_task`, `batch` a turn: each of the family its id asks for (catch-up, decisions, commitments, status), in 1
-  to 4 parts, each part with its answer and the messages it rests on. It starts from the world's task material
-  (`forge/material.py`, `world_material`: each value's messages and who can read them) and reads the world to walk a
-  task's route. Code refuses at once, with every reason, what it can tell is wrong:
-  an asker who is no person, a message out of the asker's sight, an answer of the wrong shape, two parts alike, a
-  question that gives its answer away, a repeat.
+  to 4 parts, each part with its answer and the messages it rests on, aiming at the skill code deals it (`skills`,
+  in turn: aggregation, temporal, abstention, synthesis). It starts from the world's task material
+  (`forge/material.py`, `world_material`: each value's messages, page depth and who can read them, the collections,
+  every promise and how it went) and a page of what its tasks cover so far (`forge/coverage.py`: families, skills,
+  storylines, the material no task rests on yet, the openings used), and reads the world to walk a task's route.
+  Code refuses at once, with every reason, what it can tell is wrong: an asker who is no person, a message out of the
+  asker's sight, an answer of the wrong shape, two parts alike, a question that gives its answer away, a repeat, a
+  task without its skill's shape. An id offered `offers` turns unwritten is dropped, short of material.
 - **Labelling** (no VM; every task side by side, each step kept as it lands): the verifier, a stronger model with the
   student's Slack tools, must reach each part's answer in 2 tries (a third on a split; a try that ends with no answer
   runs again), or the task is dropped; the student tries it `tries` times; the judge (`forge/judge.py`, one structured
@@ -65,7 +74,8 @@ notes; its tasks live in its own state, never in the world file.
 - **Adapting** (`adapt` passes): the proposer writes a harder version of each solved task, an easier one of each
   unsolved task, and a repaired one of each verified task the judge refused, which are labelled in turn.
 - **The release:** every approved task, with its set, its rates (by part), and the verifier's try that reached its
-  answer; `report.json` says where the world ran short, for whoever writes the next chapter.
+  answer; `report.json` says where the world ran short, for whoever writes the next chapter: by family and skill,
+  the ids dropped, its askers and openings, and the material no task rests on.
 
 A forge carries on by itself: a lost proposer session is taken up again after a pause (`max_losses` times a turn), a
 failed model call is asked again, a task whose steps fail is marked failed while the others go on, and the CLI resumes
