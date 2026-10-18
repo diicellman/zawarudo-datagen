@@ -66,6 +66,7 @@ from ..world.organization import (
     direct_messages,
     organize,
 )
+from ..world.profile import counts
 from ..world.text import TIME_LITERAL
 from ..world.writing import (
     Close,
@@ -104,8 +105,91 @@ from .support import (
     seed_person,
     served_tools,
     with_state,
+    world_fixture,
     world_settings,
 )
+
+
+def test_counts(tmp_path):
+    """The ledger's material, counted off the plan: a chain is a value superseded 3 deep across 2 or more channels
+    (a 4-deep one is a deep chain too); a decoy counts beside a real value of its group; a private truth is a changed
+    value whose current one is planned in a private channel or a DM; a collection is 4 or more items across 3 or
+    more channels with an item's value changed; archives and departures are the plan's moves; `through_day` counts
+    only what is first stated by then."""
+    world, at, _ = world_fixture(tmp_path / "w.sqlite")
+
+    def fact(id, channel, day, subject="Release 4.3", attribute="date", value=None, **extra):
+        return (
+            dict(
+                id=id,
+                storyline="r",
+                subject=subject,
+                attribute=attribute,
+                value=value or id,
+                channel_id=channel,
+                author_id="U1",
+                day=day,
+                summary=id,
+            )
+            | extra
+        )
+
+    with world.batch():
+        world.insert(
+            "facts",
+            [
+                fact("d1", "C1", 1),
+                fact("d2", "G1", 2),
+                fact("d3", "D1", 3),
+                fact("d0", "C1", 2, is_decoy=1),
+                *(
+                    fact(f"b{n}", ch, 1, f"blocker {n}", "state", "open", collection="4.3 blockers")
+                    for n, ch in ((1, "C1"), (2, "G1"), (3, "D1"), (4, "C1"))
+                ),
+                fact("b1x", "C1", 2, "blocker 1", "state", "fixed", collection="4.3 blockers"),
+            ],
+        )
+        world.insert(
+            "fact_relations",
+            [
+                dict(src_fact="d2", dst_fact="d1", kind="supersedes"),
+                dict(src_fact="d3", dst_fact="d2", kind="supersedes"),
+                dict(src_fact="b1x", dst_fact="b1", kind="supersedes"),
+            ],
+        )
+        world.db.execute("UPDATE channels SET archived_us = ? WHERE id = 'G1'", (at(3, 9),))
+        world.db.execute("UPDATE users SET deactivated_us = ? WHERE id = 'U3'", (at(2, 9),))
+    found = counts(world)
+    assert {k: v for k, v in found.items() if k != "by_storyline"} == {
+        "facts": 10,
+        "chains": 1,
+        "deep_chains": 0,
+        "decoys": 1,
+        "private_truths": 1,
+        "collections": 1,
+        "archives": 1,
+        "departures": 1,
+    }, found
+    assert found["by_storyline"]["r"]["chains"] == 1 and set(found["by_storyline"]) == {"r"}
+    early = counts(world, through_day=2)
+    assert (
+        early["chains"],
+        early["private_truths"],
+        early["collections"],
+        early["archives"],
+        early["departures"],
+    ) == (
+        0,
+        1,
+        1,
+        0,
+        1,
+    ), "by day 2: the chain is 2 deep, its current value in #exec; the archive is on day 3"
+    world.insert("facts", [fact("d4", "C1", 3)])
+    world.insert("fact_relations", [dict(src_fact="d4", dst_fact="d3", kind="supersedes")])
+    assert (counts(world)["deep_chains"], counts(world)["private_truths"]) == (1, 0), (
+        "d4 is current, in public"
+    )
 
 
 def test_contracts(tmp_path):

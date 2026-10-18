@@ -8,12 +8,29 @@ chapter planted. A forge's proposer reads the same world as its task material (f
 value rests on and who can read them."""
 
 import json
+import math
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from worldgen_slack.slack import PAGE
+
 from ..workspace import Workspace, asked
 from .board import answer_facts, readable
-from .clock import meta
+from .clock import bounds, meta, present
+from .text import PEOPLE
+
+PRIVATE = ("private", "im", "mpim")
+# What a world's ledger is held to (`[ledger]`) and measured by: the counts of `counts`.
+MATERIAL = (
+    "facts",
+    "chains",
+    "deep_chains",
+    "decoys",
+    "private_truths",
+    "collections",
+    "archives",
+    "departures",
+)
 
 
 def chains(world) -> dict[str, int]:
@@ -31,6 +48,120 @@ def chains(world) -> dict[str, int]:
     for (fact,) in world.db.execute("SELECT id FROM facts"):
         of(fact)
     return depth
+
+
+def counts(world, through_day: int | None = None) -> dict:
+    """The world's task material, counted off the ledger as planned, so a plan is held to it before a line is written:
+    its facts; chains, value groups (a subject and attribute) whose values supersede one another 3 deep (deep chains:
+    4) across 2 or more channels; decoys beside a real value of their group; private truths, groups of 2 or more
+    values whose current value is planned in a private channel or a DM; collections, sets of 4 or more items planned
+    across 3 or more channels, an item's value changed at least once; the channels archived and the people who leave.
+    Each but the last two also by storyline. `through_day` counts only what is first stated by that day."""
+    last = through_day if through_day is not None else math.inf
+    # a world of an older schema, read as it is (not brought forward), has no collections
+    collection = (
+        "lower(trim(f.collection))"
+        if "collection" in {r[1] for r in world.db.execute("PRAGMA table_info(facts)")}
+        else "NULL"
+    )
+    facts = [
+        dict(r)
+        for r in world.db.execute(
+            f"""SELECT f.id, f.storyline, f.day, lower(trim(f.subject)) AS subject, lower(trim(f.attribute)) AS attribute,
+            lower(trim(f.value)) AS value, f.channel_id, f.is_decoy, {collection} AS collection, c.type
+            FROM facts f JOIN channels c ON c.id = f.channel_id ORDER BY f.day, f.id"""
+        )
+        if r["day"] <= last
+    ]
+    known = {f["id"] for f in facts}
+    supersedes = {
+        src: dst
+        for src, dst in world.db.execute(
+            "SELECT src_fact, dst_fact FROM fact_relations WHERE kind = 'supersedes'"
+        )
+        if src in known and dst in known
+    }
+    replaced, depth = set(supersedes.values()), {}
+
+    def of(
+        fact: str,
+    ) -> int:  # its depth in its chain: 1 for a fact that supersedes nothing (a ledger has no cycle)
+        if fact not in depth:
+            depth[fact] = 1 + (of(supersedes[fact]) if fact in supersedes else 0)
+        return depth[fact]
+
+    groups, sets = defaultdict(list), defaultdict(list)
+    for f in facts:
+        groups[(f["subject"], f["attribute"])].append(f)
+        if f["collection"]:
+            sets[f["collection"]].append(f)
+    tally = defaultdict(Counter)  # storyline -> material -> count
+    for f in facts:
+        tally[f["storyline"]]["facts"] += 1
+    for group in groups.values():
+        storyline, real = group[0]["storyline"], [f for f in group if not f["is_decoy"]]
+        deepest, channels = max(of(f["id"]) for f in group), len({f["channel_id"] for f in group})
+        tally[storyline]["chains"] += deepest >= 3 and channels >= 2
+        tally[storyline]["deep_chains"] += deepest >= 4 and channels >= 2
+        tally[storyline]["decoys"] += sum(f["is_decoy"] for f in group) if real else 0
+        current = [f for f in real if f["id"] not in replaced]
+        tally[storyline]["private_truths"] += (
+            len({f["value"] for f in group}) >= 2
+            and bool(current)
+            and all(f["type"] in PRIVATE for f in current)
+        )
+    for items in sets.values():
+        tally[items[0]["storyline"]]["collections"] += (
+            len({f["subject"] for f in items}) >= 4
+            and len({f["channel_id"] for f in items}) >= 3
+            and any(f["id"] in replaced for f in items)
+        )
+    end = bounds(world, through_day)[1] if through_day is not None else math.inf
+
+    def moved(sql: str) -> int:
+        return sum(us < end for (us,) in world.db.execute(sql))
+
+    by_storyline = {s: {k: c[k] for k in MATERIAL[:6]} for s, c in sorted(tally.items())}
+    return {k: sum(c[k] for c in by_storyline.values()) for k in MATERIAL[:6]} | {
+        "archives": moved("SELECT archived_us FROM channels WHERE archived_us IS NOT NULL"),
+        "departures": moved(
+            "SELECT deactivated_us FROM users WHERE is_bot = 0 AND deactivated_us IS NOT NULL"
+        ),
+        "by_storyline": by_storyline,
+    }
+
+
+def promises(world) -> dict[str, int]:
+    """How the world's promises went, as of its present: kept by their due day or later, changed, dropped, slipped
+    (past due with nothing said), and still open."""
+    now, out = present(world), Counter()
+    for status, due, closed in world.db.execute(
+        """SELECT c.status, c.due_us, m.ts_us FROM commitments c LEFT JOIN messages m ON m.id = c.closed_by"""
+    ):
+        if status == "kept":
+            out["kept late" if closed > due else "kept"] += 1
+        else:
+            out[status if status != "open" else "slipped" if due < now else "open"] += 1
+    return {k: out[k] for k in ("kept", "kept late", "changed", "dropped", "slipped", "open")}
+
+
+def depth_of_channels(world, top: int = 5) -> list[dict]:
+    """The busiest channels, how many top-level messages each holds, and how many of read_channel's pages they fill."""
+    rows = world.db.execute(
+        """SELECT c.name, c.type, COUNT(*) FROM messages m JOIN channels c ON c.id = m.channel_id
+        WHERE m.parent_id IS NULL AND c.name IS NOT NULL GROUP BY c.id ORDER BY COUNT(*) DESC, c.name LIMIT ?""",
+        (top,),
+    ).fetchall()
+    return [{"channel": f"#{n}", "type": t, "top_level": k, "pages": math.ceil(k / PAGE)} for n, t, k in rows]
+
+
+def fact_share(world) -> float:
+    """The share of people's messages that state or repeat a fact."""
+    total, stating = world.db.execute(
+        f"""SELECT COUNT(*), COUNT(DISTINCT e.message_id) FROM messages m JOIN users u ON u.id = m.user_id
+        LEFT JOIN evidence e ON e.message_id = m.id WHERE {PEOPLE}"""
+    ).fetchone()
+    return round(stating / total, 3) if total else 0.0
 
 
 def version_of_day(world) -> dict[int, int]:
@@ -137,6 +268,10 @@ def profile(world) -> dict:
             "decoys_unused": len([d for d in decoys if d not in used]),
             "groups_without_tasks": sum(not g["tasks"] for g in found),
         },
+        "counts": counts(world),
+        "promises": promises(world),
+        "deepest_channels": depth_of_channels(world),
+        "fact_share": fact_share(world),
         "groups": found,
         "threads": {
             "threads": len(replies),
@@ -153,15 +288,31 @@ def profile(world) -> dict:
 
 def page(found: dict) -> str:
     """The profile as a page to read."""
-    w, m = found["world"], found["material"]
+    w, m, c = found["world"], found["material"], found["counts"]
     out = [
         f"# Profile: {w['company']}, version {w['version']}",
         "",
         f"{w['days']} days, {w['messages']} messages, {w['people']} people, channels {w['channels']}; {w['facts']} facts, "
-        f"{w['tasks']} tasks, {w['board_entries']} board entries.",
+        f"{w['tasks']} tasks, {w['board_entries']} board entries; {found['fact_share']:.1%} of people's messages state "
+        "a fact.",
         "",
         "## Material",
         *(f"- {k.replace('_', ' ')}: {v}" for k, v in m.items()),
+        "",
+        "## The ledger's counts (what `[ledger]` holds a world to)",
+        "- " + ", ".join(f"{k.replace('_', ' ')} {c[k]}" for k in MATERIAL),
+        *(
+            f"- {s}: " + ", ".join(f"{k.replace('_', ' ')} {n}" for k, n in t.items())
+            for s, t in c["by_storyline"].items()
+        ),
+        "",
+        "## Promises: " + ", ".join(f"{k} {n}" for k, n in found["promises"].items()),
+        "",
+        "## Deepest channels: "
+        + "; ".join(
+            f"{d['channel']} {d['top_level']} top-level ({d['pages']} pages)"
+            for d in found["deepest_channels"]
+        ),
         "",
         "## Value groups (by values, then chain depth)",
     ]
@@ -197,4 +348,7 @@ def write(run: Path) -> dict:
         world.close()
     (run / "profile.json").write_text(json.dumps(found, indent=1, ensure_ascii=False))
     (run / "profile.md").write_text(page(found))
-    return found["material"]
+    return {
+        "material": found["material"],
+        "counts": {k: v for k, v in found["counts"].items() if k != "by_storyline"},
+    }

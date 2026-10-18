@@ -56,6 +56,7 @@ from ..world.config import WorldConfig
 from ..world.env import WorldEnv, provenance
 from ..world.ledger import BoardEntry, Event, Plan, PlanFact, Storyline, front_loaded, record_plan, unplanned
 from ..world.organization import Channel, Organization, Person, Routine, channel_id
+from ..world.profile import page as profile_page
 from ..world.profile import profile
 from ..world.style import style
 from ..world.writing import Close, Commit, Conversation, PostLine, Reaction, post, quotas, revise
@@ -1829,6 +1830,9 @@ async def chapter_flow(root, parent, settings):
         and found["world"]["version"] == 2
         and found["material"]["groups_3_values"] >= 1
     ), owners
+    assert found["counts"]["private_truths"] >= 1 and "Audit" in profile_page(found), (
+        "the owner changed, its current value in a private channel: a private truth, on the page"
+    )
     tools_task = AuthorTask.create("fix", 0, world.path, env.tools_context(), "check")
     (tools,) = tools_task.toolsets(tools_task.config)
     assert not any(hasattr(tools, t) for t in ("add_task", "probe", "annotate")), (
