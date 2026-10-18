@@ -170,6 +170,7 @@ def test_prompts(tmp_path):
             "never listed whole in one place",
             "Handoffs",
             "unless it slips",
+            "Quantities that must add up",
         )
     ), "the guide's fact bundle"
     parts = ", ".join(f"{p} {a:02d}-{b:02d}" for p, (a, b) in PARTS.items())

@@ -58,6 +58,9 @@ The ledger (world_plan)
     channel the work outgrew, whose messages stay readable.
 - An anchor is distinctive: a few words of its value no other line would use by chance ("51-micron mono-PE", not
   "approved").
+- Quantities that must add up (units and pallets, a total and its parts, a count of items, what fits on a truck) are
+  computed in your IPython when you plan them: a stated fact never changes, so a figure that does not add up stays in
+  the world.
 - The facts run through the days being written: each third of them first states at least half its share of the
   facts first stated in those days, as it holds of their messages, so the storylines unfold to the last day.
 

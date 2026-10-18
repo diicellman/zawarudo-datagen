@@ -52,6 +52,13 @@ bot_posts = 3.0           # each app's routine posts per workday (the apps the o
 promise_rate = 0.03       # promises made per message, at least, each day
 promise_slips = 0.3       # of the promises made so far, at least this share slip, change or are dropped
 
+# Where the agents that run code work: Docker containers on the research VM, of the agents' image (the pinned base with
+# the rlm harness installed: scripts/worldgen_slack/agent_image.py, built on the VM 2026-10-18), not Prime VMs, whose
+# sandbox streams dropped 6 times on W2's smoke. Each container starts in seconds; the run resumes itself after a stop.
+[env]
+sandbox = "docker"
+docker_image = "sha256:86fe169858e8270c367f687ad9a4e6e52d15f99e8ba3bcf65fb5327c345668e8"
+
 # One model per agent. Unset fields (harness, runtime, sampling) keep the role defaults in config.py.
 [env.timeout]
 episode = 172800          # the run's wall clock: 40 days run longer than W1's 12 hours
