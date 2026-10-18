@@ -369,12 +369,13 @@ def posted(world, start_us: int, end_us: int) -> int:
     ).fetchone()[0]
 
 
-def opening(world, settings, rng, now: int, day: int) -> int:
-    """How long the present waits before a conversation starts: the part's remaining time, spread over the
+def opening(world, settings, rng, now: int, day: int, line_us: int = 0) -> int:
+    """How long the present waits before a conversation starts: the part's idle time (what is left of it, less what
+    its remaining lines take talking, `line_us` each: conversations run one after another), spread over the
     conversations it can still expect (what its quota still holds, or what its pace so far brings in the time left,
-    whichever is more); never longer than the day can spare, the rest of the day spread over the conversations it
-    still needs to close. An author who writes past a part's quota keeps its pace: each conversation does not halve
-    the time left, which would bunch conversations at the end of the morning and of the evening."""
+    whichever is more); never longer than the day can spare, its idle time spread over the conversations it still
+    needs to close. An author who writes past a part's quota keeps its pace: each conversation does not halve the time
+    left, which would bunch conversations at the end of the morning and of the evening."""
     part = part_of(world, now)
     start, end = window(world, day, part)
     left = max(quotas(world, settings)[day]["parts"][part] - posted(world, start, now), 0)
@@ -383,20 +384,21 @@ def opening(world, settings, rng, now: int, day: int) -> int:
     ).fetchone()[0]
     pace = started * (end - now) / (now - start) if now > start else 0.0
     conversations = max(1.0, left / settings.activity.conversation_lines, pace)
-    wait = int(rng.random() * 2 * max(end - now, 0) / (conversations + 1))
-    if (most := spare(world, settings, day, now)) is not None:
+    wait = int(rng.random() * 2 * max(end - now - left * line_us, 0) / (conversations + 1))
+    if (most := spare(world, settings, day, now, line_us)) is not None:
         wait = min(wait, most)
     return wait + rng.randrange(1_000_000, 60_000_000)
 
 
-def spare(world, settings, day: int, now: int) -> int | None:
-    """How long the day can spare before its next line: the rest of the day spread over the conversations it still
-    needs to close; None when it needs no more."""
+def spare(world, settings, day: int, now: int, line_us: int = 0) -> int | None:
+    """How long the day can spare before its next line: its idle time (the rest of the day, less what its lines still
+    needed take talking, `line_us` each) spread over the conversations it still needs to close; None when it needs no
+    more."""
     if (ways := room(world, settings, day)) is not None and (
         need := ways["closes"][0] - tally(world, day)["messages"]
     ) > 0:
         still = math.ceil(need / settings.activity.conversation_lines)
-        return max(bounds(world, day)[1] - now, 0) // (still + 1)
+        return max(bounds(world, day)[1] - now - need * line_us, 0) // (still + 1)
     return None
 
 
@@ -498,8 +500,15 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
     if errors:
         raise ValueError("; ".join(errors))
     now, before = present(world), today_line(world, settings, day)
-    most = spare(world, settings, day, now)
-    stamps = [now + (paused(gaps, rng, most) if lines[0].pause else opening(world, settings, rng, now, day))]
+    most = spare(world, settings, day, now, gaps.line_us)
+    stamps = [
+        now
+        + (
+            paused(gaps, rng, most)
+            if lines[0].pause
+            else opening(world, settings, rng, now, day, gaps.line_us)
+        )
+    ]
     for line in lines[1:]:
         stamps.append(stamps[-1] + (paused(gaps, rng, most) if line.pause else gaps.sample(rng, "")))
     if stamps[-1] >= end:

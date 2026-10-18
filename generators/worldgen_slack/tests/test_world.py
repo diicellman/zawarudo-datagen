@@ -1258,6 +1258,20 @@ def test_clock(tmp_path):
     still = math.ceil(ways["closes"][0] / big.activity.conversation_lines)
     waits = [opening(world, big, random.Random(i), night, 2) for i in range(200)]
     assert max(waits) <= (end - night) // (still + 1) + 60_000_000, (max(waits), still)
+    # Conversations run one after another, so the openings spread only the idle time: what is left, less what the
+    # lines still to come take talking (W2's smoke: 6-7 hours a day of 170 lines, which once overran the day).
+    line_us = gaps.line_us
+    need = ways["closes"][0]
+    talking = [opening(world, big, random.Random(i), night, 2, line_us) for i in range(200)]
+    assert max(talking) <= max(end - night - need * line_us, 0) // (still + 1) + 60_000_000, (
+        max(talking),
+        need,
+    )
+    morning = window(world, 2, "morning")[0]
+    early_waits = [opening(world, big, random.Random(i), morning, 2, line_us) for i in range(200)]
+    assert statistics.mean(early_waits) < statistics.mean(
+        opening(world, big, random.Random(i), morning, 2) for i in range(200)
+    ), "a part's talking time is no opening's"
     # Four conversations in the morning's first 90 minutes: the next keeps that pace, not half the time left.
     morning, noon = window(world, 2, "morning")
     later = morning + 90 * 60_000_000

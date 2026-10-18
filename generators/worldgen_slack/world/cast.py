@@ -143,6 +143,7 @@ class Gaps:
     def __init__(self, path: Path):
         self.quantiles = json.loads(path.read_text().splitlines()[0])["quantiles"]
         self.hour = bisect.bisect_left(self.quantiles, 3600) / (len(self.quantiles) - 1)
+        self.line_us = self.line()
 
     def sample(self, rng: random.Random, pause: str) -> int:
         u = rng.random() * self.hour if pause == "" else self.hour + rng.random() * (1 - self.hour)
@@ -151,3 +152,15 @@ class Gaps:
         high = min(low + 1, len(self.quantiles) - 1)
         seconds = self.quantiles[low] + (self.quantiles[high] - self.quantiles[low]) * (position - low)
         return int(seconds * 1_000_000) + rng.randrange(1, 1_000_000)
+
+    def line(self) -> int:
+        """How long a line of talk takes on average after the one before it (a gap under an hour), in microseconds:
+        what the day's remaining lines will take, talking, which the openings between conversations cannot have."""
+        steps = 1000
+        total = 0.0
+        for k in range(steps):
+            position = (k + 0.5) / steps * self.hour * (len(self.quantiles) - 1)
+            low = int(position)
+            high = min(low + 1, len(self.quantiles) - 1)
+            total += self.quantiles[low] + (self.quantiles[high] - self.quantiles[low]) * (position - low)
+        return int(total / steps * 1_000_000) + 500_000
