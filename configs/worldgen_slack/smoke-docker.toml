@@ -1,0 +1,42 @@
+# The Docker check (2026-10-18): a world of one day, its author and judge each in a Docker container on the run's
+# machine (`[env] sandbox = "docker"`), not a Prime VM, to prove the runtime before a long run uses it (about $2-3).
+sector = "a consumer smart-home hardware company: firmware and companion-app releases, contract manufacturing and component supply, certification and retail launches, and customer support"
+seed = 20261019
+output = "data/v8-05/smoke-docker"
+storylines = 1
+max_losses = 3
+
+[author]
+review_days = []
+keepalive = 600
+
+[personas]
+path = "data/seeds/personas-usa.jsonl"
+typing = "data/seeds/typing-profiles.jsonl"
+gaps = "data/seeds/reply-gaps.json"
+pool = 8
+
+[calendar]
+days = 1
+
+[activity]
+messages = 30
+bot_posts = 1.0
+promise_rate = 0.03
+promise_slips = 0.3
+
+[env]
+sandbox = "docker"        # the author and the judge work in Docker containers on this machine
+
+[env.timeout]
+episode = 7200
+finalize = 300
+
+[env.author]
+model = "anthropic/claude-opus-5.5"
+
+[env.author.sampling]
+cache_control = { type = "ephemeral", ttl = "1h" }
+
+[env.judge]
+model = "openai/gpt-6-sol"

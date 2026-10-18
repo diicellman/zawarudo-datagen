@@ -11,6 +11,7 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+import verifiers.v1 as vf
 from worldgen_slack import slack
 
 from ..config import Category, Needs
@@ -348,17 +349,54 @@ def test_contracts(tmp_path):
         "CHG-2291",
         "v2",
     ]
-    # Every seat that runs code needs an immutable VM with no egress: the world's author, and the forge's proposer.
+    # Every seat that runs code needs an immutable sandbox with no egress: the world's author, and the forge's proposer.
     for config, seat in ((settings, "author"), (forge_of(settings), "proposer")):
         agent = getattr(config.env, seat)
         loose = agent.model_copy(
             update={"runtime": agent.runtime.model_copy(update={"image": "python:3.12-slim"})}
         )
         refused(
-            f"{seat} executes code, so it requires an immutable Prime VM",
+            f"{seat} executes code, so it requires an immutable sandbox",
             type(config).model_validate,
             config.model_dump(mode="json")
             | {"env": config.env.model_dump(mode="json") | {seat: loose.model_dump(mode="json")}},
+        )
+        # On `sandbox = "docker"` each such seat works in a Docker container on the run's machine instead: the same
+        # pinned image, working directory and framework-only egress; one with egress is refused as a loose VM is.
+        boxed = type(config).model_validate(
+            config.model_dump(mode="json")
+            | {"env": config.env.model_dump(mode="json") | {"sandbox": "docker"}}
+        )
+        box, vm = getattr(boxed.env, seat).runtime, agent.runtime
+        assert isinstance(box, vf.DockerConfig) and (
+            box.image,
+            box.workdir,
+            box.block,
+            box.allow,
+            box.cpu,
+        ) == (
+            vm.image,
+            "/task",
+            ["*"],
+            [],
+            vm.cpu,
+        ), box
+        assert (
+            isinstance(boxed.env.judge.runtime, vf.DockerConfig)
+            and type(config).model_validate(boxed.model_dump(mode="json")) == boxed
+        ), "the judge too, and it round-trips as a resume compares it"
+        if seat == "proposer":
+            assert isinstance(boxed.env.solver.runtime, vf.SubprocessConfig), (
+                "a solver runs no code: a local process"
+            )
+        open_box = getattr(boxed.env, seat).model_copy(
+            update={"runtime": box.model_copy(update={"block": [], "allow": ["*"]})}
+        )
+        refused(
+            f"{seat} executes code, so it requires an immutable sandbox",
+            type(config).model_validate,
+            boxed.model_dump(mode="json")
+            | {"env": boxed.env.model_dump(mode="json") | {seat: open_box.model_dump(mode="json")}},
         )
 
 

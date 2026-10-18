@@ -144,9 +144,33 @@ def vm_seat(model: str, tokens: int = 600_000) -> vf.AgentConfig:
     )
 
 
+def in_docker(agent: vf.AgentConfig) -> vf.AgentConfig:
+    """An agent's Prime VM as a Docker container on this machine: the same pinned image, working directory, CPUs,
+    memory and framework-only egress."""
+    vm = agent.runtime
+    return agent.model_copy(
+        update={
+            "runtime": vf.DockerConfig(
+                image=vm.image, workdir=vm.workdir, cpu=vm.cpu, memory=vm.memory, allow=[], block=["*"]
+            )
+        }
+    )
+
+
+def isolated(runtime) -> bool:
+    """Whether a runtime holds an agent that runs code: an immutable Prime VM, or a Docker container of a pinned image,
+    each with framework-only egress."""
+    return (
+        (isinstance(runtime, vf.PrimeConfig) and runtime.vm or isinstance(runtime, vf.DockerConfig))
+        and not runtime.allow
+        and runtime.block == ["*"]
+        and "@sha256:" in runtime.image
+    )
+
+
 class Seats(vf.EnvConfig):
     """The seats every run has (a part adds its own), held to code's rules: an agent that runs code works in an
-    immutable Prime VM with framework-only egress, and every seat names its model."""
+    immutable sandbox with framework-only egress, and every seat names its model."""
 
     taskset: vf.TasksetConfig = vf.TasksetConfig(id="worldgen-slack")
     judge: vf.AgentConfig = role("openai/gpt-6-sol")
@@ -154,6 +178,9 @@ class Seats(vf.EnvConfig):
     # The episode's agents at once. GLM, whose account allows 8 concurrent requests, is gated on its own by a forge's
     # `solvers`, so the judge's reviews run beside its solves.
     max_concurrent_agents: int | None = 16
+    # Where an agent that runs code works: a Prime VM, or a Docker container on the machine the run is on (the same
+    # pinned image and egress), as when Prime's sandbox streams drop (W2's smoke, 2026-10-18).
+    sandbox: Literal["prime", "docker"] = "prime"
 
     @model_validator(mode="after")
     def secure(self):
@@ -163,16 +190,13 @@ class Seats(vf.EnvConfig):
             agent = getattr(self, name)
             if not isinstance(agent, vf.AgentConfig):
                 continue
-            runtime = agent.runtime
-            if not isinstance(agent.harness, NullHarnessConfig) and (
-                not isinstance(runtime, vf.PrimeConfig)
-                or not runtime.vm
-                or runtime.allow
-                or runtime.block != ["*"]
-                or "@sha256:" not in runtime.image
-            ):
+            if self.sandbox == "docker" and isinstance(agent.runtime, vf.PrimeConfig):
+                agent = in_docker(agent)
+                object.__setattr__(self, name, agent)  # set in place: an assignment would validate again
+            if not isinstance(agent.harness, NullHarnessConfig) and not isolated(agent.runtime):
                 raise ValueError(
-                    f"{name} executes code, so it requires an immutable Prime VM with framework-only egress"
+                    f"{name} executes code, so it requires an immutable sandbox (a Prime VM, or a Docker container "
+                    "of a pinned image) with framework-only egress"
                 )
             if not agent.model:
                 raise ValueError(f"{name} needs an explicit model")
