@@ -1,7 +1,7 @@
 # The forge's smoke on W2's smoke world: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-w2-smoke.toml
 # Eight initial tasks and one adapting pass, through every path with the real models: the skills dealt and checked, a
 # stuck id dropped, the material's collections and promises, the coverage page and the report.
-world = "data/v8-05/smoke-w2c"
+world = "data/v8-05/smoke-w2d"
 output = "data/v8-05/forge-smoke-w2"
 tasks = 8
 batch = 4                 # a turn's ids, one of each family: a turn of 12 had GLM 5.3 flash survey the world until its

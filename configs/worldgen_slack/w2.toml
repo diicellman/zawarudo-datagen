@@ -67,9 +67,8 @@ model = "anthropic/claude-opus-5.5"  # blind judges rated its days 0.77 for real
 [env.author.sampling]
 cache_control = { type = "ephemeral", ttl = "1h" }
 
-# The judge: GLM 5.3, thinking at "high", the middle of its three efforts (low, high, max).
+# The judge: gpt-6-sol, as it judged S3, C1 and the first W1. GLM 5.3 at "high" judged W1 while OpenAI refused this
+# account (2026-10-15), but on W2's smoke, with room for 64k-token replies, it lost its sandbox's stream on every try
+# of a review, mid-call (2026-10-18).
 [env.judge]
-model = "z-ai/glm-5.3"
-
-[env.judge.sampling]
-reasoning_effort = "high"
+model = "openai/gpt-6-sol"
