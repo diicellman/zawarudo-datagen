@@ -1044,6 +1044,12 @@ async def run_flows(root):
         seats.solver.sampling.temperature == 1.0 == seats.verifier.sampling.temperature
         and seats.verifier.sampling.reasoning_effort == "high"
     )
+    # A judge thinks as long as an author before it writes its verdict (a final review of W2's smoke was cut off at
+    # 16k, mid-call); a solver answers in 16k.
+    assert (settings.env.judge.sampling.max_tokens, settings.env.author.sampling.max_tokens) == (
+        64_000,
+        64_000,
+    ) and (seats.solver.sampling.max_tokens == 16_000)
     assert rates([{"correct": i < 6, "semantic_correctness": 0.0} for i in range(8)])["right_interval"] == [
         0.46,
         0.913,
