@@ -5,7 +5,8 @@ This page is the algorithm.
 
 ## The world
 
-`WorldEnv` (`world/env.py`) runs it. One author, an rlm agent, works in one Prime VM for the whole world, with one
+`WorldEnv` (`world/env.py`) runs it. One author, an rlm agent, works in one Prime VM (or, with `[env] sandbox =
+"docker"`, one Docker container on the run's machine) for the whole world, with one
 interaction per block of work (`SessionEnv.work_in_vm`). The world is written forward in time: code holds the
 present (`world_meta.now_us`), and nothing is written before it.
 

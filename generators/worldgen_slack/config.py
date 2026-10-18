@@ -3,6 +3,7 @@ run has, held to code's rules. A world's settings are in world/config.py, a forg
 
 import hashlib
 import json
+import re
 import tomllib
 from pathlib import Path
 from typing import Annotated, Literal
@@ -144,27 +145,48 @@ def vm_seat(model: str, tokens: int = 600_000) -> vf.AgentConfig:
     )
 
 
-def in_docker(agent: vf.AgentConfig) -> vf.AgentConfig:
-    """An agent's Prime VM as a Docker container on this machine: the same pinned image, working directory, CPUs,
-    memory and framework-only egress."""
+LOCAL_IMAGE = re.compile(
+    r"sha256:[0-9a-f]{64}"
+)  # a local image by its content id (scripts/worldgen_slack/agent_image.py)
+
+
+def local_image(image: str) -> str:
+    if not LOCAL_IMAGE.fullmatch(image):
+        raise ValueError(
+            f"docker_image is a local image's content id (sha256: and 64 hex digits), not {image!r}"
+        )
+    return image
+
+
+def in_docker(agent: vf.AgentConfig, image: str | None = None) -> vf.AgentConfig:
+    """An agent's Prime VM as a Docker container on this machine: the same pinned image (or `image`, the agents' image
+    with the harness installed), working directory, CPUs, memory and framework-only egress."""
     vm = agent.runtime
     return agent.model_copy(
         update={
             "runtime": vf.DockerConfig(
-                image=vm.image, workdir=vm.workdir, cpu=vm.cpu, memory=vm.memory, allow=[], block=["*"]
+                image=image or vm.image,
+                workdir=vm.workdir,
+                cpu=vm.cpu,
+                memory=vm.memory,
+                allow=[],
+                block=["*"],
             )
         }
     )
 
 
 def isolated(runtime) -> bool:
-    """Whether a runtime holds an agent that runs code: an immutable Prime VM, or a Docker container of a pinned image,
-    each with framework-only egress."""
+    """Whether a runtime holds an agent that runs code: an immutable Prime VM, or a Docker container of a pinned image
+    (a registry digest, or a local image's content id), each with framework-only egress."""
+    pinned = "@sha256:" in runtime.image or (
+        isinstance(runtime, vf.DockerConfig) and LOCAL_IMAGE.fullmatch(runtime.image) is not None
+    )
     return (
         (isinstance(runtime, vf.PrimeConfig) and runtime.vm or isinstance(runtime, vf.DockerConfig))
         and not runtime.allow
         and runtime.block == ["*"]
-        and "@sha256:" in runtime.image
+        and pinned
     )
 
 
@@ -181,6 +203,10 @@ class Seats(vf.EnvConfig):
     # Where an agent that runs code works: a Prime VM, or a Docker container on the machine the run is on (the same
     # pinned image and egress), as when Prime's sandbox streams drop (W2's smoke, 2026-10-18).
     sandbox: Literal["prime", "docker"] = "prime"
+    # The image a Docker sandbox runs, by its content id: the agents' image with the harness installed, so a container
+    # starts at once (scripts/worldgen_slack/agent_image.py builds it). Unset, the Prime VM's base, which installs the
+    # harness in each container first.
+    docker_image: Annotated[str, AfterValidator(local_image)] | None = None
 
     @model_validator(mode="after")
     def secure(self):
@@ -191,7 +217,7 @@ class Seats(vf.EnvConfig):
             if not isinstance(agent, vf.AgentConfig):
                 continue
             if self.sandbox == "docker" and isinstance(agent.runtime, vf.PrimeConfig):
-                agent = in_docker(agent)
+                agent = in_docker(agent, self.docker_image)
                 object.__setattr__(self, name, agent)  # set in place: an assignment would validate again
             if not isinstance(agent.harness, NullHarnessConfig) and not isolated(agent.runtime):
                 raise ValueError(

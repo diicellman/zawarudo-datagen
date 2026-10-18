@@ -125,7 +125,10 @@ depth and people, for whoever writes its next chapter.
 Each agent's prompts are files in a `prompts/` folder beside its code. The world part never loads the forge's code;
 the forge builds on the world's. Verifiers owns model execution, harnesses, runtimes, traces and episodes. The
 author and the proposer are rlm agents, each in one Prime VM for the whole run, with one interaction per block of
-work; their world tools run on the host. The judge cannot edit the world; its issues go back to the author.
+work; their world tools run on the host. With `[env] sandbox = "docker"` every agent that runs code (author,
+proposer, judge) works in a Docker container on the run's machine instead: the same pinned image, `/task` and
+framework-only egress, for when Prime's sandbox streams drop (the machine needs Docker, and its user the `docker`
+group). The judge cannot edit the world; its issues go back to the author.
 
 **Agents and models** (one per seat, set in the config): the author and the proposer, Claude Opus 5.5; the judge,
 the witness and the answer judge, gpt-6-sol; the solver, GLM 5.3 flash (or the student, DeepSeek V4.1 flash), with the

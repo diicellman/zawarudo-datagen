@@ -1,6 +1,7 @@
 """The world: cast, premise and organization; apps, churn and links; the clock and a day's writing; the author's tools
 and memory."""
 
+import importlib.util
 import json
 import math
 import random
@@ -8,13 +9,16 @@ import re
 import statistics
 from collections import Counter
 from datetime import date, datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 import verifiers.v1 as vf
+from verifiers.v1.harnesses.rlm.harness import RLMHarness
 from worldgen_slack import slack
+from worldgen_slack.config import RLM_REVISION
 
-from ..config import Category, Needs
+from ..config import ROOT, Category, Needs
 from ..evidence import IDENTIFIER
 from ..forge.config import ForgeConfig, load_forge
 from ..forge.proposer.task import ProposerTask
@@ -389,6 +393,36 @@ def test_contracts(tmp_path):
             assert isinstance(boxed.env.solver.runtime, vf.SubprocessConfig), (
                 "a solver runs no code: a local process"
             )
+        # The agents' image (the harness installed, so a container starts at once) by its local content id; a name
+        # that pins nothing is refused.
+        built = "sha256:" + "ab" * 32
+        imaged = type(config).model_validate(
+            config.model_dump(mode="json")
+            | {"env": config.env.model_dump(mode="json") | {"sandbox": "docker", "docker_image": built}}
+        )
+        assert getattr(imaged.env, seat).runtime.image == built == imaged.env.judge.runtime.image
+        refused(
+            "docker_image is a local image's content id",
+            type(config).model_validate,
+            config.model_dump(mode="json")
+            | {
+                "env": config.env.model_dump(mode="json")
+                | {"sandbox": "docker", "docker_image": "zawarudo-agent"}
+            },
+        )
+        # The image's harness is installed where the harness checks it is ready, at the pinned revision.
+        spec = importlib.util.spec_from_file_location(
+            "agent_image", ROOT / "scripts/worldgen_slack/agent_image.py"
+        )
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        home = RLMHarness._install_dir(SimpleNamespace(config=SimpleNamespace(version=RLM_REVISION)))
+        recipe = builder.dockerfile()
+        assert (
+            recipe.startswith(f"FROM {vm.image}\n")
+            and f"touch {home}/.ready" in recipe
+            and RLM_REVISION in recipe
+        )
         open_box = getattr(boxed.env, seat).model_copy(
             update={"runtime": box.model_copy(update={"block": [], "allow": ["*"]})}
         )
