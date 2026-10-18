@@ -125,6 +125,9 @@ class WorldConfig(Section):
     activity: ActivityConfig = Field(default_factory=ActivityConfig)
     storylines: int = Field(default=2, ge=1, le=20)  # the plot the ledger plans before day 1
     ledger: LedgerTargets = Field(default_factory=LedgerTargets)
+    # lost sessions a block of work may take before the run stops (each a fresh VM after a pause): a long world loses
+    # more (W1 lost 4 in 2.9 hours)
+    max_losses: int = Field(default=1, ge=0, le=20)
     review_rounds: ReviewRounds = Field(default_factory=ReviewRounds)
     author: AuthorSettings = Field(default_factory=AuthorSettings)
     env: WorldSeats = Field(default_factory=WorldSeats)

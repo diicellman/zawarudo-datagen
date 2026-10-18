@@ -195,9 +195,9 @@ class SessionEnv(vf.Env[Seats]):
         """One agent and one VM for the whole run; one interaction per block of work. A session lost to its sandbox,
         tunnel or provider (or a VM gone mid-run) is none of the agent's limits: after a pause, a fresh VM takes the
         run up where its state says, as a resume does, and the attempt it cut off spends no round. A block may lose
-        its session `max_losses` times (the run's setting; a world's 1); one more stops the run."""
+        its session `max_losses` times (the run's setting); one more stops the run."""
         state, losses = self.store.state, {}
-        allowed = getattr(self.settings, "max_losses", 1)
+        allowed = self.settings.max_losses
         setup = self.provision_task()
         while True:
             try:

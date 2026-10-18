@@ -1122,9 +1122,10 @@ async def run_flows(root):
         raise AssertionError("a block that lost its session twice went on")
     except SessionLost:
         assert blocks[2:] == ["gone-01", "gone-02"] and store.state.lost["gone"] == 2, blocks
-    settings_ = env.settings  # a run that allows more losses (a forge's 5) takes a block up again each time
-    env.settings = settings_.model_copy()
-    object.__setattr__(env.settings, "max_losses", 3)
+    settings_ = (
+        env.settings
+    )  # a run that allows more losses (a long world's, a forge's 5) takes a block up again
+    env.settings = settings_.model_copy(update={"max_losses": 3})
     blocks.clear()
     dropping = Dropping("many", 3)
     dropping.settings = env.settings
