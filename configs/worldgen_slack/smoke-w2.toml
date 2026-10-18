@@ -3,8 +3,9 @@
 # 120, a plan that meets its targets, days of about 170 messages inside the author's caps, a slip the judge lets stand.
 sector = "a consumer smart-home hardware company: firmware and companion-app releases, contract manufacturing and component supply, certification and retail launches, and customer support"
 seed = 20261019
-output = "data/v8-05/smoke-w2b"  # the first (data/v8-05/smoke-w2) ran out of day 2's clock: openings spread all of a
-                                 # part over a day's conversations and their talking came on top (fixed in f77629f)
+output = "data/v8-05/smoke-w2c"  # the first (data/v8-05/smoke-w2) ran out of day 2's clock: openings spread all of a
+                                 # part over a day's conversations and their talking came on top (fixed in f77629f);
+                                 # the second (smoke-w2b) wrote its days, then its judge was cut off at 16k (2569cb8)
 storylines = 3            # the plot the ledger plans before day 1
 max_losses = 3            # lost sessions a day may take (W1 lost 4 in 2.9 hours), each a fresh VM after a pause
 
