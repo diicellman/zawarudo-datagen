@@ -384,12 +384,30 @@ def opening(world, settings, rng, now: int, day: int) -> int:
     pace = started * (end - now) / (now - start) if now > start else 0.0
     conversations = max(1.0, left / settings.activity.conversation_lines, pace)
     wait = int(rng.random() * 2 * max(end - now, 0) / (conversations + 1))
+    if (most := spare(world, settings, day, now)) is not None:
+        wait = min(wait, most)
+    return wait + rng.randrange(1_000_000, 60_000_000)
+
+
+def spare(world, settings, day: int, now: int) -> int | None:
+    """How long the day can spare before its next line: the rest of the day spread over the conversations it still
+    needs to close; None when it needs no more."""
     if (ways := room(world, settings, day)) is not None and (
         need := ways["closes"][0] - tally(world, day)["messages"]
     ) > 0:
         still = math.ceil(need / settings.activity.conversation_lines)
-        wait = min(wait, max(bounds(world, day)[1] - now, 0) // (still + 1))
-    return wait + rng.randrange(1_000_000, 60_000_000)
+        return max(bounds(world, day)[1] - now, 0) // (still + 1)
+    return None
+
+
+HOUR = 3_600_000_000
+
+
+def paused(gaps, rng, most: int | None) -> int:
+    """A pause of an hour or more, as real replies take, but no longer than the day can spare (`most`): one drawn from
+    the gaps' long tail would otherwise skip a busy day's morning, and the day could no longer hold its quota."""
+    gap = gaps.sample(rng, "hours")
+    return gap if most is None else min(gap, max(most, HOUR + rng.randrange(1_000_000, 600_000_000)))
 
 
 def stated_anchors(facts: dict[str, dict], text: str) -> list[str]:
@@ -480,11 +498,10 @@ def post(world, conversation: Conversation, settings, rng, gaps) -> dict:
     if errors:
         raise ValueError("; ".join(errors))
     now, before = present(world), today_line(world, settings, day)
-    stamps = [
-        now + (gaps.sample(rng, "hours") if lines[0].pause else opening(world, settings, rng, now, day))
-    ]
+    most = spare(world, settings, day, now)
+    stamps = [now + (paused(gaps, rng, most) if lines[0].pause else opening(world, settings, rng, now, day))]
     for line in lines[1:]:
-        stamps.append(stamps[-1] + gaps.sample(rng, line.pause))
+        stamps.append(stamps[-1] + (paused(gaps, rng, most) if line.pause else gaps.sample(rng, "")))
     if stamps[-1] >= end:
         raise ValueError(
             f"this conversation would run past midnight ({clock(world, stamps[-1])}); post fewer lines or pauses "

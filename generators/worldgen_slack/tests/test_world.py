@@ -70,6 +70,7 @@ from ..world.organization import (
 from ..world.profile import counts, promises
 from ..world.text import TIME_LITERAL
 from ..world.writing import (
+    HOUR,
     Close,
     Commit,
     Conversation,
@@ -81,6 +82,7 @@ from ..world.writing import (
     close_day,
     edit,
     opening,
+    paused,
     post,
     posted,
     promises_made,
@@ -789,6 +791,14 @@ def test_clock(tmp_path):
     zone = "America/Chicago"
     sampler = random.Random(1)
     assert all(gaps.sample(sampler, "") < 3_600_000_000 <= gaps.sample(sampler, "hours") for _ in range(200))
+    # A pause of hours is an hour or more, but no longer than the day can spare: real gaps' long tail (7 hours once)
+    # skipped a busy day's morning, and the day could no longer hold its quota.
+    longest = max(gaps.sample(random.Random(i), "hours") for i in range(200))
+    spared = [paused(gaps, random.Random(i), HOUR * 3 // 2) for i in range(200)]
+    assert longest > HOUR * 3 // 2 and all(HOUR <= g <= HOUR * 3 // 2 for g in spared), (longest, max(spared))
+    assert all(HOUR <= paused(gaps, random.Random(i), 0) < HOUR + 600_000_000 for i in range(50)), (
+        "an hour at least"
+    )
 
     def plan(**changes):
         return ledger_plan(ops, leads, a, b, **changes)
