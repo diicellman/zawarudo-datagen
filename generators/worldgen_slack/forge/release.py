@@ -7,7 +7,7 @@ import json
 import os
 import shutil
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from worldgen_slack import slack
@@ -22,6 +22,7 @@ from worldgen_slack.release import (
 )
 from worldgen_slack.world import file_hash
 
+from .coverage import coverage
 from .tasks import FAMILIES, SETS, Task, private_answer
 from .tries import agreeing, by_part, rates
 
@@ -117,6 +118,14 @@ def report(store) -> dict:
         counts[family]["approved"] += label in KEPT
         counts[family]["window"] += label == "window"
         counts[family][record["set"]] += 1
+    skills: dict[str, Counter] = defaultdict(Counter)
+    for record in store.state.forged.values():
+        skill, label = record.get("skill") or "none", record.get("label")
+        skills[skill]["written"] += 1
+        skills[skill]["verified"] += bool(record.get("verified"))
+        skills[skill]["approved"] += label in KEPT
+        skills[skill]["window"] += label == "window"
+    covered = coverage(store.world, list(store.state.forged.values()))
     # The proposer's notes as its last clean turn kept them.
     notes = store.root / "attempts" / store.state.restore_point / "notes" / "forge.md"
     return {
@@ -124,7 +133,16 @@ def report(store) -> dict:
             f: {k: c[k] for k in ("written", "verified", "approved", "window", *SETS)}
             for f, c in counts.items()
         },
+        "skills": {s: dict(c) for s, c in sorted(skills.items())},
         "short": sorted(f for f, c in counts.items() if c["approved"] < 2),
+        "dropped": store.state.plans.get("forge", {}).get("dropped", []),
+        "askers": covered["askers"],
+        "openings": covered["openings"],
+        "material": {
+            k: covered[k]
+            for k in ("storylines", "unused_groups", "unused_by_storyline", "unused_collections")
+        }
+        | {"unused_promises": len(covered["unused_promises"])},
         "proposer_notes": notes.read_text()[-4000:] if notes.is_file() else "",
     }
 

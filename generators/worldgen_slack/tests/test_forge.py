@@ -393,6 +393,7 @@ def test_release(tmp_path):
                 "set": "harder",
                 "label": "window",
                 "verified": True,
+                "skill": "aggregation",
             },
             "t8": {
                 "task": task.model_dump(mode="json") | {"id": "t8"},
@@ -403,6 +404,7 @@ def test_release(tmp_path):
         solves={"t9": {"results": [right, {"correct": False}], "traces": [None, None]}},
         verifier={"t9": {"results": [right | {"grounded": False}, right], "traces": ["v0", "v1"]}},
         restore_point="adapt1-02",
+        plans={"forge": {"dropped": ["t7"]}},
     )
     for attempt, text in (("adapt1-02", "no owner named for the audit"), ("source", "the author's plan")):
         (tmp_path / "attempts" / attempt / "notes").mkdir(parents=True)
@@ -429,4 +431,14 @@ def test_release(tmp_path):
     assert found["proposer_notes"] == "no owner named for the audit", (
         "the notes of the proposer's last clean turn"
     )
+    assert (found["skills"]["aggregation"], found["skills"]["none"]["written"], found["dropped"]) == (
+        {"written": 1, "verified": 1, "approved": 1, "window": 1},
+        1,
+        ["t7"],
+    ), "by skill, and the ids dropped short of material"
+    assert (found["askers"], found["openings"], found["material"]["unused_groups"]) == (
+        1,
+        [["catch me", 2]],
+        0,
+    ), "its askers, the openings it repeats, and the world's one value group, which its tasks rest on"
     assert ForgeEnv.WHY["repaired"].startswith("The judge refused it")

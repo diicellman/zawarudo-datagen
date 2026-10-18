@@ -10,16 +10,21 @@ Tools and memory
 - world_now(), world_view(ref), world_sql(sql, actor_id=None) and world_read(actor_id, tool, arguments) read the
   world: the whole file, or what one person sees, through the student's own tools. Walk a task's route as its asker
   before you write it: search with the request's words, read what comes up, see what a hasty reader would answer.
-- world_material() is the world's task material by code: each value group's values in order, each with its messages
-  (the evidence ids an answer names) and place, which is current, the decoys, who can read each private channel, and
-  the people who could ask. Start from it, and read the world to walk a task's route.
+- world_material() is the world's task material by code: a summary (what the world holds, by storyline, and how its
+  promises went); each value group's values in order, each with its messages (the evidence ids an answer names), its
+  place and how many read_channel pages deep it sits, which is current, the decoys; the collections, sets of items
+  each stated where it came up and never listed whole; every promise, its owner, due day and how it went (kept, kept
+  late, changed, dropped, or slipped: past due with nothing said); who can read each private channel; and the people
+  who could ask. Keep it in a variable and start from it; read the world to walk a task's route.
 - world_add_task(task) writes a task under one of the turn's open ids: code checks it and keeps it, or tells you every
   reason it refuses; write the id again to replace it.
 - A turn ends when it has spent its {budget} new tokens, or when its session drops: a task is kept the moment
   world_add_task takes it, and nothing else of the turn is. Write each task as soon as you have walked its route, then
   the next.
-- /task/memory/ is code's: tasks.md (every task written so far: write new ones, never a repeat), families.md, and a
-  page per person (its id, U..., is what actor_id takes), channel, storyline and event; in an adapting turn, adapt.md.
+- /task/memory/ is code's: tasks.md (what the tasks so far cover: families, skills, storylines, the material no task
+  rests on yet, the openings already used; then every task written so far: write new ones, never a repeat),
+  families.md, and a page per person (its id, U..., is what actor_id takes), channel, storyline and event; in an
+  adapting turn, adapt.md.
   /task/notes/ is yours: keep your notes in forge.md (what you looked for and could not find goes to whoever writes
   the world's next chapter); the world's author left its plan.md there.
 
@@ -39,17 +44,21 @@ A request a colleague would make
   the rotation actually planned for at that point?"; "All told, how many hours later than its original Thursday slot
   did the prod deploy window end up opening?" (a manager's); "Did William end up approving the second QA req, so I'm
   not the only one doing regression?" (nothing says so: the right answer says it isn't settled); "For Tuesday's
-  billing roadmap: who's the owner of the skip audit at this point?".
+  billing roadmap: who's the owner of the skip audit at this point?"; "Which of the retailers still haven't confirmed
+  the new ship date?" (each confirmed somewhere else); "What's still blocking 4.9, all of it, and who has each one?".
+- Open each request as its asker would, in their own way: tasks.md lists the openings already used more than once;
+  open a new request otherwise.
 
 Where difficulty comes from
 - A real request needs what a solver gets wrong, along four skills: complete aggregation (every change, every open
   item, every person who still owes something, across channels and threads); temporal reasoning (the answer as of a
   moment, a value that changed more than once, how long something ran or how far it moved); calibrated abstention
   (what is asked is not there, not settled, or out of the asker's sight, and the right answer says so); synthesis (a
-  decision and its reason stated apart, an owner handed over, a promise and whether it was kept).
-- A composite request is the main lever: one request in 2 to 4 parts, right only when every part is ("before I brief
-  the copywriter: what packaging did we land on, how did the re-run samples do, and what figure can we use now?").
-  Each part is a real part of the request, in its words, and answers what no other part does.
+  decision and its reason stated apart, an owner handed over, a promise and whether it was kept). An id may name the
+  skill its request needs, as code deals them across the set; code checks the shape it can tell.
+- A composite request is the main lever: one request in 2 to 4 parts, right only when every part is ("what packaging
+  did we land on, how did the re-run samples do, and what figure can we use now?", a copywriter's brief). Each part is
+  a real part of the request, in its words, and answers what no other part does.
 - A single lookup is easy: most are; put it inside a bigger request.
 - The cheapest route decides: a solver answers wrong when the first value its search for the request's own words
   finds is stale, or a near-miss whose correction sits where that search does not reach (a thread under another post,

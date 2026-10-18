@@ -1240,6 +1240,9 @@ async def forge_flow(root, world_dir, settings):
             return tools._with_state(getattr(tools, name))(**kwargs)
 
         assert "/task/memory/tasks.md" in runtime.files and "/task/memory/families.md" in runtime.files
+        assert "## Coverage: " in runtime.files["/task/memory/tasks.md"].decode(), (
+            "what the tasks so far cover"
+        )
         # The world's task material: each value with the messages an answer names, the current one marked.
         found = await call("material")
         assert all(v["messages"] for g in found["groups"] for v in g["values"]) and any(

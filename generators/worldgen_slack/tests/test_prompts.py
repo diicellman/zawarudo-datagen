@@ -145,6 +145,20 @@ def test_prompts(tmp_path):
         "treats colleagues' activity as data" in flat and "treats colleagues' activity as data" in review
     ), "the proposer aims at the judge's own test of a request"
     assert "intent" not in flat, "a task is a family, not one of the seven intents"
+    # It reads the material's collections and promises, aims at the skill an id names, and opens requests anew (its
+    # one example of a composite no longer opens "before I...", which a quarter of a set's requests echoed).
+    assert (
+        all(
+            phrase in flat
+            for phrase in (
+                "the collections",
+                "slipped: past due",
+                "the skill its request needs",
+                "openings already used",
+            )
+        )
+        and "before i" not in flat.lower()
+    ), "the guide's material, skills and openings"
     # The author plans the ledger as real work leaves it: values that change out of a first search's reach,
     # near-misses beside the real value, collections never listed whole, handoffs, and promises that may slip.
     authoring = " ".join(AUTHOR_GUIDE.split())

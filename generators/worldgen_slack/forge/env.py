@@ -18,6 +18,8 @@ from ..session import SETUP_FILES, SessionEnv, require_session
 from ..store import ReviewLimit, Store
 from ..workspace import Workspace, reset_tasks
 from .config import ForgeConfig
+from .coverage import coverage
+from .coverage import page as coverage_page
 from .judge import rule
 from .proposer.task import ProposerTask, adapt_prompt, initial_prompt
 from .release import KEPT
@@ -259,7 +261,13 @@ class ForgeEnv(SessionEnv):
     def pages(self, ids: list[str]) -> dict[str, str]:
         """The forge's own memory pages: the tasks written, the families, and in an adapting turn what to write."""
         state = self.store.state
-        tasks = ["# Tasks written (write new requests, never a repeat)", ""]
+        tasks = [
+            "# Tasks written (write new requests, never a repeat)",
+            "",
+            *coverage_page(coverage(self.world, list(state.forged.values()))),
+            "## The tasks",
+            "",
+        ]
         for task_id, record in state.forged.items():
             task = Task.model_validate(record["task"])
             tasks.append(
