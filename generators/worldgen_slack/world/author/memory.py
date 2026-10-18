@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from ...config import Needs
 from ..board import Slot, needs_text, on_board, slot_needs
 from ..clock import bounds, chapter_start, clock, frozen_before, part_of, present, today, window, world_meta
+from ..profile import target_line
 from ..style import LONG, SHORT
 from ..writing import drift, posted, quotas, today_line
 
@@ -123,6 +124,8 @@ def now_page(world, settings, context: dict) -> str:
                 f"({', '.join(who[p]['real_name'] for p in a['participants'])}; about {a['length']} lines)"
                 for a in drawn
             ]
+    if line := target_line(world, getattr(settings, "ledger", None)):  # a forge's settings hold no ledger
+        out += ["", f"## Ledger, against what it holds at least: {line}"]
     for s in world.db.execute("SELECT * FROM storylines ORDER BY position"):
         out += ["", f"## Storyline [[{s['id']}]]: {s['summary']}"]
         out += [

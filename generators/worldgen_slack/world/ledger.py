@@ -26,6 +26,7 @@ from .clock import (
     world_meta,
 )
 from .integrations import app_id, event_errors, queue, queue_day, queue_events
+from .profile import shortfalls
 from .text import TIME_LITERAL, normalized
 from .writing import keep_busy, quotas, room, today_line
 
@@ -549,6 +550,10 @@ def record_plan(world, plan: Plan, settings, slots=()) -> None:
         )
         if short := front_loaded(world, settings, plan.facts, day):
             raise ValueError(short)
+        if short := shortfalls(world, settings.ledger):
+            raise ValueError(
+                "the ledger plans too little material for the world's tasks: " + "; ".join(short)
+            )
         world.insert("board", [dict(slot=s, fact_id=f) for s, facts in board.items() for f in facts])
         for s, facts in board.items():
             needs, level = slot_needs(settings, backward[s]), backward[s].level

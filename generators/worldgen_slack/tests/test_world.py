@@ -41,6 +41,7 @@ from ..world.clock import (
     window,
     world_meta,
 )
+from ..world.config import LedgerTargets
 from ..world.ledger import (
     Artifact,
     BoardEntry,
@@ -881,7 +882,29 @@ def test_clock(tmp_path):
             raise LookupError("drop the trial")
     except LookupError:
         pass
+
+    def held_to(targets):
+        def record(document):
+            with world.trial() as copy:
+                record_plan(copy, document, settings.model_copy(update={"ledger": targets}))
+
+        return record
+
+    # The ledger holds at least what `[ledger]` asks, counted off the plan: a plan short of it is refused with every
+    # shortfall, before day 1 and on every later replan, and one that keeps it is recorded.
+    refused(
+        "too little material for the world's tasks: 4 facts of the 5 it holds at least; 0 decoys",
+        held_to(LedgerTargets(facts=5, decoys=1)),
+        first_plan,
+    )
+    held_to(LedgerTargets(facts=4))(first_plan)
+    refused("3 facts of the 4 it holds at least", held_to(LedgerTargets(facts=4)), plan(facts=facts[:3]))
     recorded(first_plan)
+    held = settings.model_copy(update={"ledger": LedgerTargets(facts=4, chains=1)})
+    assert (
+        "## Ledger, against what it holds at least: facts 4/4, chains 0/1"
+        in files(world, held, {})["memory/now.md"]
+    )
     shared = world.db.execute(
         "SELECT DISTINCT f.moment_us, e.moment_us FROM facts f JOIN events e ON e.id = f.event_id WHERE e.id = 'e1'"
     ).fetchall()

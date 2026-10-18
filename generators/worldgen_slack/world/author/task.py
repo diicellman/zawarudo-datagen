@@ -11,6 +11,7 @@ from worldgen_slack.taskset import WorldTaskData
 from ...prompt import prompt, render
 from ...session import AuthoringToolsConfig, tools_config
 from ..clock import PARTS, bounds, chapter_start, clock, present
+from ..profile import MATERIAL
 from .tools import AuthorTools
 
 AUTHOR_GUIDE = render(
@@ -57,6 +58,12 @@ def rejected(feedback: str, restored: str = "") -> str:
     return f"\nYour last attempt at this was rejected{restored}: {feedback}" if feedback else ""
 
 
+def targets_text(settings) -> str:
+    """What the world's ledger holds at least (`[ledger]`), as the plan's prompt asks for it; empty when nothing is."""
+    asked = [f"{n} {MATERIAL[k]}" for k in MATERIAL if (n := getattr(settings.ledger, k))]
+    return f" The ledger holds at least: {'; '.join(asked)}." if asked else ""
+
+
 def plan_prompt(world, settings, feedback: str = "") -> str:
     count, first = settings.storylines, chapter_start(world)
     total = world.db.execute("SELECT COUNT(*) FROM calendar").fetchone()[0]
@@ -66,15 +73,16 @@ def plan_prompt(world, settings, feedback: str = "") -> str:
             f"frozen, and this chapter writes days {first}-{total}. Plan its ledger with world_plan: the ledger.json "
             f"you have, going on, with {count} storylines in all (the earlier ones first), and the chapter's events "
             "and facts over its days, and the board: the facts each entry of now.md's brief will rest on, as it "
-            "needs. Then rewrite /task/notes/plan.md for the chapter: each storyline's arc day by day, and how each "
-            f"brief entry is planted. End your turn when the ledger is planned.{rejected(feedback)}"
+            f"needs.{targets_text(settings)} Then rewrite /task/notes/plan.md for the chapter: each storyline's arc "
+            f"day by day, and how each brief entry is planted. End your turn when the ledger is planned."
+            f"{rejected(feedback)}"
         )
     return (
         f"Before day 1 ({clock(world, bounds(world, 1)[0])[:14]}): plan the ledger with world_plan: exactly {count} "
         "storylines, their events and their facts, over the calendar in now.md, and its board: the facts each slot "
-        "now.md marks for the board will rest on, as many channels, relations and near-misses as its level needs. Then write "
-        "/task/notes/plan.md: each storyline's arc day by day, and how each slot will be asked. End your turn when the "
-        f"ledger is planned.{rejected(feedback)}"
+        "now.md marks for the board will rest on, as many channels, relations and near-misses as its level needs."
+        f"{targets_text(settings)} Then write /task/notes/plan.md: each storyline's arc day by day, and how each slot "
+        f"will be asked. End your turn when the ledger is planned.{rejected(feedback)}"
     )
 
 

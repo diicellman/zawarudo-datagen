@@ -20,17 +20,39 @@ from .clock import bounds, meta, present
 from .text import PEOPLE
 
 PRIVATE = ("private", "im", "mpim")
-# What a world's ledger is held to (`[ledger]`) and measured by: the counts of `counts`.
-MATERIAL = (
-    "facts",
-    "chains",
-    "deep_chains",
-    "decoys",
-    "private_truths",
-    "collections",
-    "archives",
-    "departures",
-)
+# What a world's ledger is held to (`[ledger]`) and measured by: the counts of `counts`, each as the author reads it.
+MATERIAL = {
+    "facts": "facts",
+    "chains": "chains (a subject and attribute whose values supersede one another 3 deep, across 2 or more channels)",
+    "deep_chains": "deep chains (4 deep)",
+    "decoys": "decoys (each beside a real value of its subject and attribute)",
+    "private_truths": "private truths (a value that changed, its current one planned in a private channel or a DM)",
+    "collections": "collections (4 or more items of one set, planned across 3 or more channels, an item's value "
+    "changed)",
+    "archives": "channels archived (a move)",
+    "departures": "people who leave the company (a move)",
+}
+PLANNED = list(MATERIAL)[:6]  # counted by storyline
+
+
+def shortfalls(world, targets) -> list[str]:
+    """What the ledger holds less of than `targets` (a world's `[ledger]`) asks."""
+    have = counts(world)
+    return [
+        f"{have[k]} {text} of the {want} it holds at least"
+        for k, text in MATERIAL.items()
+        if have[k] < (want := getattr(targets, k))
+    ]
+
+
+def target_line(world, targets) -> str:
+    """The ledger against its targets, on one line; empty when nothing is asked."""
+    if targets is None or not any(getattr(targets, k) for k in MATERIAL):
+        return ""
+    have = counts(world)
+    return ", ".join(
+        f"{k.replace('_', ' ')} {have[k]}/{getattr(targets, k)}" for k in MATERIAL if getattr(targets, k)
+    )
 
 
 def chains(world) -> dict[str, int]:
@@ -121,8 +143,8 @@ def counts(world, through_day: int | None = None) -> dict:
     def moved(sql: str) -> int:
         return sum(us < end for (us,) in world.db.execute(sql))
 
-    by_storyline = {s: {k: c[k] for k in MATERIAL[:6]} for s, c in sorted(tally.items())}
-    return {k: sum(c[k] for c in by_storyline.values()) for k in MATERIAL[:6]} | {
+    by_storyline = {s: {k: c[k] for k in PLANNED} for s, c in sorted(tally.items())}
+    return {k: sum(c[k] for c in by_storyline.values()) for k in PLANNED} | {
         "archives": moved("SELECT archived_us FROM channels WHERE archived_us IS NOT NULL"),
         "departures": moved(
             "SELECT deactivated_us FROM users WHERE is_bot = 0 AND deactivated_us IS NOT NULL"

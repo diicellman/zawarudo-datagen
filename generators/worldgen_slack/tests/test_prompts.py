@@ -8,8 +8,10 @@ from ..config import ROOT
 from ..forge.judge import PROMPT as JUDGE_PROMPT
 from ..forge.proposer.task import ProposerTask, forge_guide
 from ..workspace import Workspace
-from ..world.author.task import AUTHOR_GUIDE, CHAPTER_GUIDE, CRAFT_GUIDE, AuthorTask
+from ..world.author.task import AUTHOR_GUIDE, CHAPTER_GUIDE, CRAFT_GUIDE, AuthorTask, targets_text
 from ..world.clock import PARTS
+from ..world.config import LedgerTargets
+from ..world.profile import MATERIAL
 from .support import contracts_settings, forge_of
 
 # The files whose strings a model reads: guides, turn prompts, refusals, memory pages and tool descriptions.
@@ -146,6 +148,16 @@ def test_prompts(tmp_path):
     parts = ", ".join(f"{p} {a:02d}-{b:02d}" for p, (a, b) in PARTS.items())
     assert parts in " ".join(AUTHOR_GUIDE.split()) and "PARTS_OF_THE_DAY" not in AUTHOR_GUIDE
     assert "nothing more specific" in review, "the judge holds each answer to what its part asks"
+    # The plan's prompt asks for what the world's ledger holds at least, in numbers from its config, and nothing when
+    # the config asks nothing.
+    dense = settings.model_copy(update={"ledger": LedgerTargets(facts=240, chains=30, collections=12)})
+    assert targets_text(settings) == "" and targets_text(dense) == (
+        " The ledger holds at least: 240 facts; 30 "
+        + MATERIAL["chains"]
+        + "; 12 "
+        + MATERIAL["collections"]
+        + "."
+    )
     assert "written and frozen" in CHAPTER_GUIDE and "No tasks are written in a chapter" in CHAPTER_GUIDE
     # The world's author writes with the craft page (voice lab 02); the proposer has its own guide, and a chapter's
     # author has the chapter's too.

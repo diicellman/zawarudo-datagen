@@ -86,6 +86,24 @@ class AuthorSettings(Section):
     plan_attempts: int = Field(default=3, ge=1, le=10)
 
 
+class LedgerTargets(Section):
+    """What the ledger holds at least, counted off the plan (world/profile.py's counts): the material a forge's tasks
+    rest on, planned before the day it is written. 0 holds the ledger to nothing."""
+
+    facts: int = Field(default=0, ge=0, le=5000)
+    chains: int = Field(default=0, ge=0, le=1000)  # values superseded 3 deep, across 2 or more channels
+    deep_chains: int = Field(default=0, ge=0, le=1000)  # 4 deep
+    decoys: int = Field(default=0, ge=0, le=1000)  # beside a real value of their subject and attribute
+    private_truths: int = Field(
+        default=0, ge=0, le=1000
+    )  # a changed value, its current one in a private place
+    collections: int = Field(
+        default=0, ge=0, le=1000
+    )  # 4 or more items across 3 or more channels, one changed
+    archives: int = Field(default=0, ge=0, le=100)  # channels a move archives
+    departures: int = Field(default=0, ge=0, le=100)  # people a move has leave the company
+
+
 class WorldSeats(Seats):
     author: vf.AgentConfig = vm_seat("z-ai/glm-5.3")
 
@@ -103,6 +121,7 @@ class WorldConfig(Section):
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
     activity: ActivityConfig = Field(default_factory=ActivityConfig)
     storylines: int = Field(default=2, ge=1, le=20)  # the plot the ledger plans before day 1
+    ledger: LedgerTargets = Field(default_factory=LedgerTargets)
     review_rounds: ReviewRounds = Field(default_factory=ReviewRounds)
     author: AuthorSettings = Field(default_factory=AuthorSettings)
     env: WorldSeats = Field(default_factory=WorldSeats)
