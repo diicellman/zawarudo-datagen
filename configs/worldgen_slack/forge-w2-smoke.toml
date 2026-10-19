@@ -1,8 +1,8 @@
-# The forge's smoke on W2's smoke world: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-w2-smoke.toml
-# Eight initial tasks and one adapting pass, through every path with the real models: the skills dealt and checked, a
-# stuck id dropped, the material's collections and promises, the coverage page and the report.
-world = "data/v8-05/smoke-w2d"
-output = "data/v8-05/forge-smoke-w2"
+# The forge's smoke on W2: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-w2-smoke.toml
+# Eight initial tasks and one adapting pass on W2 itself, through every path with the real models: the skills dealt and
+# checked, a stuck id dropped, the material's collections and promises, the coverage page and the report.
+world = "data/v8-05/w2"
+output = "data/v8-05/forge-w2-smoke"
 tasks = 8
 batch = 4                 # a turn's ids, one of each family: a turn of 12 had GLM 5.3 flash survey the world until its
                           # 1.5M tokens ran out, before it wrote one (the W1 pilot, 2026-10-17)
@@ -15,6 +15,12 @@ verify = 2
 skills = ["aggregation", "temporal", "aggregation", "abstention", "synthesis"]
 offers = 3                # turns an id is offered unwritten before it is dropped, short of material
 spend_limit = 40.0        # a guard against a runaway, not a budget
+
+# The proposer works in a Docker container on the research VM, of the agents' image (the rlm harness installed), as W2's
+# author did: W2 ran 40 days with no lost session there, where Prime's sandbox streams dropped 6 times on its smoke.
+[env]
+sandbox = "docker"
+docker_image = "sha256:86fe169858e8270c367f687ad9a4e6e52d15f99e8ba3bcf65fb5327c345668e8"
 
 # One model per seat. The proposer, the models that check its tasks and the student, whose pass rates select them,
 # are of three families, so none checks its own family's writing; unset fields keep the seat defaults.

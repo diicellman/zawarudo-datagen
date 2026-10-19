@@ -17,6 +17,12 @@ skills = ["aggregation", "temporal", "aggregation", "abstention", "synthesis"]
 offers = 3                # turns an id is offered unwritten before it is dropped, short of material
 spend_limit = 600.0       # a guard against a runaway, not a budget: the pilot cost about $1.11 a task
 
+# The proposer works in a Docker container on the research VM, of the agents' image (the rlm harness installed), as W2's
+# author did: W2 ran 40 days with no lost session there, where Prime's sandbox streams dropped 6 times on its smoke.
+[env]
+sandbox = "docker"
+docker_image = "sha256:86fe169858e8270c367f687ad9a4e6e52d15f99e8ba3bcf65fb5327c345668e8"
+
 # One model per seat. The proposer, the models that check its tasks and the student, whose pass rates select them,
 # are of three families, so none checks its own family's writing; unset fields keep the seat defaults.
 [env.proposer]
