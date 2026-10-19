@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from ..forge import tries as tries_module
-from ..forge.env import ForgeEnv, label_of, priced, spent
+from ..forge.env import ForgeEnv, label_of, on_crashes, priced, spent
 from ..forge.judge import Ruling, hearing, rule
 from ..forge.material import material
 from ..forge.release import level, release_rows, report
@@ -237,9 +237,13 @@ async def test_tries(tmp_path):
     assert rates(measured)["right_rate"] == 0.5 and rates(measured)["crashed"] == 1
     assert len(saved) == 6, "each try is saved as it lands"
     state.solves["t9"]["results"][2] = None  # a run cut off before its last try
-    before = made["solver"]
+    kept, crashed_trace = state.solves["t9"]["traces"][0], state.solves["t9"]["traces"][1]
     await tries.measure(agents, task, "k")
-    assert made["solver"] == before + 1, "a resume tries only the empty places"
+    after = state.solves["t9"]
+    assert (
+        after["traces"][0] == kept and after["traces"][1] != crashed_trace and after["results"][2] is not None
+    ), "a resume tries the empty places and those that crashed, and keeps the rest"
+    before = made["solver"]
     await tries.measure(agents, task, "k2")
     assert made["solver"] > before + 3 and state.solves["t9"]["key"] == "k2", "a changed task is tried afresh"
     composite = request(part(), part(label="who answered", answer=["Owen Sato"], evidence=[2]))
@@ -256,6 +260,14 @@ async def test_tries(tmp_path):
             raise RuntimeError("unavailable")
         return "ok"
 
+    # The verifier's tries that crashed (a provider's refusals) reach nothing and refute nothing: short of `verify`
+    # answered, the task fails rather than its answer going unreached, and a later try of it tops them up.
+    plan["verifier"] = [None]
+    state.verifier.clear()
+    with pytest.raises(RuntimeError, match="the verifier's tries crashed"):
+        await tries.verify(agents, task, "k")
+    plan["verifier"] = [True]
+    assert [r["correct"] for r in await tries.verify(agents, task, "k")] == [True, True]
     assert await patient(flaky, timeout=5) == "ok" and len(calls) == 3
     with pytest.raises(RuntimeError):
         await patient(lambda: (_ for _ in ()).throw(RuntimeError("down")), timeout=5)
@@ -369,6 +381,18 @@ def test_spend_and_labels(tmp_path):
         )
     ] == ["rejected", "rejected", "solved", "unsolved", "window"]
     assert [level(r) for r in (1.0, 0.75, 0.25, 0.0)] == [1, 2, 3, 4]
+    # A label that rests on tries that crashed is the provider's, not the task's: it is labelled again.
+    lost = {"results": [{"crashed": True}, {"correct": False}]}
+    assert [
+        on_crashes(r, v)
+        for r, v in (
+            ({"label": "rejected", "verified": False}, lost),
+            ({"label": "rejected", "verified": False}, {"results": [{"correct": False}] * 2}),
+            ({"label": "window", "verified": True, "rates": {"crashed": 2}}, {}),
+            ({"label": "solved", "verified": True, "rates": {"crashed": 0}}, lost),
+            ({"verified": False}, lost),
+        )
+    ] == [True, False, True, False, False]
 
 
 def test_release(tmp_path):

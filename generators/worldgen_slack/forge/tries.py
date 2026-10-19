@@ -147,7 +147,11 @@ class Tries:
         verifier's that ends with no answer (stuck at its turn cap on calls that lost their arguments): it says nothing
         of whether the answer can be reached. A student's unanswered try is its own failure, and counted."""
         first = None
-        for _ in range(self.ATTEMPTS):
+        for attempt in range(self.ATTEMPTS):
+            if attempt and (wait := WAITS[min(attempt - 1, len(WAITS) - 1)]):
+                await asyncio.sleep(
+                    wait
+                )  # a provider's burst of refusals (429: too many concurrent requests) passes
             async with self.gates[seat]:
                 trace = await getattr(agents, seat).run(task)
             self.store.trace(trace)
@@ -160,8 +164,9 @@ class Tries:
 
     async def tried(self, agents, book: dict, task: Task, key: str, n: int, seat: str) -> list[dict]:
         """`n` tries of a task by `seat`, kept in `book` (the state's solves or verifier) under the task's key, each in
-        its own place and saved the moment it lands: a run cut off tops the task up to `n` when it resumes. A changed
-        task (another key) is tried afresh."""
+        its own place and saved the moment it lands: a run cut off tops the task up to `n` when it resumes, and a try
+        that crashed is tried again, since it tells nothing of the task. A changed task (another key) is tried
+        afresh."""
         entry = book.get(task.id)
         if entry is None or entry.get("key") != key:
             entry = book[task.id] = {"key": key, "results": [], "traces": []}
@@ -175,14 +180,24 @@ class Tries:
             entry["results"][i], entry["traces"][i] = outcome, trace.id
             self.store.save()
 
-        await asyncio.gather(*(one(i) for i, r in enumerate(entry["results"]) if r is None))
+        await asyncio.gather(
+            *(one(i) for i, r in enumerate(entry["results"]) if r is None or r.get("crashed"))
+        )
         return entry["results"]
 
     async def verify(self, agents, task: Task, key: str) -> list[dict]:
         """The verifier's tries: `verify` of them, and one more when a part is reached once; its answer holds when
-        each part is reached twice."""
+        each part is reached twice. Tries that crashed reach nothing and refute nothing: short of `verify` that
+        answered, the task fails (and is labelled again on a resume), rather than its answer being unreached."""
         n = self.settings.verify
         results = await self.tried(agents, self.store.state.verifier, task, key, n, "verifier")
+        if crashed := [r for r in results if r and r.get("crashed")]:
+            if len(results) - len(crashed) < n:
+                raise RuntimeError(
+                    f"the verifier's tries crashed: {crashed[0].get('rerun') or crashed[0].get('reason') or ''}"[
+                        :300
+                    ]
+                )
         if min(reached(task, results)) == 1:  # a split on some part
             results = await self.tried(agents, self.store.state.verifier, task, key, n + 1, "verifier")
         return results

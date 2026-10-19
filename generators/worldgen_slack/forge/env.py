@@ -73,6 +73,17 @@ def provenance(config: ForgeConfig) -> dict:
     } | pinned()
 
 
+def on_crashes(record: dict, verifier: dict) -> bool:
+    """Whether a task's label rests on tries that crashed (a provider's refusals): its answer unreached while a
+    verifier's try crashed, or its rates short of tries that crashed. Such a label is not the task's: it is labelled
+    again."""
+    if record.get("label") is None:
+        return False
+    if not record.get("verified") and any(r and r.get("crashed") for r in verifier.get("results", [])):
+        return True
+    return bool((record.get("rates") or {}).get("crashed"))
+
+
 def label_of(record: dict, solved: float) -> str:
     """A labelled task's label: rejected (its answer not verified, or the judge refused it), else by its pass rate:
     solved, unsolved (never right), or in the window."""
@@ -90,6 +101,7 @@ class ForgeEnv(SessionEnv):
     def __init__(self, settings: ForgeConfig, store: Store):
         super().__init__(settings, store)
         self.tries = Tries(settings, store)
+        self.judging = asyncio.Semaphore(settings.solvers)
 
     @property
     def plan(self) -> dict:
@@ -337,6 +349,14 @@ class ForgeEnv(SessionEnv):
         """Every task of the pass labelled side by side, each step kept as it lands. A task whose step fails is marked
         failed and the others go on; most of them failing is the run's stop."""
         state = self.store.state
+        if reopened := [
+            t
+            for t, r in state.forged.items()
+            if r["pass"] == state.batch and on_crashes(r, state.verifier.get(t, {}))
+        ]:
+            for t in reopened:
+                state.forged[t].pop("label")
+            self.store.event("labels_reopened", tasks=reopened, why="their tries crashed")
         due = [t for t, r in state.forged.items() if r["pass"] == state.batch and "label" not in r]
         outcomes = await asyncio.gather(*(self.label_one(agents, t) for t in due), return_exceptions=True)
         failed = {t: o for t, o in zip(due, outcomes) if isinstance(o, BaseException)}
@@ -368,7 +388,10 @@ class ForgeEnv(SessionEnv):
                 raise RuntimeError("every one of the student's tries crashed")
             record["parts"] = by_part(task, measured)
             if "ruling" not in record:
-                ruling, usage = await rule(self.settings.judge, self.world, task, verified, measured)
+                async with (
+                    self.judging
+                ):  # the judge's model is the verifier's and the grader's: a share of its limit
+                    ruling, usage = await rule(self.settings.judge, self.world, task, verified, measured)
                 record["ruling"], record["usage"] = ruling.model_dump(), usage
             record["approved"] = all(
                 record["ruling"][k] for k in ("realistic", "one_reading", "exact", "supported")
