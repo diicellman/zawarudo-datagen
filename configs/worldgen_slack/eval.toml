@@ -1,10 +1,19 @@
-model = "z-ai/glm-5.3-flash"
+# A release evaluated as the forge measured it: its student solves each task (the asker's Slack tools, no code, a local
+# process), graded by the forge's answer judge (GLM 5.3 at high).
+# uv run --frozen eval @ configs/worldgen_slack/eval.toml [--env.taskset.task.release_dir data/<forge>/release] -r 2 --no-push
+model = "deepseek/deepseek-v4.1-flash"
 num_examples = 10
 rollouts_per_example = 1
 
 [env.taskset]
 id = "worldgen-slack"
 
-# The release the FC1 re-measure writes (P2); any generated world's release/ directory evaluates the same way.
+# Any forge's release/ directory evaluates the same way; this is W2's forge's.
 [env.taskset.task]
-release_dir = "data/v7-06/remeasure-c1/release"
+release_dir = "data/v8-05/forge-w2/release"
+
+[env.taskset.task.judge]
+model = "z-ai/glm-5.3"
+
+[env.taskset.task.judge.sampling]
+reasoning_effort = "high"
