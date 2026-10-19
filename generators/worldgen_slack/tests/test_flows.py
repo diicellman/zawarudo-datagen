@@ -25,6 +25,8 @@ class Solver:
         self.right, self.scores = right, []
 
     async def run(self, solve):
+        # the env's solver is a local process, which enforces no network policy: its task asks for none
+        assert not solve.data.network_block, "a local solver's task asks for no network policy"
         tools = SlackToolset(solve.config.tools)
         await tools.setup()
         stored = with_state(tools)

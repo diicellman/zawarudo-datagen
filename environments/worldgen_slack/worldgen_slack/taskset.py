@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import verifiers.v1 as vf
 from pydantic import Field
+from verifiers.v1.configs.runtime import NetworkPolicyConfig
 
 from .config import role
 from .judge import AnswerJudge, empty_grade, reward
@@ -171,12 +172,14 @@ def release(config: EvaluationConfig):
 
 
 class EvaluationTask(vf.Task[WorldTaskData, vf.State, EvaluationConfig]):
-    def solver_task(self):
+    def solver_task(self, network_policy: bool = True):
+        """The release's task as its solver gets it; `network_policy` where the solver's runtime enforces one (a VM's,
+        not a local process's)."""
         world, rows, answers = release(self.config)
         row = next(r for r in rows if r.task_id == self.data.task_id)
         if (row.question, row.world_hash) != (self.data.prompt, self.data.world_hash):
             raise ValueError("task differs from the immutable release")
-        return SolverTask.create(row, world, answers[row.task_id], self.config.judge)
+        return SolverTask.create(row, world, answers[row.task_id], self.config.judge, network_policy)
 
     async def validate(self, runtime):
         self.solver_task()
@@ -208,4 +211,5 @@ class SlackEnvConfig(vf.EnvConfig):
 
 class SlackEnv(vf.Env[SlackEnvConfig]):
     async def run(self, task: EvaluationTask, agents: vf.Agents):
-        await agents.solver.run(task.solver_task())
+        # a local solver (the default) has no egress to block; one in a VM gets the task's network policy
+        await agents.solver.run(task.solver_task(isinstance(self.config.solver.runtime, NetworkPolicyConfig)))
