@@ -36,6 +36,12 @@ cache_control = { type = "ephemeral", ttl = "1h" }
 [env.verifier]            # reaches each task's answer from Slack, or the task is dropped
 model = "z-ai/glm-5.3"
 
+# At "max": on the forge's smoke, at "high" it missed a later correction in another channel on both tries of 2 tasks
+# whose gold was right; a probe of them (local-docs/tools-v8/verifier-probe) had max reach every part of 6 tries,
+# high 5 of 6, gpt-6-sol 3 of 6 (2026-10-19).
+[env.verifier.sampling]
+reasoning_effort = "max"
+
 [env.solver]              # the student
 model = "deepseek/deepseek-v4.1-flash"
 
