@@ -19,7 +19,8 @@ import verifiers.v1 as vf
 import verifiers.v1.utils.interrupt
 from verifiers.v1.dialects.base import append_user_notice
 from verifiers.v1.errors import SandboxError
-from worldgen_slack.judge import AnswerGrade, PartGrade
+from worldgen_slack.judge import AnswerGrade, Grading, PartGrade, PartReading, Reading
+from worldgen_slack.judge import Commit as ReadCommit
 from worldgen_slack.release import load_release
 from worldgen_slack.taskset import SolverTask
 from worldgen_slack.world import file_hash
@@ -31,6 +32,7 @@ from ..forge.config import ForgeConfig
 from ..forge.env import provenance as forge_provenance
 from ..forge.judge import Ruling
 from ..forge.proposer.task import ProposerTask
+from ..forge.regrade import regrade
 from ..forge.tasks import Part, Task
 from ..forge.tries import rates
 from ..judge.verdict import PHASE_CRITERIA, Issue, TaskReview, Verdict
@@ -100,6 +102,27 @@ async def scripted_complete(self, messages, *, trace=None, schema=None, parse=No
         )
         return vf.JudgeResponse(
             text=ruling.model_dump_json(), parsed=parse(vf.JudgeResponse(text="", parsed=ruling))
+        )
+    if text.startswith("Read a Slack answer"):  # grader v2's reader: a right answer states every gold item
+        fields = json.loads(text.rsplit("\n", 1)[1])
+        right = fields["response"] == "the answer"
+        reading = Reading(
+            parts=[
+                PartReading(
+                    label=part["label"],
+                    committed=[ReadCommit(value=i["value"], item=i["item"]) for i in part["answer"]]
+                    if right
+                    else [ReadCommit(value="another answer")],
+                    hedged=False,
+                    holds_back=False,
+                    claims="unsettled" if part["answer_type"] == "status" else "none",
+                )
+                for part in fields["reference"]
+            ],
+            reason="scripted",
+        )
+        return vf.JudgeResponse(
+            text=reading.model_dump_json(), parsed=parse(vf.JudgeResponse(text="", parsed=reading))
         )
     if not GRADER["on"] or not text.startswith("Grade a Slack answer"):
         return await offline()
@@ -1455,6 +1478,41 @@ async def forge_flow(root, world_dir, settings):
     _, rows, _ = load_release(root / "release")
     assert {r.task_id for r in rows} == {r.task_id for r in first_release} | {"i005"}
     assert load_release(root / "release.superseded")[1] == first_release
+    # A regrade: every stored try graded again by grader v2 (its reader scripted to read a right answer as stating the
+    # gold), with one gold split into answer and context. No try runs again, the labels stand, the release is anew.
+    splits = root / "splits"
+    splits.mkdir()
+    (splits / "batch-01.json").write_text(
+        json.dumps(
+            [
+                {
+                    "task_id": "i001",
+                    "split": [
+                        {
+                            "part": "who posted it",
+                            "answer": [first["real_name"]],
+                            "context": ["the first update"],
+                            "changed": True,
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tried = sum(counts.values())
+    summary = await regrade(plan.model_copy(update={"grading": Grading(version=2, ground=False)}), splits)
+    assert (summary["status"], summary["moved"], summary["split_tasks"]) == ("complete", {}, 1), summary
+    assert sum(counts.values()) == tried, "no try runs again"
+    store = TestStore(plan.output, forge_provenance(plan))
+    i001 = store.state.forged["i001"]
+    assert i001["task"]["parts"][0]["context"] == ["the first update"] and not i001["gold_before_split"][
+        0
+    ].get("context")
+    assert store.state.plans["forge"]["regraded"]["grading"]["version"] == 2
+    assert all(r.get("regraded") and r.get("outcome") for r in store.state.solves["i001"]["results"])
+    store.close()
+    _, rows, answers = load_release(root / "release")
+    assert answers["i001"].context == ["the first update"], "the release carries the split gold"
 
 
 # The forge flow's faults, each spent once.

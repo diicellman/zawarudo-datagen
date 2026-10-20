@@ -20,6 +20,7 @@ from verifiers.v1.utils.interrupt import cleaning_up, install_interrupt
 from worldgen_slack.release import atomic_json
 
 from .forge import env as forge
+from .forge import regrade as forge_regrade
 from .forge.config import ForgeConfig, load_forge
 from .forge.release import publish
 from .store import Store
@@ -32,6 +33,7 @@ PARTS = {
     "world": ("Generate the shared Slack workspace.", "run"),
     "chapter": ("Continue the shared Slack workspace.", "chapter"),
     "forge": ("Forge tasks on the finished workspace.", "forge"),
+    "regrade": ("", "regrade"),  # no episode: a forge's tries graded again
 }
 
 
@@ -162,11 +164,14 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "command", nargs="?", choices=["chapter", "forge", "profile"], help="a world when omitted"
+        "command", nargs="?", choices=["chapter", "forge", "profile", "regrade"], help="a world when omitted"
     )
     parser.add_argument("--config", type=Path)
     parser.add_argument("--world", type=Path, help="profile: the run directory whose world.sqlite to profile")
     parser.add_argument("--dry-run", action="store_true", help="validate the configuration; spend nothing")
+    parser.add_argument(
+        "--splits", type=Path, help="regrade: reference batches that split golds into answer and context"
+    )
     args = parser.parse_args()
     if args.command == "profile":
         if args.world is None:
@@ -178,6 +183,10 @@ def main() -> int:
     if args.command == "forge":
         config = load_forge(args.config)
         dry, going = (lambda: forge.dry_run(config)), (lambda: run_forge(config))
+    elif args.command == "regrade":
+        config = load_forge(args.config)
+        dry = lambda: forge_regrade.dry_regrade(config, args.splits)  # noqa: E731
+        going = lambda: forge_regrade.regrade(config, args.splits)  # noqa: E731
     elif args.command == "chapter":
         plan, settings = chapter.load_chapter(args.config)
         dry, going = (lambda: chapter.dry_run(plan, settings)), (lambda: run_chapter(plan, settings))
