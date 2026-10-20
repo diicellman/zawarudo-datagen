@@ -188,6 +188,12 @@ def test_contract(tmp_path):
     }
     assert answer_text(composite) == ["who called it: Alicia Rao", "who answered: Owen Sato"]
     assert private_answer(world, single).rows == [{"answer": "Alicia Rao"}]
+    # What a part rests on but does not ask for is its context: carried to the release, not required of an answer.
+    dated = single.model_copy(
+        update={"parts": [single.parts[0].model_copy(update={"context": ["on Oct 14, in #release"]})]}
+    )
+    assert private_answer(world, dated).context == ["on Oct 14, in #release"]
+    assert private_answer(world, dated).reference()["context"] == ["on Oct 14, in #release"]
 
 
 async def test_tries(tmp_path):
@@ -339,6 +345,7 @@ async def test_judge(tmp_path):
     )
     assert heard["asker"].startswith("Owen Sato") and heard["parts"][0]["messages"][0]["from"] == "Alicia Rao"
     assert heard["student_wrong_answers"] == [{"answer": "Owen", "grade": "x"}] and heard["verifier_answers"]
+    assert heard["parts"][0]["context"] == [], "the judge reads each part's context beside its answer"
     ruling, usage = await rule(forge_of(contracts_settings(tmp_path)).judge, world, task, [], [])
     assert ruling.approved and usage == {}
     precise = request(question="Who precisely called the 4.2 rollback?")

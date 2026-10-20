@@ -10,6 +10,7 @@ import verifiers.v1 as vf
 from pydantic import Field
 from verifiers.v1.configs.agent import TimeoutConfig
 from worldgen_slack.config import role
+from worldgen_slack.judge import Grading
 
 from ..config import RootedPath, Seats, Section, vm_seat
 
@@ -85,6 +86,9 @@ class ForgeConfig(Section):
     env: ForgeSeats = Field(default_factory=ForgeSeats)
     judge: vf.JudgeConfig = Field(default_factory=high)  # the task judge: one structured call a task
     answer_judge: vf.JudgeConfig = Field(default_factory=high)
+    # Which grader grades the tries (v1: one call decides; v2: the model reads, code grades by the policy) and whether
+    # it reads their tool outputs for grounding (v2's forge grades correctness only: grounding is code's).
+    grading: Grading = Field(default_factory=Grading)
 
 
 def load_forge(path: Path) -> ForgeConfig:

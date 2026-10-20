@@ -139,6 +139,7 @@ class Tries:
             private_answer(self.store.world, task),
             self.settings.answer_judge,
             isinstance(self.settings.env.solver.runtime, NetworkPolicyConfig),
+            self.settings.grading,
         )
 
     async def solve(self, agents, task: SolverTask, seat: str):

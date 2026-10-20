@@ -76,6 +76,7 @@ def hearing(world, task: Task, verified: list[dict], measured: list[dict]) -> di
                 "label": p.label,
                 "answer_type": p.answer_type,
                 "answer": p.answer,
+                "context": p.context,
                 "messages": said(world, p.evidence),
                 "out_of_sight": said(world, p.unseen),
             }

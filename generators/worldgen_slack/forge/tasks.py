@@ -40,11 +40,14 @@ class Part(StrictModel):
     """One part of a request: what it asks, in the request's own words (`label`); its answer as the asker can tell it
     from Slack (one value; a set's every row; none for a refusal, which is right when the request cannot be fulfilled
     from what the asker can see); the messages it rests on, which the asker can read; and, for a status or a refusal,
-    the messages out of the asker's sight that settle it or hold the truth."""
+    the messages out of the asker's sight that settle it or hold the truth. Its `context` is what the answer rests on
+    that the request does not ask for (when, who said it, what it replaced): an answer may give it or leave it out,
+    and only `answer` is required (local-docs/calibration/POLICY.md)."""
 
     label: NonEmptyText
     answer_type: Literal["text", "number", "set", "status", "refusal"]
     answer: list[NonEmptyText] = Field(default_factory=list)
+    context: list[NonEmptyText] = Field(default_factory=list)
     evidence: list[int] = Field(default_factory=list)
     unseen: list[int] = Field(default_factory=list)
 
@@ -185,6 +188,7 @@ def private_answer(world, task: Task) -> PrivateAnswer:
             unseen=place(p.unseen),
             users=[],
             label=p.label if len(task.parts) > 1 else None,
+            context=p.context,
         )
         for p in task.parts
     ]

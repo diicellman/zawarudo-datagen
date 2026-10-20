@@ -18,7 +18,8 @@ each true or false, and give one short reason that names what decided any false.
   allow is the request's fault, and one_reading is false.
 - exact. Each part's answer answers exactly what its label asks, nothing more specific: a part that asks whether a
   writeup was posted is answered by whether and the day, not a clock time; why something was pulled is answered by the
-  reason, not a measurement the request never asks for. An answer that demands more than the request asks turns right
+  reason, not a measurement the request never asks for. Details the request does not ask for belong in the part's
+  context, which an answer may give or leave out. An answer that demands more than the request asks turns right
   answers wrong, and exact is false.
 - supported. The messages a part rests on state its answer, as its asker can read them; for a status, the visible
   value is not settled, as the unseen message shows; for a refusal, what is asked is not there to see, or its premise
