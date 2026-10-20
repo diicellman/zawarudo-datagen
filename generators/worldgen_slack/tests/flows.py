@@ -1165,8 +1165,10 @@ async def forge_flow(root, world_dir, settings):
     """The forge on a finished world, through the CLI as a person runs it: five initial tasks, labelled (verified,
     measured, judged), then one adapting pass that writes a harder, an easier and a repaired version, labelled too, and
     the release of every approved task. Along the way: a task code refuses and the proposer fixes; a verifier split
-    tried a third time; a task whose student tries all crash, failed while the others go on; a proposer session lost
-    and taken up again; and a judge down for a whole pass, which stops the run, and the CLI takes it up again."""
+    tried a third time; a task whose student tries all crash, labelled again after a wait and then failed while the
+    others go on, taken up by the next pass and, once its provider is back, by the forge run again, which publishes its
+    release anew; a proposer session lost and taken up again; and a judge down for a whole pass, which stops the run,
+    and the CLI takes it up again."""
     plan = flow_forge(settings, world=world_dir, output=root, skills=["temporal"])
     world = Workspace(world_dir / "world.sqlite")
     people = [r[0] for r in world.db.execute("SELECT id FROM users WHERE is_bot = 0 ORDER BY id")]
@@ -1293,10 +1295,11 @@ async def forge_flow(root, world_dir, settings):
             FAULTS["session"] -= 1
             raise SessionLost("the proposer's sandbox dropped its stream")
 
-    # The student's tries, right by a schedule per task; i005's always crash. The verifier reaches every answer, but
-    # splits on i003 (its second try wrong), so a third decides.
+    # The student's tries, right by a schedule per task; i005's crash while its provider is down. The verifier reaches
+    # every answer, but splits on i003 (its second try wrong), so a third decides.
     schedule = {
         "i001": "1111",
+        "i005": "1111",
         "i002": "0000",
         "i003": "1010",
         "i004": "1111",
@@ -1313,7 +1316,7 @@ async def forge_flow(root, world_dir, settings):
                 counts[seat, task_id] += 1
                 n = counts[seat, task_id]
                 trace = self.trace(seat, task)
-                if seat == "solver" and task_id == "i005":
+                if seat == "solver" and task_id == "i005" and FAULTS["crash"]:
                     trace.ok, trace.errors = (
                         False,
                         [SimpleNamespace(type="Crash", message="model stream ended")],
@@ -1366,7 +1369,7 @@ async def forge_flow(root, world_dir, settings):
         1,
         16,
     )  # the judge fails all 4 attempts of the first pass's 4 rulings
-    FAULTS["stop"] = 1
+    FAULTS["stop"], FAULTS["crash"] = 1, 1
     with episodes(agents):
         try:
             summary = await run_forge(plan)
@@ -1383,8 +1386,9 @@ async def forge_flow(root, world_dir, settings):
     assert turns["adapt"] == 2, (
         "the versions a turn cut off had kept are taken, not written again: r103 alone is left for a turn"
     )
-    assert kinds["task_failed"] == 5 + 1, (
-        "the first pass failed on the judge (and i005 on its tries), then went on"
+    assert (kinds["task_failed"], kinds["labels_retried"]) == (5 + 1 + 1, 2 + 2), (
+        "the first pass failed on the judge (and i005 on its tries), then went on; i005 is labelled again twice after a"
+        " wait, in its own pass and in the next, and fails both times"
     )
     store = TestStore(plan.output, forge_provenance(plan))
     forged = store.state.forged
@@ -1399,6 +1403,7 @@ async def forge_flow(root, world_dir, settings):
         "r103": "window",
     }, forged
     assert "crashed" in forged["i005"]["failed"], "its tries all crashed: it fails, the others go on"
+    first_release = load_release(root / "release")[1]
     assert len(store.state.verifier["i003"]["results"]) == 3, "a split is decided by a third try"
     assert forged["i004"]["verified"] and not forged["i004"]["ruling"]["exact"], "verified, but over-specific"
     assert {r.get("skill") for r in forged.values()} == {"temporal"}, "each kept with the skill it aimed at"
@@ -1432,10 +1437,28 @@ async def forge_flow(root, world_dir, settings):
     )
     assert summary["labels"]["window"] == 4
     store.close()
+    # Its provider back, the forge is run again: the task its labelling left failed is labelled, and the release is
+    # published anew, the earlier one kept beside it.
+    FAULTS["crash"] = 0
+    with episodes(agents):
+        summary = await run_forge(plan)
+    assert summary["status"] == "complete" and summary["labels"]["solved"] == 2, summary
+    events = [json.loads(line) for line in (root / "progress.jsonl").read_text().splitlines()]
+    assert [e["tasks"] for e in events if e["event"] == "forge_reopened"] == [["i005"]]
+    store = TestStore(plan.output, forge_provenance(plan))
+    assert (store.state.phase, store.state.forged["i005"]["label"], store.state.batch) == (
+        "done",
+        "solved",
+        1,
+    ), "labelled in the last pass, with no version of it: the adapting passes are spent"
+    store.close()
+    _, rows, _ = load_release(root / "release")
+    assert {r.task_id for r in rows} == {r.task_id for r in first_release} | {"i005"}
+    assert load_release(root / "release.superseded")[1] == first_release
 
 
 # The forge flow's faults, each spent once.
-FAULTS = {"session": 0, "stop": 0}
+FAULTS = {"session": 0, "stop": 0, "crash": 0}
 
 
 async def chapter_flow(root, parent, settings):

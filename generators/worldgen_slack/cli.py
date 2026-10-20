@@ -56,6 +56,7 @@ async def run(
     seed: int,
     start: Callable[[Store], vf.Env],
     finish: Callable[[Store], None] = lambda store: None,
+    reopen: Callable[[Store], bool] = lambda store: False,
 ) -> dict:
     """One run: its env (`start`) as one episode on its run directory, from where the directory left off, then
     `finish` once it is complete; `seed` is the episode's task index. Its summary says how it ended; an interrupted run
@@ -64,6 +65,7 @@ async def run(
     set_base_sandbox_labels([run_label(output)])
     store = Store(output, origin)
     try:
+        reopen(store)  # a finished run with work left undone (a forge's failed labels) takes it up
         if store.state.phase != "done":
             env = start(store)
             # Every seat names its model (Seats.secure), so the episode's model is a stand-in that no agent uses: the
@@ -142,7 +144,15 @@ async def run_forge(config: ForgeConfig) -> dict:
     origin = forge.provenance(config)
     return await carry_on(
         "forge",
-        lambda: run("forge", config.output, origin, 0, lambda store: forge.ForgeEnv(config, store), publish),
+        lambda: run(
+            "forge",
+            config.output,
+            origin,
+            0,
+            lambda store: forge.ForgeEnv(config, store),
+            publish,
+            forge.reopen,
+        ),
         config.max_resumes,
     )
 

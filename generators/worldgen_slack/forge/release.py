@@ -157,16 +157,31 @@ def publish(store) -> None:
     atomic_json(store.root / "report.json", report(store))
     rows, answers = release_rows(store, file_hash(copy))
     if rows:  # a forge that approved nothing has no release
-        write_release(store.root / "release", copy, rows, answers)
+        relabelled = store.state.plans.get("forge", {}).get("relabelled", False)
+        write_release(store.root / "release", copy, rows, answers, supersede=relabelled)
 
 
-def write_release(root: Path, world: Path, rows: list[PublicTask], answers: dict[str, PrivateAnswer]) -> None:
-    """Publish atomically; an existing release must be the same one."""
+def write_release(
+    root: Path,
+    world: Path,
+    rows: list[PublicTask],
+    answers: dict[str, PrivateAnswer],
+    supersede: bool = False,
+) -> None:
+    """Publish atomically; an existing release must be the same one, unless the forge labelled tasks again after it
+    (`supersede`): the earlier release is then kept beside it, as release.superseded."""
     if root.exists():
         _, old_rows, old_answers = load_release(root)
-        if (old_rows, old_answers) != (rows, answers) or file_hash(root / "world.sqlite") != file_hash(world):
+        if (old_rows, old_answers) == (rows, answers) and file_hash(root / "world.sqlite") == file_hash(
+            world
+        ):
+            return
+        if not supersede:
             raise ValueError("refusing to overwrite a different release")
-        return
+        kept = root.with_name(root.name + ".superseded")
+        if kept.exists():
+            shutil.rmtree(kept)
+        os.rename(root, kept)
     root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root.parent, prefix=".release-") as temporary:
         stage = Path(temporary) / "release"

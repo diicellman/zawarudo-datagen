@@ -17,6 +17,7 @@ from ..config import pinned
 from ..session import SETUP_FILES, SessionEnv, require_session
 from ..store import ReviewLimit, Store
 from ..workspace import Workspace, reset_tasks
+from . import tries as try_module
 from .config import ForgeConfig
 from .coverage import coverage
 from .coverage import page as coverage_page
@@ -101,7 +102,9 @@ class ForgeEnv(SessionEnv):
     def __init__(self, settings: ForgeConfig, store: Store):
         super().__init__(settings, store)
         self.tries = Tries(settings, store)
-        self.judging = asyncio.Semaphore(settings.solvers)
+        # The task judge's model is the verifier's and the grader's (GLM, 32 requests at once on this account): it
+        # takes a quarter of the tries' share, so the forge stays under the limit (forge-w2's 429s, 2026-10-19).
+        self.judging = asyncio.Semaphore(max(1, settings.solvers // 4))
 
     @property
     def plan(self) -> dict:
@@ -346,8 +349,10 @@ class ForgeEnv(SessionEnv):
     # ------------------------------------------------------------------ labelling: verify, measure, judge
 
     async def label(self, agents) -> None:
-        """Every task of the pass labelled side by side, each step kept as it lands. A task whose step fails is marked
-        failed and the others go on; most of them failing is the run's stop."""
+        """Every task due labelled side by side, each step kept as it lands: the pass's, and any an earlier labelling
+        left failed. A few that fail (a provider's burst of refusals) wait and are labelled again, twice; a task that
+        still fails is marked failed and the others go on, and the next labelling (a later pass, or the forge run
+        again) takes it up. Most of them failing is the run's stop, which the CLI resumes."""
         state = self.store.state
         if reopened := [
             t
@@ -357,12 +362,20 @@ class ForgeEnv(SessionEnv):
             for t in reopened:
                 state.forged[t].pop("label")
             self.store.event("labels_reopened", tasks=reopened, why="their tries crashed")
-        due = [t for t, r in state.forged.items() if r["pass"] == state.batch and "label" not in r]
-        outcomes = await asyncio.gather(*(self.label_one(agents, t) for t in due), return_exceptions=True)
-        failed = {t: o for t, o in zip(due, outcomes) if isinstance(o, BaseException)}
+        due = [
+            t
+            for t, r in state.forged.items()
+            if "label" not in r and (r["pass"] == state.batch or "failed" in r)
+        ]
+        failed = await self.label_all(agents, due)
+        for wait in (try_module.WAITS[-1],) * 2:
+            if not failed or len(failed) * 2 > len(due):
+                break
+            self.store.event("labels_retried", tasks=sorted(failed), wait=wait)
+            if wait:
+                await asyncio.sleep(wait)
+            failed = await self.label_all(agents, sorted(failed))
         for task_id, error in failed.items():
-            if isinstance(error, asyncio.CancelledError):
-                raise error
             state.forged[task_id]["failed"] = f"{type(error).__name__}: {error}"[:500]
             self.store.event("task_failed", task_id=task_id, error=state.forged[task_id]["failed"])
         self.store.save()
@@ -370,6 +383,14 @@ class ForgeEnv(SessionEnv):
             raise RuntimeError(
                 f"labelling failed for {len(failed)} of {len(due)} tasks: {next(iter(failed.values()))}"
             )
+
+    async def label_all(self, agents, due: list[str]) -> dict[str, BaseException]:
+        """The tasks `due` labelled side by side; those that failed, with why (a stop is raised)."""
+        outcomes = await asyncio.gather(*(self.label_one(agents, t) for t in due), return_exceptions=True)
+        failed = {t: o for t, o in zip(due, outcomes) if isinstance(o, BaseException)}
+        if stop := next((o for o in failed.values() if isinstance(o, asyncio.CancelledError)), None):
+            raise stop
+        return failed
 
     async def label_one(self, agents, task_id: str) -> None:
         record = self.store.state.forged[task_id]
@@ -434,6 +455,20 @@ class ForgeEnv(SessionEnv):
             self.plan["turn"], self.plan["offered"], state.phase = 0, {}, "adapt"
         self.store.event("pass_labelled", passed=state.batch, next=state.phase, versions=len(sources))
         self.store.save()
+
+
+def reopen(store) -> bool:
+    """A finished forge run again, when an earlier labelling left tasks failed: it labels them, and its release is
+    published anew. Whether it reopened."""
+    state = store.state
+    failed = [t for t, r in state.forged.items() if "label" not in r and "failed" in r]
+    if state.phase != "done" or not failed:
+        return False
+    state.phase = "label"
+    store.state.plans.setdefault("forge", {})["relabelled"] = True
+    store.event("forge_reopened", tasks=failed, why="their labelling failed")
+    store.save()
+    return True
 
 
 def dry_run(config: ForgeConfig) -> dict:
