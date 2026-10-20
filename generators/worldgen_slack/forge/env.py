@@ -10,6 +10,7 @@ import asyncio
 import json
 import shutil
 
+from worldgen_slack.judge import Grading
 from worldgen_slack.release import atomic_json
 from worldgen_slack.world import file_hash
 
@@ -45,13 +46,19 @@ def spent(store) -> float:
     return total + sum(priced(r.get("usage") or {}, judge) for r in store.state.forged.values())
 
 
+# Settings added after forges had started on them: at their defaults they are left out of a forge's provenance, so a
+# forge started before them resumes; set otherwise, they are part of it.
+LATER = {"grading": Grading().model_dump(mode="json")}  # 2026-10-21: grader v2
+
+
 def provenance(config: ForgeConfig) -> dict:
     """Everything a resumed forge must share with its start: its configuration, the world it writes on (by hash), the
     pinned framework and the lock file."""
-    return {
-        "config": config.model_dump(mode="json"),
-        "world_hash": file_hash(config.world / "world.sqlite"),
-    } | pinned()
+    own = config.model_dump(mode="json")
+    for setting, default in LATER.items():
+        if own.get(setting) == default:
+            own.pop(setting)
+    return {"config": own, "world_hash": file_hash(config.world / "world.sqlite")} | pinned()
 
 
 def on_crashes(record: dict, verifier: dict) -> bool:

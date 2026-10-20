@@ -354,6 +354,21 @@ async def test_judge(tmp_path):
     assert not Ruling(realistic=False, one_reading=True, exact=True, supported=True, reason="r").approved
 
 
+def test_provenance_of_later_settings(tmp_path):
+    """A setting added after forges started on it is left out of a forge's provenance at its default, so those forges
+    resume; set otherwise, it is part of it."""
+    from worldgen_slack.judge import Grading
+
+    from ..forge.env import provenance
+
+    config = forge_of(contracts_settings(tmp_path))
+    (config.world).mkdir(parents=True, exist_ok=True)
+    (config.world / "world.sqlite").write_bytes(b"w")
+    assert "grading" not in provenance(config)["config"]
+    v2 = config.model_copy(update={"grading": Grading(version=2, ground=False)})
+    assert provenance(v2)["config"]["grading"] == {"version": 2, "ground": False}
+
+
 def test_spend_and_labels(tmp_path):
     """What a forge spent (reported, or else list prices), how a labelled task is labelled, and its release row."""
     (tmp_path / "traces").mkdir()
