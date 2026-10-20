@@ -27,6 +27,7 @@ from pathlib import Path
 
 import verifiers.v1 as vf
 from worldgen_slack.judge import AnswerJudge, AnswerReader, reader_reference
+from worldgen_slack.judge import graded as grade_reading
 from worldgen_slack.slack import compact
 
 from generators.worldgen_slack.forge.tasks import Task, private_answer
@@ -234,7 +235,7 @@ async def main() -> None:
                             )
                             reading = result.parsed
                             grounded = bool(reading.grounded) if args.ground else bool(observations)
-                            new, verdict = graded(reading, answer, grounded)
+                            new, verdict = grade_reading(reading, answer, grounded)
                             parsed = new.model_dump(mode="json") | {
                                 "outcome": verdict,
                                 "reading": reading.model_dump(mode="json"),
