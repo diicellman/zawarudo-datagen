@@ -106,7 +106,8 @@ class PrivateAnswer(StrictModel):
     truth out of its actor's sight (`unseen`). Its rows come from a gold query, or (v12) are the answer an agent's
     tries verified, with no query. A composite request's answer (v11) is its parts', each such an answer
     under its label, in the request's order: it has no rows or query of its own, and its messages, people and unseen
-    are its parts' together. `solution` is a right and grounded try of it."""
+    are its parts' together. `solution` is a right and grounded try of it. Its `context` (v13) is what its answer
+    rests on that the request does not ask for: an answer may give it or leave it out, and is wrong to contradict it."""
 
     answer_type: Literal["text", "set", "number", "refusal", "status", "composite"]
     rows: list[dict[str, JsonValue]]
@@ -117,6 +118,7 @@ class PrivateAnswer(StrictModel):
     label: NonEmptyText | None = None  # v11: a part's, what of its request it answers
     parts: list["PrivateAnswer"] = []  # v11: a composite request's
     solution: Solution | None = None  # v11: a try of it that reached its gold, the request's and not a part's
+    context: list[NonEmptyText] = []  # v13: supporting details, not required (a composite's are its parts')
 
     @model_validator(mode="after")
     def shaped(self):
@@ -126,6 +128,8 @@ class PrivateAnswer(StrictModel):
             if self.parts or not (self.gold_sql or self.rows or self.answer_type == "refusal"):
                 raise ValueError("an answer has its rows (or its gold query, or is a refusal) and no parts")
             return self
+        if self.context:
+            raise ValueError("a composite answer's context is its parts'")
         labels = [p.label for p in self.parts]
         if not 2 <= len(self.parts) <= 4 or self.rows or self.gold_sql:
             raise ValueError("a composite answer is its 2-4 parts', with no rows or query of its own")
@@ -153,11 +157,15 @@ class PrivateAnswer(StrictModel):
                 "answer_type": "composite",
                 "parts": [p.reference() | {"label": p.label} for p in self.parts],
             }
-        return {"answer_type": self.answer_type, "rows": self.rows}
+        return {"answer_type": self.answer_type, "rows": self.rows} | (
+            {"context": self.context} if self.context else {}
+        )
 
 
 class Manifest(StrictModel):
-    format: Literal["worldgen-slack.v12", "worldgen-slack.v11"] = "worldgen-slack.v12"  # v11 still reads
+    format: Literal["worldgen-slack.v13", "worldgen-slack.v12", "worldgen-slack.v11"] = (
+        "worldgen-slack.v13"  # v11, v12 still read
+    )
     world_hash: str
     files: dict[str, str]
 

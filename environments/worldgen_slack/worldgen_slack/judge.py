@@ -1,11 +1,19 @@
-"""The answer judge: a solver's answer graded against the release's reference, on what its calls showed."""
+"""The answer judge: a solver's answer graded against the release's reference, on what its calls showed.
+
+Two graders. v1 (AnswerJudge) is one model call that decides right, declined or wrong. v2 (AnswerReader) has the model
+read what an answer commits to, part by part, and code decide each part's outcome by the grading policy
+(local-docs/calibration/POLICY.md, after "Training Language Models to Fail Gracefully"): a success gives every item the
+request asks for and commits nothing false; a fallback holds back honestly and commits nothing false; anything else
+that commits is an error. A v2 grade is mapped onto v1's fields (a success is correct, a fallback abstained), so what
+reads grades reads either."""
 
 import json
+from typing import Literal
 
 import verifiers.v1 as vf
-from pydantic import Field
+from pydantic import BaseModel, Field
 
-from .release import NonEmptyText, StrictModel
+from .release import NonEmptyText, PrivateAnswer, StrictModel
 
 
 class PartGrade(StrictModel):
@@ -147,3 +155,185 @@ def reward(grade: AnswerGrade) -> float:
     if grade.correct:
         return 1.0 if grade.grounded else 0.0
     return 0.0 if grade.abstained else -1.0
+
+
+# ---------------------------------------------------------------------- v2: the model reads, code grades
+
+Outcome = Literal["success", "fallback", "error"]
+
+
+class Grading(BaseModel):
+    """Which grader grades a try, and whether it reads the try's tool outputs to judge grounding (else grounding is
+    code's: each part's answer rests on a message the try was shown)."""
+
+    version: Literal[1, 2] = 1
+    ground: bool = True
+
+
+class Commit(StrictModel):
+    """A value the response commits to as its answer to a part: which reference answer item it states, if any (by
+    index), and whether it states, for something the reference covers, another value than the reference's."""
+
+    value: NonEmptyText
+    item: int | None = None
+    contradicts: bool = False
+
+
+class PartReading(StrictModel):
+    """What a response says to one part of a request: read, not graded."""
+
+    label: NonEmptyText
+    committed: list[Commit]
+    hedged: bool
+    holds_back: bool
+    claims: Literal["settled", "unsettled", "not_visible", "never_happened", "none"]
+    contradicts_context: list[str] = []
+    slips: list[str] = []
+
+
+class Reading(StrictModel):
+    parts: list[PartReading]
+    grounded: bool | None = None  # read only when the reader is given the try's observations
+    reason: NonEmptyText
+
+
+def golds(reference: PrivateAnswer) -> list[dict]:
+    """What code grades each part against: its answer type, its answer items, its context, and whether the truth it
+    rests on is out of its asker's sight."""
+    return [
+        {
+            "label": a.label,
+            "answer_type": a.answer_type,
+            "items": [str(r.get("answer")) for r in a.rows],
+            "context": a.context,
+            "unseen": bool(a.unseen),
+        }
+        for a in reference.answers()
+    ]
+
+
+def part_outcome(reading: PartReading, gold: dict) -> Outcome:
+    """A part's outcome by the grading policy. Any committed falsehood is an error: a hedge, a value that contradicts
+    the reference's answer or context, a status given as settled, and a flat "it never happened" about a truth out of
+    the asker's sight. Then: a refusal succeeds when it holds back; a set when it states every item and nothing beyond
+    them, and falls back when it flags a partial answer that adds nothing false; a status when it states the latest
+    visible value and says it is unsettled or out of sight; a text or number when it states the value. Holding back with
+    nothing committed is a fallback; committing a value that states no item is an error."""
+    kind, count = gold["answer_type"], len(gold["items"])
+    stated = {c.item for c in reading.committed if c.item is not None and 0 <= c.item < count}
+    stray = [c for c in reading.committed if c.item is None or not 0 <= c.item < count]
+    if (
+        reading.hedged
+        or reading.contradicts_context
+        or any(c.contradicts for c in reading.committed)
+        or (kind == "status" and reading.claims == "settled")
+        or (reading.claims == "never_happened" and gold["unseen"])
+    ):
+        return "error"
+    if kind == "refusal":
+        return "success" if reading.holds_back and not reading.committed else "error"
+    complete = count > 0 and stated == set(range(count))
+    if kind == "set":
+        if complete and not stray:
+            return "success"
+        return "fallback" if reading.holds_back and not stray else "error"
+    if kind == "status" and complete:
+        return "success" if reading.claims in ("unsettled", "not_visible") else "error"
+    if kind != "status" and 0 in stated:
+        return "success"
+    return "fallback" if reading.holds_back and not reading.committed else "error"
+
+
+def request_outcome(outcomes: list[Outcome]) -> Outcome:
+    """A request's outcome from its parts': a success when every part is, an error when any part is, else a fallback."""
+    if all(o == "success" for o in outcomes):
+        return "success"
+    return "error" if "error" in outcomes else "fallback"
+
+
+def graded(reading: Reading, reference: PrivateAnswer, grounded: bool) -> tuple[AnswerGrade, Outcome]:
+    """A reading graded by code, as an AnswerGrade (a success correct, a fallback abstained) and its outcome."""
+    parts = golds(reference)
+    if len(reading.parts) != len(parts):
+        raise ValueError(f"a reading reads each of its {len(parts)} parts, in order")
+    outcomes = [part_outcome(r, g) for r, g in zip(reading.parts, parts)]
+    outcome = request_outcome(outcomes)
+
+    def aligned(r: PartReading, g: dict) -> dict:
+        stated = {c.item for c in r.committed if c.item is not None}
+        return {
+            "committed": [c.value for c in r.committed],
+            "missing": [item for i, item in enumerate(g["items"]) if i not in stated],
+            "extra": [c.value for c in r.committed if c.item is None],
+        }
+
+    own = [aligned(r, g) for r, g in zip(reading.parts, parts)]
+    composite = reference.answer_type == "composite"
+    grade = AnswerGrade(
+        correct=outcome == "success",
+        abstained=outcome == "fallback",
+        grounded=grounded,
+        unsupported_asides=0,
+        committed=[
+            (f"{g['label']}: " if composite else "") + v for a, g in zip(own, parts) for v in a["committed"]
+        ],
+        missing=[
+            (f"{g['label']}: " if composite else "") + v for a, g in zip(own, parts) for v in a["missing"]
+        ],
+        extra=[(f"{g['label']}: " if composite else "") + v for a, g in zip(own, parts) for v in a["extra"]],
+        reason=reading.reason,
+        parts=[
+            PartGrade(label=g["label"], correct=o == "success", abstained=o == "fallback", **a)
+            for a, g, o in zip(own, parts, outcomes)
+        ]
+        if composite
+        else [],
+    )
+    return grade, outcome
+
+
+READ = (
+    "Read a Slack answer against the question and its reference, and report what it commits to, part by part. Do not "
+    "grade it: report what it says. The reference has one part per thing the question asks (a single question has "
+    "one), each with its answer type, its answer items (numbered from 0) and its context (details the answer rests on "
+    "that the question does not ask for). For each part, in order: committed lists each value the response commits to "
+    "as its answer to that part (for a set, each member it presents as the set), with item the number of the answer "
+    "item it states in any equivalent wording (a time on the asker's clock counts; a wrong weekday beside a right date "
+    "still states the date unless the question asks for the day: list such slips in slips), or null when it states "
+    "none, and contradicts true when it gives, for something the answer items or the context cover, another value. A "
+    "value named only in passing, as an aside or a side option, is not committed. hedged: it offers alternatives for "
+    "the part without settling on one. holds_back: it says it cannot find, see or confirm the part, or flags its "
+    "answer as partial. claims: what it says of the part's state: settled (final, done, decided), unsettled (not final "
+    "or not confirmed), not_visible (out of the asker's sight), never_happened (it did not or will not happen, or does "
+    "not exist), or none. contradicts_context: the context details it contradicts. Then a concise reason."
+)
+GROUND = (
+    " Also decide grounded: whether the observations (what the solver's calls showed: messages in time order, the "
+    "people, channels and members it looked up, and a log of its calls) support the claims that make its answer; the "
+    "reference is not an observation, and no observations means not grounded."
+)
+
+
+def reader_reference(reference: PrivateAnswer) -> list[dict]:
+    """The reference as the reader sees it: each part's label, answer type, numbered answer items and context."""
+    return [
+        {
+            "label": g["label"] or "the answer",
+            "answer_type": g["answer_type"],
+            "answer": [{"item": i, "value": v} for i, v in enumerate(g["items"])],
+            "context": g["context"],
+        }
+        for g in golds(reference)
+    ]
+
+
+class AnswerReader(vf.Judge[Reading]):
+    schema = Reading
+
+    def build_messages(self, **fields):
+        grounding = "observations" in fields
+        return [
+            vf.UserMessage(
+                content=READ + (GROUND if grounding else "") + "\n" + json.dumps(fields, ensure_ascii=False)
+            )
+        ]

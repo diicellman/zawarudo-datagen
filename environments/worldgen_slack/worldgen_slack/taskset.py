@@ -10,7 +10,7 @@ from pydantic import Field
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 
 from .config import role
-from .judge import AnswerJudge, empty_grade, reward
+from .judge import AnswerJudge, AnswerReader, Grading, empty_grade, graded, reader_reference, reward
 from .release import PrivateAnswer, PublicTask, load_release
 from .slack import compact, people_shown, shown
 from .toolset import CallState, SlackToolset, WorldToolsConfig, stage_world
@@ -42,6 +42,7 @@ class SolverConfig(vf.TaskConfig):
     tools: WorldToolsConfig
     reference: PrivateAnswer = Field(exclude=True, repr=False)
     judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
+    grading: Grading = Grading()
 
 
 class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
@@ -51,13 +52,21 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
 
     @classmethod
     def create(
-        cls, task: PublicTask, world: Path, reference: PrivateAnswer, judge=None, network_policy=True
+        cls,
+        task: PublicTask,
+        world: Path,
+        reference: PrivateAnswer,
+        judge=None,
+        network_policy=True,
+        grading: Grading | None = None,
     ) -> Self:
         """`world` is a solver copy (no answer key); `network_policy` blocks egress where the runtime enforces it."""
         config = SolverConfig(tools=WorldToolsConfig(actor_id=task.actor_id), reference=reference)
         stage_world(config.tools, world)
         if judge is not None:
             config.judge = judge
+        if grading is not None:
+            config.grading = grading
         return cls(
             WorldTaskData(
                 name=task.task_id,
@@ -108,7 +117,24 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         observations = trace.info.get("observations", [])
         reference = self.config.reference
         expected = reference.reference()
-        if (trace.last_reply or "").strip():
+        outcome = None
+        if not (trace.last_reply or "").strip():
+            grade = empty_grade(expected)
+        elif self.config.grading.version == 2:
+            # v2: the model reads what the answer commits to; code grades it. Grounding is the model's when it is
+            # given the observations, else code's alone (below: each part's answer rests on a message it was shown).
+            grounding = {"observations": compact(observations)} if self.config.grading.ground else {}
+            result = await AnswerReader(self.config.judge).evaluate(
+                trace=trace,
+                question=self.data.prompt,
+                reference=reader_reference(reference),
+                response=trace.last_reply,
+                **grounding,
+            )
+            reading = result.parsed
+            ground = bool(reading.grounded) if self.config.grading.ground else bool(observations)
+            grade, outcome = graded(reading, reference, ground)
+        else:
             result = await AnswerJudge(self.config.judge).evaluate(
                 trace=trace,
                 question=self.data.prompt,
@@ -117,8 +143,6 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
                 observations=compact(observations),
             )
             grade = result.parsed
-        else:
-            grade = empty_grade(expected)
         if grade.grounded and not observations:
             raise ValueError("judge claimed grounding without observations")
         seen = set().union(*map(shown, observations))
@@ -137,11 +161,13 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             update={"grounded": grade.grounded and all(covered(a) != 0 for a in reference.answers())}
         )
         score = reward(grade)
+        outcome = outcome or ("success" if grade.correct else "fallback" if grade.abstained else "error")
         trace.info["evaluation"] = {
             "task_id": self.data.task_id,
             "execution_ok": True,
             "semantic_correctness": score,
             **grade.model_dump(mode="json"),
+            "outcome": outcome,
             "response": trace.last_reply,
             "evidence_coverage": coverage,
             **({"part_coverage": [covered(p) for p in reference.parts]} if reference.parts else {}),
@@ -163,6 +189,7 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
 class EvaluationConfig(vf.TaskConfig):
     release_dir: Path | None = None  # the release to evaluate: a generated world's release/ directory
     judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
+    grading: Grading = Grading()
 
 
 def release(config: EvaluationConfig):
@@ -179,7 +206,9 @@ class EvaluationTask(vf.Task[WorldTaskData, vf.State, EvaluationConfig]):
         row = next(r for r in rows if r.task_id == self.data.task_id)
         if (row.question, row.world_hash) != (self.data.prompt, self.data.world_hash):
             raise ValueError("task differs from the immutable release")
-        return SolverTask.create(row, world, answers[row.task_id], self.config.judge, network_policy)
+        return SolverTask.create(
+            row, world, answers[row.task_id], self.config.judge, network_policy, self.config.grading
+        )
 
     async def validate(self, runtime):
         self.solver_task()
