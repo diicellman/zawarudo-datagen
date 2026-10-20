@@ -217,8 +217,9 @@ def part_outcome(reading: PartReading, gold: dict) -> Outcome:
     the reference's answer or context, a status given as settled, and a flat "it never happened" about a truth out of
     the asker's sight. Then: a refusal succeeds when it holds back; a set when it states every item and nothing beyond
     them, and falls back when it flags a partial answer that adds nothing false; a status when it states the latest
-    visible value and says it is unsettled or out of sight; a text or number when it states the value. Holding back with
-    nothing committed is a fallback; committing a value that states no item is an error."""
+    visible value and says it is unsettled or out of sight; a text or number when it states every answer item (a split
+    gold may ask for more than one). Holding back with nothing committed, or with only some items and none beyond them,
+    is a fallback; committing a value that states no item, or part of the answer as if whole, is an error."""
     kind, count = gold["answer_type"], len(gold["items"])
     stated = {c.item for c in reading.committed if c.item is not None and 0 <= c.item < count}
     stray = [c for c in reading.committed if c.item is None or not 0 <= c.item < count]
@@ -239,9 +240,11 @@ def part_outcome(reading: PartReading, gold: dict) -> Outcome:
         return "fallback" if reading.holds_back and not stray else "error"
     if kind == "status" and complete:
         return "success" if reading.claims in ("unsettled", "not_visible") else "error"
-    if kind != "status" and 0 in stated:
+    if kind != "status" and complete:
         return "success"
-    return "fallback" if reading.holds_back and not reading.committed else "error"
+    if reading.holds_back and not stray:
+        return "fallback"  # nothing committed, or only some of what is asked, flagged as partial
+    return "error"
 
 
 def request_outcome(outcomes: list[Outcome]) -> Outcome:

@@ -58,6 +58,8 @@ def gold(kind: str, items: int = 1, unseen: bool = False) -> dict:
         (read(back=True), gold("text"), "fallback", "holds back, commits nothing"),
         (read(("w", None, False)), gold("text"), "error", "another value"),
         (read(("w", None, False), back=True), gold("text"), "error", "a wrong value, though it holds back"),
+        (read(("v0", 0, False)), gold("text", 2), "error", "a text asked in two items, one given as whole"),
+        (read(("v0", 0, False), back=True), gold("text", 2), "fallback", "one of two, flagged as partial"),
         (
             read(("v0", 0, False), ("w", None, True), hedged=True),
             gold("text"),
