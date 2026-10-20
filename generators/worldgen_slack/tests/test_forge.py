@@ -5,9 +5,10 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from worldgen_slack.judge import Grading
 
 from ..forge import tries as tries_module
-from ..forge.env import ForgeEnv, label_of, on_crashes, reopen, spent
+from ..forge.env import ForgeEnv, label_of, on_crashes, provenance, reopen, spent
 from ..forge.judge import Ruling, hearing, rule
 from ..forge.material import material
 from ..forge.release import level, release_rows, report
@@ -357,10 +358,6 @@ async def test_judge(tmp_path):
 def test_provenance_of_later_settings(tmp_path):
     """A setting added after forges started on it is left out of a forge's provenance at its default, so those forges
     resume; set otherwise, it is part of it."""
-    from worldgen_slack.judge import Grading
-
-    from ..forge.env import provenance
-
     config = forge_of(contracts_settings(tmp_path))
     (config.world).mkdir(parents=True, exist_ok=True)
     (config.world / "world.sqlite").write_bytes(b"w")
