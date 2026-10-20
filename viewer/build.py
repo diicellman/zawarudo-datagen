@@ -328,12 +328,16 @@ def forged(run: Path, state: dict) -> dict:
     """A forge's tasks as a reviewer labels them: each one's label, set, dealt skill, rates (by part), verification
     and the task judge's ruling; the messages beside its answer that state another value of the same facts (earlier,
     later, or a decoy); every try of the student and the verifier, with its grade by part; whether its release holds
-    it; and, when the run has a qc.json, the QC reading of it. Empty for a run that is not a forge."""
+    it; when the run has a qc.json, the QC reading of it; and when it has a calibration.json, each calibrated try's
+    reference grade beside the recorded one. Empty for a run that is not a forge."""
     records = {t: r for t, r in (state.get("forged") or {}).items() if "task" in r}
     if not records:
         return {}
     released = read_json(run / "release" / "tasks.json") or []
     qc = {v["task_id"]: v for v in read_json(run / "qc.json") or []}
+    calibration = {}  # task -> try -> its reference grade, the recorded one, and whether a person should rule on it
+    for row in read_json(run / "calibration.json") or []:
+        calibration.setdefault(row["task_id"], {})[row["try"]] = row
     db = connect(run / "world.sqlite")
     out = {}
     for task_id, record in records.items():
@@ -400,6 +404,7 @@ def forged(run: Path, state: dict) -> dict:
             "tries": {"student": tries("solves"), "verifier": tries("verifier")},
             "released": any(r["task_id"] == task_id for r in released),
             "qc": qc.get(task_id),
+            "calibration": calibration.get(task_id) or {},
         }
     db.close()
     return out

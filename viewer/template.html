@@ -624,13 +624,15 @@ function tasks() {
 }
 
 /* ---------- a forge's tasks, and labelling them ---------- */
-const FILTERS = [['release', 'In the release'], ['window', 'Window'], ['solved', 'Solved'], ['unsolved', 'Unsolved'], ['rejected', 'Rejected'],
+const FILTERS = [['release', 'In the release'], ['adjudicate', 'To adjudicate (calibration)'], ['window', 'Window'], ['solved', 'Solved'], ['unsolved', 'Unsolved'], ['rejected', 'Rejected'],
   ['unlabelled', 'Not labelled by the forge'], ['all', 'Every task written']];
 const ORDER = {window: 0, unsolved: 1, solved: 2, rejected: 3};
 const LABEL_CLASS = {solved: 'good', window: 'warn', unsolved: 'bad'};
 function forgeMatch(t, k) {
   const f = R.forge[t];
-  return !!f && (k === 'all' || (k === 'release' ? f.released : k === 'unlabelled' ? !f.label : f.label === k));
+  if (!f) return false;
+  if (k === 'adjudicate') return Object.values(f.calibration || {}).some(c => c.adjudicate);
+  return k === 'all' || (k === 'release' ? f.released : k === 'unlabelled' ? !f.label : f.label === k);
 }
 function shownTasks() {
   if (!Object.values(R.forge).some(f => f.released) && S.flabel === 'release') S.flabel = 'all';
@@ -688,16 +690,41 @@ function forgeDetail(t) {
     h('p', {class: 'small', text: f.ruling.reason})) : null;
   const tried = (name, prefix, rows, note) => rows.length ? h('div', {class: 'card', style: 'margin-top:12px'},
     label(`${name} (${rows.filter(s => s.correct).length} of ${rows.filter(s => !s.crashed).length} right` + (rows.some(s => s.crashed) ? `, ${rows.filter(s => s.crashed).length} crashed)` : ')')),
-    h('p', {class: 'small muted', text: note}), h('div', {class: 'solves'}, rows.map((s, k) => forgeTry(s, prefix + (k + 1), evidence)))) : null;
+    h('p', {class: 'small muted', text: note}), h('div', {class: 'solves'}, rows.map((s, k) => forgeTry(s, prefix + (k + 1), evidence, t.id, f.calibration?.[prefix + (k + 1)])))) : null;
   return h('div', {class: 'forge'},
     h('div', {}, head, answer, traps, ruling, f.qc ? qcCard(f.qc) : null,
       tried('Student tries', 'S', f.tries.student, 'The student whose share of right answers labels the task: solved, in the window, or unsolved.'),
       tried('Verifier tries', 'V', f.tries.verifier, 'A stronger model with the same tools: its tries must reach each part twice for the task to count.')),
     labelPanel(t.id));
 }
-function forgeTry(s, name, evidence) {
+// A calibrated try: the reference grade (success, fallback or error) beside the recorded one, and the person's ruling.
+const OUTCOMES = [['success', 'Success'], ['fallback', 'Fallback'], ['error', 'Error']];
+const OUTCOME_CLASS = {success: 'good', fallback: 'warn', error: 'bad'};
+function ruling(task, name, cal) {
+  const key = `${labelKey(task)}/${name}`, mine = LABELS.store[key] || {};
+  const status = h('span', {class: 'small mono faint', role: 'status', text: mine.outcome ? 'ruled ' + mine.outcome : (cal.adjudicate ? 'yours to rule' : '')});
+  return h('div', {class: 'card', style: 'margin:8px 0;padding:8px 10px' + (cal.adjudicate ? ';border-color:var(--warn)' : '')},
+    h('div', {class: 'small'}, h('span', {class: 'label', text: 'Calibration  '}),
+      h('span', {class: 'chip ' + (OUTCOME_CLASS[cal.reference] || ''), text: 'reference · ' + cal.reference + (cal.confidence === 'low' ? ' (low confidence)' : '')}),
+      h('span', {class: 'chip', text: 'recorded · ' + cal.recorded})),
+    list(cal.parts).length ? h('div', {}, cal.parts.map(p => h('div', {class: 'small faint'}, `${p.label}: ${p.outcome} · ${p.why}`))) : null,
+    cal.note ? h('div', {class: 'small faint', text: cal.note}) : null,
+    h('div', {class: 'opts', style: 'margin-top:6px'}, OUTCOMES.map(([value, text]) => {
+      const input = h('input', {type: 'radio', name: key, value});
+      input.checked = mine.outcome === value;
+      input.addEventListener('change', () => saveTry(key, value, status));
+      return h('label', {}, input, h('span', {text}));
+    }), status));
+}
+async function saveTry(key, outcome, status) {
+  LABELS.store[key] = {...LABELS.store[key], outcome, at: new Date().toISOString().slice(0, 19) + 'Z'};
+  labelsLocal(true);
+  status.textContent = 'ruled ' + outcome;
+  if (LABELS.server) await fetch('labels', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: key, label: {outcome}})}).catch(() => { status.textContent += ' (in this browser only)'; });
+}
+function forgeTry(s, name, evidence, task, cal) {
   const trace = X.traces[s.solver_trace_id] || null;
-  return h('div', {class: 'card', style: 'background:var(--bg)'},
+  return h('div', {class: 'card', style: 'background:var(--bg)' + (cal?.adjudicate ? ';border-color:var(--warn)' : '')},
     h('div', {}, h('span', {class: 'mono small', text: name + '  '}),
       s.crashed ? h('span', {class: 'chip warn', text: '! crashed'}) : h('span', {class: 'chip ' + (s.correct ? 'good' : 'bad'), text: s.correct ? '✓ right' : '✕ wrong'}),
       s.crashed ? null : h('span', {class: 'chip ' + (s.grounded ? 'good' : 'warn'), text: s.grounded ? '✓ grounded' : '! ungrounded'}),
@@ -707,8 +734,9 @@ function forgeTry(s, name, evidence) {
       h('span', {class: 'chip ' + (p.correct ? 'good' : 'bad'), text: p.correct ? '✓' : '✕'}), p.label,
       list(p.missing).length ? h('span', {class: 'faint', text: ' · missing: ' + p.missing.join('; ')}) : null,
       list(p.extra).length ? h('span', {class: 'faint', text: ' · extra: ' + p.extra.join('; ')}) : null))) : null,
-    h('details', {}, h('summary', {class: 'label', text: 'Answer'}), h('div', {class: 'pre small', text: s.response || ''})),
-    s.reason ? h('details', {}, h('summary', {class: 'label', text: 'Grade'}), h('p', {class: 'small muted', text: s.reason})) : null,
+    h('details', {open: cal?.adjudicate || null}, h('summary', {class: 'label', text: 'Answer'}), h('div', {class: 'pre small', text: s.response || ''})),
+    s.reason ? h('details', {open: cal?.adjudicate || null}, h('summary', {class: 'label', text: 'Grade'}), h('p', {class: 'small muted', text: s.reason})) : null,
+    cal ? ruling(task, name, cal) : null,
     trace?.route ? h('details', {}, h('summary', {class: 'label', text: `Calls (${trace.route.length})`}), trace.route.map((r, i) => h('div', {class: 'small mono'},
       `${i + 1}. ${r.call.action}(${Object.entries(r.call.arguments || {}).filter(([, v]) => v !== null && v !== undefined).map(([a, v]) => `${a}=${JSON.stringify(v)}`).join(', ')})`))) : null,
     trace ? h('button', {class: 'linkish', type: 'button', text: 'open trace', onclick: () => go('traces', {trace: trace.id})}) : null);

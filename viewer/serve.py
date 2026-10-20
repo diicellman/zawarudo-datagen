@@ -15,7 +15,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-FIELDS = {"fair", "reading", "failure", "realistic", "skill", "note"}  # the page's label panel
+FIELDS = {
+    "fair",
+    "reading",
+    "failure",
+    "realistic",
+    "skill",
+    "note",
+    "outcome",
+}  # the label panel; a try's outcome
 lock = threading.Lock()
 
 
