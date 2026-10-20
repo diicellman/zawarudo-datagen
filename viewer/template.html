@@ -648,14 +648,20 @@ function taskFilters() {
     [['all', 'Labelled by you or not'], ['todo', 'Not labelled by you yet'], ['done', 'Labelled by you']].map(([k, name]) => h('option', {value: k, text: name})));
   mine.value = S.fmine;
   const of = ids.filter(t => forgeMatch(t, S.flabel)), done = of.filter(labelled).length;
+  const tries = ids.flatMap(toRule).length, left = ids.flatMap(unruled).length;
   return h('div', {class: 'filters'}, which, mine,
     h('div', {class: 'small mono faint', text: `${done} of ${of.length} labelled · ${LABELS.server ? 'saved to a file' : 'saved in this browser'}`}),
+    tries ? h('div', {class: 'small mono', text: `calibration: ${tries - left} of ${tries} tries ruled`}) : null,
     h('div', {}, h('button', {class: 'btn', type: 'button', text: 'Export labels', onclick: exportLabels}), ' ',
       h('label', {class: 'btn'}, 'Import', h('input', {type: 'file', accept: '.json,application/json', style: 'display:none', onchange: importLabels}))));
 }
+// A task's tries a person should rule on, and how many of them are still unruled.
+const toRule = t => Object.keys(R.forge[t]?.calibration || {}).filter(k => R.forge[t].calibration[k].adjudicate);
+const unruled = t => toRule(t).filter(k => !LABELS.store[`${labelKey(t)}/${k}`]?.outcome);
 function forgeChips(t) {
-  const f = R.forge[t], r = f.rates || {};
-  return [h('span', {class: 'chip ' + (LABEL_CLASS[f.label] || ''), text: f.label || (f.failed ? 'failed' : 'unlabelled')}),
+  const f = R.forge[t], r = f.rates || {}, rule = toRule(t), left = unruled(t);
+  return [rule.length ? h('span', {class: 'chip ' + (left.length ? 'warn' : 'good'), text: left.length ? `${left.length} of ${rule.length} to rule` : '✓ ruled'}) : null,
+    h('span', {class: 'chip ' + (LABEL_CLASS[f.label] || ''), text: f.label || (f.failed ? 'failed' : 'unlabelled')}),
     f.skill ? h('span', {class: 'chip', text: f.skill}) : null,
     r.right_rate !== null && r.right_rate !== undefined ? h('span', {class: 'chip', text: 'right ' + pct(r.right_rate)}) : null,
     labelled(t) ? h('span', {class: 'chip good', text: '✓ labelled'}) : null];
@@ -720,6 +726,8 @@ async function saveTry(key, outcome, status) {
   LABELS.store[key] = {...LABELS.store[key], outcome, at: new Date().toISOString().slice(0, 19) + 'Z'};
   labelsLocal(true);
   status.textContent = 'ruled ' + outcome;
+  const list = document.querySelector('.tlist');  // refresh the counts beside the list, keeping the page as it is
+  if (list) { const fresh = tasks().querySelector('.tlist'); if (fresh) list.replaceWith(fresh); }
   if (LABELS.server) await fetch('labels', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: key, label: {outcome}})}).catch(() => { status.textContent += ' (in this browser only)'; });
 }
 function forgeTry(s, name, evidence, task, cal) {
