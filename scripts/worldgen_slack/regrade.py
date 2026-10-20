@@ -134,6 +134,7 @@ async def main() -> None:
     parser.add_argument("--judge", choices=["v1", "v2"], default="v1")
     parser.add_argument("--ground", action="store_true", help="v2: the reader also judges grounding")
     parser.add_argument("--effort", help="the grader's reasoning effort (low, high, max)")
+    parser.add_argument("--temperature", type=float, help="the grader's sampling temperature")
     parser.add_argument("--set", type=Path, help="a calibration set: regrade only its tries")
     parser.add_argument(
         "--splits", type=Path, help="v2: the readers' gold splits (a folder of reference batches)"
@@ -212,7 +213,10 @@ async def main() -> None:
     if args.dry_run:
         return
 
-    sampling = vf.SamplingConfig(reasoning_effort=args.effort) if args.effort else vf.SamplingConfig()
+    sampling = vf.SamplingConfig(
+        **({"reasoning_effort": args.effort} if args.effort else {}),
+        **({"temperature": args.temperature} if args.temperature is not None else {}),
+    )
     config = vf.JudgeConfig(model=args.model, sampling=sampling)
     judge = AnswerReader(config) if args.judge == "v2" else AnswerJudge(config)
     gate = asyncio.Semaphore(args.jobs)
