@@ -91,6 +91,7 @@ def main():
     assert all(isinstance(r["near_misses"], dict) and r["qc"] is None for r in reviewed.values()), (
         "no qc.json, no QC"
     )
+    assert all(r["calibration"] == {} for r in reviewed.values()), "no calibration.json, no tries to rule on"
     assert not world["forge"], "a world's page has no forge tasks"
     # A chapter: the version it writes, from its first day, and its brief, each entry with the facts the board plants.
     brief = chapter["chapter"]["brief"]
