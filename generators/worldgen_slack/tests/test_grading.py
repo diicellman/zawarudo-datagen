@@ -69,8 +69,8 @@ def gold(kind: str, items: int = 1, unseen: bool = False) -> dict:
         (
             read(("v0", 0, False), context=["the 1.4 dB margin"]),
             gold("text"),
-            "error",
-            "contradicts its context",
+            "success",
+            "a false context detail is an aside, counted not failed (decided)",
         ),
         (read(("v0", 0, False), ("v1", 1, False)), gold("set", 2), "success", "every member, nothing beyond"),
         (read(("v0", 0, False), back=True), gold("set", 2), "fallback", "a partial set, flagged as partial"),
@@ -174,6 +174,10 @@ def test_request_and_grade():
         ("who", False, True),
     ]
     assert grade.missing == ["who: b"] and grade.committed == ["when: Fri Nov 6", "who: a"]
+    aside = Reading(
+        parts=[read(("Nov 6", 0, False), context=["Oct 22"], label="when"), reading.parts[1]], reason="r"
+    )
+    assert graded(aside, answer, grounded=True)[0].unsupported_asides == 1, "a false aside is counted"
     with pytest.raises(ValueError, match="reads each of its 2 parts"):
         graded(Reading(parts=[reading.parts[0]], reason="r"), answer, grounded=True)
 

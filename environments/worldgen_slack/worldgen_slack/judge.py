@@ -214,8 +214,9 @@ def golds(reference: PrivateAnswer) -> list[dict]:
 
 def part_outcome(reading: PartReading, gold: dict) -> Outcome:
     """A part's outcome by the grading policy. Any committed falsehood is an error: a hedge, a value that contradicts
-    the reference's answer or context, a status given as settled, and a flat "it never happened" about a truth out of
-    the asker's sight. Then: a refusal succeeds when it holds back; a set when it states every item and nothing beyond
+    the reference's answer, a status given as settled, and a flat "it never happened" about a truth out of the asker's
+    sight. A detail beside what was asked (its context, or anything the request does not ask for) decides nothing: a
+    false one is counted as an aside. Then: a refusal succeeds when it holds back; a set when it states every item and nothing beyond
     them, and falls back when it flags a partial answer that adds nothing false; a status when it states the latest
     visible value and says it is unsettled or out of sight; a text or number when it states every answer item (a split
     gold may ask for more than one). Holding back with nothing committed, or with only some items and none beyond them,
@@ -225,7 +226,6 @@ def part_outcome(reading: PartReading, gold: dict) -> Outcome:
     stray = [c for c in reading.committed if c.item is None or not 0 <= c.item < count]
     if (
         reading.hedged
-        or reading.contradicts_context
         or any(c.contradicts for c in reading.committed)
         or (kind == "status" and reading.claims == "settled")
         or (reading.claims == "never_happened" and gold["unseen"])
@@ -276,7 +276,7 @@ def graded(reading: Reading, reference: PrivateAnswer, grounded: bool) -> tuple[
         correct=outcome == "success",
         abstained=outcome == "fallback",
         grounded=grounded,
-        unsupported_asides=0,
+        unsupported_asides=sum(len(r.contradicts_context) for r in reading.parts),
         committed=[
             (f"{g['label']}: " if composite else "") + v for a, g in zip(own, parts) for v in a["committed"]
         ],
@@ -302,13 +302,17 @@ READ = (
     "that the question does not ask for). For each part, in order: committed lists each value the response commits to "
     "as its answer to that part (for a set, each member it presents as the set), with item the number of the answer "
     "item it states in any equivalent wording (a time on the asker's clock counts; a wrong weekday beside a right date "
-    "still states the date unless the question asks for the day: list such slips in slips), or null when it states "
-    "none, and contradicts true when it gives, for something the answer items or the context cover, another value. A "
-    "value named only in passing, as an aside or a side option, is not committed. hedged: it offers alternatives for "
+    "still states the date, unless the question asks what day, which day or on what day, which asks for the weekday "
+    "too: list such slips in slips), or null when it states none, and contradicts true when it gives, for something "
+    "an answer item covers, another value. A flat headline or opening claim commits, even when the body later softens "
+    "it with a caveat; an explicit correction of a value replaces it; a headline scoped to what is visible ('not as far "
+    "as Slack shows') holds back. A value it settles on, though framed as an inference or with a caveat, is committed. "
+    "A value named only in passing, as an aside or a side option, is not committed. hedged: it offers alternatives for "
     "the part without settling on one. holds_back: it says it cannot find, see or confirm the part, or flags its "
     "answer as partial. claims: what it says of the part's state: settled (final, done, decided), unsettled (not final "
     "or not confirmed), not_visible (out of the asker's sight), never_happened (it did not or will not happen, or does "
-    "not exist), or none. contradicts_context: the context details it contradicts. Then a concise reason."
+    "not exist), or none. contradicts_context: the details beside the answer that the context contradicts (false "
+    "asides). Then a concise reason."
 )
 GROUND = (
     " Also decide grounded: whether the observations (what the solver's calls showed: messages in time order, the "
