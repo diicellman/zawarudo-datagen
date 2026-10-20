@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from ..forge import tries as tries_module
-from ..forge.env import ForgeEnv, label_of, on_crashes, priced, spent
+from ..forge.env import ForgeEnv, label_of, on_crashes, priced, reopen, spent
 from ..forge.judge import Ruling, hearing, rule
 from ..forge.material import material
 from ..forge.release import level, release_rows, report
@@ -393,6 +393,22 @@ def test_spend_and_labels(tmp_path):
             ({"verified": False}, lost),
         )
     ] == [True, False, True, False, False]
+    # A finished forge is taken up again by its own command when a task's labelling failed, or its label rests on tries
+    # that crashed (an earlier pass's too); else it stays done.
+    for forged, again in (
+        ({"i001": {"label": "solved", "rates": {"crashed": 0}}}, False),
+        ({"i001": {"failed": "RuntimeError: 3 of the student's 8 tries crashed"}}, True),
+        ({"i001": {"label": "solved", "verified": True, "rates": {"crashed": 4}}}, True),
+    ):
+        events = []
+        store = SimpleNamespace(
+            state=SimpleNamespace(phase="done", forged=forged, verifier={}, plans={}),
+            event=lambda kind, **fields: events.append(kind),
+            save=lambda: None,
+        )
+        assert (reopen(store), store.state.phase, events) == (
+            (True, "label", ["forge_reopened"]) if again else (False, "done", [])
+        ), forged
 
 
 def test_release(tmp_path):

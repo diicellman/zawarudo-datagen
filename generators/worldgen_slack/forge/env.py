@@ -349,16 +349,12 @@ class ForgeEnv(SessionEnv):
     # ------------------------------------------------------------------ labelling: verify, measure, judge
 
     async def label(self, agents) -> None:
-        """Every task due labelled side by side, each step kept as it lands: the pass's, and any an earlier labelling
-        left failed. A few that fail (a provider's burst of refusals) wait and are labelled again, twice; a task that
+        """Every task due labelled side by side, each step kept as it lands: the pass's, any an earlier labelling left
+        failed, and any whose label rests on tries that crashed (whichever pass labelled it). A few that fail (a provider's burst of refusals) wait and are labelled again, twice; a task that
         still fails is marked failed and the others go on, and the next labelling (a later pass, or the forge run
         again) takes it up. Most of them failing is the run's stop, which the CLI resumes."""
         state = self.store.state
-        if reopened := [
-            t
-            for t, r in state.forged.items()
-            if r["pass"] == state.batch and on_crashes(r, state.verifier.get(t, {}))
-        ]:
+        if reopened := [t for t, r in state.forged.items() if on_crashes(r, state.verifier.get(t, {}))]:
             for t in reopened:
                 state.forged[t].pop("label")
             self.store.event("labels_reopened", tasks=reopened, why="their tries crashed")
@@ -405,8 +401,10 @@ class ForgeEnv(SessionEnv):
         if record["verified"]:
             measured = await self.tries.measure(agents, task, task_key)
             record["rates"] = rates(measured)
-            if record["rates"]["right_rate"] is None:
-                raise RuntimeError("every one of the student's tries crashed")
+            if crashed := record["rates"][
+                "crashed"
+            ]:  # its rate would rest on fewer tries: they run again first
+                raise RuntimeError(f"{crashed} of the student's {len(measured)} tries crashed")
             record["parts"] = by_part(task, measured)
             if "ruling" not in record:
                 async with (
@@ -458,15 +456,18 @@ class ForgeEnv(SessionEnv):
 
 
 def reopen(store) -> bool:
-    """A finished forge run again, when an earlier labelling left tasks failed: it labels them, and its release is
-    published anew. Whether it reopened."""
+    """A finished forge run again, when an earlier labelling left tasks failed or labelled them on tries that crashed:
+    it labels them, and its release is published anew. Whether it reopened."""
     state = store.state
     failed = [t for t, r in state.forged.items() if "label" not in r and "failed" in r]
-    if state.phase != "done" or not failed:
+    crashed = [t for t, r in state.forged.items() if on_crashes(r, state.verifier.get(t, {}))]
+    if state.phase != "done" or not (failed or crashed):
         return False
     state.phase = "label"
     store.state.plans.setdefault("forge", {})["relabelled"] = True
-    store.event("forge_reopened", tasks=failed, why="their labelling failed")
+    store.event(
+        "forge_reopened", tasks=failed + crashed, why="their labelling failed, or rests on tries that crashed"
+    )
     store.save()
     return True
 
