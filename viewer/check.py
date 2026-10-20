@@ -75,6 +75,23 @@ def main():
         tasks["i001"]["gold_sql"].startswith("rests on m") and "verifier agreed" in tasks["i001"]["gold_sql"]
     )
     assert any(t["role"] == "verifier" and t["evaluation"] for t in forge["traces"]), "the verifier's tries"
+    # A forge's tasks as a reviewer labels them: each with its label, its tries (a split decided by a third), the
+    # values beside its answer, and whether its release holds it; labels are kept per run, as <run>/<task>.
+    reviewed = forge["forge"]
+    assert set(reviewed) == set(tasks) and forge["label_set"] == "forge", sorted(reviewed)
+    assert reviewed["i003"]["label"] == "window" and len(reviewed["i003"]["tries"]["verifier"]) == 3
+    assert all(
+        r["tries"]["student"] and "correct" in r["tries"]["student"][0]
+        for r in reviewed.values()
+        if r["label"] != "rejected"
+    )
+    assert reviewed["i001"]["released"] and not reviewed["i004"]["released"], (
+        "a release holds its approved tasks"
+    )
+    assert all(isinstance(r["near_misses"], dict) and r["qc"] is None for r in reviewed.values()), (
+        "no qc.json, no QC"
+    )
+    assert not world["forge"], "a world's page has no forge tasks"
     # A chapter: the version it writes, from its first day, and its brief, each entry with the facts the board plants.
     brief = chapter["chapter"]["brief"]
     assert chapter["chapter"]["first_day"] == 5 and brief and all(b["facts"] for b in brief), chapter[
@@ -83,11 +100,13 @@ def main():
     assert {b["slot"] for b in brief} <= set(chapter["board"]) and all(chapter["board"].values()), (
         "the board per slot"
     )
+    page = render({"runs": [forge]})
+    assert "labelPanel(t.id)" in page and "worldgen-labels" in page, "a forge's page labels its tasks"
     attack = "</script><script>alert('artifact')</script>&"
     html = render({"runs": [], "probe": attack})
     assert attack not in html and "__VIEWER_DATA__" not in html and "\\u003c/script\\u003e" in html
     print(
-        "Viewer checks passed: attempt order, snapshots, conversations, cast, reactions, mentions, facts, forge tasks, verifier, chapter, board, escaping."
+        "Viewer checks passed: attempt order, snapshots, conversations, cast, reactions, mentions, facts, forge tasks, verifier, labelling, chapter, board, escaping."
     )
 
 
