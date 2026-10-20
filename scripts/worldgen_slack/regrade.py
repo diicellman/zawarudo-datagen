@@ -22,10 +22,8 @@ import verifiers.v1 as vf
 from worldgen_slack.judge import AnswerJudge
 
 from generators.worldgen_slack.forge.tasks import Task, private_answer
+from generators.worldgen_slack.prices import priced
 from generators.worldgen_slack.workspace import Workspace
-
-# $ per million input, output and cached input tokens (list prices)
-PRICES = {"z-ai/glm-5.3": (1.4, 4.4, 0.26)}
 
 
 def outcome(grade: dict) -> str:
@@ -39,16 +37,6 @@ def kappa(pairs: list[tuple[str, str]]) -> float:
     first, second = Counter(a for a, _ in pairs), Counter(b for _, b in pairs)
     chance = sum(first[k] * second[k] for k in first) / (n * n)
     return 1.0 if chance == 1 else (agree - chance) / (1 - chance)
-
-
-def cost(model: str, usage: dict) -> float:
-    if usage.get("cost") is not None:
-        return usage["cost"]
-    fresh, out, cached = PRICES.get(model, (0, 0, 0))
-    hit = usage.get("cached_input_tokens") or 0
-    return (
-        (usage.get("prompt_tokens", 0) - hit) * fresh + hit * cached + usage.get("completion_tokens", 0) * out
-    ) / 1e6
 
 
 # FC1's tries were recorded on the tools before Slack's own: a person read by get_user or whoami, and messages with
@@ -226,8 +214,8 @@ async def main() -> None:
             print(
                 f"  {g['task']} {g['trace'][:8]} {outcome(g['recorded'])}→{outcome(g['new'])}: {g['new']['reason'][:220]}"
             )
-    spend = sum(cost(args.model, g["usage"]) for g in graded)
-    print(f"\nspend ${spend:.2f} ({args.model}, list prices where the gateway gave no cost)")
+    spend = sum(priced(g["usage"], args.model) for g in graded)
+    print(f"\nspend ${spend:.2f} ({args.model}, prices.py where the gateway gave no cost)")
 
 
 if __name__ == "__main__":

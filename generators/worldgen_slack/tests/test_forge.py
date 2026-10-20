@@ -7,12 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from ..forge import tries as tries_module
-from ..forge.env import ForgeEnv, label_of, on_crashes, priced, reopen, spent
+from ..forge.env import ForgeEnv, label_of, on_crashes, reopen, spent
 from ..forge.judge import Ruling, hearing, rule
 from ..forge.material import material
 from ..forge.release import level, release_rows, report
 from ..forge.tasks import Part, Task, answer_text, check, key, private_answer
 from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached
+from ..prices import priced
 from .support import contracts_settings, forge_of, refused, world_fixture
 
 
@@ -369,6 +370,10 @@ def test_spend_and_labels(tmp_path):
     assert priced({"prompt_tokens": 1e6}, "a model of no list") == 4.0, (
         "an unlisted model at the dearest price"
     )
+    assert priced({"prompt_tokens": 0, "cached_input_tokens": 1e6}, "z-ai/glm-5.3") == 1.2, (
+        "GLM's cached input as the bill charged it (about $1.20), not as listed ($0.26)"
+    )
+    assert priced({"cached_input_tokens": 1e6, "cost": 0.5}, "z-ai/glm-5.3") == 0.5, "a reported cost stands"
     measured = {"right_rate": 0.5}
     assert [
         label_of(r, 0.875)

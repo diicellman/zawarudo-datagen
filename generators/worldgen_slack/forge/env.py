@@ -14,6 +14,7 @@ from worldgen_slack.release import atomic_json
 from worldgen_slack.world import file_hash
 
 from ..config import pinned
+from ..prices import priced
 from ..session import SETUP_FILES, SessionEnv, require_session
 from ..store import ReviewLimit, Store
 from ..workspace import Workspace, reset_tasks
@@ -27,31 +28,10 @@ from .release import KEPT
 from .tasks import FAMILIES, Task, answer_text, check, key
 from .tries import Tries, agreeing, by_part, rates, reached
 
-# $ per million fresh input, cached input and output tokens (`prime inference models`, 2026-10-16), for a call its
-# provider leaves unpriced; a model not listed is priced as the dearest.
-PRICES = {
-    "z-ai/glm-5.3": (1.4, 0.26, 4.4),
-    "z-ai/glm-5.3-flash": (0.15, 0.15, 0.5),
-    "deepseek/deepseek-v4.1-flash": (0.3, 0.03, 1.2),
-    "anthropic/claude-opus-5.5": (4.0, 4.0, 20.0),
-}
-DEAREST = (4.0, 4.0, 20.0)
-
-
-def priced(usage: dict, model: str | None) -> float:
-    if usage.get("cost") is not None:
-        return usage["cost"]
-    fresh, cached, out = PRICES.get(model or "", DEAREST)
-    return (
-        (usage.get("prompt_tokens") or 0) * fresh
-        + (usage.get("cached_input_tokens") or 0) * cached
-        + (usage.get("completion_tokens") or 0) * out
-    ) / 1e6
-
 
 def spent(store) -> float:
     """What a forge has spent: each trace's calls (its own and its answer judge's), and the task judge's rulings, at
-    their reported cost or else list prices: an estimate that errs high."""
+    their reported cost or else the prices the bill shows (prices.py)."""
     env, judges = store.settings.get("env", {}), store.settings.get("answer_judge", {}).get("model")
     total = 0.0
     for path in (store.root / "traces").glob("*.json"):
