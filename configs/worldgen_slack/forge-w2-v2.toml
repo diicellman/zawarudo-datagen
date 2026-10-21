@@ -14,6 +14,7 @@ batch = 4                 # a turn's ids, one of each family: a turn of 12 had G
                           # 1.5M tokens ran out, before it wrote one (the W1 pilot, 2026-10-17)
 adapt = 1
 tries = 8
+solvers = 24              # a regrade's grading calls at once: GLM takes 32, and nothing else runs
 verify = 2
 # The skills code deals the initial ids, in turn: aggregation twice in 5 (the research's surest near-miss for a fast
 # model, and W1's rarest), then temporal, abstention and synthesis. Crossed with the 4 families, every pair occurs
