@@ -1,6 +1,7 @@
 """A forge's stored tries graded again, by another grader or on golds split into answer and context: each try's grade
 replaced, each task's reach, rates and label recomputed from them, and its release published anew (the earlier kept as
-release.superseded). No try runs again: a regrade costs one grading call a try.
+release.superseded) when the forge is finished; a forge mid-label keeps the new grades and publishes when it finishes.
+No try runs again: a regrade costs one grading call a try.
 
 uv run --frozen worldgen-slack regrade --config configs/worldgen_slack/forge-w2.toml [--splits <folder>] [--dry-run]
 
@@ -136,9 +137,14 @@ async def regrade(config: ForgeConfig, splits: Path | None = None) -> dict:
         store.save()
         if failed:
             raise RuntimeError(f"{len(failed)} of {len(todo)} tries failed to regrade: {failed[0]}")
-        publish(store)
+        finished = (
+            store.state.phase == "done"
+        )  # a forge mid-label publishes when it finishes, from these grades
+        if finished:
+            publish(store)
         return {
             "status": "complete",
+            "published": finished,
             "tries": len(todo),
             "split_tasks": len(changed),
             "moved": moved,
