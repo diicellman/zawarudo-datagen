@@ -83,6 +83,19 @@ def agreeing(results: list[dict]) -> list[dict]:
     return [r for r in results if r and not r.get("crashed") and r.get("correct")]
 
 
+def public_task(task: Task, world) -> PublicTask:
+    """A forged task as its solver gets it: its question, as its asker, on the solver copy of the world."""
+    return PublicTask(
+        task_id=task.id,
+        question=task.question,
+        actor_id=task.actor_id,
+        category=task.family,
+        level=1,
+        answer_type="composite" if len(task.parts) > 1 else task.parts[0].answer_type,
+        world_hash=file_hash(world),
+    )
+
+
 WAITS = (5, 30, 120)  # seconds before a call is asked again
 
 
@@ -141,22 +154,12 @@ class Tries:
 
     def solver_task(self, task: Task, world) -> SolverTask:
         """A task as a solver gets it: its question, as its asker, on the solver copy; its grade against its answer."""
-        row = PublicTask(
-            task_id=task.id,
-            question=task.question,
-            actor_id=task.actor_id,
-            category=task.family,
-            level=1,
-            answer_type="composite" if len(task.parts) > 1 else task.parts[0].answer_type,
-            world_hash=file_hash(world),
-        )
         return SolverTask.create(
-            row,
+            public_task(task, world),
             world,
             private_answer(self.store.world, task),
             self.settings.answer_judge,
             isinstance(self.settings.env.solver.runtime, NetworkPolicyConfig),
-            self.settings.grading,
         )
 
     async def solve(self, agents, task: SolverTask, seat: str):

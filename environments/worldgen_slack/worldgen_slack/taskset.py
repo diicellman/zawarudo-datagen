@@ -10,19 +10,9 @@ from pydantic import Field
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 
 from .config import role
-from .judge import (
-    READINGS,
-    AnswerJudge,
-    AnswerReader,
-    Grading,
-    Misread,
-    empty_grade,
-    graded,
-    reader_reference,
-    reward,
-)
+from .judge import READINGS, AnswerJudge, Misread, empty_grade, fenced, gold, graded, reward
 from .release import PrivateAnswer, PublicTask, load_release
-from .slack import compact, people_shown, shown
+from .slack import people_shown, shown
 from .toolset import CallState, SlackToolset, WorldToolsConfig, stage_world
 from .world import World
 
@@ -48,11 +38,48 @@ def system_prompt(world) -> str:
     return f"You are using Slack as the user with user_id {world.actor['id']}." + when
 
 
+def out_of_sight(path: str, actor_id: str, reference: PrivateAnswer) -> list[list[dict]]:
+    """Each part's messages out of its asker's sight, as the grader reads them: who wrote what, where and when (on the
+    asker's clock). They show how things really stand, against which a flat claim is judged."""
+    world = World(path)
+    try:
+        zone = ZoneInfo(world.db.execute("SELECT tz FROM users WHERE id = ?", (actor_id,)).fetchone()[0])
+        hidden = []
+        for answer in reference.answers():
+            said = []
+            for channel, ts in answer.unseen:
+                row = world.db.execute(
+                    """SELECT m.ts_us, m.text, m.parent_id, c.name, c.type, u.real_name FROM messages m
+                    JOIN channels c ON c.id = m.channel_id JOIN users u ON u.id = m.user_id
+                    WHERE m.channel_id = ? AND m.ts = ?""",
+                    (channel, ts),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"a message out of sight, {channel} {ts}, is not in the world")
+                where = (
+                    f"#{row['name']}" if row["name"] else ("a DM" if row["type"] == "im" else "a group DM")
+                )
+                when = datetime.fromtimestamp(row["ts_us"] / 1e6, zone)
+                said.append(
+                    {
+                        "from": row["real_name"],
+                        "where": where + (" (thread reply)" if row["parent_id"] else ""),
+                        "when": f"{when:%a %b} {when.day}, {when:%H:%M}",
+                        "text": row["text"],
+                    }
+                )
+            hidden.append(said)
+        return hidden
+    finally:
+        world.close()
+
+
 class SolverConfig(vf.TaskConfig):
     tools: WorldToolsConfig
     reference: PrivateAnswer = Field(exclude=True, repr=False)
-    judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
-    grading: Grading = Grading()
+    judge: vf.JudgeConfig = vf.JudgeConfig(
+        model="z-ai/glm-5.3", sampling=vf.SamplingConfig(reasoning_effort="high")
+    )
 
 
 class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
@@ -68,15 +95,12 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         reference: PrivateAnswer,
         judge=None,
         network_policy=True,
-        grading: Grading | None = None,
     ) -> Self:
         """`world` is a solver copy (no answer key); `network_policy` blocks egress where the runtime enforces it."""
         config = SolverConfig(tools=WorldToolsConfig(actor_id=task.actor_id), reference=reference)
         stage_world(config.tools, world)
         if judge is not None:
             config.judge = judge
-        if grading is not None:
-            config.grading = grading
         return cls(
             WorldTaskData(
                 name=task.task_id,
@@ -126,45 +150,29 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         trace.info["grading_started"] = True
         observations = trace.info.get("observations", [])
         reference = self.config.reference
-        expected = reference.reference()
-        outcome, readings = None, {}
+        outcome, reading = "error", {}
         if not (trace.last_reply or "").strip():
-            grade = empty_grade(expected)
-        elif self.config.grading.version == 2:
-            # v2: the model reads what the answer commits to; code grades it. Grounding is the model's when it is
-            # given the observations, else code's alone (below: each part's answer rests on a message it was shown).
-            # A reading that misreads the parts is asked again (each call recorded on the trace, so paid once and
+            grade = empty_grade(reference)
+        else:
+            # The model reads what the answer commits to, criterion by criterion; code grades it. A reading that
+            # misreads the gold's parts or items is asked again (each call recorded on the trace, so paid once and
             # counted): a grade costs a reading, where its try's crash would cost the whole try again.
-            grounding = {"observations": compact(observations)} if self.config.grading.ground else {}
+            hidden = out_of_sight(self.config.tools.db_path, self.config.tools.actor_id, reference)
             for n in range(1, READINGS + 1):
-                result = await AnswerReader(self.config.judge).evaluate(
+                result = await AnswerJudge(self.config.judge).evaluate(
                     trace=trace,
-                    question=self.data.prompt,
-                    reference=reader_reference(reference),
-                    response=trace.last_reply,
-                    **grounding,
+                    request=self.data.prompt,
+                    reference=gold(reference, hidden),
+                    response=fenced(trace.last_reply),
                 )
-                reading = result.parsed
-                ground = bool(reading.grounded) if self.config.grading.ground else bool(observations)
                 try:
-                    grade, outcome = graded(reading, reference, ground)
+                    grade, outcome = graded(result.parsed, reference, bool(observations))
                 except Misread:
                     if n == READINGS:
                         raise
                 else:
-                    readings = {"readings": n}
+                    reading = {"reading": result.parsed.model_dump(mode="json"), "readings": n}
                     break
-        else:
-            result = await AnswerJudge(self.config.judge).evaluate(
-                trace=trace,
-                question=self.data.prompt,
-                reference=expected,
-                response=trace.last_reply,
-                observations=compact(observations),
-            )
-            grade = result.parsed
-        if grade.grounded and not observations:
-            raise ValueError("judge claimed grounding without observations")
         seen = set().union(*map(shown, observations))
         users = set().union(*map(people_shown, observations))
 
@@ -181,14 +189,13 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             update={"grounded": grade.grounded and all(covered(a) != 0 for a in reference.answers())}
         )
         score = reward(grade)
-        outcome = outcome or ("success" if grade.correct else "fallback" if grade.abstained else "error")
         trace.info["evaluation"] = {
             "task_id": self.data.task_id,
             "execution_ok": True,
             "semantic_correctness": score,
             **grade.model_dump(mode="json"),
             "outcome": outcome,
-            **readings,
+            **reading,
             "response": trace.last_reply,
             "evidence_coverage": coverage,
             **({"part_coverage": [covered(p) for p in reference.parts]} if reference.parts else {}),
@@ -209,8 +216,9 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
 
 class EvaluationConfig(vf.TaskConfig):
     release_dir: Path | None = None  # the release to evaluate: a generated world's release/ directory
-    judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
-    grading: Grading = Grading()
+    judge: vf.JudgeConfig = vf.JudgeConfig(
+        model="z-ai/glm-5.3", sampling=vf.SamplingConfig(reasoning_effort="high")
+    )
 
 
 def release(config: EvaluationConfig):
@@ -227,9 +235,7 @@ class EvaluationTask(vf.Task[WorldTaskData, vf.State, EvaluationConfig]):
         row = next(r for r in rows if r.task_id == self.data.task_id)
         if (row.question, row.world_hash) != (self.data.prompt, self.data.world_hash):
             raise ValueError("task differs from the immutable release")
-        return SolverTask.create(
-            row, world, answers[row.task_id], self.config.judge, network_policy, self.config.grading
-        )
+        return SolverTask.create(row, world, answers[row.task_id], self.config.judge, network_policy)
 
     async def validate(self, runtime):
         self.solver_task()

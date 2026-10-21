@@ -15,7 +15,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["worldgen_slack"]
-include = ["worldgen_slack/**/*.sql"]
+include = ["worldgen_slack/**/*.sql", "worldgen_slack/**/*.md"]
 
 [tool.ruff]
 line-length = 110

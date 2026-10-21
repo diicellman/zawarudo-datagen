@@ -1,8 +1,8 @@
-# forge-w2 regraded by grader v2: uv run --frozen worldgen-slack regrade --config configs/worldgen_slack/forge-w2-v2.toml \
+# forge-w2 regraded: uv run --frozen worldgen-slack regrade --config configs/worldgen_slack/forge-w2-regrade.toml \
 #     --splits local-docs/calibration/forge-w2/reference
-# forge-w2's configuration with grader v2 (2026-10-21): the model reads what an answer commits to, code grades it by
-# the policy (local-docs/calibration/POLICY.md); correctness only, grounding by code. A regrade keeps the run's own
-# manifest; a forge run with this file would be refused as another configuration.
+# forge-w2's configuration, its grading calls 24 at once. A regrade keeps the run's own manifest and grades by the
+# grader of the day (local-docs/calibration/POLICY.md); a forge run with this file would be refused as another
+# configuration.
 # The forge on W2: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-w2.toml
 # 150 initial tasks, then their harder, easier and repaired versions: about 270 tasks. W1's pilot (67 tasks, $74.49)
 # had 2% of its parts aggregation and a quarter of its requests opening alike; here code deals each id a skill and the
@@ -62,8 +62,3 @@ model = "z-ai/glm-5.3"
 
 [answer_judge.sampling]
 reasoning_effort = "high"
-
-# Grader v2: on forge-w2's calibration (350 tries, 70 ruled) as accurate as v1's fresh pass at a fifth of its cost.
-[grading]
-version = 2
-ground = false

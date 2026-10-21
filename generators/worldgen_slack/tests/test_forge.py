@@ -7,12 +7,12 @@ from types import SimpleNamespace
 import httpx
 import openai
 import pytest
-from worldgen_slack.judge import Grading
 
 from ..forge import tries as tries_module
-from ..forge.env import ForgeEnv, label_of, on_crashes, provenance, reopen, spent
+from ..forge.env import ForgeEnv, label_of, on_crashes, reopen, spent
 from ..forge.judge import Ruling, hearing, rule
 from ..forge.material import material
+from ..forge.regrade import grader
 from ..forge.release import level, release_rows, report
 from ..forge.tasks import Part, Task, answer_text, check, key, private_answer
 from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached, transient
@@ -381,15 +381,15 @@ async def test_judge(tmp_path):
     assert not Ruling(realistic=False, one_reading=True, exact=True, supported=True, reason="r").approved
 
 
-def test_provenance_of_later_settings(tmp_path):
-    """A setting added after forges started on it is left out of a forge's provenance at its default, so those forges
-    resume; set otherwise, it is part of it."""
+def test_regrade_mark(tmp_path):
+    """A try regraded carries its grader's model and prompt file: a regrade by another prompt on the same model grades
+    it again rather than skipping it as done."""
     config = forge_of(contracts_settings(tmp_path))
-    (config.world).mkdir(parents=True, exist_ok=True)
-    (config.world / "world.sqlite").write_bytes(b"w")
-    assert "grading" not in provenance(config)["config"]
-    v2 = config.model_copy(update={"grading": Grading(version=2, ground=False)})
-    assert provenance(v2)["config"]["grading"] == {"version": 2, "ground": False}
+    variant = config.model_copy(
+        update={"answer_judge": config.answer_judge.model_copy(update={"prompt": tmp_path / "strict.md"})}
+    )
+    assert grader(config) == f"{config.answer_judge.model}:judge_prompt.md"
+    assert grader(variant) == f"{config.answer_judge.model}:strict.md"
 
 
 def test_resume_limits(tmp_path):

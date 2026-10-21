@@ -5,8 +5,8 @@ No try runs again: a regrade costs one grading call a try.
 
 uv run --frozen worldgen-slack regrade --config configs/worldgen_slack/forge-w2.toml [--splits <folder>] [--dry-run]
 
-The run keeps its own manifest (run.json): the grader comes from the config given (its `grading` and `answer_judge`),
-and the regrade is recorded in the run's state and events. `--splits` names a folder of reference batches whose
+The run keeps its own manifest (run.json): the grader comes from the config given (its `answer_judge`, whose `prompt`
+may name another prompt file), and the regrade is recorded in the run's state and events. `--splits` names a folder of reference batches whose
 `split` entries move a part's un-asked details into its context (local-docs/calibration/POLICY.md); a task's gold
 before its split is kept beside it."""
 
@@ -72,6 +72,13 @@ def stored_tries(store: Store) -> list[tuple[str, str, int]]:
     ]
 
 
+def grader(config: ForgeConfig) -> str:
+    """Which grader grades: its model and its prompt file (the default's, or the one `answer_judge.prompt` names), the
+    mark a try regraded by it carries, so a regrade by another prompt on the same model grades it again."""
+    prompt = config.answer_judge.prompt
+    return f"{config.answer_judge.model}:{prompt.name if prompt else 'judge_prompt.md'}"
+
+
 FAIL_FAST = 20  # grades that fail before any lands, and the regrade stops: a bug, not a provider's burst
 SAVE_EVERY = 50  # grades between a regrade's saves and progress events
 PER_GRADE = (
@@ -116,7 +123,7 @@ async def regrade(
     store = Store(config.output, manifest)
     try:
         changed = split(store, splits_of(splits))
-        mark = f"v{config.grading.version}:{config.answer_judge.model}"
+        mark = grader(config)
         todo = [
             t
             for t in stored_tries(store)
@@ -216,8 +223,7 @@ async def regrade(
                 )  # verified only now: the task judge never ruled on it, so it stays rejected
         store.state.plans.setdefault("forge", {})["relabelled"] = True
         store.state.plans["forge"]["regraded"] = {
-            "grading": config.grading.model_dump(),
-            "judge": config.answer_judge.model,
+            "grader": mark,
             "splits": str(splits) if splits else None,
             "split_tasks": len(changed),
             **measured,
@@ -259,7 +265,6 @@ def dry_regrade(config: ForgeConfig, splits: Path | None = None) -> dict:
         "run": manifest.get("config", {}).get("output"),
         "tries": len(stored_tries(store)),
         "split_tasks": sum(1 for t, parts in found.items() if parts and t in state.get("forged", {})),
-        "grading": config.grading.model_dump(),
-        "judge": config.answer_judge.model,
+        "grader": grader(config),
         "budget": round(PER_GRADE * len(stored_tries(store)), 2),
     }

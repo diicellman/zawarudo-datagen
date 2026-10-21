@@ -1,137 +1,145 @@
-"""Grader v2: the model reads what an answer commits to, part by part, and code grades it by the policy (a success,
-a fallback or an error); the release's answer carries its context (v13); a solve graded by v2 reads as v1's."""
+"""The answer judge: the model reports what an answer commits to and the policy's narrow criteria, and code decides each
+part's outcome (a success, a fallback or an error); the reader is shown the gold, and what is out of the asker's sight;
+a try is graded on its own trace, through the judge's own call, only the network faked."""
 
-import asyncio
 import json
-from types import SimpleNamespace
 
 import pytest
+import verifiers.v1 as vf
 from worldgen_slack.judge import (
     READINGS,
-    AnswerReader,
-    Commit,
-    Grading,
+    Check,
+    Gives,
     Misread,
     PartReading,
     Reading,
-    golds,
+    fenced,
+    gold,
     graded,
     part_outcome,
-    reader_reference,
     request_outcome,
 )
 from worldgen_slack.release import PrivateAnswer, PublicTask
-from worldgen_slack.taskset import SolverTask
+from worldgen_slack.taskset import SolverTask, out_of_sight
 
+from ..prices import priced
+from .flows import FakeInference, answer_fields, live_judging
 from .support import world_fixture
 
 
-def read(*commits, hedged=False, back=False, claims="none", context=(), label="p") -> PartReading:
+def check(verdict: bool) -> Check:
+    return Check(reason="r", verdict=verdict)
+
+
+def read(
+    *gives,
+    conflicts=False,
+    hedged=False,
+    held=False,
+    extra=None,
+    declines=None,
+    asides=(),
+    part="p",
+    commits="c",
+) -> PartReading:
     return PartReading(
-        label=label,
-        committed=[Commit(value=v, item=i, contradicts=x) for v, i, x in commits],
-        hedged=hedged,
-        holds_back=back,
-        claims=claims,
-        contradicts_context=list(context),
+        part=part,
+        commits=commits,
+        gives=[Gives(item=n, reason="r", verdict=v) for n, v in enumerate(gives, 1)],
+        conflicts=check(conflicts),
+        extra=None if extra is None else check(extra),
+        hedged=check(hedged),
+        holds_back=check(held),
+        declines=None if declines is None else check(declines),
+        false_asides=list(asides),
     )
 
 
-def gold(kind: str, items: int = 1, unseen: bool = False) -> dict:
-    return {
-        "label": "p",
-        "answer_type": kind,
-        "items": [f"v{i}" for i in range(items)],
-        "context": [],
-        "unseen": unseen,
-    }
+def part(kind: str, items: int = 1, label: str = "p") -> PrivateAnswer:
+    rows = [{"answer": f"v{n}"} for n in range(items)] if kind != "refusal" else []
+    return PrivateAnswer(answer_type=kind, rows=rows, messages=[], users=[], label=label)
+
+
+INVENTED = pytest.mark.xfail(
+    strict=True,
+    reason="18d: an invented quoted message fails the request; its check lands after the core's calibration",
+)
 
 
 @pytest.mark.parametrize(
-    "reading, part, outcome, why",
+    "reading, kind, items, outcome, why",
     [
-        (read(("v0", 0, False)), gold("text"), "success", "the value stated"),
+        (read(True), "text", 1, "success", "gives the item (anchors 9, 10, 18, 18b, 20; i099 S4 derived)"),
+        (read(True, asides=["Oct 9"]), "text", 1, "success", "a false aside is counted, not failed (16)"),
+        (read(False, held=True), "text", 1, "fallback", "holds back without the item (3)"),
+        (read(True, conflicts=True), "text", 1, "error", "another value, weekday or source (17, 18c)"),
         (
-            read(("v0", 0, False), ("an aside", None, False)),
-            gold("text"),
-            "success",
-            "an aside costs nothing",
-        ),
-        (read(back=True), gold("text"), "fallback", "holds back, commits nothing"),
-        (read(("w", None, False)), gold("text"), "error", "another value"),
-        (read(("w", None, False), back=True), gold("text"), "error", "a wrong value, though it holds back"),
-        (read(("v0", 0, False)), gold("text", 2), "error", "a text asked in two items, one given as whole"),
-        (read(("v0", 0, False), back=True), gold("text", 2), "fallback", "one of two, flagged as partial"),
-        (
-            read(("v0", 0, False), ("w", None, True), hedged=True),
-            gold("text"),
+            read(False, conflicts=True, held=True),
+            "text",
+            1,
             "error",
-            "a hedge fails (decided)",
+            "a denial of the item, though held (i010)",
         ),
+        (read(True, False), "text", 2, "error", "one of two items, given as whole"),
+        (read(True, False, held=True), "text", 2, "fallback", "one of two, flagged as partial"),
+        (read(True, hedged=True), "text", 1, "error", "a hedge (19)"),
+        (read(False), "text", 1, "error", "cut off: no item and no holding back (i076 S7)"),
+        (read(True), "text", 1, "success", "a flat 'never happened' gives 'nothing says it did' (i075 S5)"),
+        (read(True, True, extra=False), "set", 2, "success", "every member, nothing beyond"),
+        (read(True, False, extra=False, held=True), "set", 2, "fallback", "a partial set, flagged (12)"),
+        (read(True, False, extra=False), "set", 2, "error", "a partial set presented as whole (13)"),
+        (read(True, True, extra=True), "set", 2, "error", "a non-member (14)"),
         (
-            read(("v0", 0, False), context=["the 1.4 dB margin"]),
-            gold("text"),
+            read(True),
+            "status",
+            1,
             "success",
-            "a false context detail is an aside, counted not failed (decided)",
+            "scoped, or flat and borne out by what is out of sight (1, 2; h139 S2)",
         ),
-        (read(("v0", 0, False), ("v1", 1, False)), gold("set", 2), "success", "every member, nothing beyond"),
-        (read(("v0", 0, False), back=True), gold("set", 2), "fallback", "a partial set, flagged as partial"),
-        (read(("v0", 0, False)), gold("set", 2), "error", "a partial set presented as whole"),
         (
-            read(("v0", 0, False), ("v1", 1, False), ("v9", None, False)),
-            gold("set", 2),
+            read(True, conflicts=True),
+            "status",
+            1,
             "error",
-            "a non-member",
+            "a claim what is out of sight contradicts (h145 S7)",
+        ),
+        (read(False, held=True), "status", 1, "fallback", "can't tell, without the latest word (3)"),
+        (read(declines=True), "refusal", 0, "success", "declines: it isn't there, or not found (5, 5b, 7)"),
+        (
+            read(declines=False, held=True),
+            "refusal",
+            0,
+            "fallback",
+            "nearby facts flagged as inferred (h147 S3)",
         ),
         (
-            read(("v0", 0, False), claims="unsettled"),
-            gold("status"),
-            "success",
-            "the latest value, not final",
-        ),
-        (read(("v0", 0, False), claims="not_visible"), gold("status"), "success", "the latest visible value"),
-        (
-            read(("v0", 0, False), claims="settled"),
-            gold("status"),
+            read(declines=False, conflicts=True),
+            "refusal",
+            0,
             "error",
-            "an unsettled status given as final",
+            "settles on an answer anyway (6; h147 S2)",
         ),
-        (read(("v0", 0, False)), gold("status"), "error", "a status that never says it is unsettled"),
-        (read(back=True, claims="not_visible"), gold("status"), "fallback", "cannot tell, says so"),
         (
-            read(claims="never_happened"),
-            gold("status", unseen=True),
+            read(declines=True, conflicts=True),
+            "refusal",
+            0,
             "error",
-            "a flat no about the unseen (decided)",
+            "'never happened', contradicted out of sight (8)",
         ),
-        (
-            read(back=True, claims="not_visible"),
-            gold("refusal", 0, True),
-            "success",
-            "cannot be told, says so",
-        ),
-        (read(("w", None, False)), gold("refusal", 0), "error", "answers what cannot be answered"),
-        (
-            read(back=True, claims="never_happened"),
-            gold("refusal", 0),
-            "success",
-            "it does not exist: a refusal",
-        ),
-        (
-            read(back=True, claims="never_happened"),
-            gold("refusal", 0, True),
-            "error",
-            "unseen, yet called false",
+        (read(declines=False), "refusal", 0, "error", "neither declines nor holds back"),
+        pytest.param(
+            read(True), "text", 1, "error", "a right answer on an invented quote (18d)", marks=INVENTED
         ),
     ],
 )
-def test_policy(reading, part, outcome, why):
-    assert part_outcome(reading, part) == outcome, why
+def test_policy(reading, kind, items, outcome, why):
+    assert part_outcome(reading, part(kind, items)) == outcome, why
 
 
 def test_request_and_grade():
-    """A request is a success when every part is, an error when any part is, else a fallback; its grade reads as v1's:
-    a success correct, a fallback abstained, each part aligned under its label."""
+    """A request is a success when every part is, an error when any part is, else a fallback; its grade reads as an
+    AnswerGrade (a success correct, a fallback abstained), each part aligned under its label. A reading must read
+    every part and item, and a set's or a refusal's own criterion, or it misreads and is asked again."""
     assert [
         request_outcome(o) for o in (["success"] * 2, ["success", "fallback"], ["fallback", "error"])
     ] == [
@@ -158,16 +166,11 @@ def test_request_and_grade():
             ),
         ],
     )
-    assert [g["context"] for g in golds(answer)] == [["the date before the slip"], []]
-    assert reader_reference(answer)[1]["answer"] == [
-        {"item": 0, "value": "a"},
-        {"item": 1, "value": "b"},
-    ] and ("unseen" not in json.dumps(reader_reference(answer))), (
-        "the reader sees the numbered items and the context, not what code alone decides on"
-    )
     reading = Reading(
-        parts=[read(("Fri Nov 6", 0, False), label="when"), read(("a", 0, False), back=True, label="who")],
-        reason="r",
+        parts=[
+            read(True, part="when", commits="Fri Nov 6"),
+            read(True, False, extra=False, held=True, part="who", commits="a"),
+        ]
     )
     grade, outcome = graded(reading, answer, grounded=True)
     assert (outcome, grade.correct, grade.abstained) == ("fallback", False, True)
@@ -176,30 +179,38 @@ def test_request_and_grade():
         ("who", False, True),
     ]
     assert grade.missing == ["who: b"] and grade.committed == ["when: Fri Nov 6", "who: a"]
-    aside = Reading(
-        parts=[read(("Nov 6", 0, False), context=["Oct 22"], label="when"), reading.parts[1]], reason="r"
-    )
+    assert grade.reason.startswith("when: success") and "who: fallback" in grade.reason
+    aside = Reading(parts=[read(True, asides=["Oct 22"], part="when"), reading.parts[1]])
     assert graded(aside, answer, grounded=True)[0].unsupported_asides == 1, "a false aside is counted"
-    # A reading's parts are matched by label, in any order; by place when the reader renames them; else it misreads.
-    assert graded(Reading(parts=reading.parts[::-1], reason="r"), answer, grounded=True) == (
-        grade,
-        outcome,
-    ), "a reading out of order grades as in order"
-    renamed = [p.model_copy(update={"label": f"Part {n}"}) for n, p in enumerate(reading.parts, 1)]
-    assert graded(Reading(parts=renamed, reason="r"), answer, grounded=True)[1] == outcome, (
-        "renamed: by place"
+    assert graded(Reading(parts=reading.parts[::-1]), answer, grounded=True) == (grade, outcome), (
+        "in any order"
     )
-    with pytest.raises(Misread, match="reads each of its 2 parts once, not 1"):
-        graded(Reading(parts=[reading.parts[0]], reason="r"), answer, grounded=True)
-    with pytest.raises(Misread, match="not 3"):
-        graded(Reading(parts=[*reading.parts, reading.parts[0]], reason="r"), answer, grounded=True)
+    renamed = [p.model_copy(update={"part": f"Part {n}"}) for n, p in enumerate(reading.parts, 1)]
+    assert graded(Reading(parts=renamed), answer, grounded=True)[1] == outcome, "renamed: by place"
+    for misread, why in (
+        ([reading.parts[0]], "reads each of its 2 parts once, not 1"),
+        ([*reading.parts, reading.parts[0]], "not 3"),
+        (
+            [reading.parts[0], read(True, extra=False, part="who")],
+            "who: gives reads each of its 2 items once",
+        ),
+        ([reading.parts[0], read(True, True, part="who")], "who: its set criterion is unread"),
+    ):
+        with pytest.raises(Misread, match=why):
+            graded(Reading(parts=misread), answer, grounded=True)
+    with pytest.raises(Misread, match="its refusal criterion is unread"):
+        graded(
+            Reading(parts=[read(held=True, part="the answer")]),
+            part("refusal").model_copy(update={"label": None}),
+            True,
+        )
 
 
 def test_release_context():
     """A part's context is its own (v13): a composite's is its parts', and the reference shows it."""
-    part = PrivateAnswer(answer_type="text", rows=[{"answer": "x"}], messages=[], users=[], context=["why"])
-    assert part.reference() == {"answer_type": "text", "rows": [{"answer": "x"}], "context": ["why"]}
-    assert PrivateAnswer.model_validate_json(part.model_dump_json()) == part
+    single = PrivateAnswer(answer_type="text", rows=[{"answer": "x"}], messages=[], users=[], context=["why"])
+    assert single.reference() == {"answer_type": "text", "rows": [{"answer": "x"}], "context": ["why"]}
+    assert PrivateAnswer.model_validate_json(single.model_dump_json()) == single
     with pytest.raises(ValueError, match="context is its parts'"):
         PrivateAnswer(
             answer_type="composite",
@@ -207,13 +218,73 @@ def test_release_context():
             messages=[],
             users=[],
             context=["no"],
-            parts=[part.model_copy(update={"label": "a"}), part.model_copy(update={"label": "b"})],
+            parts=[single.model_copy(update={"label": "a"}), single.model_copy(update={"label": "b"})],
         )
 
 
-async def test_solve_graded_by_v2(tmp_path):
-    """A solve graded by v2: the reader is given no observations when grounding is code's, its reading graded by code,
-    and the evaluation carries the outcome beside v1's fields."""
+def test_gold_as_read(tmp_path):
+    """The reader is shown each part's numbered items and context, and, where its truth is out of the asker's sight,
+    what those messages say, on the asker's clock: never their ids. The answer is fenced as data."""
+    world, _, _ = world_fixture(tmp_path / "world.sqlite")
+    world.solver_copy(tmp_path / "solver.sqlite")
+    hidden = world.db.execute("SELECT channel_id, ts FROM messages WHERE id = 4").fetchone()
+    shown = world.db.execute("SELECT channel_id, ts FROM messages WHERE id = 1").fetchone()
+    answer = PrivateAnswer(
+        answer_type="composite",
+        rows=[],
+        messages=[list(shown)],
+        unseen=[list(hidden)],
+        users=[],
+        parts=[
+            PrivateAnswer(
+                answer_type="text",
+                rows=[{"answer": "rollback"}],
+                messages=[list(shown)],
+                users=[],
+                label="what",
+            ),
+            PrivateAnswer(
+                answer_type="status",
+                rows=[{"answer": "nothing visible says it is approved"}],
+                messages=[],
+                unseen=[list(hidden)],
+                users=[],
+                label="budget",
+                context=["asked on Monday"],
+            ),
+        ],
+    )
+    seen = out_of_sight(str(tmp_path / "solver.sqlite"), "U2", answer)
+    assert seen == [
+        [],
+        [
+            {
+                "from": "Alicia Rao",
+                "where": "#exec",
+                "when": "Mon Jun 15, 11:00",
+                "text": "private: rollback budget approved",
+            }
+        ],
+    ]
+    shown_gold = json.loads(gold(answer, seen))
+    assert shown_gold == [
+        {"part": "what", "answer_type": "text", "items": [{"item": 1, "answer": "rollback"}], "context": []},
+        {
+            "part": "budget",
+            "answer_type": "status",
+            "items": [{"item": 1, "answer": "nothing visible says it is approved"}],
+            "context": ["asked on Monday"],
+            "out_of_sight": seen[1],
+        },
+    ]
+    assert hidden[1] not in gold(answer, seen), "the reader is never given the message's id"
+    assert fenced("plain") == "```\nplain\n```" and fenced("a ```b``` c").startswith("````\n"), (
+        "it can't close the fence"
+    )
+
+
+def rollback(tmp_path):
+    """A one-part task ("What did we decide?": rollback), what its try was shown, and the reader's right reading."""
     world, _, _ = world_fixture(tmp_path / "world.sqlite")
     world.solver_copy(tmp_path / "solver.sqlite")
     ts = world.db.execute("SELECT ts FROM messages WHERE id = 1").fetchone()[0]
@@ -227,64 +298,86 @@ async def test_solve_graded_by_v2(tmp_path):
         answer_type="text",
         world_hash="h",
     )
-    solve = SolverTask.create(
-        task,
-        tmp_path / "solver.sqlite",
-        answer,
-        network_policy=False,
-        grading=Grading(version=2, ground=False),
-    )
-    asked = {}
-
-    async def reading(self, **fields):
-        asked.update(fields)
-        return SimpleNamespace(parsed=Reading(parts=[read(("the rollback", 0, False))], reason="r"))
-
+    solve = SolverTask.create(task, tmp_path / "solver.sqlite", answer, network_policy=False)
     shown = [{"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C1", "ts": ts}]}}]
-    trace = SimpleNamespace(
-        info={"observations": shown}, last_reply="We rolled back.", id="try", record_metrics=lambda m: None
-    )
-    evaluate, AnswerReader.evaluate = AnswerReader.evaluate, reading
-    try:
+    return solve, shown, Reading(parts=[read(True, part="the answer", commits="We rolled back.")])
+
+
+async def test_try_graded_on_a_real_trace(tmp_path):
+    """A try's grade as the forge and the eval take it: on the harness's own trace, through the judge's own call, only
+    the network faked. The reader is asked the request, the gold and the fenced answer; the grade lands with its
+    reading, grounded by code; each paid call (a misread's second reading too) is recorded on the trace, where the forge
+    prices its spend. A reader that misreads every time fails the grade after READINGS readings; an empty answer is an
+    error with no call."""
+    solve, shown, right = rollback(tmp_path)
+    asked = []
+
+    def reply(fields):
+        asked.append(fields)
+        return right
+
+    trace = vf.Trace.model_construct(root_reply="We rolled back.", info={"observations": shown})
+    with live_judging(FakeInference(reply)) as network:
         assert await SolverTask.semantic_correctness(solve, trace) == 1.0
-    finally:
-        AnswerReader.evaluate = evaluate
-    result = trace.info["evaluation"]
-    assert "observations" not in asked and asked["reference"][0]["answer"] == [
-        {"item": 0, "value": "rollback"}
+    assert asked == [
+        {
+            "request": "What did we decide?",
+            "reference": [
+                {
+                    "part": "the answer",
+                    "answer_type": "text",
+                    "items": [{"item": 1, "answer": "rollback"}],
+                    "context": [],
+                }
+            ],
+            "response": "We rolled back.",
+        }
     ]
-    assert (result["outcome"], result["correct"], result["grounded"]) == ("success", True, True), (
-        "grounded by code: its answer rests on a message the try was shown"
+    evaluation = trace.info["evaluation"]
+    assert (evaluation["outcome"], evaluation["correct"], evaluation["grounded"], evaluation["readings"]) == (
+        "success",
+        True,
+        True,
+        1,
+    ) and evaluation["reading"] == right.model_dump(mode="json"), (
+        "graded by code, grounded by code, its reading kept"
     )
-    assert result["readings"] == 1, "read once"
-    # A reader that misreads the parts (here one too many) is asked again, and the grade lands on its next reading; one
-    # that misreads every time fails the grade after READINGS readings, not more. Each reading is its own paid call.
-    calls = []
-
-    def reader(counts):
-        async def reading(self, **fields):
-            calls.append(next(counts))
-            return SimpleNamespace(
-                parsed=Reading(parts=[read(("the rollback", 0, False))] * calls[-1], reason="r")
-            )
-
-        return reading
-
-    AnswerReader.evaluate = reader(iter([2, 1]))
-    try:
+    assert (network.calls, len(trace.info["judge_calls"]), len(trace.extra_usage)) == (1, 1, 1)
+    assert priced(trace.extra_usage[0].model_dump(mode="json"), "z-ai/glm-5.3") == pytest.approx(0.01)
+    assert json.loads(json.dumps(trace.info)), "the trace saves"
+    # A misread (one part too many) is asked again: two paid calls, both recorded; one that misreads every time fails.
+    readings = iter([right.model_copy(update={"parts": right.parts * 2}), right])
+    trace = vf.Trace.model_construct(root_reply="We rolled back.", info={"observations": shown})
+    with live_judging(FakeInference(lambda fields: next(readings))) as network:
         assert await SolverTask.semantic_correctness(solve, trace) == 1.0
-        assert (calls, trace.info["evaluation"]["readings"]) == ([2, 1], 2), "a misread is asked again"
-        calls.clear()
-        AnswerReader.evaluate = reader(iter([2] * 10))
+    assert (network.calls, len(trace.info["judge_calls"]), trace.info["evaluation"]["readings"]) == (2, 2, 2)
+    trace = vf.Trace.model_construct(root_reply="We rolled back.", info={"observations": shown})
+    with live_judging(
+        FakeInference(lambda fields: right.model_copy(update={"parts": right.parts * 2}))
+    ) as network:
         with pytest.raises(Misread):
             await SolverTask.semantic_correctness(solve, trace)
-        assert calls == [2] * READINGS, ("asked READINGS times, then the grade fails", calls)
-    finally:
-        AnswerReader.evaluate = evaluate
-    asks = AnswerReader(solve.config.judge).build_messages(question="q", reference=[], response="r")
-    assert "Do not grade it" in asks[0].content and "decide grounded" not in asks[0].content
-    grounding = AnswerReader(solve.config.judge).build_messages(
-        question="q", reference=[], response="r", observations=[]
+    assert network.calls == len(trace.info["judge_calls"]) == READINGS, (
+        "asked READINGS times, each paid and kept"
     )
-    assert "decide grounded" in grounding[0].content
-    await asyncio.sleep(0)
+    # Grounded by message: a right answer whose try never saw the gold's message is right but ungrounded (0).
+    elsewhere = [
+        {"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C9", "ts": "1.000001"}]}}
+    ]
+    trace = vf.Trace.model_construct(root_reply="We rolled back.", info={"observations": elsewhere})
+    with live_judging(FakeInference(lambda fields: right)):
+        assert await SolverTask.semantic_correctness(solve, trace) == 0.0
+    assert trace.info["evaluation"]["correct"] and not trace.info["evaluation"]["grounded"]
+    trace = vf.Trace.model_construct(root_reply="  ", info={"observations": shown})
+    with live_judging(FakeInference(lambda fields: right)) as network:
+        assert await SolverTask.semantic_correctness(solve, trace) == -1.0
+    assert network.calls == 0 and trace.info["evaluation"]["outcome"] == "error", "an empty answer: no call"
+
+
+def test_prompt_fields():
+    """The flows' provider reads the prompt as the reader does: the fenced answer comes back whole."""
+    solve_prompt = (
+        "x\n\nThe request:\nq\n\nThe gold, by part:\n[]\n\nThe answer, between the fences:\n"
+        + fenced("a\n```b```")
+    )
+    assert answer_fields(solve_prompt) == {"request": "q", "reference": [], "response": "a\n```b```"}

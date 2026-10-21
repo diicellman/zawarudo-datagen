@@ -5,9 +5,10 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from worldgen_slack.judge import EMPTY, AnswerGrade, AnswerJudge, PartGrade
+import verifiers.v1 as vf
+from worldgen_slack.judge import EMPTY, AnswerGrade, Check, Gives, PartReading, Reading, reward
 from worldgen_slack.release import PrivateAnswer, PublicTask, Solution, load_release
-from worldgen_slack.slack import compact, people_shown, shown
+from worldgen_slack.slack import people_shown, shown
 from worldgen_slack.taskset import SolverTask
 from worldgen_slack.world import file_hash
 
@@ -26,6 +27,7 @@ from ..judge.verdict import (
     verdict_schema,
 )
 from ..workspace import Workspace
+from .flows import FakeInference, live_judging
 from .support import contracts_settings, fails, served_tools, with_state, world_fixture
 
 
@@ -190,16 +192,9 @@ async def test_reviews(tmp_path):
     )
     assert "rollback" not in solve.data.model_dump_json() + solve.config.tools.model_dump_json()
     assert solve.config.tools.db_hash == file_hash(tmp_path / "solver.sqlite")
-    # The answer judge grades the answer the response commits to and grounds the claims that make it; an unsupported
-    # aside is counted, and costs nothing.
-    asks = AnswerJudge(solve.config.judge).build_messages(
-        question="q", reference={}, response="r", observations=[]
-    )
-    assert (
-        "lists alternatives without settling on one is wrong" in asks[0].content
-        and "do not change grounded" in asks[0].content
-        and "a value named only in passing, as an aside or a side option, is not committed" in asks[0].content
-    ), "a row named in passing does not complete a set"
+    # The answer judge: graded on the try's own trace through the judge's own call, the network faked. A right answer
+    # the gold's message grounds scores +1; its false asides are counted and cost nothing; the gold's evidence it saw is
+    # measured (here its message, not its person).
     assert "never ask for a decoy to be\ncorrected or hedged" in PHASE_GUIDES["world"], (
         "the world judge knows a decoy is planned"
     )
@@ -211,17 +206,36 @@ async def test_reviews(tmp_path):
             "output": {"items": [{"channel": "C1", "ts": answer.messages[0][1]}]},
         }
     ]
-    assert (
-        "A status reference is the latest value the asker can see" in asks[0].content
-        and "has abstained" in asks[0].content
+    right = Reading(
+        parts=[
+            PartReading(
+                part="the answer",
+                commits="rollback",
+                gives=[Gives(item=1, reason="r", verdict=True)],
+                conflicts=Check(reason="r", verdict=False),
+                extra=None,
+                hedged=Check(reason="r", verdict=False),
+                holds_back=Check(reason="r", verdict=False),
+                declines=None,
+                false_asides=["the 4.1 date", "the owner"],
+            )
+        ]
     )
+
+    async def scored(observations, reply="rollback"):
+        trace = vf.Trace.model_construct(root_reply=reply, info={"observations": observations})
+        with live_judging(FakeInference(lambda fields: right)) as network:
+            score = await SolverTask.semantic_correctness(solve, trace)
+        return score, trace.info["evaluation"], network.calls
+
+    score, evaluation, _ = await scored(observed)
+    assert (score, evaluation["unsupported_asides"], evaluation["evidence_coverage"]) == (1.0, 2, 0.5)
     # The reward: +1 right and grounded, 0 right but ungrounded or declined, -1 wrong (an aside costs nothing).
-    for correct, abstained, grounded, asides, score in (
+    for correct, abstained, grounded, asides, value in (
         (True, False, True, 2, 1.0),
         (True, False, False, 0, 0.0),
         (False, True, False, 0, 0.0),
         (False, False, False, 0, -1.0),
-        (True, True, True, 0, 1.0),
         (False, False, True, 0, -1.0),
     ):
         grade = AnswerGrade(
@@ -234,54 +248,7 @@ async def test_reviews(tmp_path):
             extra=[],
             reason="r",
         )
-        trace = SimpleNamespace(
-            info={"observations": observed}, last_reply="rollback", id="try", record_metrics=lambda m: None
-        )
-        judged = AnswerJudge.evaluate
-        AnswerJudge.evaluate = lambda self, **fields: asyncio.sleep(0, SimpleNamespace(parsed=grade))
-        try:
-            assert await SolverTask.semantic_correctness(solve, trace) == score, (
-                correct,
-                abstained,
-                grounded,
-            )
-        finally:
-            AnswerJudge.evaluate = judged
-        assert (
-            trace.info["evaluation"]["unsupported_asides"] == asides
-            and trace.info["evaluation"]["evidence_coverage"] == 0.5
-        )
-    # Grounded by message: tries never shown the gold's messages are ungrounded, whatever the judge says.
-    elsewhere = [
-        {"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C9", "ts": "1.000001"}]}}
-    ]
-    grade = AnswerGrade(
-        correct=True,
-        abstained=False,
-        grounded=True,
-        unsupported_asides=0,
-        committed=["x"],
-        missing=[],
-        extra=[],
-        reason="r",
-    )
-    trace = SimpleNamespace(
-        info={"observations": elsewhere}, last_reply="rollback", id="try", record_metrics=lambda m: None
-    )
-    judged, AnswerJudge.evaluate = (
-        AnswerJudge.evaluate,
-        lambda self, **fields: asyncio.sleep(0, SimpleNamespace(parsed=grade)),
-    )
-    try:
-        assert (
-            await SolverTask.semantic_correctness(solve, trace) == 0.0
-            and not trace.info["evaluation"]["grounded"]
-        )
-    finally:
-        AnswerJudge.evaluate = judged
-    # The grader reads what the calls showed, each thing once, and aligns the answer it commits to with the reference;
-    # an empty response is wrong by rule, with no grader call.
-    assert "Then align: committed lists the answer the response commits to" in asks[0].content
+        assert reward(grade) == value, (correct, abstained, grounded)
     gold_ts = answer.messages[0][1]
     calls = [
         {
@@ -293,13 +260,6 @@ async def test_reviews(tmp_path):
             "tool": "read_channel",
             "arguments": {},
             "output": {"items": [{"channel": "C1", "ts": gold_ts, "user": "U1", "text": "a"}]},
-        },
-        {
-            "tool": "search_public",
-            "arguments": {"keywords": ["a"]},
-            "output": {
-                "items": [{"channel": "C1", "ts": gold_ts, "user": "U1", "text": "a", "channel_name": "c"}]
-            },
         },
         {
             "tool": "get_reactions",
@@ -316,12 +276,6 @@ async def test_reviews(tmp_path):
             "output": {"items": ["U4", "U2"], "next_cursor": None},
         },
     ]
-    view = compact(calls)
-    assert [(m["ts"], m.get("channel_name")) for m in view["messages"]] == [(gold_ts, "c")], (
-        "a message once, merged"
-    )
-    assert view["messages"][0]["reactions"][0]["users"] == ["U3"] and view["members"] == {"C1": ["U2", "U4"]}
-    assert [c["results"] for c in view["calls"]] == [0, 1, 1, 1, 2], "an empty search stays in the log"
     assert set().union(*map(people_shown, calls)) == {"U1", "U2", "U3", "U4"}, (
         "authors, reactors, members are seen"
     )
@@ -347,41 +301,12 @@ async def test_reviews(tmp_path):
         "U1",
         "U5",
     }, "a hit's context is shown too"
-    passed = {}
-
-    async def graded(self, **fields):
-        passed.update(fields)
-        return SimpleNamespace(
-            parsed=AnswerGrade(
-                correct=True,
-                abstained=False,
-                grounded=True,
-                unsupported_asides=0,
-                committed=["x"],
-                missing=[],
-                extra=[],
-                reason="r",
-            )
-        )
-
-    trace = SimpleNamespace(
-        info={"observations": calls}, last_reply="rollback", id="try", record_metrics=lambda m: None
-    )
-    judged, AnswerJudge.evaluate = AnswerJudge.evaluate, graded
-    try:
-        assert await SolverTask.semantic_correctness(solve, trace) == 1.0
-        assert passed["observations"] == view and trace.info["evaluation"]["evidence_coverage"] == 1.0, (
-            "U1 is seen as the gold message's author"
-        )
-        passed.clear()
-        trace = SimpleNamespace(
-            info={"observations": calls}, last_reply="  ", id="try", record_metrics=lambda m: None
-        )
-        assert await SolverTask.semantic_correctness(solve, trace) == -1.0 and not passed, "no grader call"
-        empty = trace.info["evaluation"]
-        assert empty["reason"] == EMPTY and empty["missing"] == [str(r["answer"]) for r in answer.rows]
-    finally:
-        AnswerJudge.evaluate = judged
+    score, evaluation, _ = await scored(calls)
+    assert score == 1.0 and evaluation["evidence_coverage"] == 1.0, "U1 is seen as the gold message's author"
+    # An empty response is wrong by rule, with no grader call.
+    score, empty, called = await scored(calls, reply="  ")
+    assert (score, called, empty["reason"]) == (-1.0, 0, EMPTY)
+    assert empty["missing"] == [str(r["answer"]) for r in answer.rows]
     write_release(tmp_path / "release", tmp_path / "solver.sqlite", [task], {"t1": answer})
     assert load_release(tmp_path / "release")[1:] == ([task], {"t1": answer})
     manifest = json.loads((tmp_path / "release" / "manifest.json").read_text())
@@ -424,10 +349,10 @@ async def test_reviews(tmp_path):
     )
 
 
-async def test_composite_grade(tmp_path, monkeypatch):
-    """A composite request's answer is its parts', each under its label; the answer judge grades each part, and code
-    settles the whole, all or nothing: right only when every part is, declined when no part is wrong and one was
-    declined, grounded only when each part was shown what it rests on. A release carries it whole (v11)."""
+async def test_composite_grade(tmp_path):
+    """A composite request's answer is its parts', each under its label; the reader reads each part, and code settles
+    the whole, all or nothing: right only when every part is, held back when no part is wrong and one was held back,
+    grounded only when each part was shown what it rests on. A release carries it whole (v11)."""
     world, at, message = world_fixture(tmp_path / "world.sqlite")
     world.solver_copy(tmp_path / "solver.sqlite")
     ts = dict(world.db.execute("SELECT id, ts FROM messages").fetchall())
@@ -500,10 +425,6 @@ async def test_composite_grade(tmp_path, monkeypatch):
         family="catch-up",
     )
     solve = SolverTask.create(task, tmp_path / "solver.sqlite", answer, network_policy=False)
-    asks = AnswerJudge(solve.config.judge).build_messages(
-        question="q", reference={}, response="r", observations=[]
-    )
-    assert "grade each part on its own by the rules above" in asks[0].content
 
     def read(*ids):
         return [
@@ -511,58 +432,49 @@ async def test_composite_grade(tmp_path, monkeypatch):
             for i in ids
         ]
 
-    def grade(*parts, correct=True, grounded=True):
-        return AnswerGrade(
-            correct=correct,  # the grader's word on the whole, which code does not read
-            abstained=False,
-            grounded=grounded,
-            unsupported_asides=0,
-            committed=[],
-            missing=[],
-            extra=[],
-            reason="r",
+    def reading(*parts):
+        """The reader's report: each part right (gives its row), wrong (conflicts) or held back, by label."""
+        return Reading(
             parts=[
-                PartGrade(
-                    label=f"part {n}",
-                    correct=right,
-                    abstained=declined,
-                    committed=[] if declined else ["x"],
-                    missing=[] if right else ["y"],
-                    extra=[],
+                PartReading(
+                    part=label,
+                    commits="" if how == "held" else "x",
+                    gives=[Gives(item=1, reason="r", verdict=how == "right")],
+                    conflicts=Check(reason="r", verdict=how == "wrong"),
+                    extra=None,
+                    hedged=Check(reason="r", verdict=False),
+                    holds_back=Check(reason="r", verdict=how == "held"),
+                    declines=None,
+                    false_asides=[],
                 )
-                for n, (right, declined) in enumerate(parts, 1)
-            ],
+                for label, how in zip(("who called it", "who posted the notes"), parts)
+            ]
         )
 
-    async def scored(graded, observations, reply="Alicia Rao called it; Owen Sato posted the notes."):
-        async def complete(self, messages, **kwargs):
-            return SimpleNamespace(parsed=graded)
+    async def scored(read_as, observations, reply="Alicia Rao called it; Owen Sato posted the notes."):
+        trace = vf.Trace.model_construct(root_reply=reply, info={"observations": observations})
+        with live_judging(FakeInference(lambda fields: read_as)):
+            return await SolverTask.semantic_correctness(solve, trace), trace.info["evaluation"]
 
-        monkeypatch.setattr(AnswerJudge, "complete", complete)
-        trace = SimpleNamespace(
-            info={"observations": observations}, last_reply=reply, id="try", record_metrics=lambda m: None
-        )
-        return await SolverTask.semantic_correctness(solve, trace), trace.info["evaluation"]
-
-    score, evaluation = await scored(grade((True, False), (True, False)), read(1, 3))
+    score, evaluation = await scored(reading("right", "right"), read(1, 3))
     assert score == 1.0 and [p["label"] for p in evaluation["parts"]] == [
         "who called it",
         "who posted the notes",
     ], "every part right and grounded; the labels are the reference's"
-    score, evaluation = await scored(grade((True, False), (False, False), correct=True), read(1, 3))
+    score, evaluation = await scored(reading("right", "wrong"), read(1, 3))
     assert (
-        score == -1.0 and not evaluation["correct"] and evaluation["missing"] == ["who posted the notes: y"]
-    ), "one part wrong is the whole wrong, whatever the grader says of the whole"
-    score, evaluation = await scored(grade((True, False), (False, True), correct=False), read(1, 3))
-    assert score == 0.0 and evaluation["abstained"], "what it could not tell, declined, costs nothing"
-    score, evaluation = await scored(grade((False, False), (False, True), correct=False), read(1, 3))
-    assert score == -1.0 and not evaluation["abstained"], "a wrong part is not undone by a declined one"
-    score, evaluation = await scored(grade((True, False), (True, False)), read(1))
+        score == -1.0
+        and not evaluation["correct"]
+        and evaluation["missing"] == ["who posted the notes: Owen Sato"]
+    ), "one part wrong is the whole wrong"
+    score, evaluation = await scored(reading("right", "held"), read(1, 3))
+    assert score == 0.0 and evaluation["abstained"], "what it could not tell, held back, costs nothing"
+    score, evaluation = await scored(reading("wrong", "held"), read(1, 3))
+    assert score == -1.0 and not evaluation["abstained"], "a wrong part is not undone by a held one"
+    score, evaluation = await scored(reading("right", "right"), read(1))
     assert score == 0.0 and not evaluation["grounded"], "each part grounded by its own messages"
     assert evaluation["part_coverage"] == [1.0, 0.0] and evaluation["evidence_coverage"] == 0.5
-    with pytest.raises(ValueError, match="each of its 2 parts"):
-        await scored(grade((True, False)), read(1, 3))
-    score, evaluation = await scored(grade(), read(1, 3), reply=" ")
+    score, evaluation = await scored(reading("right", "right"), read(1, 3), reply=" ")
     assert score == -1.0 and [p["missing"] for p in evaluation["parts"]] == [["Alicia Rao"], ["Owen Sato"]], (
         "an empty response lacks every part's rows"
     )
