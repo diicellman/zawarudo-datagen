@@ -24,13 +24,14 @@ from worldgen_slack.taskset import SolverTask
 from .support import world_fixture
 
 
-def read(*commits, hedged=False, back=False, claims="none", context=(), label="p") -> PartReading:
+def read(*commits, hedged=False, back=False, final=False, unseen=False, context=(), label="p") -> PartReading:
     return PartReading(
         label=label,
         committed=[Commit(value=v, item=i, contradicts=x) for v, i, x in commits],
         hedged=hedged,
         holds_back=back,
-        claims=claims,
+        as_final=final,
+        asserts_unseen=unseen,
         contradicts_context=list(context),
     )
 
@@ -81,46 +82,25 @@ def gold(kind: str, items: int = 1, unseen: bool = False) -> dict:
             "error",
             "a non-member",
         ),
+        (read(("v0", 0, False)), gold("status"), "success", "the latest visible value, not as final"),
         (
-            read(("v0", 0, False), claims="unsettled"),
-            gold("status"),
-            "success",
-            "the latest value, not final",
-        ),
-        (read(("v0", 0, False), claims="not_visible"), gold("status"), "success", "the latest visible value"),
-        (
-            read(("v0", 0, False), claims="settled"),
+            read(("v0", 0, False), final=True),
             gold("status"),
             "error",
-            "an unsettled status given as final",
+            "an unsettled status presented as final",
         ),
-        (read(("v0", 0, False)), gold("status"), "error", "a status that never says it is unsettled"),
-        (read(back=True, claims="not_visible"), gold("status"), "fallback", "cannot tell, says so"),
+        (read(back=True), gold("status"), "fallback", "cannot tell, says so"),
         (
-            read(claims="never_happened"),
+            read(("v0", 0, False), unseen=True),
             gold("status", unseen=True),
             "error",
-            "a flat no about the unseen (decided)",
+            "a flat assertion about the unseen, though the value is stated (decided)",
         ),
-        (
-            read(back=True, claims="not_visible"),
-            gold("refusal", 0, True),
-            "success",
-            "cannot be told, says so",
-        ),
+        (read(unseen=True), gold("status", unseen=True), "error", "a flat no about the unseen (decided)"),
+        (read(back=True), gold("refusal", 0, True), "success", "cannot be told, says so"),
         (read(("w", None, False)), gold("refusal", 0), "error", "answers what cannot be answered"),
-        (
-            read(back=True, claims="never_happened"),
-            gold("refusal", 0),
-            "success",
-            "it does not exist: a refusal",
-        ),
-        (
-            read(back=True, claims="never_happened"),
-            gold("refusal", 0, True),
-            "error",
-            "unseen, yet called false",
-        ),
+        (read(back=True, unseen=True), gold("refusal", 0), "success", "it does not exist: a refusal"),
+        (read(back=True, unseen=True), gold("refusal", 0, True), "error", "unseen, yet called false"),
     ],
 )
 def test_policy(reading, part, outcome, why):

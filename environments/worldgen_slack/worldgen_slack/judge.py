@@ -186,7 +186,10 @@ class PartReading(StrictModel):
     committed: list[Commit]
     hedged: bool
     holds_back: bool
-    claims: Literal["settled", "unsettled", "not_visible", "never_happened", "none"]
+    as_final: bool = False  # presents the part's state as final, done or confirmed
+    asserts_unseen: bool = (
+        False  # flatly asserts as fact what the asker cannot see, not scoped to what is visible
+    )
     contradicts_context: list[str] = []
     slips: list[str] = []
 
@@ -214,11 +217,11 @@ def golds(reference: PrivateAnswer) -> list[dict]:
 
 def part_outcome(reading: PartReading, gold: dict) -> Outcome:
     """A part's outcome by the grading policy. Any committed falsehood is an error: a hedge, a value that contradicts
-    the reference's answer, a status given as settled, and a flat "it never happened" about a truth out of the asker's
-    sight. A detail beside what was asked (its context, or anything the request does not ask for) decides nothing: a
+    the reference's answer, an unsettled status presented as final, and a flat assertion about a truth out of the
+    asker's sight ("it never came in"). A detail beside what was asked (its context, or anything the request does not ask for) decides nothing: a
     false one is counted as an aside. Then: a refusal succeeds when it holds back; a set when it states every item and nothing beyond
     them, and falls back when it flags a partial answer that adds nothing false; a status when it states the latest
-    visible value and says it is unsettled or out of sight; a text or number when it states every answer item (a split
+    visible value without presenting it as final; a text or number when it states every answer item (a split
     gold may ask for more than one). Holding back with nothing committed, or with only some items and none beyond them,
     is a fallback; committing a value that states no item, or part of the answer as if whole, is an error."""
     kind, count = gold["answer_type"], len(gold["items"])
@@ -227,8 +230,8 @@ def part_outcome(reading: PartReading, gold: dict) -> Outcome:
     if (
         reading.hedged
         or any(c.contradicts for c in reading.committed)
-        or (kind == "status" and reading.claims == "settled")
-        or (reading.claims == "never_happened" and gold["unseen"])
+        or (kind == "status" and reading.as_final)
+        or (reading.asserts_unseen and gold["unseen"])
     ):
         return "error"
     if kind == "refusal":
@@ -238,9 +241,7 @@ def part_outcome(reading: PartReading, gold: dict) -> Outcome:
         if complete and not stray:
             return "success"
         return "fallback" if reading.holds_back and not stray else "error"
-    if kind == "status" and complete:
-        return "success" if reading.claims in ("unsettled", "not_visible") else "error"
-    if kind != "status" and complete:
+    if complete:
         return "success"
     if reading.holds_back and not stray:
         return "fallback"  # nothing committed, or only some of what is asked, flagged as partial
@@ -309,10 +310,12 @@ READ = (
     "as Slack shows') holds back. A value it settles on, though framed as an inference or with a caveat, is committed. "
     "A value named only in passing, as an aside or a side option, is not committed. hedged: it offers alternatives for "
     "the part without settling on one. holds_back: it says it cannot find, see or confirm the part, or flags its "
-    "answer as partial. claims: what it says of the part's state: settled (final, done, decided), unsettled (not final "
-    "or not confirmed), not_visible (out of the asker's sight), never_happened (it did not or will not happen, or does "
-    "not exist), or none. contradicts_context: the details beside the answer that the context contradicts (false "
-    "asides). Then a concise reason."
+    "answer as partial. as_final: it presents the part's state as final, done, decided or confirmed (not merely the "
+    "latest that can be seen). asserts_unseen: it flatly asserts as fact something the asker could not see in Slack "
+    "(that a thing never happened, never arrived, was never done, or exists nowhere), rather than scoping it to what "
+    "is visible ('nothing in Slack says so', 'as far as I can see'); a scoped statement is not an assertion. "
+    "contradicts_context: the details beside the answer that the context contradicts (false asides). Then a concise "
+    "reason."
 )
 GROUND = (
     " Also decide grounded: whether the observations (what the solver's calls showed: messages in time order, the "
