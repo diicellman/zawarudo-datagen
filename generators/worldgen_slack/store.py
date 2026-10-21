@@ -98,6 +98,16 @@ class SessionLost(RuntimeError):
     """An author's session ended on an error that is none of its own limits: its sandbox, tunnel or provider."""
 
 
+# What a run may change between its start and a resume: limits on when it stops, not what it makes. A forge whose
+# books came to match its bill (2026-10-21) had passed the spend guard its start set, with work left to do.
+LIMITS = {"spend_limit", "max_resumes", "max_losses"}
+
+
+def comparable(manifest: dict) -> dict:
+    """A run's provenance as a resume must share it: everything but its limits."""
+    return manifest | {"config": {k: v for k, v in manifest.get("config", {}).items() if k not in LIMITS}}
+
+
 class Store:
     def __init__(self, root: Path, config: dict):
         self.root = root.resolve()
@@ -107,7 +117,7 @@ class Store:
         fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         manifest = self.root / "run.json"
         if manifest.exists():
-            if read_json(manifest) != config:
+            if comparable(read_json(manifest)) != comparable(config):
                 raise ValueError("resume configuration differs; use a new output directory")
             self.state = RunState.model_validate_json((self.root / "state.json").read_bytes())
             self.world = Workspace(self.root / "world.sqlite", writable=True)

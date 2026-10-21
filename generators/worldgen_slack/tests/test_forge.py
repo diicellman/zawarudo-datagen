@@ -17,6 +17,7 @@ from ..forge.release import level, release_rows, report
 from ..forge.tasks import Part, Task, answer_text, check, key, private_answer
 from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached, transient
 from ..prices import priced
+from ..store import Store
 from .support import contracts_settings, forge_of, refused, world_fixture
 
 
@@ -389,6 +390,18 @@ def test_provenance_of_later_settings(tmp_path):
     assert "grading" not in provenance(config)["config"]
     v2 = config.model_copy(update={"grading": Grading(version=2, ground=False)})
     assert provenance(v2)["config"]["grading"] == {"version": 2, "ground": False}
+
+
+def test_resume_limits(tmp_path):
+    """A run resumes with other limits (when it stops), never with another configuration (what it makes)."""
+    manifest = {"config": {"tries": 8, "spend_limit": 600.0, "max_resumes": 3}, "world_hash": "w"}
+    Store(tmp_path / "run", manifest).close()
+    raised = manifest | {"config": manifest["config"] | {"spend_limit": 700.0, "max_resumes": 5}}
+    store = Store(tmp_path / "run", raised)
+    assert store.settings["spend_limit"] == 700.0, "the limit the run resumes with"
+    store.close()
+    with pytest.raises(ValueError, match="resume configuration differs"):
+        Store(tmp_path / "run", manifest | {"config": manifest["config"] | {"tries": 4}})
 
 
 def test_spend_and_labels(tmp_path):
