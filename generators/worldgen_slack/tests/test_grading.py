@@ -7,9 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 from worldgen_slack.judge import (
+    READINGS,
     AnswerReader,
     Commit,
     Grading,
+    Misread,
     PartReading,
     Reading,
     golds,
@@ -178,8 +180,19 @@ def test_request_and_grade():
         parts=[read(("Nov 6", 0, False), context=["Oct 22"], label="when"), reading.parts[1]], reason="r"
     )
     assert graded(aside, answer, grounded=True)[0].unsupported_asides == 1, "a false aside is counted"
-    with pytest.raises(ValueError, match="reads each of its 2 parts"):
+    # A reading's parts are matched by label, in any order; by place when the reader renames them; else it misreads.
+    assert graded(Reading(parts=reading.parts[::-1], reason="r"), answer, grounded=True) == (
+        grade,
+        outcome,
+    ), "a reading out of order grades as in order"
+    renamed = [p.model_copy(update={"label": f"Part {n}"}) for n, p in enumerate(reading.parts, 1)]
+    assert graded(Reading(parts=renamed, reason="r"), answer, grounded=True)[1] == outcome, (
+        "renamed: by place"
+    )
+    with pytest.raises(Misread, match="reads each of its 2 parts once, not 1"):
         graded(Reading(parts=[reading.parts[0]], reason="r"), answer, grounded=True)
+    with pytest.raises(Misread, match="not 3"):
+        graded(Reading(parts=[*reading.parts, reading.parts[0]], reason="r"), answer, grounded=True)
 
 
 def test_release_context():
@@ -243,6 +256,31 @@ async def test_solve_graded_by_v2(tmp_path):
     assert (result["outcome"], result["correct"], result["grounded"]) == ("success", True, True), (
         "grounded by code: its answer rests on a message the try was shown"
     )
+    assert result["readings"] == 1, "read once"
+    # A reader that misreads the parts (here one too many) is asked again, and the grade lands on its next reading; one
+    # that misreads every time fails the grade after READINGS readings, not more. Each reading is its own paid call.
+    calls = []
+
+    def reader(counts):
+        async def reading(self, **fields):
+            calls.append(next(counts))
+            return SimpleNamespace(
+                parsed=Reading(parts=[read(("the rollback", 0, False))] * calls[-1], reason="r")
+            )
+
+        return reading
+
+    AnswerReader.evaluate = reader(iter([2, 1]))
+    try:
+        assert await SolverTask.semantic_correctness(solve, trace) == 1.0
+        assert (calls, trace.info["evaluation"]["readings"]) == ([2, 1], 2), "a misread is asked again"
+        calls.clear()
+        AnswerReader.evaluate = reader(iter([2] * 10))
+        with pytest.raises(Misread):
+            await SolverTask.semantic_correctness(solve, trace)
+        assert calls == [2] * READINGS, ("asked READINGS times, then the grade fails", calls)
+    finally:
+        AnswerReader.evaluate = evaluate
     asks = AnswerReader(solve.config.judge).build_messages(question="q", reference=[], response="r")
     assert "Do not grade it" in asks[0].content and "decide grounded" not in asks[0].content
     grounding = AnswerReader(solve.config.judge).build_messages(

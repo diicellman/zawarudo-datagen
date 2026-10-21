@@ -30,7 +30,7 @@ from .tries import Tries, agreeing, by_part, patient, rates, reached
 
 GRADE = (
     "correct", "abstained", "grounded", "unsupported_asides", "committed", "missing", "extra", "reason", "parts",
-    "outcome", "semantic_correctness", "evidence_coverage", "part_coverage",
+    "outcome", "readings", "semantic_correctness", "evidence_coverage", "part_coverage",
 )  # fmt: skip
 
 
@@ -129,7 +129,7 @@ async def regrade(
         budget = budget if budget is not None else PER_GRADE * len(todo)
         tries = Tries(config, store)
         world, gate = tries.copy(), asyncio.Semaphore(config.solvers)
-        done, failed, outcomes, spent, stop = [], [], Counter(), [0.0], []
+        done, failed, outcomes, spent, reread, stop = [], [], Counter(), [0.0], [0], []
 
         async def one(task_id: str, book: str, n: int) -> None:
             if stop:
@@ -154,6 +154,7 @@ async def regrade(
             else:
                 evaluation = graded.info["evaluation"]
                 outcomes[evaluation.get("outcome")] += 1
+                reread[0] += evaluation.get("readings", 1) > 1  # the reader misread it first: asked again
                 done.append((task_id, book, n))
                 if not sample:
                     entry["results"][n] = (
@@ -182,6 +183,7 @@ async def regrade(
             "spent": round(spent[0], 4),
             "per_grade": round(spent[0] / max(len(done) + len(failed), 1), 4),
             "outcomes": dict(outcomes),
+            "reread": reread[0],
         }
         if sample:
             return {"status": "sampled", **measured, "failures": failed[:5]}

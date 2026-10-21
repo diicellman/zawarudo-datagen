@@ -10,7 +10,17 @@ from pydantic import Field
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 
 from .config import role
-from .judge import AnswerJudge, AnswerReader, Grading, empty_grade, graded, reader_reference, reward
+from .judge import (
+    READINGS,
+    AnswerJudge,
+    AnswerReader,
+    Grading,
+    Misread,
+    empty_grade,
+    graded,
+    reader_reference,
+    reward,
+)
 from .release import PrivateAnswer, PublicTask, load_release
 from .slack import compact, people_shown, shown
 from .toolset import CallState, SlackToolset, WorldToolsConfig, stage_world
@@ -117,23 +127,33 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         observations = trace.info.get("observations", [])
         reference = self.config.reference
         expected = reference.reference()
-        outcome = None
+        outcome, readings = None, {}
         if not (trace.last_reply or "").strip():
             grade = empty_grade(expected)
         elif self.config.grading.version == 2:
             # v2: the model reads what the answer commits to; code grades it. Grounding is the model's when it is
             # given the observations, else code's alone (below: each part's answer rests on a message it was shown).
+            # A reading that misreads the parts is asked again (each call recorded on the trace, so paid once and
+            # counted): a grade costs a reading, where its try's crash would cost the whole try again.
             grounding = {"observations": compact(observations)} if self.config.grading.ground else {}
-            result = await AnswerReader(self.config.judge).evaluate(
-                trace=trace,
-                question=self.data.prompt,
-                reference=reader_reference(reference),
-                response=trace.last_reply,
-                **grounding,
-            )
-            reading = result.parsed
-            ground = bool(reading.grounded) if self.config.grading.ground else bool(observations)
-            grade, outcome = graded(reading, reference, ground)
+            for n in range(1, READINGS + 1):
+                result = await AnswerReader(self.config.judge).evaluate(
+                    trace=trace,
+                    question=self.data.prompt,
+                    reference=reader_reference(reference),
+                    response=trace.last_reply,
+                    **grounding,
+                )
+                reading = result.parsed
+                ground = bool(reading.grounded) if self.config.grading.ground else bool(observations)
+                try:
+                    grade, outcome = graded(reading, reference, ground)
+                except Misread:
+                    if n == READINGS:
+                        raise
+                else:
+                    readings = {"readings": n}
+                    break
         else:
             result = await AnswerJudge(self.config.judge).evaluate(
                 trace=trace,
@@ -168,6 +188,7 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             "semantic_correctness": score,
             **grade.model_dump(mode="json"),
             "outcome": outcome,
+            **readings,
             "response": trace.last_reply,
             "evidence_coverage": coverage,
             **({"part_coverage": [covered(p) for p in reference.parts]} if reference.parts else {}),

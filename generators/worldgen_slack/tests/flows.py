@@ -3,6 +3,7 @@ answer judge), the agent's VM as files, and a world, the forge, a measure and a 
 CLI with them. The behaviour lock and the viewer's check run them too."""
 
 import asyncio
+import contextvars
 import io
 import json
 import random
@@ -103,6 +104,21 @@ def scripted_reading(fields: dict) -> Reading:
         ],
         reason="scripted",
     )
+
+
+def misreading_first(answer):
+    """A reader that misreads each try's first reading (one part too many), then reads as `answer` does. Each try's
+    grade runs in its own task, so a context variable is its own."""
+    first = contextvars.ContextVar("first", default=True)
+
+    def reading(fields: dict) -> Reading:
+        read = answer(fields)
+        if first.get():
+            first.set(False)
+            return read.model_copy(update={"parts": [*read.parts, read.parts[0]]})
+        return read
+
+    return reading
 
 
 REAL_COMPLETE = vf.Judge.complete  # the judges' own call, before the flows script it
@@ -1564,15 +1580,17 @@ async def forge_flow(root, world_dir, settings):
         with pytest.raises(RuntimeError, match=f"its first {FAIL_FAST} grades all failed"):
             await regrade(v2, splits)
     assert broken.calls <= FAIL_FAST + plan.solvers, ("it stops, not grading every try", broken.calls)
-    # A live sample: five tries graded and their cost measured, nothing changed.
-    with live_judging(FakeInference(scripted_reading)):
+    # A live sample: five tries graded and their cost measured, nothing changed. Its reader misreads each try's first
+    # reading: the grade asks again, and both readings are paid and counted.
+    with live_judging(FakeInference(misreading_first(scripted_reading))) as sampler:
         sampled = await regrade(v2, splits, sample=5)
-    assert (sampled["status"], sampled["graded"], sampled["failed"], sampled["per_grade"]) == (
+    assert (sampled["status"], sampled["graded"], sampled["failed"], sampled["reread"]) == (
         "sampled",
         5,
         0,
-        0.01,
+        5,
     ), sampled
+    assert sampler.calls == 10 and sampled["per_grade"] == 0.02, ("two readings a try, both counted", sampled)
     # The regrade: every try graded once, paid once, its cost measured; the labels stand.
     with live_judging(FakeInference(scripted_reading)) as network:
         summary = await regrade(v2, splits)
@@ -1580,6 +1598,7 @@ async def forge_flow(root, world_dir, settings):
     assert network.calls == summary["tries"] == summary["graded"] and summary["spent"] == pytest.approx(
         0.01 * summary["tries"]
     ), ("each grade paid once", network.calls, summary)
+    assert summary["reread"] == 0, summary
     assert sum(counts.values()) == tried, "no try runs again"
     store = TestStore(plan.output, forge_provenance(plan))
     i001 = store.state.forged["i001"]

@@ -254,12 +254,31 @@ def request_outcome(outcomes: list[Outcome]) -> Outcome:
     return "error" if "error" in outcomes else "fallback"
 
 
+READINGS = 3  # readings a grade asks for before a misread fails it: each a fresh call, paid once
+
+
+class Misread(ValueError):
+    """A reading that does not read the reference's parts: the reader's slip, not the answer's, so it is asked again
+    (READINGS) where an error of the grader's own code is not."""
+
+
+def matched(reading: Reading, parts: list[dict]) -> list[PartReading]:
+    """Each part's reading: by its label when the reading names every part once, in any order; else by its place when
+    it reads as many parts as there are (a reader that renames them); else a Misread."""
+    labels = [g["label"] or "the answer" for g in parts]
+    named = {r.label: r for r in reading.parts}
+    if len(named) == len(reading.parts) == len(parts) and set(named) == set(labels):
+        return [named[label] for label in labels]
+    if len(reading.parts) == len(parts):
+        return list(reading.parts)
+    raise Misread(f"a reading reads each of its {len(parts)} parts once, not {len(reading.parts)}")
+
+
 def graded(reading: Reading, reference: PrivateAnswer, grounded: bool) -> tuple[AnswerGrade, Outcome]:
     """A reading graded by code, as an AnswerGrade (a success correct, a fallback abstained) and its outcome."""
     parts = golds(reference)
-    if len(reading.parts) != len(parts):
-        raise ValueError(f"a reading reads each of its {len(parts)} parts, in order")
-    outcomes = [part_outcome(r, g) for r, g in zip(reading.parts, parts)]
+    readings = matched(reading, parts)
+    outcomes = [part_outcome(r, g) for r, g in zip(readings, parts)]
     outcome = request_outcome(outcomes)
 
     def aligned(r: PartReading, g: dict) -> dict:
@@ -270,13 +289,13 @@ def graded(reading: Reading, reference: PrivateAnswer, grounded: bool) -> tuple[
             "extra": [c.value for c in r.committed if c.item is None],
         }
 
-    own = [aligned(r, g) for r, g in zip(reading.parts, parts)]
+    own = [aligned(r, g) for r, g in zip(readings, parts)]
     composite = reference.answer_type == "composite"
     grade = AnswerGrade(
         correct=outcome == "success",
         abstained=outcome == "fallback",
         grounded=grounded,
-        unsupported_asides=sum(len(r.contradicts_context) for r in reading.parts),
+        unsupported_asides=sum(len(r.contradicts_context) for r in readings),
         committed=[
             (f"{g['label']}: " if composite else "") + v for a, g in zip(own, parts) for v in a["committed"]
         ],
