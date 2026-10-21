@@ -23,7 +23,9 @@ FIELDS = {
     "skill",
     "note",
     "outcome",
-}  # the label panel; a try's outcome
+    "parts",
+    "codes",
+}  # the label panel; a try's outcome, and a blind ruling's outcome by part with its reason codes
 lock = threading.Lock()
 
 
