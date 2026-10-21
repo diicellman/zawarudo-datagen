@@ -115,6 +115,7 @@ async def scripted_complete(self, messages, *, trace=None, schema=None, parse=No
                     else [ReadCommit(value="another answer")],
                     hedged=False,
                     holds_back=False,
+                    claims="unsettled" if part["answer_type"] == "status" else "none",
                 )
                 for part in fields["reference"]
             ],
