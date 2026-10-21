@@ -4,6 +4,8 @@ land, a split decided by a third), the judge's hearing, the spend, the labels an
 import json
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 from worldgen_slack.judge import Grading
 
@@ -13,7 +15,7 @@ from ..forge.judge import Ruling, hearing, rule
 from ..forge.material import material
 from ..forge.release import level, release_rows, report
 from ..forge.tasks import Part, Task, answer_text, check, key, private_answer
-from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached
+from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached, transient
 from ..prices import priced
 from .support import contracts_settings, forge_of, refused, world_fixture
 
@@ -265,7 +267,7 @@ async def test_tries(tmp_path):
     async def flaky():
         calls.append(1)
         if len(calls) < 3:
-            raise RuntimeError("unavailable")
+            raise openai.APIConnectionError(request=httpx.Request("POST", "https://inference"))
         return "ok"
 
     # The verifier's tries that crashed (a provider's refusals) reach nothing and refute nothing: short of `verify`
@@ -276,9 +278,32 @@ async def test_tries(tmp_path):
         await tries.verify(agents, task, "k")
     plan["verifier"] = [True]
     assert [r["correct"] for r in await tries.verify(agents, task, "k")] == [True, True]
-    assert await patient(flaky, timeout=5) == "ok" and len(calls) == 3
-    with pytest.raises(RuntimeError):
-        await patient(lambda: (_ for _ in ()).throw(RuntimeError("down")), timeout=5)
+    assert await patient(flaky, timeout=5) == "ok" and len(calls) == 3, "a lost connection is asked again"
+    bugs = []
+
+    async def broken():  # our own bug after a paid call: asking again pays again for the same failure
+        bugs.append(1)
+        raise AttributeError("'SimpleNamespace' object has no attribute 'record_judge_call'")
+
+    with pytest.raises(AttributeError):
+        await patient(broken, timeout=5)
+    assert len(bugs) == 1, "a bug fails at once, paid for once"
+    limited = openai.RateLimitError(
+        "429", response=httpx.Response(429, request=httpx.Request("POST", "https://x")), body=None
+    )
+    malformed = openai.BadRequestError(
+        "400", response=httpx.Response(400, request=httpx.Request("POST", "https://x")), body=None
+    )
+    assert [
+        transient(e)
+        for e in (TimeoutError(), limited, malformed, ValueError("parts"), RuntimeError("no output"))
+    ] == [
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
     assert tries_module.WAITS == (0, 0, 0), "the checks wait for no provider"
 
 

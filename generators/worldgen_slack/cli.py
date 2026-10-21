@@ -172,6 +172,10 @@ def main() -> int:
     parser.add_argument(
         "--splits", type=Path, help="regrade: reference batches that split golds into answer and context"
     )
+    parser.add_argument("--sample", type=int, help="regrade: grade this many tries live and change nothing")
+    parser.add_argument(
+        "--budget", type=float, help="regrade: stop past this many dollars (default $0.02 a try)"
+    )
     args = parser.parse_args()
     if args.command == "profile":
         if args.world is None:
@@ -186,7 +190,7 @@ def main() -> int:
     elif args.command == "regrade":
         config = load_forge(args.config)
         dry = lambda: forge_regrade.dry_regrade(config, args.splits)  # noqa: E731
-        going = lambda: forge_regrade.regrade(config, args.splits)  # noqa: E731
+        going = lambda: forge_regrade.regrade(config, args.splits, args.sample, args.budget)  # noqa: E731
     elif args.command == "chapter":
         plan, settings = chapter.load_chapter(args.config)
         dry, going = (lambda: chapter.dry_run(plan, settings)), (lambda: run_chapter(plan, settings))

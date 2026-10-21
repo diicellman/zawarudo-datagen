@@ -5,6 +5,8 @@ judge's grade), on one copy of the frozen world, and is kept the moment it lands
 import asyncio
 import math
 
+import httpx
+import openai
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from worldgen_slack.release import PublicTask
 from worldgen_slack.taskset import SolverTask
@@ -84,15 +86,30 @@ def agreeing(results: list[dict]) -> list[dict]:
 WAITS = (5, 30, 120)  # seconds before a call is asked again
 
 
+RETRIED = (408, 409, 425, 429, 500, 502, 503, 504)  # a provider's statuses a call asked again may not meet
+
+
+def transient(error: BaseException) -> bool:
+    """An error of a provider's or the network's, which the same call asked again may not meet: a timeout, a lost
+    connection, a rate limit, a server's error. Anything else (an answer that does not parse, a bug in our own code)
+    fails at once: asked again, it is paid for again and fails again (forge-w2's regrade paid each of 1,610 grades
+    four times over a missing trace method, $166, 2026-10-21)."""
+    if isinstance(
+        error, TimeoutError | httpx.TransportError | openai.APIConnectionError | openai.RateLimitError
+    ):
+        return True
+    return isinstance(error, openai.APIStatusError) and error.status_code in RETRIED
+
+
 async def patient(call, timeout: float):
-    """A model call cut at `timeout` and asked again after each of WAITS (the model client has no read timeout, and
-    Prime's errors come in bursts); the last failure is raised."""
+    """A model call cut at `timeout` and asked again after each of WAITS when its error is transient (the model client
+    has no read timeout, and Prime's errors come in bursts); any other error, and the last, is raised."""
     for wait in (*WAITS, None):
         try:
             async with asyncio.timeout(timeout):
                 return await call()
-        except Exception:
-            if wait is None:
+        except Exception as error:
+            if wait is None or not transient(error):
                 raise
             await asyncio.sleep(wait)
 

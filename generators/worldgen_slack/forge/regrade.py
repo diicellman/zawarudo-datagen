@@ -13,11 +13,14 @@ before its split is kept beside it."""
 import asyncio
 import glob
 import json
+import random
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
 from worldgen_slack.taskset import SolverTask
 
+from ..prices import priced
 from ..store import Store
 from .config import ForgeConfig
 from .env import label_of
@@ -69,41 +72,127 @@ def stored_tries(store: Store) -> list[tuple[str, str, int]]:
     ]
 
 
-async def regrade(config: ForgeConfig, splits: Path | None = None) -> dict:
+FAIL_FAST = 20  # grades that fail before any lands, and the regrade stops: a bug, not a provider's burst
+SAVE_EVERY = 50  # grades between a regrade's saves and progress events
+PER_GRADE = (
+    0.02  # $ a regrade may spend on a try unless told otherwise: about twice grader v2's measured $0.0105
+)
+
+
+class Regrading:
+    """A stored try as the grader gets it again: what its calls showed and its answer. It keeps each grading call the
+    grader records on it once the call is paid, as a trace does: a stand-in without that record made every grade of
+    forge-w2's first regrade fail after its call was billed, four times over ($166, 2026-10-21)."""
+
+    def __init__(self, observations: list, reply: str, trace_id: str, model: str):
+        self.info = {"observations": observations}
+        self.last_reply, self.id, self.model = reply, trace_id, model
+        self.usage = []
+
+    def record_metrics(self, metrics: dict) -> None:
+        pass
+
+    def record_judge_call(self, *, name: str, request: dict, response) -> None:
+        if response.usage is not None:
+            self.usage.append(response.usage.model_dump(mode="json"))
+
+    @property
+    def spend(self) -> float:
+        return sum(priced(u, self.model) for u in self.usage)
+
+
+async def regrade(
+    config: ForgeConfig,
+    splits: Path | None = None,
+    sample: int | None = None,
+    budget: float | None = None,
+    seed: int = 20261021,
+) -> dict:
+    """See the module. `sample` grades that many tries at random and changes nothing: a live check of the grader, its
+    cost and its outcomes before a whole regrade. A regrade stops when its first FAIL_FAST grades all fail, or its
+    measured spend passes `budget` (PER_GRADE a try by default); it keeps what it graded, saved every SAVE_EVERY grades,
+    and a run again skips the tries this grader has already regraded."""
     manifest = json.loads((config.output / "run.json").read_text())
     store = Store(config.output, manifest)
     try:
         changed = split(store, splits_of(splits))
-        store.save()
+        mark = f"v{config.grading.version}:{config.answer_judge.model}"
+        todo = [
+            t
+            for t in stored_tries(store)
+            if getattr(store.state, t[1])[t[0]]["results"][t[2]].get("regraded") != mark
+        ]
+        if sample:
+            todo = random.Random(seed).sample(todo, min(sample, len(todo)))
+        else:
+            store.save()  # the gold splits, before any grade
+        budget = budget if budget is not None else PER_GRADE * len(todo)
         tries = Tries(config, store)
         world, gate = tries.copy(), asyncio.Semaphore(config.solvers)
-        todo = stored_tries(store)
-        failed = []
+        done, failed, outcomes, spent, stop = [], [], Counter(), [0.0], []
 
         async def one(task_id: str, book: str, n: int) -> None:
+            if stop:
+                return
             entry = getattr(store.state, book)[task_id]
             result, trace_id = entry["results"][n], entry["traces"][n]
             trace = json.loads((store.root / "traces" / f"{trace_id}.json").read_text())
-            task = Task.model_validate(store.state.forged[task_id]["task"])
-            solve = tries.solver_task(task, world)
-            graded = SimpleNamespace(
-                info={"observations": (trace.get("info") or {}).get("observations", [])},
-                last_reply=result.get("response") or "",
-                id=trace_id,
-                record_metrics=lambda metrics: None,
+            solve = tries.solver_task(Task.model_validate(store.state.forged[task_id]["task"]), world)
+            graded = Regrading(
+                (trace.get("info") or {}).get("observations", []),
+                result.get("response") or "",
+                trace_id,
+                config.answer_judge.model,
             )
             try:
                 async with gate:
+                    if stop:
+                        return
                     await patient(lambda: SolverTask.semantic_correctness(solve, graded), timeout=300)
             except Exception as error:
                 failed.append(f"{task_id}/{book}/{n}: {type(error).__name__}: {error}"[:300])
-                return
-            evaluation = graded.info["evaluation"]
-            entry["results"][n] = (
-                result | {k: evaluation[k] for k in GRADE if k in evaluation} | {"regraded": True}
-            )
+            else:
+                evaluation = graded.info["evaluation"]
+                outcomes[evaluation.get("outcome")] += 1
+                done.append((task_id, book, n))
+                if not sample:
+                    entry["results"][n] = (
+                        result | {k: evaluation[k] for k in GRADE if k in evaluation} | {"regraded": mark}
+                    )
+            finally:
+                spent[0] += graded.spend
+            if not stop and not done and len(failed) >= FAIL_FAST:
+                stop.append(f"its first {len(failed)} grades all failed: {failed[0]}")
+            if not stop and spent[0] > budget:
+                stop.append(f"it spent ${spent[0]:.2f}, past its ${budget:.2f} budget")
+            if not sample and (len(done) + len(failed)) % SAVE_EVERY == 0:
+                store.event(
+                    "regrade_progress",
+                    graded=len(done),
+                    failed=len(failed),
+                    spent=round(spent[0], 2),
+                    of=len(todo),
+                )
+                store.save()
 
         await asyncio.gather(*(one(*t) for t in todo))
+        measured = {
+            "graded": len(done),
+            "failed": len(failed),
+            "spent": round(spent[0], 4),
+            "per_grade": round(spent[0] / max(len(done) + len(failed), 1), 4),
+            "outcomes": dict(outcomes),
+        }
+        if sample:
+            return {"status": "sampled", **measured, "failures": failed[:5]}
+        store.save()
+        if stop:
+            store.event("regrade_stopped", why=stop[0], **measured)
+            raise RuntimeError(f"the regrade stopped: {stop[0]} ({measured})")
+        if failed:
+            raise RuntimeError(
+                f"{len(failed)} of {len(todo)} tries failed to regrade, the rest kept (run again to finish): {failed[0]}"
+            )
         labels, unjudged = {}, []
         for task_id, record in store.state.forged.items():
             if record.get("label") is None:
@@ -113,9 +202,9 @@ async def regrade(config: ForgeConfig, splits: Path | None = None) -> dict:
             record["agree"] = len(agreeing(verified))
             record["reached"] = reached(task, verified)
             record["verified"] = min(record["reached"]) >= 2
-            measured = store.state.solves.get(task_id, {}).get("results", [])
-            if measured:
-                record["rates"], record["parts"] = rates(measured), by_part(task, measured)
+            measured_rates = store.state.solves.get(task_id, {}).get("results", [])
+            if measured_rates:
+                record["rates"], record["parts"] = rates(measured_rates), by_part(task, measured_rates)
             before = record["label"]
             record["label"] = label_of(record, config.solved)
             labels[task_id] = (before, record["label"])
@@ -129,14 +218,11 @@ async def regrade(config: ForgeConfig, splits: Path | None = None) -> dict:
             "judge": config.answer_judge.model,
             "splits": str(splits) if splits else None,
             "split_tasks": len(changed),
+            **measured,
         }
         moved = {t: f"{a}->{b}" for t, (a, b) in labels.items() if a != b}
-        store.event(
-            "forge_regraded", tries=len(todo), failed=len(failed), split_tasks=len(changed), moved=moved
-        )
+        store.event("forge_regraded", tries=len(todo), split_tasks=len(changed), moved=moved, **measured)
         store.save()
-        if failed:
-            raise RuntimeError(f"{len(failed)} of {len(todo)} tries failed to regrade: {failed[0]}")
         finished = (
             store.state.phase == "done"
         )  # a forge mid-label publishes when it finishes, from these grades
@@ -146,6 +232,7 @@ async def regrade(config: ForgeConfig, splits: Path | None = None) -> dict:
             "status": "complete",
             "published": finished,
             "tries": len(todo),
+            **measured,
             "split_tasks": len(changed),
             "moved": moved,
             "verified_unjudged": unjudged,
@@ -172,4 +259,5 @@ def dry_regrade(config: ForgeConfig, splits: Path | None = None) -> dict:
         "split_tasks": sum(1 for t, parts in found.items() if parts and t in state.get("forged", {})),
         "grading": config.grading.model_dump(),
         "judge": config.answer_judge.model,
+        "budget": round(PER_GRADE * len(stored_tries(store)), 2),
     }

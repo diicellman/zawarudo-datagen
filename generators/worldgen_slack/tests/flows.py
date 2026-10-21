@@ -14,8 +14,11 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 import verifiers.v1 as vf
+import verifiers.v1.judge as vf_judge
 import verifiers.v1.utils.interrupt
 from verifiers.v1.dialects.base import append_user_notice
 from verifiers.v1.errors import SandboxError
@@ -32,7 +35,7 @@ from ..forge.config import ForgeConfig
 from ..forge.env import provenance as forge_provenance
 from ..forge.judge import Ruling
 from ..forge.proposer.task import ProposerTask
-from ..forge.regrade import regrade
+from ..forge.regrade import FAIL_FAST, regrade
 from ..forge.tasks import Part, Task
 from ..forge.tries import rates
 from ..judge.verdict import PHASE_CRITERIA, Issue, TaskReview, Verdict
@@ -81,6 +84,72 @@ async def offline(*args, **kwargs):
 GRADER = {"on": False, "loose": False, "blind": False, "grounded": False, "judge_fails": 0}
 
 
+def scripted_reading(fields: dict) -> Reading:
+    """Grader v2's reader, played by code: a right answer ("the answer") states every gold item of every part; any
+    other commits a value that states none."""
+    right = fields["response"] == "the answer"
+    return Reading(
+        parts=[
+            PartReading(
+                label=part["label"],
+                committed=[ReadCommit(value=i["value"], item=i["item"]) for i in part["answer"]]
+                if right
+                else [ReadCommit(value="another answer")],
+                hedged=False,
+                holds_back=False,
+                claims="unsettled" if part["answer_type"] == "status" else "none",
+            )
+            for part in fields["reference"]
+        ],
+        reason="scripted",
+    )
+
+
+REAL_COMPLETE = vf.Judge.complete  # the judges' own call, before the flows script it
+
+
+class FakeInference:
+    """The model provider, played by code: each structured call answered by `answer(fields)` (a parsed answer, or None
+    for one that does not parse) at a reported cost. Only the network is faked: the judge's own call runs whole,
+    recording each paid call on its trace."""
+
+    def __init__(self, answer, cost: float = 0.01):
+        self.answer, self.cost, self.calls = answer, cost, 0
+        self.beta = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=self.parse)))
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def parse(self, *, response_format, model, messages, **sampling):
+        self.calls += 1
+        parsed = self.answer(json.loads(messages[0]["content"].rsplit("\n", 1)[1]))
+        message = SimpleNamespace(
+            content=parsed.model_dump_json() if parsed else "", parsed=parsed, refusal=None
+        )
+        usage = SimpleNamespace(
+            prompt_tokens=1200,
+            completion_tokens=300,
+            prompt_tokens_details=None,
+            completion_tokens_details=None,
+            cost=self.cost,
+        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")], usage=usage)
+
+
+@contextmanager
+def live_judging(network: FakeInference):
+    """The judges' own call, on a faked network."""
+    scripted, client = vf.Judge.complete, vf_judge.build_async_openai
+    vf.Judge.complete, vf_judge.build_async_openai = REAL_COMPLETE, (lambda config: network)
+    try:
+        yield network
+    finally:
+        vf.Judge.complete, vf_judge.build_async_openai = scripted, client
+
+
 def gold_text(reference: dict) -> str:
     """A reference's gold as a right answer says it: its rows, or each part's under its label."""
     if "parts" in reference:
@@ -96,7 +165,10 @@ async def scripted_complete(self, messages, *, trace=None, schema=None, parse=No
     if text.startswith("You judge one task"):
         if GRADER["judge_fails"]:
             GRADER["judge_fails"] -= 1
-            raise RuntimeError("the judge's provider is unavailable")
+            raise openai.APIConnectionError(
+                message="the judge's provider is unavailable",
+                request=httpx.Request("POST", "https://inference"),
+            )
         ruling = Ruling(
             realistic=True, one_reading=True, exact="precisely" not in text, supported=True, reason="r"
         )
@@ -104,23 +176,7 @@ async def scripted_complete(self, messages, *, trace=None, schema=None, parse=No
             text=ruling.model_dump_json(), parsed=parse(vf.JudgeResponse(text="", parsed=ruling))
         )
     if text.startswith("Read a Slack answer"):  # grader v2's reader: a right answer states every gold item
-        fields = json.loads(text.rsplit("\n", 1)[1])
-        right = fields["response"] == "the answer"
-        reading = Reading(
-            parts=[
-                PartReading(
-                    label=part["label"],
-                    committed=[ReadCommit(value=i["value"], item=i["item"]) for i in part["answer"]]
-                    if right
-                    else [ReadCommit(value="another answer")],
-                    hedged=False,
-                    holds_back=False,
-                    claims="unsettled" if part["answer_type"] == "status" else "none",
-                )
-                for part in fields["reference"]
-            ],
-            reason="scripted",
-        )
+        reading = scripted_reading(json.loads(text.rsplit("\n", 1)[1]))
         return vf.JudgeResponse(
             text=reading.model_dump_json(), parsed=parse(vf.JudgeResponse(text="", parsed=reading))
         )
@@ -1500,8 +1556,30 @@ async def forge_flow(root, world_dir, settings):
         )
     )
     tried = sum(counts.values())
-    summary = await regrade(plan.model_copy(update={"grading": Grading(version=2, ground=False)}), splits)
+    v2 = plan.model_copy(update={"grading": Grading(version=2, ground=False)})
+    # A regrade grades on the judges' own call, only the network faked, so what the call does once it is paid is tested
+    # too: forge-w2's first regrade failed every grade there, after paying for it, four times over ($166, 2026-10-21).
+    # A grader whose answers never parse: the regrade stops after its first FAIL_FAST failures, each paid once.
+    with live_judging(FakeInference(lambda fields: None)) as broken:
+        with pytest.raises(RuntimeError, match=f"its first {FAIL_FAST} grades all failed"):
+            await regrade(v2, splits)
+    assert broken.calls <= FAIL_FAST + plan.solvers, ("it stops, not grading every try", broken.calls)
+    # A live sample: five tries graded and their cost measured, nothing changed.
+    with live_judging(FakeInference(scripted_reading)):
+        sampled = await regrade(v2, splits, sample=5)
+    assert (sampled["status"], sampled["graded"], sampled["failed"], sampled["per_grade"]) == (
+        "sampled",
+        5,
+        0,
+        0.01,
+    ), sampled
+    # The regrade: every try graded once, paid once, its cost measured; the labels stand.
+    with live_judging(FakeInference(scripted_reading)) as network:
+        summary = await regrade(v2, splits)
     assert (summary["status"], summary["moved"], summary["split_tasks"]) == ("complete", {}, 1), summary
+    assert network.calls == summary["tries"] == summary["graded"] and summary["spent"] == pytest.approx(
+        0.01 * summary["tries"]
+    ), ("each grade paid once", network.calls, summary)
     assert sum(counts.values()) == tried, "no try runs again"
     store = TestStore(plan.output, forge_provenance(plan))
     i001 = store.state.forged["i001"]
