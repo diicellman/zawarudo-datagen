@@ -8,6 +8,7 @@ import pytest
 import verifiers.v1 as vf
 from worldgen_slack.judge import (
     READINGS,
+    AnswerJudge,
     Check,
     Gives,
     Misread,
@@ -89,6 +90,7 @@ INVENTED = pytest.mark.xfail(
         (read(True, False, extra=False, held=True), "set", 2, "fallback", "a partial set, flagged (12)"),
         (read(True, False, extra=False), "set", 2, "error", "a partial set presented as whole (13)"),
         (read(True, True, extra=True), "set", 2, "error", "a non-member (14)"),
+        (read(True, extra=True), "text", 1, "success", "extra beside a set decides nothing (i092 S8)"),
         (
             read(True),
             "status",
@@ -204,6 +206,11 @@ def test_request_and_grade():
             part("refusal").model_copy(update={"label": None}),
             True,
         )
+    # A part with no items reads none it is held to: a gives the reader adds to a refusal decides nothing (h147 S4).
+    refusal = part("refusal").model_copy(update={"label": None})
+    assert (
+        graded(Reading(parts=[read(True, declines=True, part="the answer")]), refusal, True)[1] == "success"
+    )
 
 
 def test_release_context():
@@ -360,6 +367,20 @@ async def test_try_graded_on_a_real_trace(tmp_path):
     assert network.calls == len(trace.info["judge_calls"]) == READINGS, (
         "asked READINGS times, each paid and kept"
     )
+    # A reply that does not parse (a stray control character in GLM's JSON) is the reader's slip, asked again; the
+    # provider billed it, but the judge's call records a reply only once it parses.
+    unparsed = []
+
+    def unparseable_first(fields):
+        if not unparsed:
+            unparsed.append(1)
+            Reading.model_validate_json('{"parts": [')
+        return right
+
+    trace = vf.Trace.model_construct(root_reply="We rolled back.", info={"observations": shown})
+    with live_judging(FakeInference(unparseable_first)) as network:
+        assert await SolverTask.semantic_correctness(solve, trace) == 1.0
+    assert (network.calls, len(trace.info["judge_calls"]), trace.info["evaluation"]["readings"]) == (2, 1, 2)
     # Grounded by message: a right answer whose try never saw the gold's message is right but ungrounded (0).
     elsewhere = [
         {"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C9", "ts": "1.000001"}]}}
@@ -372,6 +393,15 @@ async def test_try_graded_on_a_real_trace(tmp_path):
     with live_judging(FakeInference(lambda fields: right)) as network:
         assert await SolverTask.semantic_correctness(solve, trace) == -1.0
     assert network.calls == 0 and trace.info["evaluation"]["outcome"] == "error", "an empty answer: no call"
+
+
+def test_prompt_names_every_criterion():
+    """The prompt, the schema and code say the same thing: every criterion the reading reports is defined in the
+    prompt under its own name, and the prompt fills the three fields the grade passes."""
+    for name in PartReading.model_fields:
+        if name != "part":
+            assert f"**{name}" in AnswerJudge.prompt, name
+    assert all(f"{{{field}}}" in AnswerJudge.prompt for field in ("request", "reference", "response"))
 
 
 def test_prompt_fields():

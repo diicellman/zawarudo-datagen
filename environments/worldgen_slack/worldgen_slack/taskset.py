@@ -155,17 +155,17 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             grade = empty_grade(reference)
         else:
             # The model reads what the answer commits to, criterion by criterion; code grades it. A reading that
-            # misreads the gold's parts or items is asked again (each call recorded on the trace, so paid once and
-            # counted): a grade costs a reading, where its try's crash would cost the whole try again.
+            # misreads the gold's parts or items, or a reply that does not parse, is asked again (each call recorded on
+            # the trace once it parses): a grade costs a reading, where its try's crash would cost the whole try again.
             hidden = out_of_sight(self.config.tools.db_path, self.config.tools.actor_id, reference)
             for n in range(1, READINGS + 1):
-                result = await AnswerJudge(self.config.judge).evaluate(
-                    trace=trace,
-                    request=self.data.prompt,
-                    reference=gold(reference, hidden),
-                    response=fenced(trace.last_reply),
-                )
                 try:
+                    result = await AnswerJudge(self.config.judge).evaluate(
+                        trace=trace,
+                        request=self.data.prompt,
+                        reference=gold(reference, hidden),
+                        response=fenced(trace.last_reply),
+                    )
                     grade, outcome = graded(result.parsed, reference, bool(observations))
                 except Misread:
                     if n == READINGS:

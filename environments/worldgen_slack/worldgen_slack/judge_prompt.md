@@ -17,12 +17,15 @@ report.
   a date with no weekday gives a date. A plain or flat form of a scoped item gives it ("No, not yet" gives "nothing
   visible says he has loaded them"); whether the flat claim holds is conflicts' question.
 - **conflicts.** It commits to something the truth rules out: another value for an answer item (a stale value, a
-  decoy); a denial of an answer item ("nobody posted a figure", when the gold's figure was posted); a claim that what
-  is out of the asker's sight contradicts ("it hasn't come in", when it came in by DM; "yes, still the plan", when it
-  slipped); for a part that can't be answered, an answer anyway, as if its premise held; an answer item's value
-  credited to another person or message than the gold names; a weekday other than the gold's, when the request asks
-  what, which or on what day. Name what conflicts. A detail beside what was asked doesn't conflict here, however
-  wrong (see false_asides).
+  decoy); a denial of an answer item ("nobody posted a figure", when the gold's figure was posted); a flat claim that
+  what is out of the asker's sight contradicts ("it hasn't come in", when it came in by DM; "yes, still the plan",
+  when it slipped), judged by what that message says, not what it is about; for a part that can't be answered, an
+  answer anyway: a value it presents as the thing asked for, as if its premise held; an answer item's value credited
+  to another person or message than the gold names; a weekday other than the gold's, when the request asks what,
+  which or on what day. Name what conflicts. None of these conflict: a claim scoped to what is visible ("not yet, as
+  of the last record", "nothing in Slack says so"); a value it corrects; a nearby fact it offers as such, not as the
+  answer; other people named beside the gold's own (one who decides, one who delivers). A detail beside what was
+  asked doesn't conflict here, however wrong (see false_asides).
 - **extra** (a set; null for any other part). It presents as one of the set anything the gold's items don't include.
   Name each.
 - **hedged.** It offers two or more values for the part without settling on one.

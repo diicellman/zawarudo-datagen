@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import verifiers.v1 as vf
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from .release import NonEmptyText, PrivateAnswer, StrictModel
 
@@ -98,10 +98,12 @@ def label_of(answer: PrivateAnswer) -> str:
 
 
 def part_outcome(reading: PartReading, answer: PrivateAnswer) -> Outcome:
-    """A part's outcome by the policy (v4): anything the truth rules out, a hedge or a non-member is an error; a part
-    that can't be answered succeeds when it declines and falls back when it holds back; any other succeeds when it
-    gives every item and falls back when it holds back. Whatever else it commits is an error."""
-    if reading.conflicts.verdict or reading.hedged.verdict or (reading.extra and reading.extra.verdict):
+    """A part's outcome by the policy (v4): anything the truth rules out, a hedge or, in a set, a non-member is an
+    error; a part that can't be answered succeeds when it declines and falls back when it holds back; any other
+    succeeds when it gives every item and falls back when it holds back. Whatever else it commits is an error. A
+    criterion a part's type does not ask (extra beside a set, gives beside its items) decides nothing."""
+    member = answer.answer_type == "set" and reading.extra.verdict
+    if reading.conflicts.verdict or reading.hedged.verdict or member:
         return "error"
     if answer.answer_type == "refusal":
         return (
@@ -121,8 +123,9 @@ def request_outcome(outcomes: list[Outcome]) -> Outcome:
 
 def matched(reading: Reading, reference: PrivateAnswer) -> list[PartReading]:
     """Each part's reading: by its label when the reading names every part once, in any order, else by its place when
-    it reads as many parts as there are (a reader that renames them). Each reads every item of its part once, a set
-    whether it presents a non-member, and a part that can't be answered whether it declines; else a Misread."""
+    it reads as many parts as there are (a reader that renames them). Each reads every item of its part once (a part
+    with no items reads none it is held to), a set whether it presents a non-member, and a part that can't be answered
+    whether it declines; else a Misread."""
     answers = reference.answers()
     labels = [label_of(a) for a in answers]
     named = {r.part: r for r in reading.parts}
@@ -133,7 +136,7 @@ def matched(reading: Reading, reference: PrivateAnswer) -> list[PartReading]:
     else:
         raise Misread(f"a reading reads each of its {len(answers)} parts once, not {len(reading.parts)}")
     for r, a in zip(readings, answers):
-        if sorted(g.item for g in r.gives) != list(range(1, len(a.rows) + 1)):
+        if a.rows and sorted(g.item for g in r.gives) != list(range(1, len(a.rows) + 1)):
             raise Misread(f"{label_of(a)}: gives reads each of its {len(a.rows)} items once")
         if (a.answer_type == "set" and r.extra is None) or (
             a.answer_type == "refusal" and r.declines is None
@@ -252,3 +255,11 @@ def fenced(text: str) -> str:
 class AnswerJudge(vf.Judge[Reading]):
     prompt = (Path(__file__).with_name("judge_prompt.md")).read_text(encoding="utf-8")
     schema = Reading
+
+    async def evaluate(self, *, trace=None, **fields):
+        """A reading, or a Misread when the reply does not parse as one (a stray control character in GLM's JSON): the
+        reader's slip, asked again. The provider billed it, but the judge's call records a reply only once it parses."""
+        try:
+            return await super().evaluate(trace=trace, **fields)
+        except ValidationError as error:
+            raise Misread(f"a reply that does not parse: {error}"[:300]) from error
