@@ -14,7 +14,8 @@ own (`JudgeConfig.prompt`): a variant is a file, not a code change. A provider's
 `patient`); any other fails that try. Each grade is written to --out as it lands, with its usage; then the agreement
 with the recorded grades, the spend, and with `--truth` the agreement with the calibration's truth, overall, by
 stratum and on its random sample. `--set` regrades only a calibration set's tries (the verifier's among them),
-`--tries N` a seeded sample that keeps every try the run graded wrong. A dry run spends nothing."""
+`--tries N` a seeded sample that keeps every try the run graded wrong. An --out that exists is gone on with: its grades
+stand, and only the tries it lacks (or failed) are graded. A dry run spends nothing."""
 
 import argparse
 import asyncio
@@ -146,9 +147,19 @@ async def main() -> None:
         wrong = [t for t in work if not t["recorded"]["correct"]]
         rest = [t for t in work if t["recorded"]["correct"]]
         work = wrong + random.Random(args.seed).sample(rest, max(0, args.tries - len(wrong)))
+    # A run stopped midway goes on: the grades --out already holds stand (each was paid for), its failed ones are
+    # graded again, and the rest are graded and added. A fresh run takes a fresh --out.
+    before = []
+    if args.out.exists():
+        before = [
+            r for r in map(json.loads, args.out.read_text().splitlines()) if not (r["new"] or {}).get("error")
+        ]
+        held = {(r["task"], r["try"]) for r in before}
+        work = [t for t in work if (t["task"], t["try"]) not in held]
     print(
         f"{len(work)} tries ({sum(not t['recorded']['correct'] for t in work)} graded wrong) for {args.model}"
         f" at effort {args.effort or 'default'}, prompt {args.prompt or 'the judge’s own'}"
+        + (f"; {len(before)} already graded in {args.out}" if before else "")
     )
     if args.dry_run:
         return
@@ -179,6 +190,8 @@ async def main() -> None:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w") as stream:
+        for row in before:
+            stream.write(json.dumps(row) + "\n")
 
         async def kept(graded):
             """A grade, written as it lands: a run stopped midway keeps every grade it paid for."""
@@ -187,7 +200,7 @@ async def main() -> None:
             stream.flush()
             return row
 
-        graded = await asyncio.gather(*(kept(regrade(t)) for t in work))
+        graded = before + await asyncio.gather(*(kept(regrade(t)) for t in work))
 
     done = [g for g in graded if g["new"] and "error" not in g["new"]]
     failed = [g for g in graded if g["new"] and "error" in g["new"]]
