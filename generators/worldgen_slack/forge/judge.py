@@ -1,11 +1,12 @@
-"""The task judge: one structured call a task, on what code and the tries already found (its answer and the messages
-it rests on, the verifier's answers, the student's wrong ones). It rules on what no try can: whether a colleague
-would ask it, whether its words allow another reading, whether its answer asks more than its label, and whether its
-messages state it. A task is approved when all four hold."""
+"""The task judge: one call a task, on what code and the tries already found (its answer and the messages it rests on,
+the verifier's answers, the student's wrong ones). It rules on what no try can: whether a colleague would ask it,
+whether its words allow another reading, whether its answer asks more than its label, and whether its messages state
+it. A task is approved when all four hold."""
 
 import json
 
 import verifiers.v1 as vf
+from worldgen_slack.judge import READINGS, Misread, asked, replied
 from worldgen_slack.release import NonEmptyText, StrictModel
 
 from ..prompt import prompt, render
@@ -29,14 +30,22 @@ class Ruling(StrictModel):
 
 
 class TaskJudge(vf.Judge[Ruling]):
-    schema = Ruling
+    """Asked for its ruling as plain JSON, as the answer judge is (not structured output, which Prime overbills on GLM
+    5.3); a reply that does not read as a ruling is a Misread."""
 
     def build_messages(self, **fields):
         return [
             vf.UserMessage(
                 content=render(PROMPT, task=json.dumps(fields["task"], ensure_ascii=False, indent=1))
+                + asked(Ruling)
             )
         ]
+
+    def parse(self, response: vf.JudgeResponse) -> Ruling:
+        try:
+            return replied(response.text, Ruling)
+        except ValueError as error:
+            raise Misread(f"a reply that does not read as a ruling: {error}"[:300], response.usage) from error
 
 
 def said(world, ids: list[int]) -> list[dict]:
@@ -96,11 +105,23 @@ def hearing(world, task: Task, verified: list[dict], measured: list[dict]) -> di
 async def rule(
     config: vf.JudgeConfig, world, task: Task, verified: list[dict], measured: list[dict]
 ) -> tuple[Ruling, dict]:
-    """The judge's ruling on one task and what its call cost, asked again when a call fails (patient)."""
+    """The judge's ruling on one task and what its calls cost: asked again when a call fails (patient), and when its
+    reply does not read as a ruling (a Misread, up to READINGS readings, each paid and counted)."""
     judge = TaskJudge(config)
 
     async def call():
         return await judge.evaluate(task=hearing(world, task, verified, measured))
 
-    result = await patient(call, timeout=600)
-    return result.parsed, (result.usage.model_dump(mode="json") if getattr(result, "usage", None) else {})
+    usages = []
+    for n in range(1, READINGS + 1):
+        try:
+            result = await patient(call, timeout=600)
+        except Misread as misread:
+            usages.append(misread.usage)
+            if n == READINGS:
+                raise
+        else:
+            usages.append(result.usage)
+            break
+    usage = vf.Usage.aggregate([u for u in usages if u is not None])
+    return result.parsed, (usage.model_dump(mode="json") if usage else {})

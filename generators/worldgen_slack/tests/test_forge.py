@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import httpx
 import openai
 import pytest
+from worldgen_slack.judge import READINGS, Misread
 
 from ..forge import tries as tries_module
 from ..forge.env import ForgeEnv, label_of, on_crashes, reopen, spent
@@ -18,6 +19,7 @@ from ..forge.tasks import Part, Task, answer_text, check, key, private_answer
 from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached, transient
 from ..prices import priced
 from ..store import Store
+from .flows import FakeInference, live_judging
 from .support import contracts_settings, forge_of, refused, world_fixture
 
 
@@ -379,6 +381,19 @@ async def test_judge(tmp_path):
     ruling, _ = await rule(forge_of(contracts_settings(tmp_path)).judge, world, precise, [], [])
     assert not ruling.exact and not ruling.approved, "an answer that asks more than its part"
     assert not Ruling(realistic=False, one_reading=True, exact=True, supported=True, reason="r").approved
+    # Its own call, only the network faked: plain JSON (no structured output), read by code; a reply that does not read
+    # as a ruling is asked again and each call's cost counted, and one that never reads fails after READINGS calls.
+    approved = Ruling(
+        realistic=True, one_reading=True, exact=True, supported=True, reason="r"
+    ).model_dump_json()
+    replies = iter(['{"realistic": true}', f"Ruling: {approved}"])
+    with live_judging(FakeInference(lambda prompt: next(replies), read=str)) as network:
+        ruling, usage = await rule(forge_of(contracts_settings(tmp_path)).judge, world, task, [], [])
+    assert ruling.approved and network.calls == 2 and usage["cost"] == pytest.approx(0.02)
+    with live_judging(FakeInference(lambda prompt: "Approved.", read=str)) as network:
+        with pytest.raises(Misread):
+            await rule(forge_of(contracts_settings(tmp_path)).judge, world, task, [], [])
+    assert network.calls == READINGS
 
 
 def test_regrade_mark(tmp_path):

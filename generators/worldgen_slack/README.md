@@ -68,8 +68,8 @@ notes; its tasks live in its own state, never in the world file.
   task without its skill's shape. An id offered `offers` turns unwritten is dropped, short of material.
 - **Labelling** (no VM; every task side by side, each step kept as it lands): the verifier, a stronger model with the
   student's Slack tools, must reach each part's answer in 2 tries (a third on a split; a try that ends with no answer
-  runs again), or the task is dropped; the student tries it `tries` times; the judge (`forge/judge.py`, one structured
-  call) rules whether a colleague would ask it, whether its words allow another reading, whether each answer is
+  runs again), or the task is dropped; the student tries it `tries` times; the judge (`forge/judge.py`, one call,
+  replied in plain JSON) rules whether a colleague would ask it, whether its words allow another reading, whether each answer is
   exactly what its part asks, and whether its messages state it. A task is rejected, solved (right `solved` of the
   time or more), unsolved (never), or in the window.
 - **Adapting** (`adapt` passes): the proposer writes a harder version of each solved task, an easier one of each

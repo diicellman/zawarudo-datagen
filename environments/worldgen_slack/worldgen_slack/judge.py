@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import verifiers.v1 as vf
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field
 
 from .release import NonEmptyText, PrivateAnswer, StrictModel
 
@@ -89,8 +89,40 @@ READINGS = 3  # readings a grade asks for before a misread fails it: each a fres
 
 
 class Misread(ValueError):
-    """A reading that does not read the gold's parts and items: the reader's slip, not the answer's, so it is asked
-    again (READINGS) where an error of the grader's own code is not."""
+    """A reading that does not read the gold's parts and items, or a reply that holds none: the reader's slip, not the
+    answer's, so it is asked again (READINGS) where an error of the grader's own code is not. `usage` is what its call
+    cost, for a judge whose calls no trace records (the forge's task judge)."""
+
+    def __init__(self, message: str, usage: vf.Usage | None = None):
+        super().__init__(message)
+        self.usage = usage
+
+
+def asked(model: type[BaseModel]) -> str:
+    """The reply a judge asks for, after its prompt: one JSON object of `model`'s schema, in plain text. Not structured
+    output: Prime bills a GLM 5.3 call made with response_format about 20 times the cost it reports, and a plain call
+    at that cost (2026-10-24, 40 calls each way on one grading prompt; 39 of the 40 plain replies read)."""
+    return "\n\nReply with only a JSON object and nothing else, matching this JSON schema:\n" + json.dumps(
+        model.model_json_schema()
+    )
+
+
+def replied[M: BaseModel](text: str, model: type[M]) -> M:
+    """A reply as `model`: the first JSON object it holds (prose around it aside, a raw control character inside a
+    string read as written), else a ValueError naming what failed."""
+    decoder = json.JSONDecoder(strict=False)
+    for start in (m.start() for m in re.finditer(r"\{", text)):
+        try:
+            value, _ = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        return model.model_validate(value)
+    raise ValueError(f"no JSON object in the reply: {text[:200]!r}")
+
+
+REPLY = asked(Reading) + (
+    "\nextra, for a part that is not a set, and declines, for a part that can be answered, are null, not objects."
+)
 
 
 def label_of(answer: PrivateAnswer) -> str:
@@ -253,13 +285,19 @@ def fenced(text: str) -> str:
 
 
 class AnswerJudge(vf.Judge[Reading]):
-    prompt = (Path(__file__).with_name("judge_prompt.md")).read_text(encoding="utf-8")
-    schema = Reading
+    """Its prompt (judge_prompt.md, or the file JudgeConfig.prompt names) asks for a reading as plain JSON (REPLY), and
+    code reads the reply: one that does not read as a Reading is a Misread, asked again. Each call is recorded on the
+    trace as billed, whether its reply reads or not."""
 
-    async def evaluate(self, *, trace=None, **fields):
-        """A reading, or a Misread when the reply does not parse as one (a stray control character in GLM's JSON): the
-        reader's slip, asked again. The provider billed it, but the judge's call records a reply only once it parses."""
+    prompt = (Path(__file__).with_name("judge_prompt.md")).read_text(encoding="utf-8")
+
+    def build_messages(self, **fields):
+        return super().build_messages(**fields) + REPLY
+
+    def parse(self, response: vf.JudgeResponse) -> Reading:
         try:
-            return await super().evaluate(trace=trace, **fields)
-        except ValidationError as error:
-            raise Misread(f"a reply that does not parse: {error}"[:300]) from error
+            return replied(response.text, Reading)
+        except ValueError as error:
+            raise Misread(
+                f"a reply that does not read as a reading: {error}"[:300], response.usage
+            ) from error

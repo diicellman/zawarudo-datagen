@@ -83,7 +83,7 @@ class ForgeConfig(Section):
     max_resumes: int = Field(default=3, ge=0, le=20)
     spend_limit: float = Field(default=50.0, gt=0)
     env: ForgeSeats = Field(default_factory=ForgeSeats)
-    judge: vf.JudgeConfig = Field(default_factory=high)  # the task judge: one structured call a task
+    judge: vf.JudgeConfig = Field(default_factory=high)  # the task judge: one call a task
     answer_judge: vf.JudgeConfig = Field(default_factory=high)
 
 

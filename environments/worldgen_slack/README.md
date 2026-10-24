@@ -7,7 +7,9 @@ answer commits to, whether it gives each answer item, whether it commits to anyt
 what is out of the asker's sight, which the reader is shown), a hedge, a non-member of a set, holding back, and, for
 a request that can't be answered, declining. Code decides each part: a success gives every item and commits nothing
 false, a fallback holds back honestly, anything else is an error; a request is a success when every part is. The
-prompt is `worldgen_slack/judge_prompt.md`; `--env.taskset.task.judge.prompt` names another file. Grounding is code's:
+prompt is `worldgen_slack/judge_prompt.md`; `--env.taskset.task.judge.prompt` names another file. The reader replies
+in plain JSON, which code reads (not structured output, which Prime bills on GLM 5.3 at about 20 times the cost it
+reports); a reply that doesn't read is asked again. Grounding is code's:
 an answer counts as grounded only when its try was shown a message its gold rests on. False details beside the answer
 are counted (`unsupported_asides`) but cost nothing. The reward is +1 for a right, grounded answer, 0 for a right one
 its observations don't ground or for holding back, and -1 for a wrong one: under a 1-or-0 grade a guess always beats

@@ -23,7 +23,7 @@ import verifiers.v1.judge as vf_judge
 import verifiers.v1.utils.interrupt
 from verifiers.v1.dialects.base import append_user_notice
 from verifiers.v1.errors import SandboxError
-from worldgen_slack.judge import Check, Gives, PartReading, Reading
+from worldgen_slack.judge import READINGS, REPLY, Check, Gives, PartReading, Reading
 from worldgen_slack.release import load_release
 from worldgen_slack.taskset import SolverTask
 from worldgen_slack.world import file_hash
@@ -87,11 +87,12 @@ REFUSED = "I can't answer that from anything you can see: it isn't there."
 
 
 def answer_fields(prompt: str) -> dict:
-    """The answer judge's prompt as its reader reads it: the request, the gold by part, and the fenced answer."""
+    """The answer judge's prompt as its reader reads it: the request, the gold by part, and the fenced answer (the
+    reply it asks for after it)."""
     _, _, rest = prompt.partition("The request:\n")
     request, _, rest = rest.partition("\n\nThe gold, by part:\n")
     reference, _, fenced = rest.partition("\n\nThe answer, between the fences:\n")
-    lines = fenced.rstrip("\n").split("\n")
+    lines = fenced.removesuffix(REPLY).rstrip("\n").split("\n")
     return {"request": request, "reference": json.loads(reference), "response": "\n".join(lines[1:-1])}
 
 
@@ -151,13 +152,14 @@ REAL_COMPLETE = vf.Judge.complete  # the judges' own call, before the flows scri
 
 
 class FakeInference:
-    """The model provider, played by code: each structured call of the answer judge answered by `answer(fields)` (a
-    parsed reading, or None for one that does not parse) at a reported cost. Only the network is faked: the judge's own
-    call runs whole, recording each paid call on its trace."""
+    """The model provider, played by code: each call of a judge answered by `answer(read(prompt))` (a reading or a
+    ruling, or a reply's own text) at a reported cost. It takes plain calls alone, as the judges ask for plain JSON, not
+    structured output. Only the network is faked: the judge's own call runs whole, recording each paid call on its
+    trace."""
 
-    def __init__(self, answer, cost: float = 0.01):
-        self.answer, self.cost, self.calls = answer, cost, 0
-        self.beta = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=self.parse)))
+    def __init__(self, answer, cost: float = 0.01, read=answer_fields):
+        self.answer, self.cost, self.read, self.calls = answer, cost, read, 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
     async def __aenter__(self):
         return self
@@ -165,11 +167,12 @@ class FakeInference:
     async def __aexit__(self, *exc):
         return False
 
-    async def parse(self, *, response_format, model, messages, **sampling):
+    async def create(self, *, model, messages, **sampling):
+        assert "response_format" not in sampling, "a judge asks for plain JSON"
         self.calls += 1
-        parsed = self.answer(answer_fields(messages[0]["content"]))
+        reply = self.answer(self.read(messages[0]["content"]))
         message = SimpleNamespace(
-            content=parsed.model_dump_json() if parsed else "", parsed=parsed, refusal=None
+            content=reply if isinstance(reply, str) else reply.model_dump_json(), refusal=None
         )
         usage = SimpleNamespace(
             prompt_tokens=1200,
@@ -216,7 +219,7 @@ async def scripted_complete(self, messages, *, trace=None, schema=None, parse=No
             realistic=True, one_reading=True, exact="precisely" not in text, supported=True, reason="r"
         )
         return vf.JudgeResponse(
-            text=ruling.model_dump_json(), parsed=parse(vf.JudgeResponse(text="", parsed=ruling))
+            text=ruling.model_dump_json(), parsed=parse(vf.JudgeResponse(text=ruling.model_dump_json()))
         )
     if GRADER["on"] and text.startswith("You grade one answer"):
         return await REAL_COMPLETE(self, messages, trace=trace, schema=schema, parse=parse, **sampling)
@@ -1571,11 +1574,15 @@ async def forge_flow(root, world_dir, settings):
     tried = sum(counts.values())
     # A regrade grades on the judges' own call, only the network faked, so what the call does once it is paid is tested
     # too: forge-w2's first regrade failed every grade there, after paying for it, four times over ($166, 2026-10-21).
-    # A grader whose answers never parse: the regrade stops after its first FAIL_FAST failures, each paid once.
-    with live_judging(FakeInference(lambda fields: None)) as broken:
+    # A grader whose replies never read: each grade asks READINGS times, and the regrade stops after its first
+    # FAIL_FAST failures.
+    with live_judging(FakeInference(lambda fields: "I can't grade this.")) as broken:
         with pytest.raises(RuntimeError, match=f"its first {FAIL_FAST} grades all failed"):
             await regrade(plan, splits)
-    assert broken.calls <= FAIL_FAST + plan.solvers, ("it stops, not grading every try", broken.calls)
+    assert broken.calls <= (FAIL_FAST + plan.solvers) * READINGS, (
+        "it stops, not grading every try",
+        broken.calls,
+    )
     # A live sample: five tries graded and their cost measured, nothing changed. Its reader misreads each try's first
     # reading: the grade asks again, and both readings are paid and counted.
     with live_judging(FakeInference(misreading_first(scripted_reading))) as sampler:

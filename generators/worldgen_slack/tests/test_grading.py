@@ -8,6 +8,7 @@ import pytest
 import verifiers.v1 as vf
 from worldgen_slack.judge import (
     READINGS,
+    REPLY,
     AnswerJudge,
     Check,
     Gives,
@@ -18,6 +19,7 @@ from worldgen_slack.judge import (
     gold,
     graded,
     part_outcome,
+    replied,
     request_outcome,
 )
 from worldgen_slack.release import PrivateAnswer, PublicTask
@@ -313,8 +315,8 @@ def rollback(tmp_path):
 async def test_try_graded_on_a_real_trace(tmp_path):
     """A try's grade as the forge and the eval take it: on the harness's own trace, through the judge's own call, only
     the network faked. The reader is asked the request, the gold and the fenced answer; the grade lands with its
-    reading, grounded by code; each paid call (a misread's second reading too) is recorded on the trace, where the forge
-    prices its spend. A reader that misreads every time fails the grade after READINGS readings; an empty answer is an
+    reading, grounded by code; each paid call (a misread's second reading too, and a reply that does not read) is
+    recorded on the trace, where the forge prices its spend. A reader that misreads every time fails the grade after READINGS readings; an empty answer is an
     error with no call."""
     solve, shown, right = rollback(tmp_path)
     asked = []
@@ -367,20 +369,21 @@ async def test_try_graded_on_a_real_trace(tmp_path):
     assert network.calls == len(trace.info["judge_calls"]) == READINGS, (
         "asked READINGS times, each paid and kept"
     )
-    # A reply that does not parse (a stray control character in GLM's JSON) is the reader's slip, asked again; the
-    # provider billed it, but the judge's call records a reply only once it parses.
+    # A reply that does not read as a reading (cut short) is the reader's slip, asked again, and each call is recorded
+    # as billed.
     unparsed = []
 
     def unparseable_first(fields):
         if not unparsed:
             unparsed.append(1)
-            Reading.model_validate_json('{"parts": [')
+            return '{"parts": ['
         return right
 
     trace = vf.Trace.model_construct(root_reply="We rolled back.", info={"observations": shown})
     with live_judging(FakeInference(unparseable_first)) as network:
         assert await SolverTask.semantic_correctness(solve, trace) == 1.0
-    assert (network.calls, len(trace.info["judge_calls"]), trace.info["evaluation"]["readings"]) == (2, 1, 2)
+    assert (network.calls, len(trace.info["judge_calls"]), len(trace.extra_usage)) == (2, 2, 2)
+    assert trace.info["evaluation"]["readings"] == 2
     # Grounded by message: a right answer whose try never saw the gold's message is right but ungrounded (0).
     elsewhere = [
         {"tool": "read_channel", "arguments": {}, "output": {"items": [{"channel": "C9", "ts": "1.000001"}]}}
@@ -411,3 +414,28 @@ def test_prompt_fields():
         + fenced("a\n```b```")
     )
     assert answer_fields(solve_prompt) == {"request": "q", "reference": [], "response": "a\n```b```"}
+    assert answer_fields(solve_prompt + REPLY)["response"] == "a\n```b```", (
+        "the reply it asks for comes after"
+    )
+
+
+def test_reply_read():
+    """A reading comes as plain JSON, which code reads (structured output is overbilled on GLM 5.3): the reply's first
+    JSON object, prose around it aside and a raw control character in a string read as written (GLM wrote one in 3 of
+    700 structured replies). A criterion a part doesn't ask is null, not an object with no verdict (the one of probe
+    C's 40 plain replies that failed), and a reply with no object fails. The prompt asks for it last, in the reading's
+    own schema."""
+    reading = Reading(parts=[read(True, part="the answer", commits="We rolled back.")])
+    text = reading.model_dump_json()
+    assert replied(f"The reading:\n{text}\nThat is all.", Reading) == reading
+    assert (
+        replied(text.replace("rolled back", "rolled\nback"), Reading).parts[0].commits == "We rolled\nback."
+    )
+    unasked = json.loads(text)
+    unasked["parts"][0]["declines"] = {"reason": "it can be answered", "verdict": None}
+    with pytest.raises(ValueError, match="verdict"):
+        replied(json.dumps(unasked), Reading)
+    with pytest.raises(ValueError, match="no JSON object"):
+        replied("I can't grade this.", Reading)
+    prompt = AnswerJudge().build_messages(request="q", reference="[]", response="a")
+    assert prompt.endswith(REPLY) and json.dumps(Reading.model_json_schema()) in REPLY
