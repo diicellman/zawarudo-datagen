@@ -11,7 +11,8 @@ trace (the regrade's `Regrading`, which keeps each paid call). The reader is ask
 answer and context by the readers' `--splits`) with what is out of the asker's sight, and the fenced answer; code
 decides, a misread is asked again, and grounding is code's. `--prompt` names a prompt file in place of the judge's
 own (`JudgeConfig.prompt`): a variant is a file, not a code change. A provider's error is asked again (the forge's
-`patient`); any other fails that try. Each grade is written to --out as it lands, with its usage; then the agreement
+`patient`); any other fails that try. Each grade is written to --out as it lands, with its usage and each reply that
+did not read (`misreads`: its text and the Misread it raised, a failed grade's every reply); then the agreement
 with the recorded grades, the spend, and with `--truth` the agreement with the calibration's truth, overall, by
 stratum and on its random sample. `--set` regrades only a calibration set's tries (the verifier's among them),
 `--tries N` a seeded sample that keeps every try the run graded wrong. An --out that exists is gone on with: its grades
@@ -26,6 +27,9 @@ from collections import Counter
 from pathlib import Path
 
 import verifiers.v1 as vf
+from worldgen_slack.judge import AnswerJudge, Misread
+from worldgen_slack.judge import graded as grade_of
+from worldgen_slack.release import PrivateAnswer
 from worldgen_slack.taskset import SolverTask
 
 from generators.worldgen_slack.forge.regrade import Regrading
@@ -68,6 +72,30 @@ def tries(run: Path, seats=("solver",)) -> list[dict]:
             )
         )
     return found
+
+
+class Kept(Regrading):
+    """The regrade's stand-in, keeping each reply's text beside its usage: what a reply that did not read said."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.replies = []
+
+    def record_judge_call(self, *, name: str, request: dict, response) -> None:
+        super().record_judge_call(name=name, request=request, response=response)
+        self.replies.append(response.text)
+
+
+def misreads(replies: list[str], reference: PrivateAnswer) -> list[dict]:
+    """Each reply that did not read, with the Misread it raised: read again as the grade read it (the judge's parse,
+    then code's reading of the gold's parts and items), which is deterministic and calls nothing."""
+    out = []
+    for text in replies:
+        try:
+            grade_of(AnswerJudge().parse(vf.JudgeResponse(text=text)), reference, True)
+        except Misread as error:
+            out.append({"text": text, "error": str(error)})
+    return out
 
 
 def usage_of(graded: Regrading) -> dict:
@@ -179,14 +207,18 @@ async def main() -> None:
         solve = SolverTask.create(
             public_task(task, solver_world), solver_world, answers[t["task"]], judge, network_policy=False
         )
-        graded = Regrading(t["observations"], t["response"], t["trace"], args.model)
+        stand_in = Kept(t["observations"], t["response"], t["trace"], args.model)
         try:
             async with gate:
-                await patient(lambda: SolverTask.semantic_correctness(solve, graded), timeout=args.timeout)
-            new = graded.info["evaluation"]
+                await patient(lambda: SolverTask.semantic_correctness(solve, stand_in), timeout=args.timeout)
+            new = stand_in.info["evaluation"]
         except Exception as error:
             new = {"error": f"{type(error).__name__}: {error}"[:300]}
-        return t | {"new": new, "usage": usage_of(graded)}
+        return t | {
+            "new": new,
+            "usage": usage_of(stand_in),
+            "misreads": misreads(stand_in.replies, answers[t["task"]]),
+        }
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w") as stream:
