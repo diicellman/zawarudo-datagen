@@ -26,7 +26,7 @@ from .config import ForgeConfig
 from .env import label_of
 from .release import publish
 from .tasks import Task
-from .tries import Tries, agreeing, by_part, patient, rates, reached
+from .tries import Tries, agreeing, by_part, patient, rates, reached, verified_by
 
 GRADE = (
     "correct", "abstained", "grounded", "unsupported_asides", "committed", "missing", "extra", "reason", "parts",
@@ -202,18 +202,28 @@ async def regrade(
             raise RuntimeError(
                 f"{len(failed)} of {len(todo)} tries failed to regrade, the rest kept (run again to finish): {failed[0]}"
             )
-        labels, unjudged = {}, []
+        labels, unjudged, reopened = {}, [], []
+        cascade = store.settings.get("cascade", 0)  # the forge's own: none before it had one
         for task_id, record in store.state.forged.items():
             if record.get("label") is None:
                 continue
             task = Task.model_validate(record["task"])
             verified = store.state.verifier.get(task_id, {}).get("results", [])
+            measured_rates = store.state.solves.get(task_id, {}).get("results", [])
             record["agree"] = len(agreeing(verified))
             record["reached"] = reached(task, verified)
-            record["verified"] = min(record["reached"]) >= 2
-            measured_rates = store.state.solves.get(task_id, {}).get("results", [])
             if measured_rates:
                 record["rates"], record["parts"] = rates(measured_rates), by_part(task, measured_rates)
+                record["student_reached"] = reached(task, measured_rates, grounded=True)
+            by = verified_by(task, verified, measured_rates, cascade)
+            if by is None and record.get("verified_by") == "student" and not verified:
+                # The student's tries alone verified it, and no longer do: the verifier never tried it, so its label is
+                # reopened, and the forge run again has the verifier try it (reopen).
+                record.pop("label")
+                record["failed"] = "the student's tries no longer verify it, regraded: the verifier tries it"
+                reopened.append(task_id)
+                continue
+            record["verified_by"], record["verified"] = by, by is not None
             before = record["label"]
             record["label"] = label_of(record, config.solved)
             labels[task_id] = (before, record["label"])
@@ -229,7 +239,14 @@ async def regrade(
             **measured,
         }
         moved = {t: f"{a}->{b}" for t, (a, b) in labels.items() if a != b}
-        store.event("forge_regraded", tries=len(todo), split_tasks=len(changed), moved=moved, **measured)
+        store.event(
+            "forge_regraded",
+            tries=len(todo),
+            split_tasks=len(changed),
+            moved=moved,
+            reopened=reopened,
+            **measured,
+        )
         store.save()
         finished = (
             store.state.phase == "done"
@@ -244,6 +261,7 @@ async def regrade(
             "split_tasks": len(changed),
             "moved": moved,
             "verified_unjudged": unjudged,
+            "reopened": reopened,
             "labels": {
                 k: sum(1 for _, b in labels.values() if b == k)
                 for k in ("solved", "window", "unsolved", "rejected")

@@ -117,29 +117,29 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
     def outcome(trace: vf.Trace) -> dict:
         """A solve's graded result. One that crashed before its grade (its harness, its model stream or its grading
         failed) scores zero and is marked crashed: its try tells nothing about the task. One that finished without an
-        answer is marked unanswered."""
-        result = trace.info.get("evaluation")
-        crashed = result is None or not trace.ok
+        answer is marked unanswered and is wrong: an empty last message, or a framework limit that cut it off (the turn
+        cap mid-search, a token cap, a reply cut at its length), whose last message is no answer, graded or not."""
+        cut = trace.ok and trace.is_truncated
+        result = None if cut else trace.info.get("evaluation")
+        crashed = not trace.ok or (result is None and not cut)
         if result is None:
             failed = "grading failed: " if trace.info.get("grading_started") else ""
             result = {
                 "task_id": trace.task.data.task_id,
-                "execution_ok": False,
+                "execution_ok": cut,
                 "semantic_correctness": 0.0,
                 "correct": False,
                 "grounded": False,
                 "calls": len(trace.info.get("observations", [])),
                 "solver_trace_id": trace.id,
-                "reason": failed + "; ".join(e.message for e in trace.errors),
+                "reason": f"cut off: {trace.stop_condition or 'its reply at its length'}"
+                if cut
+                else failed + "; ".join(e.message for e in trace.errors),
                 "response": trace.last_reply,
             }
         if not trace.ok:
             result.update(execution_ok=False, semantic_correctness=0.0)
-        # A finished try that never answers (an empty last message, or the turn cap mid-search) is wrong, and counted.
-        silent = (
-            not (result.get("response") or "").strip()
-            or getattr(trace, "stop_condition", None) == "max_turns"
-        )
+        silent = cut or not (result.get("response") or "").strip()
         return result | {"crashed": crashed, "unanswered": not crashed and silent}
 
     async def finalize(self, trace):

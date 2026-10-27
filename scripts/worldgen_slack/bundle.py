@@ -240,6 +240,9 @@ def readme(run, state, world, premise, tasks, tries, models, qc: dict, has_note:
     kinds = dict(db.execute("SELECT type, COUNT(*) FROM channels GROUP BY type").fetchall())
     storylines = [r for r in db.execute("SELECT id, summary FROM storylines ORDER BY position")]
     db.close()
+    config = read_json(run / "run.json")["config"]
+    effort = config["env"]["verifier"]["sampling"].get("reasoning_effort") or "default"
+    cascade = config.get("cascade", 0)  # none before forges had one
     labelled = [r for r in state["forged"].values() if r.get("label")]
     unlabelled = sum(1 for r in state["forged"].values() if not r.get("label"))
     events = [json.loads(line) for line in (run / "progress.jsonl").read_text().splitlines()]
@@ -276,8 +279,16 @@ def readme(run, state, world, premise, tasks, tries, models, qc: dict, has_note:
         f"- **Proposer** ({models['proposer']}): read the world and wrote each request as a named colleague (the",
         "  asker), with its answer and the messages it rests on. A request may have up to 4 parts. Code checked that",
         "  the asker can read every cited message.",
-        f"- **Verifier** ({models['verifier']}, at max reasoning): answered each request as the asker, from Slack",
+        f"- **Verifier** ({models['verifier']}, at {effort} reasoning): answered each request as the asker, from Slack",
         "  alone. Each part had to be reached twice, or the task was dropped.",
+        *(
+            [
+                f"  A request the student had already reached on every part in at least {cascade} of its tries, each",
+                "  shown a message that part rests on, needed no verifier: the student's tries verified it.",
+            ]
+            if cascade
+            else []
+        ),
         f"- **Student** ({models['student']}): tried each task 8 times. Each try was graded against the answer by",
         f"  {models['grader']}. An answer that hedges between values counts as wrong.",
         f"- **Task judge** ({models['task_judge']}): ruled each task realistic, unambiguous, exact (asking no more than",
@@ -324,8 +335,8 @@ def readme(run, state, world, premise, tasks, tries, models, qc: dict, has_note:
         "- **What the task is:** `answer_type`, `family`, `skill`, `set`, `variant_of`.",
         "- **How the student did:** `label`, `right_rate`, `right_interval` (90%), `strict_rate` (right and grounded),",
         "  `abstain_rate`, `part_rates`, `graded_tries`, `crashed_tries`.",
-        "- **The checks:** `verifier_right`, `judge` (the task judge's ruling), `solution` (a verifier try that",
-        "  reached the answer, with its calls).",
+        "- **The checks:** `verifier_right`, `judge` (the task judge's ruling), `solution` (a try that reached the",
+        "  answer, the verifier's or else the student's, with its calls).",
         "- `models`, and `qc` (the QC verdict and its reason).",
         "",
         "## Caveats",

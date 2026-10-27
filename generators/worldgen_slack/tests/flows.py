@@ -230,10 +230,23 @@ TestStore = Store  # the flows keep the real store: its traces, events and attem
 
 
 class FakeTrace(SimpleNamespace):
-    """A scripted seat's trace, with what the store and the env read of a real one."""
+    """A scripted seat's trace, with what the store and the env read of a real one, and what a task's scoring writes on
+    it (its metrics, its rewards, each judge call it paid for)."""
 
     def __init__(self, id, role, record=None, **fields):
-        base = dict(ok=True, info={}, errors=[], last_reply="", usage=None, is_completed=True)
+        base = dict(
+            ok=True,
+            info={},
+            errors=[],
+            last_reply="",
+            usage=None,
+            is_completed=True,
+            stop_condition=None,
+            is_truncated=False,
+            metrics={},
+            rewards={},
+            extra_usage=[],
+        )
         super().__init__(id=id, agent=SimpleNamespace(name=role), **(base | fields))
         self.record = record
 
@@ -247,10 +260,22 @@ class FakeTrace(SimpleNamespace):
             "ok": self.ok,
             "nodes": [],
             "info": self.info,
+            "extra_usage": [u.model_dump(mode="json") for u in self.extra_usage],
         }
 
     def record_metric(self, name, value):
-        self.info.setdefault("metrics", {})[name] = value
+        self.metrics[name] = value
+
+    def record_metrics(self, values):
+        for name, value in values.items():
+            self.record_metric(name, value)
+
+    def record_reward(self, name, value, weight=1.0):
+        self.rewards[name] = value
+
+    def record_judge_call(self, *, name, request, response):
+        if response.usage is not None:
+            self.extra_usage.append(response.usage)
 
 
 class ScriptedAgent:
@@ -1113,22 +1138,37 @@ async def run_flows(root):
     pinged = awake.pings
     await asyncio.sleep(0.03)
     assert pinged >= 2 and awake.pings == pinged, (pinged, awake.pings)
-    # A try that finished without an answer, an empty last message or the turn cap mid-search, is wrong and counted.
-    graded = {"task_id": "t", "correct": False, "semantic_correctness": 0.0, "response": "an answer"}
-    ends = [("an answer", "agent_completed"), ("", "agent_completed"), ("let me look further", "max_turns")]
-    silent = [
+    # A try that finished without an answer is wrong and counted: an empty last message, or a framework limit that cut
+    # it off (the turn cap mid-search, a token cap), whose last message is no answer even where a grade read it right.
+    graded = {"task_id": "t", "correct": True, "semantic_correctness": 1.0, "response": "an answer"}
+    ends = [
+        ("an answer", "agent_completed"),
+        ("", "agent_completed"),
+        ("let me look further", "max_turns"),
+        ("Alicia called it", "max_total_tokens"),
+    ]
+    tried = [
         SolverTask.outcome(
-            SimpleNamespace(ok=True, info={"evaluation": graded | {"response": r}}, stop_condition=stop)
-        )["unanswered"]
+            FakeTrace(
+                "t",
+                "solver",
+                info={"evaluation": graded | {"response": r}},
+                stop_condition=stop,
+                is_truncated=stop.startswith("max_"),
+                last_reply=r,
+                task=SimpleNamespace(data=SimpleNamespace(task_id="t")),
+            )
+        )
         for r, stop in ends
     ]
-    assert (
-        silent == [False, True, True]
-        and rates([{"correct": False, "semantic_correctness": 0.0, "unanswered": u} for u in silent])[
-            "unanswered"
-        ]
-        == 2
-    )
+    assert [(r["unanswered"], r["correct"], r["crashed"]) for r in tried] == [
+        (False, True, False),
+        (True, True, False),
+        (True, False, False),
+        (True, False, False),
+    ], tried
+    assert tried[3]["reason"] == "cut off: max_total_tokens"
+    assert rates([{"correct": False, "semantic_correctness": 0.0} | r for r in tried])["unanswered"] == 3
     assert run_label(Path("/x/data/v7-01/software")) == "worldgen-v7-01-software", (
         "a run's sandboxes are findable"
     )
@@ -1390,8 +1430,11 @@ async def forge_flow(root, world_dir, settings):
             FAULTS["session"] -= 1
             raise SessionLost("the proposer's sandbox dropped its stream")
 
-    # The student's tries, right by a schedule per task; i005's crash while its provider is down. The verifier reaches
-    # every answer, but splits on i003 (its second try wrong), so a third decides.
+    # The student's tries, right by a schedule per task; i005's crash while its provider is down. A task its 4 tries all
+    # reach, grounded, is verified by them (the cascade: i001, i004, i005); the verifier tries the others, reaches every
+    # answer, but splits on i003 (its second try wrong), so a third decides. Each try is graded by the forge, its run's
+    # scoring deferred: the answer judge's own call on the faked network reads "the answer" as right, and code grounds
+    # it on the gold's messages its calls showed.
     schedule = {
         "i001": "1111",
         "i005": "1111",
@@ -1407,6 +1450,7 @@ async def forge_flow(root, world_dir, settings):
     def tries_of(seat):
         class Trying(ScriptedAgent):
             async def run(self, task):
+                assert task.scoring_deferred, "the forge grades its tries, not their runs"
                 task_id = task.data.task_id
                 counts[seat, task_id] += 1
                 n = counts[seat, task_id]
@@ -1422,32 +1466,15 @@ async def forge_flow(root, world_dir, settings):
                     if seat == "verifier"
                     else schedule[task_id][(n - 1) % 4] == "1"
                 )
-                reference = task.config.reference
-                parts = [
-                    {
-                        "label": p.label,
-                        "correct": right,
-                        "abstained": False,
-                        "committed": [],
-                        "missing": [],
-                        "extra": [],
-                    }
-                    for p in reference.parts
-                ]
+                gold = [m for a in task.config.reference.answers() for m in a.messages]
+                trace.last_reply = "the answer" if right else "another answer"
                 trace.info = {
-                    "evaluation": {
-                        "task_id": task_id,
-                        "execution_ok": True,
-                        "semantic_correctness": 1.0 if right else -1.0,
-                        "correct": right,
-                        "grounded": right,
-                        "calls": 1,
-                        "reason": "r",
-                        "response": "the answer" if right else "another answer",
-                        "parts": parts,
-                    },
                     "observations": [
-                        {"tool": "read_channel", "arguments": {"channel_id": "C1"}, "output": {}}
+                        {
+                            "tool": "read_channel",
+                            "arguments": {"channel_id": gold[0][0]},
+                            "output": {"items": [{"channel": c, "ts": ts} for c, ts in gold]},
+                        }
                     ],
                 }
                 return trace
@@ -1518,7 +1545,27 @@ async def forge_flow(root, world_dir, settings):
         "e102": "easier",
         "r103": "repaired",
     }, "every approved task, with the set it came from"
-    assert all(a.solution.seat == "verifier" and a.solution.calls for a in answers.values())
+    assert {t: a.solution.seat for t, a in answers.items()} == {
+        "i001": "solver",
+        "i002": "verifier",
+        "i003": "verifier",
+        "h101": "verifier",
+        "e102": "verifier",
+        "r103": "verifier",
+    } and all(a.solution.calls for a in answers.values()), (
+        "a verified task's solution: the verifier's try, or the student's where its tries verified it"
+    )
+    assert {t: r.get("verified_by") for t, r in forged.items() if r.get("verified")} == {
+        "i001": "student",
+        "i002": "verifier",
+        "i003": "verifier",
+        "i004": "student",
+        "h101": "verifier",
+        "e102": "verifier",
+        "r103": "verifier",
+    } and not any(counts["verifier", t] for t in ("i001", "i004")), (
+        "the student's tries verified them: no verifier ran"
+    )
     assert next(r for r in rows if r.task_id == "i002").part_rates == {
         "who posted it": 0.0,
         "who answered": 0.0,
@@ -1597,7 +1644,12 @@ async def forge_flow(root, world_dir, settings):
     # The regrade: every try graded once, paid once, its cost measured; the labels stand.
     with live_judging(FakeInference(scripted_reading)) as network:
         summary = await regrade(plan, splits)
-    assert (summary["status"], summary["moved"], summary["split_tasks"]) == ("complete", {}, 1), summary
+    assert (summary["status"], summary["moved"], summary["split_tasks"], summary["reopened"]) == (
+        "complete",
+        {},
+        1,
+        [],
+    ), "the labels stand, and the tasks the student's tries verified stay verified"
     assert network.calls == summary["tries"] == summary["graded"] and summary["spent"] == pytest.approx(
         0.01 * summary["tries"]
     ), ("each grade paid once", network.calls, summary)

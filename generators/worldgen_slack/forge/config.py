@@ -69,6 +69,11 @@ class ForgeConfig(Section):
         default=8, ge=2, le=16
     )  # the student's (at 8, a task right half the time rarely shows 0 or 8)
     verify: int = Field(default=2, ge=1, le=5)  # the verifier's; a third on a split
+    # The student tries every task first, and a task its tries reach on every part `cascade` times, each shown a message
+    # that part rests on, needs no verifier: most of forge-w2's verifier tokens went on tasks the student had already
+    # reached (145 of 149 measured had every part reached twice in 8), and at 4 a few lenient grades cannot fake it (125
+    # of those 149 pass it). 0: the verifier tries every task, and the student only those it verified.
+    cascade: int = Field(default=4, ge=0, le=16)
     solved: float = Field(
         default=0.875, gt=0, le=1
     )  # a pass rate at or above it is solved: write a harder version

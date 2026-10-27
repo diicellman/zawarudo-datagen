@@ -168,7 +168,13 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
                 ),
                 "gold_sql": "rests on "
                 + ", ".join(f"m{m}" for m in evidence)
-                + (f"; the verifier agreed {record['agree']} times" if "agree" in record else ""),
+                + (
+                    "; verified by the student's tries"
+                    if record.get("verified_by") == "student"
+                    else f"; the verifier agreed {record['agree']} times"
+                    if "agree" in record
+                    else ""
+                ),
                 "category": task["family"],
                 "level": record.get("pass", 0),
                 "answer": {"canonical_answer": "; ".join(claims), "required_claims": claims},

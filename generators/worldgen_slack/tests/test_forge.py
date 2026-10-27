@@ -7,16 +7,18 @@ from types import SimpleNamespace
 import httpx
 import openai
 import pytest
+from verifiers.v1.errors import TaskError
 from worldgen_slack.judge import READINGS, Misread
 
 from ..forge import tries as tries_module
+from ..forge.config import ForgeSeats
 from ..forge.env import ForgeEnv, label_of, on_crashes, reopen, spent
 from ..forge.judge import Ruling, hearing, rule
 from ..forge.material import material
 from ..forge.regrade import grader
 from ..forge.release import level, release_rows, report
 from ..forge.tasks import Part, Task, answer_text, check, key, private_answer
-from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached, transient
+from ..forge.tries import Tries, agreeing, by_part, patient, rates, reached, transient, verified_by, wilson
 from ..prices import priced
 from ..store import Store
 from .flows import FakeInference, live_judging
@@ -31,6 +33,48 @@ def part(label="who called it", answer=("Alicia Rao",), evidence=(1,), kind="tex
 
 def request(*parts, id="t9", actor="U2", question="Catch me up on the 4.2 release: who called the rollback?"):
     return Task(id=id, family="catch-up", actor_id=actor, question=question, parts=list(parts) or [part()])
+
+
+class Solve(SimpleNamespace):
+    """A try's task as the forge runs it: its run's scoring deferred, and its grade the forge's, scripted: the
+    evaluation its seat put on the trace (`scripted`), after each error in `failing` (raised as verifiers' scoring
+    boundary raises one, with it as its cause)."""
+
+    def defer_scoring(self):
+        return self
+
+    async def score(self, trace):
+        self.graded.append(trace.id)
+        if self.failing:
+            cause = self.failing.pop(0)
+            raise TaskError(f"task Solve scoring: {type(cause).__name__}: {cause}") from cause
+        trace.info["evaluation"] = trace.scripted
+
+
+def scripted_tries(store, **settings):
+    """The forge's tries with scripted seats: no world copy, each task a Solve whose grades are listed in `graded`."""
+    tries = Tries(SimpleNamespace(env=ForgeSeats(), **settings), store)
+    tries.copy = lambda: None
+    graded, failing = [], []
+    tries.solver_task = lambda task, world: Solve(
+        data=SimpleNamespace(task_id=task.id), graded=graded, failing=failing
+    )
+    return tries, graded, failing
+
+
+def finished(seat, n, task, evaluation, cut=False):
+    """A seat's finished try, its evaluation for the forge to grade, or none when `evaluation` is None (it crashed)."""
+    return SimpleNamespace(
+        id=f"{seat}-{n}",
+        ok=evaluation is not None,
+        info={},
+        errors=[SimpleNamespace(message="stream ended")] if evaluation is None else [],
+        last_reply=(evaluation or {}).get("response", ""),
+        stop_condition="max_turns" if cut else None,
+        is_truncated=cut,
+        task=task,
+        scripted=evaluation,
+    )
 
 
 def test_material(tmp_path):
@@ -205,14 +249,10 @@ def test_contract(tmp_path):
 async def test_tries(tmp_path):
     """Each try is kept the moment it lands: a run cut off tops its task up, and a changed task is tried afresh; a
     verifier split is decided by a third try; a call that fails is asked again, and its last failure raised."""
-    saved = []
+    saved, stored = [], []
     state = SimpleNamespace(solves={}, verifier={})
-    store = SimpleNamespace(
-        state=state, trace=lambda trace: None, save=lambda: saved.append(1), root=tmp_path
-    )
-    tries = Tries(SimpleNamespace(solvers=2, verify=2, tries=3), store)
-    tries.copy = lambda: None
-    tries.solver_task = lambda task, world: SimpleNamespace(data=SimpleNamespace(task_id=task.id))
+    store = SimpleNamespace(state=state, trace=stored.append, save=lambda: saved.append(1), root=tmp_path)
+    tries, grades, failing = scripted_tries(store, solvers=2, verify=2, tries=3)
     # None crashes: the student's second try crashes all 3 of its attempts
     plan = {"verifier": [True, False, True], "solver": [True, None, None, None, False]}
     made = {"verifier": 0, "solver": 0}
@@ -225,15 +265,7 @@ async def test_tries(tmp_path):
             made[self.seat] += 1
             right = plan[self.seat][(made[self.seat] - 1) % len(plan[self.seat])]
             evaluation = {"correct": right, "semantic_correctness": 1.0 if right else -1.0, "response": "r"}
-            return SimpleNamespace(
-                id=f"{self.seat}-{made[self.seat]}",
-                ok=right is not None,
-                info={"evaluation": evaluation} if right is not None else {},
-                errors=[SimpleNamespace(message="stream ended")] if right is None else [],
-                last_reply="r",
-                stop_condition=None,
-                task=task,
-            )
+            return finished(self.seat, made[self.seat], task, evaluation if right is not None else None)
 
     agents = SimpleNamespace(verifier=Seat("verifier"), solver=Seat("solver"))
     task = request()
@@ -248,6 +280,7 @@ async def test_tries(tmp_path):
         "a try that crashes runs again, up to 3 times"
     )
     assert rates(measured)["right_rate"] == 0.5 and rates(measured)["crashed"] == 1
+    assert measured[1]["rerun"] == "stream ended", "a try run again says why"
     assert len(saved) == 6, "each try is saved as it lands"
     state.solves["t9"]["results"][2] = None  # a run cut off before its last try
     kept, crashed_trace = state.solves["t9"]["traces"][0], state.solves["t9"]["traces"][1]
@@ -308,56 +341,99 @@ async def test_tries(tmp_path):
         False,
     ]
     assert tries_module.WAITS == (0, 0, 0), "the checks wait for no provider"
+    # The forge grades each finished try, its run's scoring deferred; a try that crashed is not graded. A grade that
+    # meets a provider's error (verifiers' scoring raises it as its cause) is asked again on the same try, which never
+    # runs again; one that fails otherwise fails the task's labelling, its try's cost kept, and it does not run again.
+    assert transient(TaskError("task scoring: RateLimitError")) is False
+    try:
+        raise TaskError("task scoring: RateLimitError: 429") from limited
+    except TaskError as boundary:
+        assert transient(boundary), "a provider's error, raised through verifiers' scoring boundary"
+    assert all(t.id in grades for t in stored if t.ok) and not any(t.id in grades for t in stored if not t.ok)
+    plan["solver"] = [True]
+    made["solver"], grades[:], failing[:] = 0, [], [limited]
+    measured = await tries.measure(agents, task, "k3")
+    assert made["solver"] == 3 and len(grades) == 4 and all(r["correct"] for r in measured), (
+        "a grade asked again on its finished try, the try not run again",
+        made,
+        grades,
+    )
+    failing[:], stored[:] = [ValueError("a reply that does not read as a reading")], []
+    with pytest.raises(TaskError, match="does not read"):
+        await tries.solve(agents, tries.solver_task(task, None), "solver")
+    assert made["solver"] == 4 and [t.id for t in stored] == ["solver-4"], (
+        "a grade that fails otherwise is raised, its try kept and not run again"
+    )
 
 
 async def test_verifier_reach(tmp_path):
     """A composite's answer holds when each part is reached by two of the verifier's tries, though no one try reached
-    them all: a split on a part is decided by a third. A verifier's try that ends with no answer (its turn cap, on calls
-    that lost their arguments) runs again, as a crash does; a student's is its own failure, and counted."""
+    them all: a split on a part is decided by a third. A try that a framework limit cut off (its turn cap, a token cap)
+    is not graded and not run again: it is unanswered and wrong, the verifier's as the student's (it was run again,
+    $39 on forge-w2). With a cascade, the student's tries verify a task when every part is reached by that many of
+    them, each shown a message the part rests on."""
     state = SimpleNamespace(solves={}, verifier={})
     store = SimpleNamespace(state=state, trace=lambda trace: None, save=lambda: None, root=tmp_path)
-    tries = Tries(SimpleNamespace(solvers=2, verify=2, tries=2), store)
-    tries.copy = lambda: None
-    tries.solver_task = lambda task, world: SimpleNamespace(data=SimpleNamespace(task_id=task.id))
+    tries, graded_ids, _ = scripted_tries(store, solvers=2, verify=2, tries=2)
 
     def graded(*parts):
         return {"correct": all(parts), "response": "r", "parts": [{"correct": c} for c in parts]}
 
-    silent = {"correct": False, "response": "", "parts": [{"correct": False}, {"correct": False}]}
+    # mid-search at its turn cap: its words would read as right, were it graded
+    cut = {
+        "correct": True,
+        "response": "let me look further",
+        "parts": [{"correct": True}, {"correct": True}],
+    }
 
     class Seat:
-        def __init__(self, plan):
-            self.plan, self.made = list(plan), 0
+        def __init__(self, name, plan):
+            self.name, self.plan, self.made = name, list(plan), 0
 
         async def run(self, task):
             evaluation = self.plan[self.made]
             self.made += 1
-            return SimpleNamespace(
-                id=f"t{self.made}",
-                ok=True,
-                info={"evaluation": evaluation},
-                errors=[],
-                last_reply=evaluation["response"],
-                stop_condition="max_turns" if evaluation is silent else None,
-                task=task,
-            )
+            return finished(self.name, self.made, task, evaluation, cut=evaluation is cut)
 
     composite = request(part(), part(label="who answered", answer=["Owen Sato"], evidence=[2]))
-    verifier = Seat([graded(True, False), silent, graded(False, True), graded(True, True)])
+    verifier = Seat("v", [graded(True, False), graded(False, True), graded(True, True)])
     results = await tries.verify(SimpleNamespace(verifier=verifier), composite, "k")
-    assert verifier.made == 4 and len(results) == 3, (
-        "a silent try ran again, and a split on a part took a third"
-    )
+    assert verifier.made == 3 and len(results) == 3, "a split on a part took a third"
     assert reached(composite, results) == [2, 2] and not agreeing(results[:2]), (
         "each part reached twice, apart"
     )
-    assert results[1]["rerun"] == "no answer"
-    student = Seat([silent, graded(True, True)])
+    capped = Seat("c", [graded(True, False), cut])
+    results = await tries.verify(SimpleNamespace(verifier=capped), composite, "k2")
+    assert capped.made == 2 and reached(composite, results) == [1, 0], (
+        "a cut-off try reaches nothing and runs no more: a part no try reached takes no third"
+    )
+    assert results[1]["unanswered"] and not results[1]["correct"] and "c-2" not in graded_ids, (
+        "a cut-off try is not graded"
+    )
+    assert results[1]["reason"] == "cut off: max_turns"
+    student = Seat("s", [cut, graded(True, True)])
     measured = await tries.measure(SimpleNamespace(solver=student), composite, "k")
     assert student.made == 2 and measured[0]["unanswered"] and rates(measured)["right_rate"] == 0.5, (
-        "a student's silent try is counted wrong, not run again"
+        "a student's cut-off try is counted wrong, not run again"
     )
     assert reached(request(), [{"correct": True}, None, {"correct": True, "crashed": True}]) == [1]
+    # The cascade: a right try counts toward it only shown a message its part rests on (a composite's, by part).
+    single, shown, blind = (
+        request(),
+        {"correct": True, "grounded": True},
+        {"correct": True, "grounded": False},
+    )
+    assert verified_by(single, [], [shown] * 4 + [blind] * 4, 4) == "student"
+    assert verified_by(single, [], [shown] * 3 + [blind] * 5, 4) is None, (
+        "right but ungrounded tries do not count"
+    )
+    assert verified_by(single, [{"correct": True}] * 2, [shown] * 3, 4) == "verifier"
+    assert verified_by(single, [], [shown] * 8, 0) is None, "no cascade: the verifier's tries alone verify"
+    both = {"calls": 2, "part_coverage": [1.0, 0.5], "parts": [{"correct": True}, {"correct": True}]}
+    half = both | {"part_coverage": [1.0, 0.0]}
+    unread = both | {"calls": 0}
+    assert reached(composite, [both] * 4 + [half] * 4 + [unread], grounded=True) == [8, 4]
+    assert verified_by(composite, [], [half] * 8, 4) is None, "a part never shown its message is not verified"
 
 
 async def test_judge(tmp_path):
@@ -373,7 +449,24 @@ async def test_judge(tmp_path):
         [{"correct": False, "response": "Owen", "reason": "x"}],
     )
     assert heard["asker"].startswith("Owen Sato") and heard["parts"][0]["messages"][0]["from"] == "Alicia Rao"
-    assert heard["student_wrong_answers"] == [{"answer": "Owen", "grade": "x"}] and heard["verifier_answers"]
+    assert heard["student_wrong_answers"] == [{"answer": "Owen", "grade": "x"}] and (
+        heard["reached_by"],
+        heard["reaching_answers"],
+    ) == ("the verifier", ["Alicia Rao called it"])
+    heard = hearing(
+        world,
+        task,
+        [],
+        [
+            {"correct": True, "grounded": False, "response": "Alicia, I think"},
+            {"correct": True, "grounded": True, "response": "Alicia Rao"},
+            {"correct": False, "response": "Owen", "reason": "x"},
+        ],
+    )
+    assert (heard["reached_by"], heard["reaching_answers"]) == (
+        "the student",
+        ["Alicia Rao", "Alicia, I think"],
+    ), "where the student's tries verified it, its right answers reached it, grounded first"
     assert heard["parts"][0]["context"] == [], "the judge reads each part's context beside its answer"
     ruling, usage = await rule(forge_of(contracts_settings(tmp_path)).judge, world, task, [], [])
     assert ruling.approved and usage == {}
@@ -531,13 +624,14 @@ def test_release(tmp_path):
     )
     rows, answers = release_rows(store, "h")
     (row,) = rows
-    assert (row.task_id, row.set, row.right_rate, row.level, row.verifier_right) == (
+    assert (row.task_id, row.set, row.right_rate, row.right_interval, row.level, row.verifier_right) == (
         "t9",
         "harder",
         0.5,
+        wilson(1, 2),
         2,
         1.0,
-    )
+    ), "its rate published with its 90% interval"
     assert answers["t9"].solution.trace_id == "v1" and answers["t9"].solution.calls == [
         {"tool": "read_channel", "arguments": {"channel_id": "C1"}}
     ], "the solution is a grounded try, though an ungrounded one came first"

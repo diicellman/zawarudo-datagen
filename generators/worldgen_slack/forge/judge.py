@@ -1,5 +1,5 @@
 """The task judge: one call a task, on what code and the tries already found (its answer and the messages it rests on,
-the verifier's answers, the student's wrong ones). It rules on what no try can: whether a colleague would ask it,
+the answers that reached it, the student's wrong ones). It rules on what no try can: whether a colleague would ask it,
 whether its words allow another reading, whether its answer asks more than its label, and whether its messages state
 it. A task is approved when all four hold."""
 
@@ -73,9 +73,13 @@ def said(world, ids: list[int]) -> list[dict]:
 
 def hearing(world, task: Task, verified: list[dict], measured: list[dict]) -> dict:
     """What the judge reads of a task: its asker, its request, each part with its answer and its messages (and what is
-    out of the asker's sight), the verifier's answers and the student's wrong ones with their grades."""
+    out of the asker's sight), the answers that reached it (the verifier's tries, or, where the student's verified it
+    and no verifier ran, the student's right ones, grounded first) and the student's wrong ones with their grades."""
     asker = world.db.execute("SELECT real_name, title FROM users WHERE id = ?", (task.actor_id,)).fetchone()
-    wrong = [r for r in measured if r and not r.get("crashed") and not r.get("correct")]
+    finished = [r for r in measured if r and not r.get("crashed")]
+    wrong = [r for r in finished if not r.get("correct")]
+    tried = [r for r in verified if r and not r.get("crashed")]
+    right = sorted((r for r in finished if r.get("correct")), key=lambda r: not r.get("grounded"))
     return {
         "asker": f"{asker['real_name']} ({asker['title']})" if asker else task.actor_id,
         "family": task.family,
@@ -91,10 +95,9 @@ def hearing(world, task: Task, verified: list[dict], measured: list[dict]) -> di
             }
             for p in task.parts
         ],
-        "verifier_answers": [
-            (r.get("response") or "")[:1500] for r in verified if r and not r.get("crashed")
-        ],
-        "student_tries": len([r for r in measured if r and not r.get("crashed")]),
+        "reached_by": "the verifier" if tried else "the student",
+        "reaching_answers": [(r.get("response") or "")[:1500] for r in tried or right[:3]],
+        "student_tries": len(finished),
         "student_wrong_answers": [
             {"answer": (r.get("response") or "")[:1200], "grade": (r.get("reason") or "")[:600]}
             for r in wrong

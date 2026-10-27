@@ -72,8 +72,10 @@ def main():
         "each task shows its messages"
     )
     assert (
-        tasks["i001"]["gold_sql"].startswith("rests on m") and "verifier agreed" in tasks["i001"]["gold_sql"]
-    )
+        tasks["i001"]["gold_sql"].startswith("rests on m")
+        and "verified by the student's tries" in tasks["i001"]["gold_sql"]
+        and "verifier agreed" in tasks["i002"]["gold_sql"]
+    ), "a task verified by the student's tries, and one by the verifier's"
     assert any(t["role"] == "verifier" and t["evaluation"] for t in forge["traces"]), "the verifier's tries"
     # A forge's tasks as a reviewer labels them: each with its label, its tries (a split decided by a third), the
     # values beside its answer, and whether its release holds it; labels are kept per run, as <run>/<task>.

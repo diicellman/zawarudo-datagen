@@ -26,7 +26,7 @@ from .judge import rule
 from .proposer.task import ProposerTask, adapt_prompt, initial_prompt
 from .release import KEPT
 from .tasks import FAMILIES, Task, answer_text, check, key
-from .tries import Tries, agreeing, by_part, rates, reached
+from .tries import Tries, agreeing, by_part, rates, reached, verified_by
 
 
 def spent(store) -> float:
@@ -369,23 +369,27 @@ class ForgeEnv(SessionEnv):
         return failed
 
     async def label_one(self, agents, task_id: str) -> None:
+        """One task labelled. With a cascade, the student tries it first, and the verifier only when its grounded tries
+        fall short of reaching every part `cascade` times; without one, the verifier first, and the student only on a
+        task it verified. A verified task is judged."""
         record = self.store.state.forged[task_id]
         record.pop("failed", None)
         task, task_key = Task.model_validate(record["task"]), record["key"]
-        verified = await self.tries.verify(agents, task, task_key)
+        cascade = self.settings.cascade
+        measured = await self.measure(agents, task, task_key, record) if cascade else None
+        if measured is not None and min(record["student_reached"]) >= cascade:
+            verified = []  # the student reached it: no verifier runs
+        else:
+            verified = await self.tries.verify(agents, task, task_key)
         record["agree"] = len(agreeing(verified))
         record["reached"] = reached(
             task, verified
-        )  # by part: an answer holds when each part is reached twice
-        record["verified"] = min(record["reached"]) >= 2
+        )  # by part: the verifier's answer holds when each part is reached twice
+        record["verified_by"] = verified_by(task, verified, measured or [], cascade)
+        record["verified"] = record["verified_by"] is not None
         if record["verified"]:
-            measured = await self.tries.measure(agents, task, task_key)
-            record["rates"] = rates(measured)
-            if crashed := record["rates"][
-                "crashed"
-            ]:  # its rate would rest on fewer tries: they run again first
-                raise RuntimeError(f"{crashed} of the student's {len(measured)} tries crashed")
-            record["parts"] = by_part(task, measured)
+            if measured is None:
+                measured = await self.measure(agents, task, task_key, record)
             if "ruling" not in record:
                 async with (
                     self.judging
@@ -402,8 +406,20 @@ class ForgeEnv(SessionEnv):
             label=record["label"],
             agree=record["agree"],
             reached=record["reached"],
+            verified_by=record["verified_by"],
         )
         self.store.save()
+
+    async def measure(self, agents, task: Task, task_key: str, record: dict) -> list[dict]:
+        """The student's tries of a task, kept on its record as its rates, by part, and how often its grounded tries
+        reached each part."""
+        measured = await self.tries.measure(agents, task, task_key)
+        record["rates"] = rates(measured)
+        if crashed := record["rates"]["crashed"]:  # its rate would rest on fewer tries: they run again first
+            raise RuntimeError(f"{crashed} of the student's {len(measured)} tries crashed")
+        record["parts"] = by_part(task, measured)
+        record["student_reached"] = reached(task, measured, grounded=True)
+        return measured
 
     # ------------------------------------------------------------------ the next pass
 
@@ -469,8 +485,10 @@ def dry_run(config: ForgeConfig) -> dict:
         "adapt": config.adapt,
         "tries": config.tries,
         "verify": config.verify,
+        "cascade": config.cascade,
         "proposer": config.env.proposer.model,
         "verifier": config.env.verifier.model,
+        "verifier_effort": config.env.verifier.sampling.reasoning_effort,
         "solver": config.env.solver.model,
         "judge": config.judge.model,
         "spend_limit": config.spend_limit,

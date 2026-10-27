@@ -1,6 +1,6 @@
 """A forge's release: the solver's copy of its frozen world; each approved task's public row (its family, the set it
-came from, how hard it measured, by part) and its private answer (the verified gold, the messages it rests on, the
-verifier's try that reached it); and the material report, which tells a person writing the next chapter where the
+came from, how hard it measured, by part) and its private answer (the verified gold, the messages it rests on, a try
+that reached it); and the material report, which tells a person writing the next chapter where the
 world ran short."""
 
 import json
@@ -50,11 +50,16 @@ def level(right: float) -> int:
 
 
 def solution(store, task_id: str) -> Solution | None:
-    """The verifier's first try that reached the task's gold (a grounded one before any other), with its answer and
-    calls, from its saved trace."""
-    book = store.state.verifier.get(task_id, {})
-    reached = [(r, t) for r, t in zip(book.get("results", []), book.get("traces", [])) if r in agreeing([r])]
-    if not reached:
+    """The first try that reached the task's gold (a grounded one before any other), with its answer and calls, from its
+    saved trace: the verifier's, or the student's where the student's tries verified it and no verifier ran."""
+    for seat, book in (("verifier", store.state.verifier), ("solver", store.state.solves)):
+        entry = book.get(task_id, {})
+        reached = [
+            (r, t) for r, t in zip(entry.get("results", []), entry.get("traces", [])) if r in agreeing([r])
+        ]
+        if reached:
+            break
+    else:
         return None
     result, trace_id = min(
         reached, key=lambda pair: not pair[0].get("grounded")
@@ -62,8 +67,8 @@ def solution(store, task_id: str) -> Solution | None:
     record = trace_record(store, trace_id) or {}
     calls = (record.get("info") or {}).get("observations", [])
     return Solution(
-        seat="verifier",
-        model=store.settings.get("env", {}).get("verifier", {}).get("model"),
+        seat=seat,
+        model=store.settings.get("env", {}).get(seat, {}).get("model"),
         trace_id=trace_id,
         answer=result["response"],
         calls=[{"tool": c["tool"], "arguments": c["arguments"]} for c in calls],
@@ -78,7 +83,7 @@ def release_rows(store, world_hash: str) -> tuple[list[PublicTask], dict[str, Pr
             continue
         task = Task.model_validate(record["task"])
         tried = store.state.solves[task_id]["results"]
-        measured, verified = rates(tried), store.state.verifier[task_id]["results"]
+        measured, verified = rates(tried), store.state.verifier.get(task_id, {}).get("results", [])
         done = [r for r in verified if r and not r.get("crashed")]
         rows.append(
             PublicTask(
