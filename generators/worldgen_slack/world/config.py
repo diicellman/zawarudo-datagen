@@ -33,7 +33,7 @@ class ActivityConfig(Section):
     """Reference targets for the workspace's shape. One table drives where code places conversations and
     measure.py's scorecard; each value's provenance is noted in the run config."""
 
-    messages: int = Field(default=400, ge=0, le=5000)
+    messages: int = Field(default=400, ge=0, le=10000)  # W2 wrote 5,000 in 40 days; W3 asks 7,000 in 50
     channel_skew: float = Field(default=1.1, ge=0, le=4)
     dms_per_person: float = Field(default=0.4, ge=0, le=5)
     dm_share: float = Field(default=0.25, ge=0, le=1)
