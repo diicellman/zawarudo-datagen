@@ -1437,6 +1437,13 @@ async def forge_flow(root, world_dir, settings):
             assert ("a harder version of i001" in page) == ("h101" in allowed["ids"]) and (
                 "The judge refused it" in page
             ) == ("r103" in allowed["ids"]), page
+            if (
+                "h101" in allowed["ids"]
+            ):  # how the student got i001 right: its right answers, each part's messages
+                harder = page.split("## h101: ")[1].split("\n## ")[0]
+                assert "- a right answer: 'the answer'" in harder and (
+                    f"- who posted it rests on: m{first['id']} {first['real_name']}" in harder
+                ), harder
             turns["adapt"] += 1
         for task_id in allowed["ids"]:
             task = written(task_id, allowed["versions"].get(task_id))

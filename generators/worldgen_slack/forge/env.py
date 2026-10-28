@@ -22,7 +22,7 @@ from . import tries as try_module
 from .config import ForgeConfig
 from .coverage import coverage
 from .coverage import page as coverage_page
-from .judge import Ruling, rule
+from .judge import Ruling, rule, said
 from .proposer.task import ProposerTask, adapt_prompt, initial_prompt
 from .release import KEPT
 from .tasks import FAMILIES, Task, answer_text, check, key
@@ -280,7 +280,8 @@ class ForgeEnv(SessionEnv):
         return out
 
     WHY = {
-        "harder": "The student answered it right {right} of {tries}. Write a harder version: add a part the request "
+        "harder": "The student answered it right {right} of {tries}; its right answers and the messages each part rests "
+        "on are above: the path it took. Write a harder version that path no longer reaches: add a part the request "
         "needs, ask for the answer as of a moment, ask for every item where a reader would stop at one place, or ask "
         "for what is not settled. Its difficulty comes from what the request needs, not from tool tedium.",
         "easier": "The student never answered it ({right} of {tries}), though the verifier did. Write an easier version: "
@@ -291,18 +292,20 @@ class ForgeEnv(SessionEnv):
     }
 
     def adapt_page(self, ids: list[str]) -> str:
-        """What each open version is of, how its source went, and what to write."""
+        """What each open version is of, how its source went, and what to write. A harder version also shows how the
+        student got it right, its right answers (grounded first) and the messages each part rests on: a page of rates
+        and wrong answers (a solved task has at most one) left 3 of the smoke's 4 harder versions still solved."""
         state, lines = self.store.state, ["# Versions to write", ""]
         for task_id in ids:
             version = self.plan["planned"][task_id]
             record = state.forged[version["variant_of"]]
             task = Task.model_validate(record["task"])
             measured = record.get("rates") or {}
-            wrong = [
-                (r.get("response") or "")[:300]
-                for r in state.solves.get(task.id, {}).get("results", [])
-                if r and not r.get("crashed") and not r.get("correct")
+            finished = [
+                r for r in state.solves.get(task.id, {}).get("results", []) if r and not r.get("crashed")
             ]
+            wrong = [(r.get("response") or "")[:300] for r in finished if not r.get("correct")]
+            right = sorted((r for r in finished if r.get("correct")), key=lambda r: not r.get("grounded"))
             lines += [
                 f"## {task_id}: {'an' if version['why'] == 'easier' else 'a'} {version['why']} version of {task.id} "
                 f"(variant_of={task.id}, why={version['why']})",
@@ -316,6 +319,16 @@ class ForgeEnv(SessionEnv):
                 ),
             ]
             lines += [f"- a wrong answer: {w!r}" for w in wrong[:2]]
+            if version["why"] == "harder":
+                lines += [f"- a right answer: {(r.get('response') or '')[:600]!r}" for r in right[:2]]
+                lines += [
+                    f"- {p.label} rests on: "
+                    + "; ".join(
+                        f"m{m['id']} {m['from']}, {m['where']}, {m['when']}: {m['text'][:160]!r}"
+                        for m in said(self.world, p.evidence)
+                    )
+                    for p in task.parts
+                ]
             lines.append(
                 "- what to write: "
                 + self.WHY[version["why"]].format(
