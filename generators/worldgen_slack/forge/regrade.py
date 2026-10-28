@@ -1,7 +1,8 @@
 """A forge's stored tries graded again, by another grader or on golds split into answer and context: each try's grade
-replaced, each task's reach, rates and label recomputed from them, and its release published anew (the earlier kept as
-release.superseded) when the forge is finished; a forge mid-label keeps the new grades and publishes when it finishes.
-No try runs again: a regrade costs one grading call a try.
+replaced, each task's reach and rates recomputed from them, each verified task ruled again by the task judge on its new
+grades, its label recomputed, and its release published anew (the earlier kept as release.superseded) when the forge is
+finished; a forge mid-label keeps the new grades and publishes when it finishes. No try runs again: a regrade costs one
+grading call a try and one ruling a verified task.
 
 uv run --frozen worldgen-slack regrade --config configs/worldgen_slack/forge-w2.toml [--splits <folder>] [--dry-run]
 
@@ -24,6 +25,7 @@ from ..prices import priced
 from ..store import Store
 from .config import ForgeConfig
 from .env import label_of
+from .judge import rule
 from .release import publish
 from .tasks import Task
 from .tries import Tries, agreeing, by_part, patient, rates, reached, verified_by
@@ -84,6 +86,42 @@ SAVE_EVERY = 50  # grades between a regrade's saves and progress events
 PER_GRADE = (
     0.02  # $ a regrade may spend on a try unless told otherwise: about twice grader v2's measured $0.0105
 )
+PER_RULING = 0.03  # $ it may spend on ruling a task again: about twice a GLM 5.3 ruling at high (~$0.015)
+
+
+async def rerule(
+    store: Store, config: ForgeConfig, due: list[str], mark: str, spent: list, budget: float
+) -> list:
+    """Each verified task ruled again on its new grades, as labelling rules it (the config's task judge, a quarter of
+    the tries' share of GLM): its approval re-decided, its ruling before the regrade kept beside it, marked with the
+    regrade's grader so a run again skips it. Its cost is the regrade's, as its grades' are, not the forge's books.
+    What failed to be ruled, or was left past the budget."""
+    gate, failed = asyncio.Semaphore(max(1, config.solvers // 4)), []
+
+    async def one(task_id: str) -> None:
+        record = store.state.forged[task_id]
+        verified = store.state.verifier.get(task_id, {}).get("results", [])
+        measured = store.state.solves.get(task_id, {}).get("results", [])
+        async with gate:
+            if spent[0] > budget:
+                failed.append(
+                    f"{task_id}: left unruled, the regrade spent ${spent[0]:.2f} of its ${budget:.2f}"
+                )
+                return
+            try:
+                ruling, usage = await rule(
+                    config.judge, store.world, Task.model_validate(record["task"]), verified, measured
+                )
+            except Exception as error:
+                failed.append(f"{task_id}: {type(error).__name__}: {error}"[:300])
+                return
+        spent[0] += priced(usage, config.judge.model)
+        if "ruling" in record:
+            record.setdefault("ruling_before_regrade", record["ruling"])
+        record["ruling"], record["approved"], record["ruled"] = ruling.model_dump(), ruling.approved, mark
+
+    await asyncio.gather(*(one(t) for t in due))
+    return failed
 
 
 class Regrading:
@@ -133,7 +171,10 @@ async def regrade(
             todo = random.Random(seed).sample(todo, min(sample, len(todo)))
         else:
             store.save()  # the gold splits, before any grade
-        budget = budget if budget is not None else PER_GRADE * len(todo)
+        labelled = sum(1 for r in store.state.forged.values() if r.get("label") is not None)
+        budget = (
+            budget if budget is not None else PER_GRADE * len(todo) + (0 if sample else PER_RULING * labelled)
+        )
         tries = Tries(config, store)
         world, gate = tries.copy(), asyncio.Semaphore(config.solvers)
         done, failed, outcomes, spent, reread, stop = [], [], Counter(), [0.0], [0], []
@@ -202,7 +243,7 @@ async def regrade(
             raise RuntimeError(
                 f"{len(failed)} of {len(todo)} tries failed to regrade, the rest kept (run again to finish): {failed[0]}"
             )
-        labels, unjudged, reopened = {}, [], []
+        labels, befores, reopened, due = {}, {}, [], []
         cascade = store.settings.get("cascade", 0)  # the forge's own: none before it had one
         for task_id, record in store.state.forged.items():
             if record.get("label") is None:
@@ -224,13 +265,15 @@ async def regrade(
                 reopened.append(task_id)
                 continue
             record["verified_by"], record["verified"] = by, by is not None
-            before = record["label"]
+            befores[task_id] = record["label"]
+            if record["verified"] and record.get("ruled") != mark:
+                due.append(task_id)
+        rule_failed = await rerule(store, config, due, mark, spent, budget)
+        measured |= {"ruled": len(due) - len(rule_failed), "spent": round(spent[0], 4)}
+        for task_id, before in befores.items():
+            record = store.state.forged[task_id]
             record["label"] = label_of(record, config.solved)
             labels[task_id] = (before, record["label"])
-            if record["verified"] and "ruling" not in record:
-                unjudged.append(
-                    task_id
-                )  # verified only now: the task judge never ruled on it, so it stays rejected
         store.state.plans.setdefault("forge", {})["relabelled"] = True
         store.state.plans["forge"]["regraded"] = {
             "grader": mark,
@@ -248,6 +291,11 @@ async def regrade(
             **measured,
         )
         store.save()
+        if rule_failed:
+            raise RuntimeError(
+                f"{len(rule_failed)} of {len(due)} tasks failed to be ruled again, the rest kept (run again to finish): "
+                f"{rule_failed[0]}"
+            )
         finished = (
             store.state.phase == "done"
         )  # a forge mid-label publishes when it finishes, from these grades
@@ -260,7 +308,6 @@ async def regrade(
             **measured,
             "split_tasks": len(changed),
             "moved": moved,
-            "verified_unjudged": unjudged,
             "reopened": reopened,
             "labels": {
                 k: sum(1 for _, b in labels.values() if b == k)
@@ -279,10 +326,12 @@ def dry_regrade(config: ForgeConfig, splits: Path | None = None) -> dict:
         state=SimpleNamespace(**{k: state.get(k, {}) for k in ("solves", "verifier", "forged")})
     )
     found = splits_of(splits)
+    labelled = sum(1 for r in state.get("forged", {}).values() if r.get("label") is not None)
     return {
         "run": manifest.get("config", {}).get("output"),
         "tries": len(stored_tries(store)),
         "split_tasks": sum(1 for t, parts in found.items() if parts and t in state.get("forged", {})),
         "grader": grader(config),
-        "budget": round(PER_GRADE * len(stored_tries(store)), 2),
+        "task_judge": config.judge.model,
+        "budget": round(PER_GRADE * len(stored_tries(store)) + PER_RULING * labelled, 2),
     }

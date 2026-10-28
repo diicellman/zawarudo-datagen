@@ -174,7 +174,9 @@ def main() -> int:
     )
     parser.add_argument("--sample", type=int, help="regrade: grade this many tries live and change nothing")
     parser.add_argument(
-        "--budget", type=float, help="regrade: stop past this many dollars (default $0.02 a try)"
+        "--budget",
+        type=float,
+        help="regrade: stop past this many dollars (default $0.02 a try and $0.03 a labelled task's ruling)",
     )
     args = parser.parse_args()
     if args.command == "profile":

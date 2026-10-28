@@ -1,7 +1,8 @@
 """The task judge: one call a task, on what code and the tries already found (its answer and the messages it rests on,
-the answers that reached it, the student's wrong ones). It rules on what no try can: whether a colleague would ask it,
-whether its words allow another reading, whether its answer asks more than its label, and whether its messages state
-it. A task is approved when all four hold."""
+the answers that reached it, the student's wrong ones, what tries named beyond a set's answer). It rules on what no try
+can: whether a colleague would ask it, whether its words allow another reading, whether its answer asks more than its
+label, whether its messages state it, and whether a set's answer holds every member. A task is approved when all five
+hold."""
 
 import json
 
@@ -22,11 +23,12 @@ class Ruling(StrictModel):
     one_reading: bool
     exact: bool
     supported: bool
+    complete: bool
     reason: NonEmptyText
 
     @property
     def approved(self) -> bool:
-        return self.realistic and self.one_reading and self.exact and self.supported
+        return self.realistic and self.one_reading and self.exact and self.supported and self.complete
 
 
 class TaskJudge(vf.Judge[Ruling]):
@@ -71,15 +73,33 @@ def said(world, ids: list[int]) -> list[dict]:
     return out
 
 
+def named_beyond(task: Task, n: int, tries: list[tuple[str, dict]]) -> list[dict]:
+    """What each try presented beyond a set part's answer, as its grade names it (`extra`: a composite's by part, a
+    single part's whole): tries that search the world name the members its writer missed (smoke i011: the verifier's
+    and the student's tries named three promises its answer lacked, and were graded wrong for them)."""
+    out = []
+    for seat, result in tries:
+        parts = result.get("parts") or []
+        own = next((p for p in parts if p.get("label") == task.parts[n].label), None)
+        if own is None and len(parts) == len(task.parts):
+            own = parts[n]
+        items = (own or {}).get("extra") if parts else result.get("extra")
+        if items:
+            out.append({"by": seat, "items": list(items)})
+    return out
+
+
 def hearing(world, task: Task, verified: list[dict], measured: list[dict]) -> dict:
     """What the judge reads of a task: its asker, its request, each part with its answer and its messages (and what is
-    out of the asker's sight), the answers that reached it (the verifier's tries, or, where the student's verified it
-    and no verifier ran, the student's right ones, grounded first) and the student's wrong ones with their grades."""
+    out of the asker's sight), and for a set what tries named beyond its answer; the answers that reached it (the
+    verifier's tries, or, where the student's verified it and no verifier ran, the student's right ones, grounded
+    first) and the student's wrong ones with their grades."""
     asker = world.db.execute("SELECT real_name, title FROM users WHERE id = ?", (task.actor_id,)).fetchone()
     finished = [r for r in measured if r and not r.get("crashed")]
     wrong = [r for r in finished if not r.get("correct")]
     tried = [r for r in verified if r and not r.get("crashed")]
     right = sorted((r for r in finished if r.get("correct")), key=lambda r: not r.get("grounded"))
+    graded = [("the verifier", r) for r in tried] + [("the student", r) for r in finished]
     return {
         "asker": f"{asker['real_name']} ({asker['title']})" if asker else task.actor_id,
         "family": task.family,
@@ -93,7 +113,8 @@ def hearing(world, task: Task, verified: list[dict], measured: list[dict]) -> di
                 "messages": said(world, p.evidence),
                 "out_of_sight": said(world, p.unseen),
             }
-            for p in task.parts
+            | ({"named_beyond": named_beyond(task, n, graded)} if p.answer_type == "set" else {})
+            for n, p in enumerate(task.parts)
         ],
         "reached_by": "the verifier" if tried else "the student",
         "reaching_answers": [(r.get("response") or "")[:1500] for r in tried or right[:3]],

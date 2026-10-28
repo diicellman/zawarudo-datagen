@@ -202,11 +202,38 @@ def gold_text(reference: dict) -> str:
     return ", ".join(str(r.get("answer")) for r in reference["rows"])
 
 
+def scripted_ruling(text: str) -> Ruling:
+    """The forge's task judge, played by code, on its prompt: it approves a task unless its request asks something
+    "precisely" (more than a part asks) or a try named something beyond a set's answer (its hearing's named_beyond
+    holds an entry, each `"by": "the ..."`)."""
+    return Ruling(
+        realistic=True,
+        one_reading=True,
+        exact="precisely" not in text,
+        supported=True,
+        complete='"by": "the ' not in text,
+        reason="r",
+    )
+
+
+def ruling_or(answer):
+    """A network's answers (FakeInference with read=str): a task judge's prompt ruled as `scripted_ruling` rules it,
+    any other read as the answer judge's fields and answered by `answer`."""
+
+    def reply(prompt: str):
+        return (
+            scripted_ruling(prompt)
+            if prompt.startswith("You judge one task")
+            else answer(answer_fields(prompt))
+        )
+
+    return reply
+
+
 async def scripted_complete(self, messages, *, trace=None, schema=None, parse=None, **sampling):
     """The judges in the flows. The answer judge makes its own call, on a network played by FakeInference (its reader
-    `scripted_reading`), while GRADER is on. The forge's task judge, played by code, approves a task unless its request
-    asks something "precisely" (more than a part asks), and fails while `judge_fails` lasts. Any other judge call fails,
-    as `offline` does."""
+    `scripted_reading`), while GRADER is on. The forge's task judge rules as `scripted_ruling` does, and fails while
+    `judge_fails` lasts. Any other judge call fails, as `offline` does."""
     text = messages if isinstance(messages, str) else messages[0].content
     if text.startswith("You judge one task"):
         if GRADER["judge_fails"]:
@@ -215,9 +242,7 @@ async def scripted_complete(self, messages, *, trace=None, schema=None, parse=No
                 message="the judge's provider is unavailable",
                 request=httpx.Request("POST", "https://inference"),
             )
-        ruling = Ruling(
-            realistic=True, one_reading=True, exact="precisely" not in text, supported=True, reason="r"
-        )
+        ruling = scripted_ruling(text)
         return vf.JudgeResponse(
             text=ruling.model_dump_json(), parsed=parse(vf.JudgeResponse(text=ruling.model_dump_json()))
         )
@@ -1641,8 +1666,9 @@ async def forge_flow(root, world_dir, settings):
         5,
     ), sampled
     assert sampler.calls == 10 and sampled["per_grade"] == 0.02, ("two readings a try, both counted", sampled)
-    # The regrade: every try graded once, paid once, its cost measured; the labels stand.
-    with live_judging(FakeInference(scripted_reading)) as network:
+    # The regrade: every try graded once, paid once, its cost measured; every verified task ruled again on its new
+    # grades by the task judge's own call (one ruling each, paid once); the labels stand.
+    with live_judging(FakeInference(ruling_or(scripted_reading), read=str)) as network:
         summary = await regrade(plan, splits)
     assert (summary["status"], summary["moved"], summary["split_tasks"], summary["reopened"]) == (
         "complete",
@@ -1650,12 +1676,24 @@ async def forge_flow(root, world_dir, settings):
         1,
         [],
     ), "the labels stand, and the tasks the student's tries verified stay verified"
-    assert network.calls == summary["tries"] == summary["graded"] and summary["spent"] == pytest.approx(
-        0.01 * summary["tries"]
-    ), ("each grade paid once", network.calls, summary)
+    store = TestStore(plan.output, forge_provenance(plan))
+    verified = {t for t, r in store.state.forged.items() if r.get("label") and r.get("verified")}
+    store.close()
+    assert summary["tries"] == summary["graded"] and summary["ruled"] == len(verified), summary
+    assert network.calls == summary["tries"] + summary["ruled"] and summary["spent"] == pytest.approx(
+        0.01 * network.calls
+    ), ("each grade and each ruling paid once", network.calls, summary)
     assert summary["reread"] == 0, summary
     assert sum(counts.values()) == tried, "no try runs again"
     store = TestStore(plan.output, forge_provenance(plan))
+    mark = f"{plan.answer_judge.model}:judge_prompt.md"
+    assert all(store.state.forged[t]["ruled"] == mark for t in verified), (
+        "each ruled again, marked by the regrade"
+    )
+    assert (
+        not store.state.forged["i004"]["ruling"]["exact"]
+        and store.state.forged["i004"]["ruling_before_regrade"]
+    ), "ruled again as before (over-specific), its earlier ruling kept"
     i001 = store.state.forged["i001"]
     assert i001["task"]["parts"][0]["context"] == ["the first update"] and not i001["gold_before_split"][
         0

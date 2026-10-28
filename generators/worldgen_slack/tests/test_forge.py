@@ -473,11 +473,16 @@ async def test_judge(tmp_path):
     precise = request(question="Who precisely called the 4.2 rollback?")
     ruling, _ = await rule(forge_of(contracts_settings(tmp_path)).judge, world, precise, [], [])
     assert not ruling.exact and not ruling.approved, "an answer that asks more than its part"
-    assert not Ruling(realistic=False, one_reading=True, exact=True, supported=True, reason="r").approved
+    assert not Ruling(
+        realistic=False, one_reading=True, exact=True, supported=True, complete=True, reason="r"
+    ).approved
+    assert not Ruling(
+        realistic=True, one_reading=True, exact=True, supported=True, complete=False, reason="r"
+    ).approved, "a set's answer missing a member"
     # Its own call, only the network faked: plain JSON (no structured output), read by code; a reply that does not read
     # as a ruling is asked again and each call's cost counted, and one that never reads fails after READINGS calls.
     approved = Ruling(
-        realistic=True, one_reading=True, exact=True, supported=True, reason="r"
+        realistic=True, one_reading=True, exact=True, supported=True, complete=True, reason="r"
     ).model_dump_json()
     replies = iter(['{"realistic": true}', f"Ruling: {approved}"])
     with live_judging(FakeInference(lambda prompt: next(replies), read=str)) as network:
@@ -487,6 +492,47 @@ async def test_judge(tmp_path):
         with pytest.raises(Misread):
             await rule(forge_of(contracts_settings(tmp_path)).judge, world, task, [], [])
     assert network.calls == READINGS
+
+
+async def test_complete(tmp_path):
+    """A set's answer missing a member (smoke i011): the hearing lists, under each set part, what each try named beyond
+    its answer (its grade's `extra`: a composite's by part, a single part's whole), the judge rules it incomplete, and a
+    verified task it refuses is rejected, which the adapt pass repairs (the flows' r103)."""
+    world, at, message = world_fixture(tmp_path / "world.sqlite")
+    world.db.execute("INSERT OR REPLACE INTO world_meta (key, value) VALUES ('zone', 'America/Chicago')")
+    signed = part("who signed off", ("Alicia Rao",), kind="set")
+    task = request(part(), signed, question="Who called the rollback, and who signed off?")
+    beyond = ["names Owen Sato as signing off, beyond the gold"]
+    named = {
+        "correct": False,
+        "response": "Alicia Rao called it; Alicia Rao and Owen Sato signed off",
+        "reason": "x",
+        "parts": [{"label": "who called it", "extra": []}, {"label": "who signed off", "extra": beyond}],
+    }
+    plain = {
+        "correct": True,
+        "grounded": True,
+        "response": "Alicia Rao",
+        "parts": [{"label": "who called it"}],
+    }
+    heard = hearing(world, task, [named], [named, plain])
+    assert "named_beyond" not in heard["parts"][0], "a part that is not a set has no members to miss"
+    assert heard["parts"][1]["named_beyond"] == [
+        {"by": "the verifier", "items": beyond},
+        {"by": "the student", "items": beyond},
+    ]
+    alone = hearing(
+        world, request(signed), [], [{"correct": False, "response": "r", "parts": [], "extra": beyond}]
+    )
+    assert alone["parts"][0]["named_beyond"] == [{"by": "the student", "items": beyond}], (
+        "a single part's whole"
+    )
+    judge = forge_of(contracts_settings(tmp_path)).judge
+    ruling, _ = await rule(judge, world, task, [named], [named])
+    assert not ruling.complete and not ruling.approved
+    ruling, _ = await rule(judge, world, task, [plain], [plain])
+    assert ruling.complete and ruling.approved, "nothing named beyond it"
+    assert label_of({"verified": True, "approved": False, "rates": {"right_rate": 0.5}}, 0.875) == "rejected"
 
 
 def test_regrade_mark(tmp_path):

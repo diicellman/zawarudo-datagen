@@ -692,7 +692,7 @@ function forgeDetail(t) {
     h('p', {class: 'small muted', text: "Messages stating another value of the answer's facts: an earlier or later value, or a decoy. One the asker cannot read traps no one."}),
     S.spoilers ? near.map(([id, role]) => evidenceCard(id, readable(id) ? 'near' : 'hidden', role + (readable(id) ? '' : ' · the asker cannot read it'))) : spoil(h('p', {text: 'hidden'}))) : null;
   const ruling = f.ruling ? h('div', {class: 'card', style: 'margin-top:12px'}, label('Task judge'),
-    ['realistic', 'one_reading', 'exact', 'supported'].map(k => h('span', {class: 'chip ' + (f.ruling[k] ? 'good' : 'bad'), text: (f.ruling[k] ? '✓ ' : '✕ ') + k.replace('_', ' ')})),
+    ['realistic', 'one_reading', 'exact', 'supported', 'complete'].filter(k => k in f.ruling).map(k => h('span', {class: 'chip ' + (f.ruling[k] ? 'good' : 'bad'), text: (f.ruling[k] ? '✓ ' : '✕ ') + k.replace('_', ' ')})),
     h('p', {class: 'small', text: f.ruling.reason})) : null;
   const tried = (name, prefix, rows, note) => rows.length ? h('div', {class: 'card', style: 'margin-top:12px'},
     label(`${name} (${rows.filter(s => s.correct).length} of ${rows.filter(s => !s.crashed).length} right` + (rows.some(s => s.crashed) ? `, ${rows.filter(s => s.crashed).length} crashed)` : ')')),

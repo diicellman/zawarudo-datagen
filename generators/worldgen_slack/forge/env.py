@@ -22,7 +22,7 @@ from . import tries as try_module
 from .config import ForgeConfig
 from .coverage import coverage
 from .coverage import page as coverage_page
-from .judge import rule
+from .judge import Ruling, rule
 from .proposer.task import ProposerTask, adapt_prompt, initial_prompt
 from .release import KEPT
 from .tasks import FAMILIES, Task, answer_text, check, key
@@ -286,7 +286,8 @@ class ForgeEnv(SessionEnv):
         "easier": "The student never answered it ({right} of {tries}), though the verifier did. Write an easier version: "
         "a sub-question, fewer parts, or the part it missed, asked alone.",
         "repaired": "The judge refused it: {reason} Rewrite it so the judge's point is met: a request a colleague would "
-        "make, with one reading, each answer exactly what its part asks, resting on messages that state it.",
+        "make, with one reading, each answer exactly what its part asks, resting on messages that state it, a set's "
+        "answer holding every member (read the messages for each member the judge names before you add it).",
     }
 
     def adapt_page(self, ids: list[str]) -> str:
@@ -396,9 +397,7 @@ class ForgeEnv(SessionEnv):
                 ):  # the judge's model is the verifier's and the grader's: a share of its limit
                     ruling, usage = await rule(self.settings.judge, self.world, task, verified, measured)
                 record["ruling"], record["usage"] = ruling.model_dump(), usage
-            record["approved"] = all(
-                record["ruling"][k] for k in ("realistic", "one_reading", "exact", "supported")
-            )
+            record["approved"] = Ruling.model_validate(record["ruling"]).approved
         record["label"] = label_of(record, self.settings.solved)
         self.store.event(
             "task_labelled",

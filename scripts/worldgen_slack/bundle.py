@@ -243,6 +243,9 @@ def readme(run, state, world, premise, tasks, tries, models, qc: dict, has_note:
     config = read_json(run / "run.json")["config"]
     effort = config["env"]["verifier"]["sampling"].get("reasoning_effort") or "default"
     cascade = config.get("cascade", 0)  # none before forges had one
+    complete = any(
+        "complete" in (r.get("ruling") or {}) for r in state["forged"].values()
+    )  # ruled since it was asked
     labelled = [r for r in state["forged"].values() if r.get("label")]
     unlabelled = sum(1 for r in state["forged"].values() if not r.get("label"))
     events = [json.loads(line) for line in (run / "progress.jsonl").read_text().splitlines()]
@@ -292,7 +295,13 @@ def readme(run, state, world, premise, tasks, tries, models, qc: dict, has_note:
         f"- **Student** ({models['student']}): tried each task 8 times. Each try was graded against the answer by",
         f"  {models['grader']}. An answer that hedges between values counts as wrong.",
         f"- **Task judge** ({models['task_judge']}): ruled each task realistic, unambiguous, exact (asking no more than",
-        "  its parts) and supported by its messages. Only tasks with all four are in this release.",
+        "  its parts) and supported by its messages"
+        + (
+            ", and a set complete (holding every member the tries named that its words make one)"
+            if complete
+            else ""
+        )
+        + ". Only tasks it approved on all of these are in this release.",
         "- **Labels:** by the student's share of right tries.",
         "  - `solved`: at least 7 of 8 right;",
         "  - `window`: some right;",
