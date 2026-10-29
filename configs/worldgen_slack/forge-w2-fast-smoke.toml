@@ -1,0 +1,61 @@
+# The fast forge's smoke on W2: uv run --frozen worldgen-slack forge --config configs/worldgen_slack/forge-w2-fast-smoke.toml
+# forge-w2's forge with its three savings on, at about a tenth of its size: the student tries every task first and a task
+# its grounded tries reach on every part 4 times needs no verifier (cascade); the verifier thinks at high, not max; and
+# each try is graded by the forge, so a grade that fails is asked again on the finished try, never by running it again,
+# and a try cut off at its turn cap is counted unanswered, not graded or run again. The judges reply in plain JSON. Its
+# bill, read against the day's billing row, says what a full forge costs now.
+world = "data/v8-05/w2"
+output = "data/v8-05/forge-w2-fast-smoke"
+tasks = 16                # with their harder, easier and repaired versions, about 30 tasks
+batch = 4                 # a turn's ids, one of each family: a turn of 12 had GLM 5.3 flash survey the world until its
+                          # 1.5M tokens ran out, before it wrote one (the W1 pilot, 2026-10-17)
+adapt = 1
+tries = 8
+verify = 2
+cascade = 4               # forge-w2: 125 of its 149 measured tasks had every part reached 4 times, grounded
+# The skills code deals the initial ids, in turn: aggregation twice in 5 (the research's surest near-miss for a fast
+# model, and W1's rarest), then temporal, abstention and synthesis. Crossed with the 4 families, every pair occurs
+# within 20 ids.
+skills = ["aggregation", "temporal", "aggregation", "abstention", "synthesis"]
+offers = 3                # turns an id is offered unwritten before it is dropped, short of material
+spend_limit = 80.0        # a guard against a runaway, not a budget
+
+# The proposer works in a Docker container on the research VM, of the agents' image (the rlm harness installed), as W2's
+# author did: W2 ran 40 days with no lost session there, where Prime's sandbox streams dropped 6 times on its smoke.
+[env]
+sandbox = "docker"
+docker_image = "sha256:86fe169858e8270c367f687ad9a4e6e52d15f99e8ba3bcf65fb5327c345668e8"
+
+# One model per seat. The proposer, the models that check its tasks and the student, whose pass rates select them,
+# are of three families, so none checks its own family's writing; unset fields keep the seat defaults.
+[env.proposer]
+model = "anthropic/claude-opus-5.5"
+
+# Anthropic caches a prompt only when asked: each step then pays for its new tail alone. The cache lives an hour, as
+# the proposer's VM waits while a pass is labelled.
+[env.proposer.sampling]
+cache_control = { type = "ephemeral", ttl = "1h" }
+
+[env.verifier]            # reaches each task's answer from Slack the student did not, or the task is dropped
+model = "z-ai/glm-5.3"
+
+# At "high", not forge-w2's "max": under the cascade the verifier tries only the tasks the student's tries did not
+# reach. A probe of 2 tasks whose gold was right (local-docs/tools-v8/verifier-probe, 2026-10-19) had max reach every
+# part of 6 tries and high 5 of 6; the smoke measures the verifier's yield at high.
+[env.verifier.sampling]
+reasoning_effort = "high"
+
+[env.solver]              # the student
+model = "deepseek/deepseek-v4.1-flash"
+
+[judge]                   # the task judge: realistic, one reading, exact, supported
+model = "z-ai/glm-5.3"
+
+[judge.sampling]
+reasoning_effort = "high"
+
+[answer_judge]            # grades every try against a task's answer
+model = "z-ai/glm-5.3"
+
+[answer_judge.sampling]
+reasoning_effort = "high"

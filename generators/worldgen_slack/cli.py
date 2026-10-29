@@ -20,6 +20,7 @@ from verifiers.v1.utils.interrupt import cleaning_up, install_interrupt
 from worldgen_slack.release import atomic_json
 
 from .forge import env as forge
+from .forge import regrade as forge_regrade
 from .forge.config import ForgeConfig, load_forge
 from .forge.release import publish
 from .store import Store
@@ -32,6 +33,7 @@ PARTS = {
     "world": ("Generate the shared Slack workspace.", "run"),
     "chapter": ("Continue the shared Slack workspace.", "chapter"),
     "forge": ("Forge tasks on the finished workspace.", "forge"),
+    "regrade": ("", "regrade"),  # no episode: a forge's tries graded again
 }
 
 
@@ -56,6 +58,7 @@ async def run(
     seed: int,
     start: Callable[[Store], vf.Env],
     finish: Callable[[Store], None] = lambda store: None,
+    reopen: Callable[[Store], bool] = lambda store: False,
 ) -> dict:
     """One run: its env (`start`) as one episode on its run directory, from where the directory left off, then
     `finish` once it is complete; `seed` is the episode's task index. Its summary says how it ended; an interrupted run
@@ -64,6 +67,7 @@ async def run(
     set_base_sandbox_labels([run_label(output)])
     store = Store(output, origin)
     try:
+        reopen(store)  # a finished run with work left undone (a forge's failed labels) takes it up
         if store.state.phase != "done":
             env = start(store)
             # Every seat names its model (Seats.secure), so the episode's model is a stand-in that no agent uses: the
@@ -142,7 +146,15 @@ async def run_forge(config: ForgeConfig) -> dict:
     origin = forge.provenance(config)
     return await carry_on(
         "forge",
-        lambda: run("forge", config.output, origin, 0, lambda store: forge.ForgeEnv(config, store), publish),
+        lambda: run(
+            "forge",
+            config.output,
+            origin,
+            0,
+            lambda store: forge.ForgeEnv(config, store),
+            publish,
+            forge.reopen,
+        ),
         config.max_resumes,
     )
 
@@ -152,11 +164,20 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "command", nargs="?", choices=["chapter", "forge", "profile"], help="a world when omitted"
+        "command", nargs="?", choices=["chapter", "forge", "profile", "regrade"], help="a world when omitted"
     )
     parser.add_argument("--config", type=Path)
     parser.add_argument("--world", type=Path, help="profile: the run directory whose world.sqlite to profile")
     parser.add_argument("--dry-run", action="store_true", help="validate the configuration; spend nothing")
+    parser.add_argument(
+        "--splits", type=Path, help="regrade: reference batches that split golds into answer and context"
+    )
+    parser.add_argument("--sample", type=int, help="regrade: grade this many tries live and change nothing")
+    parser.add_argument(
+        "--budget",
+        type=float,
+        help="regrade: stop past this many dollars (default $0.02 a try and $0.03 a labelled task's ruling)",
+    )
     args = parser.parse_args()
     if args.command == "profile":
         if args.world is None:
@@ -168,6 +189,10 @@ def main() -> int:
     if args.command == "forge":
         config = load_forge(args.config)
         dry, going = (lambda: forge.dry_run(config)), (lambda: run_forge(config))
+    elif args.command == "regrade":
+        config = load_forge(args.config)
+        dry = lambda: forge_regrade.dry_regrade(config, args.splits)  # noqa: E731
+        going = lambda: forge_regrade.regrade(config, args.splits, args.sample, args.budget)  # noqa: E731
     elif args.command == "chapter":
         plan, settings = chapter.load_chapter(args.config)
         dry, going = (lambda: chapter.dry_run(plan, settings)), (lambda: run_chapter(plan, settings))

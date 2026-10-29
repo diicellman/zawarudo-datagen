@@ -4,7 +4,10 @@ judge's grade), on one copy of the frozen world, and is kept the moment it lands
 
 import asyncio
 import math
+from functools import partial
 
+import httpx
+import openai
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from worldgen_slack.release import PublicTask
 from worldgen_slack.taskset import SolverTask
@@ -59,20 +62,33 @@ def by_part(task: Task, results: list[dict]) -> dict[str, float] | None:
     return {p.label: sum(g[n]["correct"] for g in graded) / len(graded) for n, p in enumerate(task.parts)}
 
 
-def reached(task: Task, results: list[dict]) -> list[int]:
-    """How many of the verifier's tries reached each part's answer: right on that part (a single question: right on
-    the whole). An answer holds when each of its parts is reached twice, though no one try reaches them all: a part is
-    a claim of its own, and the student is graded on the request whole."""
+def reached(task: Task, results: list[dict], grounded: bool = False) -> list[int]:
+    """How many tries reached each part's answer: right on that part (a single question: right on the whole) and, when
+    `grounded`, shown a message that part rests on. An answer holds when each of its parts is reached twice by the
+    verifier, though no one try reaches them all: a part is a claim of its own, and the student is graded on the request
+    whole."""
     counts = [0] * len(task.parts)
     for r in results:
         if not r or r.get("crashed"):
             continue
         if len(task.parts) == 1:
-            counts[0] += bool(r.get("correct"))
+            counts[0] += bool(r.get("correct")) and (not grounded or bool(r.get("grounded")))
         elif len(r.get("parts") or []) == len(task.parts):
+            seen = r.get("part_coverage") or [None] * len(task.parts)  # None: a part that rests on no message
             for n, part in enumerate(r["parts"]):
-                counts[n] += bool(part.get("correct"))
+                shown = bool(r.get("calls")) and seen[n] != 0
+                counts[n] += bool(part.get("correct")) and (not grounded or shown)
     return counts
+
+
+def verified_by(task: Task, verifier: list[dict], solves: list[dict], cascade: int) -> str | None:
+    """Who verified a task's answer: the student, when its grounded tries reach every part `cascade` times (0: never),
+    else the verifier, when its tries reach every part twice; None when neither did."""
+    if cascade and solves and min(reached(task, solves, grounded=True)) >= cascade:
+        return "student"
+    if min(reached(task, verifier)) >= 2:
+        return "verifier"
+    return None
 
 
 def agreeing(results: list[dict]) -> list[dict]:
@@ -81,18 +97,51 @@ def agreeing(results: list[dict]) -> list[dict]:
     return [r for r in results if r and not r.get("crashed") and r.get("correct")]
 
 
+def public_task(task: Task, world) -> PublicTask:
+    """A forged task as its solver gets it: its question, as its asker, on the solver copy of the world."""
+    return PublicTask(
+        task_id=task.id,
+        question=task.question,
+        actor_id=task.actor_id,
+        category=task.family,
+        level=1,
+        answer_type="composite" if len(task.parts) > 1 else task.parts[0].answer_type,
+        world_hash=file_hash(world),
+    )
+
+
 WAITS = (5, 30, 120)  # seconds before a call is asked again
 
 
+RETRIED = (408, 409, 425, 429, 500, 502, 503, 504)  # a provider's statuses a call asked again may not meet
+
+
+def transient(error: BaseException | None) -> bool:
+    """An error of a provider's or the network's, which the same call asked again may not meet: a timeout, a lost
+    connection, a rate limit, a server's error, or an error raised with one as its cause (a task's scoring raises
+    through verifiers' boundary, which carries the provider's error as its cause). Anything else (an answer that does
+    not parse, a bug in our own code) fails at once: asked again, it is paid for again and fails again (forge-w2's
+    regrade paid each of 1,610 grades four times over a missing trace method, $166, 2026-10-21)."""
+    while error is not None:
+        if isinstance(
+            error, TimeoutError | httpx.TransportError | openai.APIConnectionError | openai.RateLimitError
+        ):
+            return True
+        if isinstance(error, openai.APIStatusError) and error.status_code in RETRIED:
+            return True
+        error = error.__cause__
+    return False
+
+
 async def patient(call, timeout: float):
-    """A model call cut at `timeout` and asked again after each of WAITS (the model client has no read timeout, and
-    Prime's errors come in bursts); the last failure is raised."""
+    """A model call cut at `timeout` and asked again after each of WAITS when its error is transient (the model client
+    has no read timeout, and Prime's errors come in bursts); any other error, and the last, is raised."""
     for wait in (*WAITS, None):
         try:
             async with asyncio.timeout(timeout):
                 return await call()
-        except Exception:
-            if wait is None:
+        except Exception as error:
+            if wait is None or not transient(error):
                 raise
             await asyncio.sleep(wait)
 
@@ -124,17 +173,8 @@ class Tries:
 
     def solver_task(self, task: Task, world) -> SolverTask:
         """A task as a solver gets it: its question, as its asker, on the solver copy; its grade against its answer."""
-        row = PublicTask(
-            task_id=task.id,
-            question=task.question,
-            actor_id=task.actor_id,
-            category=task.family,
-            level=1,
-            answer_type="composite" if len(task.parts) > 1 else task.parts[0].answer_type,
-            world_hash=file_hash(world),
-        )
         return SolverTask.create(
-            row,
+            public_task(task, world),
             world,
             private_answer(self.store.world, task),
             self.settings.answer_judge,
@@ -142,24 +182,32 @@ class Tries:
         )
 
     async def solve(self, agents, task: SolverTask, seat: str):
-        """One independent solve by `seat`, graded for correctness and grounding. One that crashed runs again, and
-        says why in `rerun`; crashed every time, it is kept as crashed, and the task's rates leave it out. So does a
-        verifier's that ends with no answer (stuck at its turn cap on calls that lost their arguments): it says nothing
-        of whether the answer can be reached. A student's unanswered try is its own failure, and counted."""
-        first = None
+        """One independent solve by `seat`, graded for correctness and grounding. The forge grades it, not its run
+        (verifiers' deferred scoring, as its harbor env grades): a grade that meets a provider's error is asked again on
+        the finished try (patient), never by running the try again (forge-w2 ran 47 finished tries again over their
+        grades); one that still fails fails the task's labelling, the try's cost kept. A try that a framework limit cut
+        off (the turn cap, a token cap) is not graded: its last message is no answer, and it counts as unanswered and
+        wrong, the verifier's as the student's (forge-w2 ran 11 turn-capped verifier tries again, for $39). One that
+        crashed runs again, and says why in `rerun`; crashed every time, it is kept as crashed, and the task's rates
+        leave it out."""
+        first, timeout = None, getattr(self.settings.env, seat).timeout.scoring or 300
         for attempt in range(self.ATTEMPTS):
             if attempt and (wait := WAITS[min(attempt - 1, len(WAITS) - 1)]):
                 await asyncio.sleep(
                     wait
                 )  # a provider's burst of refusals (429: too many concurrent requests) passes
             async with self.gates[seat]:
-                trace = await getattr(agents, seat).run(task)
-            self.store.trace(trace)
+                trace = await getattr(agents, seat).run(task.defer_scoring())
+                try:
+                    if trace.ok and not trace.is_truncated:
+                        await patient(partial(task.score, trace), timeout=timeout)
+                finally:
+                    self.store.trace(trace)
             outcome = SolverTask.outcome(trace)
-            if not (outcome["crashed"] or (seat == "verifier" and outcome["unanswered"])):
+            if not outcome["crashed"]:
                 break
             if first is None:
-                first = outcome.get("reason") or ("crashed" if outcome["crashed"] else "no answer")
+                first = outcome.get("reason") or "crashed"
         return (outcome | {"rerun": first[:200]} if first is not None else outcome), trace
 
     async def tried(self, agents, book: dict, task: Task, key: str, n: int, seat: str) -> list[dict]:

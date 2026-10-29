@@ -3,6 +3,7 @@ answer judge), the agent's VM as files, and a world, the forge, a measure and a 
 CLI with them. The behaviour lock and the viewer's check run them too."""
 
 import asyncio
+import contextvars
 import io
 import json
 import random
@@ -14,12 +15,15 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 import verifiers.v1 as vf
+import verifiers.v1.judge as vf_judge
 import verifiers.v1.utils.interrupt
 from verifiers.v1.dialects.base import append_user_notice
 from verifiers.v1.errors import SandboxError
-from worldgen_slack.judge import AnswerGrade, PartGrade
+from worldgen_slack.judge import READINGS, REPLY, Check, Gives, PartReading, Reading
 from worldgen_slack.release import load_release
 from worldgen_slack.taskset import SolverTask
 from worldgen_slack.world import file_hash
@@ -31,6 +35,7 @@ from ..forge.config import ForgeConfig
 from ..forge.env import provenance as forge_provenance
 from ..forge.judge import Ruling
 from ..forge.proposer.task import ProposerTask
+from ..forge.regrade import FAIL_FAST, regrade
 from ..forge.tasks import Part, Task
 from ..forge.tries import rates
 from ..judge.verdict import PHASE_CRITERIA, Issue, TaskReview, Verdict
@@ -75,8 +80,119 @@ async def offline(*args, **kwargs):
     raise AssertionError("the offline checks call no model: script the agent or the judge")
 
 
-# The flows' answer judge, played by code; `grounded` has it ground every answer in what the solver read.
-GRADER = {"on": False, "loose": False, "blind": False, "grounded": False, "judge_fails": 0}
+# The flows' answer judge, played by the model provider (FakeInference), and its task judge, played by code.
+GRADER = {"on": False, "judge_fails": 0}
+
+REFUSED = "I can't answer that from anything you can see: it isn't there."
+
+
+def answer_fields(prompt: str) -> dict:
+    """The answer judge's prompt as its reader reads it: the request, the gold by part, and the fenced answer (the
+    reply it asks for after it)."""
+    _, _, rest = prompt.partition("The request:\n")
+    request, _, rest = rest.partition("\n\nThe gold, by part:\n")
+    reference, _, fenced = rest.partition("\n\nThe answer, between the fences:\n")
+    lines = fenced.removesuffix(REPLY).rstrip("\n").split("\n")
+    return {"request": request, "reference": json.loads(reference), "response": "\n".join(lines[1:-1])}
+
+
+def said(reference: list[dict]) -> str:
+    """The gold as a right answer says it: its items, or each part's under its label."""
+    items = [", ".join(i["answer"] for i in part["items"]) for part in reference]
+    if len(reference) == 1:
+        return items[0]
+    return " | ".join(f"{part['part']}: {own}" for part, own in zip(reference, items))
+
+
+def scripted_reading(fields: dict) -> Reading:
+    """The answer judge's reader, played by code: a right answer ("the answer", the gold as said and a full stop, or a
+    refusal's words) gives every item of every part and declines what can't be answered; any other conflicts."""
+    gold, response = fields["reference"], fields["response"]
+    right = response in ("the answer", f"{said(gold)}.", REFUSED) or response.startswith(
+        f"{said(gold)}, though"
+    )
+
+    def check(verdict: bool) -> Check:
+        return Check(reason="scripted", verdict=verdict)
+
+    return Reading(
+        parts=[
+            PartReading(
+                part=part["part"],
+                commits=response,
+                gives=[Gives(item=i["item"], reason="scripted", verdict=right) for i in part["items"]],
+                conflicts=check(not right),
+                extra=check(False) if part["answer_type"] == "set" else None,
+                hedged=check(False),
+                holds_back=check(False),
+                declines=check(right) if part["answer_type"] == "refusal" else None,
+                false_asides=[],
+            )
+            for part in gold
+        ]
+    )
+
+
+def misreading_first(answer):
+    """A reader that misreads each try's first reading (one part too many), then reads as `answer` does. Each try's
+    grade runs in its own task, so a context variable is its own."""
+    first = contextvars.ContextVar("first", default=True)
+
+    def reading(fields: dict) -> Reading:
+        read = answer(fields)
+        if first.get():
+            first.set(False)
+            return read.model_copy(update={"parts": [*read.parts, read.parts[0]]})
+        return read
+
+    return reading
+
+
+REAL_COMPLETE = vf.Judge.complete  # the judges' own call, before the flows script it
+
+
+class FakeInference:
+    """The model provider, played by code: each call of a judge answered by `answer(read(prompt))` (a reading or a
+    ruling, or a reply's own text) at a reported cost. It takes plain calls alone, as the judges ask for plain JSON, not
+    structured output. Only the network is faked: the judge's own call runs whole, recording each paid call on its
+    trace."""
+
+    def __init__(self, answer, cost: float = 0.01, read=answer_fields):
+        self.answer, self.cost, self.read, self.calls = answer, cost, read, 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def create(self, *, model, messages, **sampling):
+        assert "response_format" not in sampling, "a judge asks for plain JSON"
+        self.calls += 1
+        reply = self.answer(self.read(messages[0]["content"]))
+        message = SimpleNamespace(
+            content=reply if isinstance(reply, str) else reply.model_dump_json(), refusal=None
+        )
+        usage = SimpleNamespace(
+            prompt_tokens=1200,
+            completion_tokens=300,
+            prompt_tokens_details=None,
+            completion_tokens_details=None,
+            cost=self.cost,
+        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")], usage=usage)
+
+
+@contextmanager
+def live_judging(network: FakeInference):
+    """The judges' own call, on a faked network."""
+    scripted, client = vf.Judge.complete, vf_judge.build_async_openai
+    vf.Judge.complete, vf_judge.build_async_openai = REAL_COMPLETE, (lambda config: network)
+    try:
+        yield network
+    finally:
+        vf.Judge.complete, vf_judge.build_async_openai = scripted, client
 
 
 def gold_text(reference: dict) -> str:
@@ -86,59 +202,76 @@ def gold_text(reference: dict) -> str:
     return ", ".join(str(r.get("answer")) for r in reference["rows"])
 
 
+def scripted_ruling(text: str) -> Ruling:
+    """The forge's task judge, played by code, on its prompt: it approves a task unless its request asks something
+    "precisely" (more than a part asks) or a try named something beyond a set's answer (its hearing's named_beyond
+    holds an entry, each `"by": "the ..."`)."""
+    return Ruling(
+        realistic=True,
+        one_reading=True,
+        exact="precisely" not in text,
+        supported=True,
+        complete='"by": "the ' not in text,
+        reason="r",
+    )
+
+
+def ruling_or(answer):
+    """A network's answers (FakeInference with read=str): a task judge's prompt ruled as `scripted_ruling` rules it,
+    any other read as the answer judge's fields and answered by `answer`."""
+
+    def reply(prompt: str):
+        return (
+            scripted_ruling(prompt)
+            if prompt.startswith("You judge one task")
+            else answer(answer_fields(prompt))
+        )
+
+    return reply
+
+
 async def scripted_complete(self, messages, *, trace=None, schema=None, parse=None, **sampling):
-    """The answer judge in the flows: it accepts a task's gold alone; a loose one a bare opener too, a blind one not even
-    the gold. The forge's task judge approves a task unless its request asks something "precisely" (more than a part
-    asks), and fails while `judge_fails` lasts. Any other judge call fails, as `offline` does."""
+    """The judges in the flows. The answer judge makes its own call, on a network played by FakeInference (its reader
+    `scripted_reading`), while GRADER is on. The forge's task judge rules as `scripted_ruling` does, and fails while
+    `judge_fails` lasts. Any other judge call fails, as `offline` does."""
     text = messages if isinstance(messages, str) else messages[0].content
     if text.startswith("You judge one task"):
         if GRADER["judge_fails"]:
             GRADER["judge_fails"] -= 1
-            raise RuntimeError("the judge's provider is unavailable")
-        ruling = Ruling(
-            realistic=True, one_reading=True, exact="precisely" not in text, supported=True, reason="r"
-        )
+            raise openai.APIConnectionError(
+                message="the judge's provider is unavailable",
+                request=httpx.Request("POST", "https://inference"),
+            )
+        ruling = scripted_ruling(text)
         return vf.JudgeResponse(
-            text=ruling.model_dump_json(), parsed=parse(vf.JudgeResponse(text="", parsed=ruling))
+            text=ruling.model_dump_json(), parsed=parse(vf.JudgeResponse(text=ruling.model_dump_json()))
         )
-    if not GRADER["on"] or not text.startswith("Grade a Slack answer"):
-        return await offline()
-    fields = json.loads(text.rsplit("\n", 1)[1])  # the fields are the prompt's last line
-    response, answers = fields["response"], gold_text(fields["reference"])
-    right = response in (
-        f"{answers}.",
-        "I can't answer that from anything you can see: it isn't there.",
-    ) or response.startswith(f"{answers}, though")
-    correct = (right and not GRADER["blind"]) or (GRADER["loose"] and response == "Thought process:")
-    parts = [
-        PartGrade(label=p["label"], correct=correct, abstained=False, committed=[], missing=[], extra=[])
-        for p in fields["reference"].get("parts", [])
-    ]
-    grade = AnswerGrade(
-        correct=correct,
-        abstained=False,
-        grounded=GRADER["grounded"],
-        unsupported_asides=0,
-        committed=[],
-        missing=[],
-        extra=[],
-        reason="scripted",
-        parts=parts,
-    )
-    return vf.JudgeResponse(
-        text=grade.model_dump_json(),
-        parsed=parse(vf.JudgeResponse(text="", parsed=grade)) if parse else grade,
-    )
+    if GRADER["on"] and text.startswith("You grade one answer"):
+        return await REAL_COMPLETE(self, messages, trace=trace, schema=schema, parse=parse, **sampling)
+    return await offline()
 
 
 TestStore = Store  # the flows keep the real store: its traces, events and attempts
 
 
 class FakeTrace(SimpleNamespace):
-    """A scripted seat's trace, with what the store and the env read of a real one."""
+    """A scripted seat's trace, with what the store and the env read of a real one, and what a task's scoring writes on
+    it (its metrics, its rewards, each judge call it paid for)."""
 
     def __init__(self, id, role, record=None, **fields):
-        base = dict(ok=True, info={}, errors=[], last_reply="", usage=None, is_completed=True)
+        base = dict(
+            ok=True,
+            info={},
+            errors=[],
+            last_reply="",
+            usage=None,
+            is_completed=True,
+            stop_condition=None,
+            is_truncated=False,
+            metrics={},
+            rewards={},
+            extra_usage=[],
+        )
         super().__init__(id=id, agent=SimpleNamespace(name=role), **(base | fields))
         self.record = record
 
@@ -152,10 +285,22 @@ class FakeTrace(SimpleNamespace):
             "ok": self.ok,
             "nodes": [],
             "info": self.info,
+            "extra_usage": [u.model_dump(mode="json") for u in self.extra_usage],
         }
 
     def record_metric(self, name, value):
-        self.info.setdefault("metrics", {})[name] = value
+        self.metrics[name] = value
+
+    def record_metrics(self, values):
+        for name, value in values.items():
+            self.record_metric(name, value)
+
+    def record_reward(self, name, value, weight=1.0):
+        self.rewards[name] = value
+
+    def record_judge_call(self, *, name, request, response):
+        if response.usage is not None:
+            self.extra_usage.append(response.usage)
 
 
 class ScriptedAgent:
@@ -643,7 +788,7 @@ async def run_flows(root):
     root.mkdir(parents=True)
     settings = flow_run_settings(root)
     seen, crash = [], {"armed": True, "review": True, "plans": 0}
-    GRADER.update(on=True, loose=False, blind=False)
+    GRADER["on"] = True
 
     class FlowJudge(ScriptedAgent):
         """The judge at its seat: it reads the review's input and writes its verdict; a review after day 2 is cut off
@@ -1018,22 +1163,37 @@ async def run_flows(root):
     pinged = awake.pings
     await asyncio.sleep(0.03)
     assert pinged >= 2 and awake.pings == pinged, (pinged, awake.pings)
-    # A try that finished without an answer, an empty last message or the turn cap mid-search, is wrong and counted.
-    graded = {"task_id": "t", "correct": False, "semantic_correctness": 0.0, "response": "an answer"}
-    ends = [("an answer", "agent_completed"), ("", "agent_completed"), ("let me look further", "max_turns")]
-    silent = [
+    # A try that finished without an answer is wrong and counted: an empty last message, or a framework limit that cut
+    # it off (the turn cap mid-search, a token cap), whose last message is no answer even where a grade read it right.
+    graded = {"task_id": "t", "correct": True, "semantic_correctness": 1.0, "response": "an answer"}
+    ends = [
+        ("an answer", "agent_completed"),
+        ("", "agent_completed"),
+        ("let me look further", "max_turns"),
+        ("Alicia called it", "max_total_tokens"),
+    ]
+    tried = [
         SolverTask.outcome(
-            SimpleNamespace(ok=True, info={"evaluation": graded | {"response": r}}, stop_condition=stop)
-        )["unanswered"]
+            FakeTrace(
+                "t",
+                "solver",
+                info={"evaluation": graded | {"response": r}},
+                stop_condition=stop,
+                is_truncated=stop.startswith("max_"),
+                last_reply=r,
+                task=SimpleNamespace(data=SimpleNamespace(task_id="t")),
+            )
+        )
         for r, stop in ends
     ]
-    assert (
-        silent == [False, True, True]
-        and rates([{"correct": False, "semantic_correctness": 0.0, "unanswered": u} for u in silent])[
-            "unanswered"
-        ]
-        == 2
-    )
+    assert [(r["unanswered"], r["correct"], r["crashed"]) for r in tried] == [
+        (False, True, False),
+        (True, True, False),
+        (True, False, False),
+        (True, False, False),
+    ], tried
+    assert tried[3]["reason"] == "cut off: max_total_tokens"
+    assert rates([{"correct": False, "semantic_correctness": 0.0} | r for r in tried])["unanswered"] == 3
     assert run_label(Path("/x/data/v7-01/software")) == "worldgen-v7-01-software", (
         "a run's sandboxes are findable"
     )
@@ -1165,8 +1325,10 @@ async def forge_flow(root, world_dir, settings):
     """The forge on a finished world, through the CLI as a person runs it: five initial tasks, labelled (verified,
     measured, judged), then one adapting pass that writes a harder, an easier and a repaired version, labelled too, and
     the release of every approved task. Along the way: a task code refuses and the proposer fixes; a verifier split
-    tried a third time; a task whose student tries all crash, failed while the others go on; a proposer session lost
-    and taken up again; and a judge down for a whole pass, which stops the run, and the CLI takes it up again."""
+    tried a third time; a task whose student tries all crash, labelled again after a wait and then failed while the
+    others go on, taken up by the next pass and, once its provider is back, by the forge run again, which publishes its
+    release anew; a proposer session lost and taken up again; and a judge down for a whole pass, which stops the run,
+    and the CLI takes it up again."""
     plan = flow_forge(settings, world=world_dir, output=root, skills=["temporal"])
     world = Workspace(world_dir / "world.sqlite")
     people = [r[0] for r in world.db.execute("SELECT id FROM users WHERE is_bot = 0 ORDER BY id")]
@@ -1275,6 +1437,13 @@ async def forge_flow(root, world_dir, settings):
             assert ("a harder version of i001" in page) == ("h101" in allowed["ids"]) and (
                 "The judge refused it" in page
             ) == ("r103" in allowed["ids"]), page
+            if (
+                "h101" in allowed["ids"]
+            ):  # how the student got i001 right: its right answers, each part's messages
+                harder = page.split("## h101: ")[1].split("\n## ")[0]
+                assert "- a right answer: 'the answer'" in harder and (
+                    f"- who posted it rests on: m{first['id']} {first['real_name']}" in harder
+                ), harder
             turns["adapt"] += 1
         for task_id in allowed["ids"]:
             task = written(task_id, allowed["versions"].get(task_id))
@@ -1293,10 +1462,14 @@ async def forge_flow(root, world_dir, settings):
             FAULTS["session"] -= 1
             raise SessionLost("the proposer's sandbox dropped its stream")
 
-    # The student's tries, right by a schedule per task; i005's always crash. The verifier reaches every answer, but
-    # splits on i003 (its second try wrong), so a third decides.
+    # The student's tries, right by a schedule per task; i005's crash while its provider is down. A task its 4 tries all
+    # reach, grounded, is verified by them (the cascade: i001, i004, i005); the verifier tries the others, reaches every
+    # answer, but splits on i003 (its second try wrong), so a third decides. Each try is graded by the forge, its run's
+    # scoring deferred: the answer judge's own call on the faked network reads "the answer" as right, and code grounds
+    # it on the gold's messages its calls showed.
     schedule = {
         "i001": "1111",
+        "i005": "1111",
         "i002": "0000",
         "i003": "1010",
         "i004": "1111",
@@ -1309,11 +1482,12 @@ async def forge_flow(root, world_dir, settings):
     def tries_of(seat):
         class Trying(ScriptedAgent):
             async def run(self, task):
+                assert task.scoring_deferred, "the forge grades its tries, not their runs"
                 task_id = task.data.task_id
                 counts[seat, task_id] += 1
                 n = counts[seat, task_id]
                 trace = self.trace(seat, task)
-                if seat == "solver" and task_id == "i005":
+                if seat == "solver" and task_id == "i005" and FAULTS["crash"]:
                     trace.ok, trace.errors = (
                         False,
                         [SimpleNamespace(type="Crash", message="model stream ended")],
@@ -1324,32 +1498,15 @@ async def forge_flow(root, world_dir, settings):
                     if seat == "verifier"
                     else schedule[task_id][(n - 1) % 4] == "1"
                 )
-                reference = task.config.reference
-                parts = [
-                    {
-                        "label": p.label,
-                        "correct": right,
-                        "abstained": False,
-                        "committed": [],
-                        "missing": [],
-                        "extra": [],
-                    }
-                    for p in reference.parts
-                ]
+                gold = [m for a in task.config.reference.answers() for m in a.messages]
+                trace.last_reply = "the answer" if right else "another answer"
                 trace.info = {
-                    "evaluation": {
-                        "task_id": task_id,
-                        "execution_ok": True,
-                        "semantic_correctness": 1.0 if right else -1.0,
-                        "correct": right,
-                        "grounded": right,
-                        "calls": 1,
-                        "reason": "r",
-                        "response": "the answer" if right else "another answer",
-                        "parts": parts,
-                    },
                     "observations": [
-                        {"tool": "read_channel", "arguments": {"channel_id": "C1"}, "output": {}}
+                        {
+                            "tool": "read_channel",
+                            "arguments": {"channel_id": gold[0][0]},
+                            "output": {"items": [{"channel": c, "ts": ts} for c, ts in gold]},
+                        }
                     ],
                 }
                 return trace
@@ -1366,7 +1523,7 @@ async def forge_flow(root, world_dir, settings):
         1,
         16,
     )  # the judge fails all 4 attempts of the first pass's 4 rulings
-    FAULTS["stop"] = 1
+    FAULTS["stop"], FAULTS["crash"] = 1, 1
     with episodes(agents):
         try:
             summary = await run_forge(plan)
@@ -1383,8 +1540,9 @@ async def forge_flow(root, world_dir, settings):
     assert turns["adapt"] == 2, (
         "the versions a turn cut off had kept are taken, not written again: r103 alone is left for a turn"
     )
-    assert kinds["task_failed"] == 5 + 1, (
-        "the first pass failed on the judge (and i005 on its tries), then went on"
+    assert (kinds["task_failed"], kinds["labels_retried"]) == (5 + 1 + 1, 2 + 2), (
+        "the first pass failed on the judge (and i005 on its tries), then went on; i005 is labelled again twice after a"
+        " wait, in its own pass and in the next, and fails both times"
     )
     store = TestStore(plan.output, forge_provenance(plan))
     forged = store.state.forged
@@ -1399,6 +1557,7 @@ async def forge_flow(root, world_dir, settings):
         "r103": "window",
     }, forged
     assert "crashed" in forged["i005"]["failed"], "its tries all crashed: it fails, the others go on"
+    first_release = load_release(root / "release")[1]
     assert len(store.state.verifier["i003"]["results"]) == 3, "a split is decided by a third try"
     assert forged["i004"]["verified"] and not forged["i004"]["ruling"]["exact"], "verified, but over-specific"
     assert {r.get("skill") for r in forged.values()} == {"temporal"}, "each kept with the skill it aimed at"
@@ -1418,7 +1577,27 @@ async def forge_flow(root, world_dir, settings):
         "e102": "easier",
         "r103": "repaired",
     }, "every approved task, with the set it came from"
-    assert all(a.solution.seat == "verifier" and a.solution.calls for a in answers.values())
+    assert {t: a.solution.seat for t, a in answers.items()} == {
+        "i001": "solver",
+        "i002": "verifier",
+        "i003": "verifier",
+        "h101": "verifier",
+        "e102": "verifier",
+        "r103": "verifier",
+    } and all(a.solution.calls for a in answers.values()), (
+        "a verified task's solution: the verifier's try, or the student's where its tries verified it"
+    )
+    assert {t: r.get("verified_by") for t, r in forged.items() if r.get("verified")} == {
+        "i001": "student",
+        "i002": "verifier",
+        "i003": "verifier",
+        "i004": "student",
+        "h101": "verifier",
+        "e102": "verifier",
+        "r103": "verifier",
+    } and not any(counts["verifier", t] for t in ("i001", "i004")), (
+        "the student's tries verified them: no verifier ran"
+    )
     assert next(r for r in rows if r.task_id == "i002").part_rates == {
         "who posted it": 0.0,
         "who answered": 0.0,
@@ -1432,10 +1611,109 @@ async def forge_flow(root, world_dir, settings):
     )
     assert summary["labels"]["window"] == 4
     store.close()
+    # Its provider back, the forge is run again: the task its labelling left failed is labelled, and the release is
+    # published anew, the earlier one kept beside it.
+    FAULTS["crash"] = 0
+    with episodes(agents):
+        summary = await run_forge(plan)
+    assert summary["status"] == "complete" and summary["labels"]["solved"] == 2, summary
+    events = [json.loads(line) for line in (root / "progress.jsonl").read_text().splitlines()]
+    assert [e["tasks"] for e in events if e["event"] == "forge_reopened"] == [["i005"]]
+    store = TestStore(plan.output, forge_provenance(plan))
+    assert (store.state.phase, store.state.forged["i005"]["label"], store.state.batch) == (
+        "done",
+        "solved",
+        1,
+    ), "labelled in the last pass, with no version of it: the adapting passes are spent"
+    store.close()
+    _, rows, _ = load_release(root / "release")
+    assert {r.task_id for r in rows} == {r.task_id for r in first_release} | {"i005"}
+    assert load_release(root / "release.superseded")[1] == first_release
+    # A regrade: every stored try graded again (its reader scripted to read a right answer as giving the gold), with one
+    # gold split into answer and context. No try runs again, the labels stand, the release is anew.
+    splits = root / "splits"
+    splits.mkdir()
+    (splits / "batch-01.json").write_text(
+        json.dumps(
+            [
+                {
+                    "task_id": "i001",
+                    "split": [
+                        {
+                            "part": "who posted it",
+                            "answer": [first["real_name"]],
+                            "context": ["the first update"],
+                            "changed": True,
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tried = sum(counts.values())
+    # A regrade grades on the judges' own call, only the network faked, so what the call does once it is paid is tested
+    # too: forge-w2's first regrade failed every grade there, after paying for it, four times over ($166, 2026-10-21).
+    # A grader whose replies never read: each grade asks READINGS times, and the regrade stops after its first
+    # FAIL_FAST failures.
+    with live_judging(FakeInference(lambda fields: "I can't grade this.")) as broken:
+        with pytest.raises(RuntimeError, match=f"its first {FAIL_FAST} grades all failed"):
+            await regrade(plan, splits)
+    assert broken.calls <= (FAIL_FAST + plan.solvers) * READINGS, (
+        "it stops, not grading every try",
+        broken.calls,
+    )
+    # A live sample: five tries graded and their cost measured, nothing changed. Its reader misreads each try's first
+    # reading: the grade asks again, and both readings are paid and counted.
+    with live_judging(FakeInference(misreading_first(scripted_reading))) as sampler:
+        sampled = await regrade(plan, splits, sample=5)
+    assert (sampled["status"], sampled["graded"], sampled["failed"], sampled["reread"]) == (
+        "sampled",
+        5,
+        0,
+        5,
+    ), sampled
+    assert sampler.calls == 10 and sampled["per_grade"] == 0.02, ("two readings a try, both counted", sampled)
+    # The regrade: every try graded once, paid once, its cost measured; every verified task ruled again on its new
+    # grades by the task judge's own call (one ruling each, paid once); the labels stand.
+    with live_judging(FakeInference(ruling_or(scripted_reading), read=str)) as network:
+        summary = await regrade(plan, splits)
+    assert (summary["status"], summary["moved"], summary["split_tasks"], summary["reopened"]) == (
+        "complete",
+        {},
+        1,
+        [],
+    ), "the labels stand, and the tasks the student's tries verified stay verified"
+    store = TestStore(plan.output, forge_provenance(plan))
+    verified = {t for t, r in store.state.forged.items() if r.get("label") and r.get("verified")}
+    store.close()
+    assert summary["tries"] == summary["graded"] and summary["ruled"] == len(verified), summary
+    assert network.calls == summary["tries"] + summary["ruled"] and summary["spent"] == pytest.approx(
+        0.01 * network.calls
+    ), ("each grade and each ruling paid once", network.calls, summary)
+    assert summary["reread"] == 0, summary
+    assert sum(counts.values()) == tried, "no try runs again"
+    store = TestStore(plan.output, forge_provenance(plan))
+    mark = f"{plan.answer_judge.model}:judge_prompt.md"
+    assert all(store.state.forged[t]["ruled"] == mark for t in verified), (
+        "each ruled again, marked by the regrade"
+    )
+    assert (
+        not store.state.forged["i004"]["ruling"]["exact"]
+        and store.state.forged["i004"]["ruling_before_regrade"]
+    ), "ruled again as before (over-specific), its earlier ruling kept"
+    i001 = store.state.forged["i001"]
+    assert i001["task"]["parts"][0]["context"] == ["the first update"] and not i001["gold_before_split"][
+        0
+    ].get("context")
+    assert store.state.plans["forge"]["regraded"]["grader"] == f"{plan.answer_judge.model}:judge_prompt.md"
+    assert all(r.get("regraded") and r.get("outcome") for r in store.state.solves["i001"]["results"])
+    store.close()
+    _, rows, answers = load_release(root / "release")
+    assert answers["i001"].context == ["the first update"], "the release carries the split gold"
 
 
 # The forge flow's faults, each spent once.
-FAULTS = {"session": 0, "stop": 0}
+FAULTS = {"session": 0, "stop": 0, "crash": 0}
 
 
 async def chapter_flow(root, parent, settings):
@@ -1872,11 +2150,16 @@ async def chapter_flow(root, parent, settings):
 
 @contextmanager
 def scripted_judges():
-    """No judge reaches a model while the checks run: the answer judge is played by code (GRADER), and any other judge
-    call fails; and nothing waits for a provider or a sandbox to come back."""
-    saved = vf.Judge.complete, session.LOSS_WAITS, forge_tries.WAITS
-    vf.Judge.complete, session.LOSS_WAITS, forge_tries.WAITS = scripted_complete, (0,), (0, 0, 0)
+    """No judge reaches a model while the checks run: the answer judge makes its own call on a faked network, the task
+    judge is played by code, and any other judge call fails; and nothing waits for a provider or a sandbox to come
+    back."""
+    saved = vf.Judge.complete, vf_judge.build_async_openai, session.LOSS_WAITS, forge_tries.WAITS
+    vf.Judge.complete, vf_judge.build_async_openai = (
+        scripted_complete,
+        (lambda config: FakeInference(scripted_reading)),
+    )
+    session.LOSS_WAITS, forge_tries.WAITS = (0,), (0, 0, 0)
     try:
         yield
     finally:
-        vf.Judge.complete, session.LOSS_WAITS, forge_tries.WAITS = saved
+        vf.Judge.complete, vf_judge.build_async_openai, session.LOSS_WAITS, forge_tries.WAITS = saved

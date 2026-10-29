@@ -66,20 +66,25 @@ notes; its tasks live in its own state, never in the world file.
   Code refuses at once, with every reason, what it can tell is wrong: an asker who is no person, a message out of the
   asker's sight, an answer of the wrong shape, two parts alike, a question that gives its answer away, a repeat, a
   task without its skill's shape. An id offered `offers` turns unwritten is dropped, short of material.
-- **Labelling** (no VM; every task side by side, each step kept as it lands): the verifier, a stronger model with the
-  student's Slack tools, must reach each part's answer in 2 tries (a third on a split; a try that ends with no answer
-  runs again), or the task is dropped; the student tries it `tries` times; the judge (`forge/judge.py`, one structured
-  call) rules whether a colleague would ask it, whether its words allow another reading, whether each answer is
-  exactly what its part asks, and whether its messages state it. A task is rejected, solved (right `solved` of the
-  time or more), unsolved (never), or in the window.
+- **Labelling** (no VM; every task side by side, each step kept as it lands): the student tries it `tries` times;
+  a task its tries reach on every part `cascade` times, each shown a message the part rests on, is verified by them;
+  else the verifier, a stronger model with the student's Slack tools, must reach each part's answer in 2 tries (a third
+  on a split), or the task is dropped (`cascade = 0`: the verifier first, the student only on what it verified); the
+  judge (`forge/judge.py`, one call, replied in plain JSON) rules whether a colleague would ask it, whether its words
+  allow another reading, whether each answer is exactly what its part asks, and whether its messages state it. A task
+  is rejected, solved (right `solved` of the time or more), unsolved (never), or in the window. The forge grades each
+  try itself (verifiers' deferred scoring): a grade that meets a provider's error is asked again on the finished try,
+  never by running it again; a try cut off at its turn cap or a token cap is not graded, and counts as unanswered.
 - **Adapting** (`adapt` passes): the proposer writes a harder version of each solved task, an easier one of each
   unsolved task, and a repaired one of each verified task the judge refused, which are labelled in turn.
-- **The release:** every approved task, with its set, its rates (by part), and the verifier's try that reached its
-  answer; `report.json` says where the world ran short, for whoever writes the next chapter: by family and skill,
+- **The release:** every approved task, with its set, its rates (by part), and a try that reached its answer (the
+  verifier's, or else the student's); `report.json` says where the world ran short, for whoever writes the next chapter: by family and skill,
   the ids dropped, its askers and openings, and the material no task rests on.
 
 A forge carries on by itself: a lost proposer session is taken up again after a pause (`max_losses` times a turn), a
-failed model call is asked again, a task whose steps fail is marked failed while the others go on, and the CLI resumes
-the run after an infrastructure stop (`max_resumes`), until it has spent `spend_limit`. A turn cut off keeps the tasks
-it wrote. A Ctrl-C is a stop, never resumed, even when it reaches the run as a cancelled stream. It resumes like a run,
+failed model call is asked again, a task whose steps fail is labelled again after a wait (twice) and then marked
+failed while the others go on, and the CLI resumes the run after an infrastructure stop (`max_resumes`), until it has
+spent `spend_limit`. A turn cut off keeps the tasks it wrote. The next pass labels a failed task again, and so does
+the same command run on a finished forge that left tasks failed: it labels them and publishes its release anew, the
+earlier one kept as `release.superseded`. A Ctrl-C is a stop, never resumed, even when it reaches the run as a cancelled stream. It resumes like a run,
 with its own configuration and the world's hash.

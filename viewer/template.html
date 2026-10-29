@@ -83,6 +83,15 @@ button.chip:hover{border-color:var(--fg3)}.chip.good{color:var(--good);border-co
 .spoiler{filter:blur(6px);user-select:none}.clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .empty{padding:28px;color:var(--fg3);font:12px var(--mono);text-align:center}
 .split{display:grid;grid-template-columns:minmax(0,1fr) 420px;gap:16px}
+/* a forge's tasks: the label panel beside each */
+.forge{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}.lbl{position:sticky;top:120px;max-height:calc(100vh - 140px);overflow:auto}
+.evmsg.near{border-left-color:var(--warn)}.evmsg.hidden{border-left-color:var(--fg3);border-left-style:dashed}
+fieldset.field{border:0;padding:0;margin:0 0 10px}fieldset.field legend{padding:0;margin-bottom:4px}
+.opts{display:flex;flex-wrap:wrap;gap:4px}.opts label{border:1px solid var(--line);padding:2px 9px;font-size:12px;cursor:pointer;user-select:none}
+.opts label:has(input:checked){border-color:var(--fg);background:var(--raise)}.opts input{position:absolute;opacity:0;width:1px;height:1px}.opts label:focus-within{outline:1px solid var(--fg)}
+textarea{width:100%;min-height:64px;background:var(--bg);border:1px solid var(--line);color:var(--fg);padding:6px 8px;font:13px var(--sans);margin:4px 0}
+.filters{display:flex;flex-direction:column;gap:6px;background:var(--card);padding:10px 12px}
+@media (max-width:1100px){.forge{grid-template-columns:1fr}.lbl{position:static;max-height:none}}
 @media (max-width:1100px){.world{grid-template-columns:220px minmax(0,1fr)}.thread{grid-column:1/-1;border-left:0;border-top:1px solid var(--line)}.split{grid-template-columns:1fr}}
 @media (max-width:760px){main{padding:16px}.bar,nav{padding-left:16px;padding-right:16px}.world{grid-template-columns:1fr;height:auto}.side{border-right:0;border-bottom:1px solid var(--line);max-height:240px}
 .pane{max-height:70vh}.tasks{grid-template-columns:1fr}.hero h1{font-size:24px}.grid2{grid-template-columns:1fr}.hbar{grid-template-columns:90px 1fr 40px}}
@@ -108,7 +117,8 @@ button.chip:hover{border-color:var(--fg3)}.chip.good{color:var(--good);border-co
 const DATA = JSON.parse(document.getElementById('viewer-data').textContent);
 const TABS = [['overview', 'Overview'], ['lineage', 'Lineage'], ['world', 'World'], ['tasks', 'Tasks'], ['cast', 'Cast'], ['traces', 'Traces']];
 const ROLES = ['author', 'proposer', 'judge', 'solver', 'witness'];
-const S = {tab: 'overview', run: 0, attempt: null, snapshot: null, conv: null, message: null, reader: '', search: '', task: null, trace: null, role: '', spoilers: true};
+const S = {tab: 'overview', run: 0, attempt: null, snapshot: null, conv: null, message: null, reader: '', search: '', task: null, trace: null, role: '', spoilers: true,
+  flabel: 'release', fmine: 'all'};
 let R, X;  // the selected run and its indexes
 
 function h(tag, props, ...kids) {
@@ -600,16 +610,250 @@ function solvesFor(t) {
   }
   return [];
 }
+const isForge = () => Object.keys(R.forge || {}).length > 0;
 function tasks() {
-  const all = list(X.cat.tasks);
-  if (!all.length) return empty('No catalog yet');
-  if (!S.task || !X.tasks[S.task]) S.task = all[0].id;
+  const forge = isForge(), all = forge ? shownTasks() : list(X.cat.tasks);
+  if (!list(X.cat.tasks).length) return empty('No catalog yet');
+  if (!all.length) return h('div', {class: 'tasks'}, h('div', {class: 'tlist'}, taskFilters()), empty('No task matches these filters'));
+  if (!S.task || !all.some(x => x.id === S.task)) S.task = all[0].id;
   const t = X.tasks[S.task];
-  const left = h('div', {class: 'tlist'}, all.map(x => h('button', {type: 'button', class: 'titem' + (x.id === S.task ? ' on' : ''), onclick: () => { S.task = x.id; render(); }},
-    h('div', {}, h('span', {class: 'mono small', text: x.id}), ' ', h('span', {class: 'faint small mono', text: x.group_id})),
-    h('div', {class: 'small clamp', text: x.question}), h('div', {}, solveDots(solvesFor(x.id))))));
-  return h('div', {class: 'tasks'}, left, taskDetail(t));
+  const left = h('div', {class: 'tlist'}, forge ? taskFilters() : null, all.map(x => h('button', {type: 'button', class: 'titem' + (x.id === S.task ? ' on' : ''), onclick: () => { S.task = x.id; render(); }},
+    h('div', {}, h('span', {class: 'mono small', text: x.id}), ' ', forge ? forgeChips(x.id) : h('span', {class: 'faint small mono', text: x.group_id})),
+    h('div', {class: 'small clamp', text: x.question}), forge ? null : h('div', {}, solveDots(solvesFor(x.id))))));
+  return h('div', {class: 'tasks'}, left, forge ? forgeDetail(t) : taskDetail(t));
 }
+
+/* ---------- a forge's tasks, and labelling them ---------- */
+const FILTERS = [['release', 'In the release'], ['adjudicate', 'To adjudicate (calibration)'], ['window', 'Window'], ['solved', 'Solved'], ['unsolved', 'Unsolved'], ['rejected', 'Rejected'],
+  ['unlabelled', 'Not labelled by the forge'], ['all', 'Every task written']];
+const ORDER = {window: 0, unsolved: 1, solved: 2, rejected: 3};
+const LABEL_CLASS = {solved: 'good', window: 'warn', unsolved: 'bad'};
+function forgeMatch(t, k) {
+  const f = R.forge[t];
+  if (!f) return false;
+  if (k === 'adjudicate') return Object.values(f.calibration || {}).some(c => c.adjudicate);
+  return k === 'all' || (k === 'release' ? f.released : k === 'unlabelled' ? !f.label : f.label === k);
+}
+function shownTasks() {
+  if (!Object.values(R.forge).some(f => f.released) && S.flabel === 'release') S.flabel = 'all';
+  return list(X.cat.tasks).filter(x => forgeMatch(x.id, S.flabel) && (S.fmine === 'all' || (S.fmine === 'done') === labelled(x.id)))
+    .sort((a, b) => (ORDER[R.forge[a.id].label] ?? 4) - (ORDER[R.forge[b.id].label] ?? 4) || a.id.localeCompare(b.id));
+}
+function taskFilters() {
+  const ids = Object.keys(R.forge), n = k => ids.filter(t => forgeMatch(t, k)).length;
+  const which = h('select', {'aria-label': 'Which tasks', onchange: e => { S.flabel = e.target.value; render(); }},
+    FILTERS.map(([k, name]) => h('option', {value: k, text: `${name} (${n(k)})`})));
+  which.value = S.flabel;
+  const mine = h('select', {'aria-label': 'Your labels', onchange: e => { S.fmine = e.target.value; render(); }},
+    [['all', 'Labelled by you or not'], ['todo', 'Not labelled by you yet'], ['done', 'Labelled by you']].map(([k, name]) => h('option', {value: k, text: name})));
+  mine.value = S.fmine;
+  const of = ids.filter(t => forgeMatch(t, S.flabel)), done = of.filter(labelled).length;
+  const tries = ids.flatMap(toRule).length, left = ids.flatMap(unruled).length;
+  return h('div', {class: 'filters'}, which, mine,
+    h('div', {class: 'small mono faint', text: `${done} of ${of.length} labelled · ${LABELS.server ? 'saved to a file' : 'saved in this browser'}`}),
+    tries ? h('div', {class: 'small mono', text: `calibration: ${tries - left} of ${tries} tries ruled`}) : null,
+    h('div', {}, h('button', {class: 'btn', type: 'button', text: 'Export labels', onclick: exportLabels}), ' ',
+      h('label', {class: 'btn'}, 'Import', h('input', {type: 'file', accept: '.json,application/json', style: 'display:none', onchange: importLabels}))));
+}
+// A task's tries a person should rule on, and how many of them are still unruled.
+const toRule = t => Object.keys(R.forge[t]?.calibration || {}).filter(k => R.forge[t].calibration[k].adjudicate);
+const unruled = t => toRule(t).filter(k => !LABELS.store[`${labelKey(t)}/${k}`]?.outcome);
+function forgeChips(t) {
+  const f = R.forge[t], r = f.rates || {}, rule = toRule(t), left = unruled(t);
+  return [rule.length ? h('span', {class: 'chip ' + (left.length ? 'warn' : 'good'), text: left.length ? `${left.length} of ${rule.length} to rule` : '✓ ruled'}) : null,
+    h('span', {class: 'chip ' + (LABEL_CLASS[f.label] || ''), text: f.label || (f.failed ? 'failed' : 'unlabelled')}),
+    f.skill ? h('span', {class: 'chip', text: f.skill}) : null,
+    r.right_rate !== null && r.right_rate !== undefined ? h('span', {class: 'chip', text: 'right ' + pct(r.right_rate)}) : null,
+    labelled(t) ? h('span', {class: 'chip good', text: '✓ labelled'}) : null];
+}
+function forgeDetail(t) {
+  const f = R.forge[t.id], r = f.rates || {}, reader = X.people[t.actor_id], persona = X.personas[t.actor_id];
+  const evidence = new Set(f.parts.flatMap(p => p.evidence));
+  const readable = id => { const c = X.convs[X.msgs[id]?.conversation_id]; return !!c && (c.kind === 'public_channel' || list(c.member_ids).includes(t.actor_id)); };
+  const head = h('div', {class: 'card'}, label(`${t.id} · ${f.family} · ${f.set}`), h('div', {class: 'q', text: t.question}),
+    h('span', {class: 'chip', text: 'asker · ' + (reader?.name || t.actor_id) + (persona ? ' · ' + persona.role : '')}), forgeChips(t.id),
+    r.right_interval ? h('span', {class: 'chip', text: `90% interval ${pct(r.right_interval[0])}–${pct(r.right_interval[1])}`}) : null,
+    r.tries !== undefined ? h('span', {class: 'chip' + (r.crashed ? ' warn' : ''), text: `${r.tries} graded tries` + (r.crashed ? ` · ${r.crashed} crashed` : '')}) : null,
+    r.strict_rate !== null && r.strict_rate !== undefined ? h('span', {class: 'chip', text: 'right and grounded ' + pct(r.strict_rate)}) : null,
+    f.verified === null || f.verified === undefined ? null : h('span', {class: 'chip ' + (f.verified ? 'good' : 'bad'), text: f.verified ? `✓ verified (${f.agree} reached it)` : '✕ not verified'}),
+    f.failed ? h('p', {class: 'small', style: 'color:var(--bad)', text: 'Its labelling failed: ' + f.failed}) : null,
+    f.part_rates ? h('div', {style: 'margin-top:8px'}, label('Student right, by part'), Object.entries(f.part_rates).map(([k, v]) => h('div', {class: 'small'}, meter(v), ' ', k))) : null,
+    f.variant_of ? h('p', {class: 'small muted'}, `${f.why ? 'The ' + f.why : 'A'} version of `,
+      h('button', {class: 'linkish', type: 'button', text: f.variant_of, onclick: () => { S.task = f.variant_of; S.flabel = 'all'; render(); }}),
+      ` (student right ${pct(f.source_right)}): ${f.source_question}`) : null);
+  const answer = h('div', {class: 'card', style: 'margin-top:12px'}, label('Answer, and the messages it rests on'),
+    f.parts.map((p, k) => h('div', {class: 'step'}, h('div', {class: 'k', text: String(k + 1).padStart(2, '0')}),
+      h('div', {}, h('div', {class: 'small faint mono', text: `${p.label} · ${p.answer_type}`}),
+        spoil(h('div', {style: 'font-size:15px', text: p.answer.length ? p.answer.join('; ') : '(nothing to find: the answer is that it is not there)'})),
+        S.spoilers ? p.evidence.map(id => evidenceCard(id)) : null,
+        S.spoilers && p.unseen.length ? [label("Out of the asker's sight"), p.unseen.map(id => evidenceCard(id, 'hidden', 'out of sight'))] : null))));
+  const near = Object.entries(f.near_misses || {});
+  const traps = near.length ? h('div', {class: 'card', style: 'margin-top:12px'}, label(`Near-misses (${near.length})`),
+    h('p', {class: 'small muted', text: "Messages stating another value of the answer's facts: an earlier or later value, or a decoy. One the asker cannot read traps no one."}),
+    S.spoilers ? near.map(([id, role]) => evidenceCard(id, readable(id) ? 'near' : 'hidden', role + (readable(id) ? '' : ' · the asker cannot read it'))) : spoil(h('p', {text: 'hidden'}))) : null;
+  const ruling = f.ruling ? h('div', {class: 'card', style: 'margin-top:12px'}, label('Task judge'),
+    ['realistic', 'one_reading', 'exact', 'supported', 'complete'].filter(k => k in f.ruling).map(k => h('span', {class: 'chip ' + (f.ruling[k] ? 'good' : 'bad'), text: (f.ruling[k] ? '✓ ' : '✕ ') + k.replace('_', ' ')})),
+    h('p', {class: 'small', text: f.ruling.reason})) : null;
+  const tried = (name, prefix, rows, note) => rows.length ? h('div', {class: 'card', style: 'margin-top:12px'},
+    label(`${name} (${rows.filter(s => s.correct).length} of ${rows.filter(s => !s.crashed).length} right` + (rows.some(s => s.crashed) ? `, ${rows.filter(s => s.crashed).length} crashed)` : ')')),
+    h('p', {class: 'small muted', text: note}), h('div', {class: 'solves'}, rows.map((s, k) => forgeTry(s, prefix + (k + 1), evidence, t.id, f.calibration?.[prefix + (k + 1)])))) : null;
+  return h('div', {class: 'forge'},
+    h('div', {}, head, answer, traps, ruling, f.qc ? qcCard(f.qc) : null,
+      tried('Student tries', 'S', f.tries.student, 'The student whose share of right answers labels the task: solved, in the window, or unsolved.'),
+      tried('Verifier tries', 'V', f.tries.verifier, 'A stronger model with the same tools: its tries must reach each part twice for the task to count.')),
+    labelPanel(t.id));
+}
+// A calibrated try: the reference grade (success, fallback or error) beside the recorded one, and the person's ruling.
+const OUTCOMES = [['success', 'Success'], ['fallback', 'Fallback'], ['error', 'Error']];
+const OUTCOME_CLASS = {success: 'good', fallback: 'warn', error: 'bad'};
+function ruling(task, name, cal) {
+  const key = `${labelKey(task)}/${name}`, mine = LABELS.store[key] || {};
+  const status = h('span', {class: 'small mono faint', role: 'status', text: mine.outcome ? 'ruled ' + mine.outcome : (cal.adjudicate ? 'yours to rule' : '')});
+  return h('div', {class: 'card', style: 'margin:8px 0;padding:8px 10px' + (cal.adjudicate ? ';border-color:var(--warn)' : '')},
+    h('div', {class: 'small'}, h('span', {class: 'label', text: 'Calibration  '}),
+      h('span', {class: 'chip ' + (OUTCOME_CLASS[cal.reference] || ''), text: 'reference · ' + cal.reference + (cal.confidence === 'low' ? ' (low confidence)' : '')}),
+      h('span', {class: 'chip', text: 'recorded · ' + cal.recorded})),
+    list(cal.parts).length ? h('div', {}, cal.parts.map(p => h('div', {class: 'small faint'}, `${p.label}: ${p.outcome} · ${p.why}`))) : null,
+    cal.note ? h('div', {class: 'small faint', text: cal.note}) : null,
+    h('div', {class: 'opts', style: 'margin-top:6px'}, OUTCOMES.map(([value, text]) => {
+      const input = h('input', {type: 'radio', name: key, value});
+      input.checked = mine.outcome === value;
+      input.addEventListener('change', () => saveTry(key, value, status));
+      return h('label', {}, input, h('span', {text}));
+    }), status));
+}
+async function saveTry(key, outcome, status) {
+  LABELS.store[key] = {...LABELS.store[key], outcome, at: new Date().toISOString().slice(0, 19) + 'Z'};
+  labelsLocal(true);
+  status.textContent = 'ruled ' + outcome;
+  const list = document.querySelector('.tlist');  // refresh the counts beside the list, keeping the page as it is
+  if (list) { const fresh = tasks().querySelector('.tlist'); if (fresh) list.replaceWith(fresh); }
+  if (LABELS.server) await fetch('labels', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: key, label: {outcome}})}).catch(() => { status.textContent += ' (in this browser only)'; });
+}
+function forgeTry(s, name, evidence, task, cal) {
+  const trace = X.traces[s.solver_trace_id] || null;
+  return h('div', {class: 'card', style: 'background:var(--bg)' + (cal?.adjudicate ? ';border-color:var(--warn)' : '')},
+    h('div', {}, h('span', {class: 'mono small', text: name + '  '}),
+      s.crashed ? h('span', {class: 'chip warn', text: '! crashed'}) : h('span', {class: 'chip ' + (s.correct ? 'good' : 'bad'), text: s.correct ? '✓ right' : '✕ wrong'}),
+      s.crashed ? null : h('span', {class: 'chip ' + (s.grounded ? 'good' : 'warn'), text: s.grounded ? '✓ grounded' : '! ungrounded'}),
+      s.abstained ? h('span', {class: 'chip', text: 'abstained'}) : null, h('span', {class: 'chip', text: `${s.calls ?? '–'} calls`}),
+      s.evidence_coverage !== null && s.evidence_coverage !== undefined ? h('span', {class: 'chip', text: `saw ${pct(s.evidence_coverage)} of the evidence`}) : null),
+    list(s.parts).length > 1 ? h('div', {style: 'margin-top:6px'}, s.parts.map(p => h('div', {class: 'small'},
+      h('span', {class: 'chip ' + (p.correct ? 'good' : 'bad'), text: p.correct ? '✓' : '✕'}), p.label,
+      list(p.missing).length ? h('span', {class: 'faint', text: ' · missing: ' + p.missing.join('; ')}) : null,
+      list(p.extra).length ? h('span', {class: 'faint', text: ' · extra: ' + p.extra.join('; ')}) : null))) : null,
+    h('details', {open: cal?.adjudicate || null}, h('summary', {class: 'label', text: 'Answer'}), h('div', {class: 'pre small', text: s.response || ''})),
+    s.reason ? h('details', {open: cal?.adjudicate || null}, h('summary', {class: 'label', text: 'Grade'}), h('p', {class: 'small muted', text: s.reason})) : null,
+    cal ? ruling(task, name, cal) : null,
+    trace?.route ? h('details', {}, h('summary', {class: 'label', text: `Calls (${trace.route.length})`}), trace.route.map((r, i) => h('div', {class: 'small mono'},
+      `${i + 1}. ${r.call.action}(${Object.entries(r.call.arguments || {}).filter(([, v]) => v !== null && v !== undefined).map(([a, v]) => `${a}=${JSON.stringify(v)}`).join(', ')})`))) : null,
+    trace ? h('button', {class: 'linkish', type: 'button', text: 'open trace', onclick: () => go('traces', {trace: trace.id})}) : null);
+}
+function qcCard(q) {
+  const cls = {good: 'good', mixed: 'warn', bad: 'bad'}[q.task_verdict] || '';
+  const row = (x, chip) => h('div', {class: 'small'}, h('span', {class: 'mono', text: x.try + ' '}), chip, ' ', x.note);
+  return h('div', {class: 'card', style: 'margin-top:12px'}, label('QC reading'),
+    h('span', {class: 'chip ' + cls, text: 'task ' + q.task_verdict}), h('span', {class: 'chip', text: 'successes ' + String(q.successes?.verdict || '–').replace('_', ' ')}),
+    h('span', {class: 'chip', text: 'skill match ' + q.skill_match}), h('span', {class: 'chip ' + (q.gold_ok === false ? 'bad' : 'good'), text: q.gold_ok === false ? '✕ gold' : '✓ gold'}),
+    h('p', {text: q.reason}), q.difficulty_source ? h('p', {class: 'small muted', text: 'What makes it hard: ' + q.difficulty_source}) : null,
+    q.gold_note ? h('p', {class: 'small', text: 'Gold: ' + q.gold_note}) : null,
+    list(q.failures).length ? h('div', {}, label('Failures'), q.failures.map(x => row(x, h('span', {class: 'chip ' + (x.intended ? '' : 'bad'), text: x.class.replace(/_/g, ' ')})))) : null,
+    list(q.successes?.flags).length ? h('div', {}, label('Flagged right tries'), q.successes.flags.map(x => row(x, h('span', {class: 'chip warn', text: x.issue.replace(/_/g, ' ')})))) : null,
+    q.successes?.note ? h('p', {class: 'small muted', text: q.successes.note}) : null);
+}
+// The person's labels: kept in this browser, and in a file when the page is served by viewer/serve.py.
+const LABEL_FIELDS = [
+  {key: 'fair', legend: 'Is the task fair?', options: [['yes', 'Yes'], ['no', 'No'], ['unsure', 'Unsure']]},
+  {key: 'reading', legend: 'Does the question have one reading?', options: [['one', 'One reading'], ['several', 'Two or more'], ['unsure', 'Unsure']]},
+  {key: 'failure', legend: 'If the student failed, what kind of failure?', options: [['deficiency', 'Meaningful deficiency'], ['mechanics', 'Mechanics / tedium'], ['ambiguity', 'Ambiguity'], ['grader', 'Grader error'], ['none', 'It did not fail']]},
+  {key: 'realistic', legend: 'Would a colleague realistically ask this?', options: [['yes', 'Yes'], ['no', 'No']]},
+  {key: 'skill', legend: 'Which target skill does it exercise?', options: [['aggregation', 'Complete aggregation'], ['temporal', 'Temporal reasoning'], ['abstention', 'Calibrated abstention'], ['synthesis', 'Synthesis'], ['none', 'None']]},
+];
+const HOWTO = [
+  ['Fair', 'the gold is the complete, correct answer from what the asker can read, and nothing else in their sight is as good an answer.'],
+  ['One reading', 'a careful colleague could not reasonably read the question another way.'],
+  ['Failure', 'a meaningful deficiency is a real gap in the skill (a missed place, a stale value); mechanics is tool friction or brute-force counting; ambiguity is the question\'s fault; grader means the grade was wrong.'],
+  ['Realistic', 'a colleague would plausibly ask this, in these words.'],
+  ['Skill', 'aggregation gathers every item across places; temporal depends on when (the latest value, the state as of a moment); abstention says it is not there, not settled or not visible; synthesis joins what is stated apart.'],
+];
+const LABELS = {store: {}, server: false};
+const labelKey = t => `${R.label_set}/${t}`;
+const labelled = t => Boolean(LABELS.store[labelKey(t)]?.fair);
+function labelsLocal(write) {
+  try {
+    if (write) localStorage.setItem('worldgen-labels', JSON.stringify(LABELS.store));
+    else Object.assign(LABELS.store, JSON.parse(localStorage.getItem('worldgen-labels') || '{}'));
+  } catch (e) { /* storage may be unavailable: labels last as long as the page */ }
+}
+async function labelsInit() {
+  labelsLocal(false);
+  if (!/^https?:$/.test(location.protocol)) return;
+  try {
+    const r = await fetch('labels', {cache: 'no-store'});
+    if (!r.ok) return;
+    for (const [k, v] of Object.entries(await r.json())) if (!LABELS.store[k] || (v.at || '') >= (LABELS.store[k].at || '')) LABELS.store[k] = v;
+    LABELS.server = true;
+    labelsLocal(true);
+    if (S.tab === 'tasks') render();
+  } catch (e) { /* no label server: labels stay in this browser */ }
+}
+async function saveLabel(t, fields, status) {
+  const key = labelKey(t);
+  LABELS.store[key] = {...LABELS.store[key], ...fields, at: new Date().toISOString().slice(0, 19) + 'Z'};
+  labelsLocal(true);
+  status.textContent = 'Saved in this browser';
+  if (!LABELS.server) return;
+  try {
+    const r = await fetch('labels', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: key, label: fields})});
+    status.textContent = r.ok ? 'Saved to the labels file' : 'Saved in this browser only: the server refused it';
+  } catch (e) { status.textContent = 'Saved in this browser only: the server is not reachable'; }
+}
+function labelPanel(t) {
+  const key = labelKey(t), mine = LABELS.store[key] || {};
+  const status = h('div', {class: 'small mono faint', role: 'status', text: mine.at ? `Labelled ${mine.at}` : 'Not labelled yet'});
+  const note = h('textarea', {'aria-label': 'Note', placeholder: 'A note (saved when you leave the box)'});
+  note.value = mine.note || '';
+  note.addEventListener('change', () => saveLabel(t, {note: note.value}, status));
+  return h('div', {class: 'card lbl'}, label('Your label'),
+    LABEL_FIELDS.map(q => h('fieldset', {class: 'field'}, h('legend', {class: 'small', text: q.legend}),
+      h('div', {class: 'opts'}, q.options.map(([value, text]) => {
+        const input = h('input', {type: 'radio', name: `${key}-${q.key}`, value});
+        input.checked = mine[q.key] === value;
+        input.addEventListener('change', () => saveLabel(t, {[q.key]: value}, status));
+        return h('label', {}, input, h('span', {text}));
+      })))),
+    note, status,
+    h('details', {class: 'small', style: 'margin-top:8px'}, h('summary', {class: 'label', text: 'How to label'}),
+      HOWTO.map(([k, v]) => h('p', {class: 'small'}, h('b', {text: k + ': '}), v))),
+    h('p', {class: 'small faint', text: 'j / k: the next or previous task in the list'}));
+}
+function exportLabels() {
+  const prefix = R.label_set + '/';
+  const mine = Object.fromEntries(Object.entries(LABELS.store).filter(([k]) => k.startsWith(prefix)));
+  const a = h('a', {href: URL.createObjectURL(new Blob([JSON.stringify(mine, null, 1)], {type: 'application/json'})), download: `labels-${R.label_set}.json`});
+  document.body.append(a); a.click(); a.remove();
+}
+async function importLabels(e) {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    const saved = JSON.parse(await file.text());
+    for (const [k, v] of Object.entries(saved)) {
+      if (!v || typeof v !== 'object') continue;
+      LABELS.store[k] = {...LABELS.store[k], ...v};
+      if (LABELS.server) await fetch('labels', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: k, label: v})}).catch(() => null);
+    }
+    labelsLocal(true);
+    render();
+  } catch (err) { alert('Not a labels file: ' + err.message); }
+}
+document.addEventListener('keydown', e => {
+  if (S.tab !== 'tasks' || !R || !isForge() || e.metaKey || e.ctrlKey || e.altKey || (e.key !== 'j' && e.key !== 'k')) return;
+  if (/^(TEXTAREA|SELECT)$/.test(e.target.tagName) || (e.target.tagName === 'INPUT' && e.target.type !== 'radio')) return;
+  const ids = shownTasks().map(x => x.id), at = ids.indexOf(S.task);
+  const next = ids[Math.max(0, Math.min(ids.length - 1, at + (e.key === 'j' ? 1 : -1)))];
+  if (next && next !== S.task) { S.task = next; render(); window.scrollTo(0, 0); }
+});
 function taskDetail(t) {
   const reader = X.people[t.actor_id], persona = X.personas[t.actor_id];
   const binding = R.bindings?.[t.id];
@@ -663,12 +907,14 @@ function taskDetail(t) {
       h('p', {text: verdict[1].summary}), Object.entries(verdict[1].criteria || {}).map(([k, v]) => h('div', {class: 'small'}, meter(v), ' ', h('span', {class: 'faint', text: k}))),
       issueList(list(verdict[1].issues))) : null);
 }
-function evidenceCard(id) {
+function evidenceCard(id, kind, note) {
   const m = X.msgs[id];
   if (!m) return h('span', {class: 'chip bad', text: id + ' (missing)'});
   const c = X.convs[m.conversation_id];
-  return h('button', {class: 'evmsg', type: 'button', onclick: () => openMessage(id)},
-    h('div', {class: 'small'}, h('b', {text: personName(m.author_id)}), h('span', {class: 'when', text: `${utc(m.timestamp, V().world?.zone)} · ${c?.name || c?.kind || ''}`})),
+  return h('button', {class: 'evmsg' + (kind ? ' ' + kind : ''), type: 'button', onclick: () => openMessage(id)},
+    h('div', {class: 'small'}, h('b', {text: personName(m.author_id)}),
+      h('span', {class: 'when', text: `${utc(m.timestamp, V().world?.zone)} · ${c?.name || c?.kind || ''}${m.thread_root_id ? ' · thread reply' : ''}`}),
+      note ? h('span', {class: 'chip' + (kind === 'near' ? ' warn' : ''), style: 'margin-left:8px', text: note}) : null),
     richText(m.text, true), reacts(m));
 }
 function solveCard(s, k, evidence) {
@@ -747,7 +993,7 @@ function traceDetail(t) {
 }
 
 try { const saved = localStorage.getItem('worldgen-theme'); if (saved) document.documentElement.dataset.theme = saved; } catch (e) { /* storage may be unavailable */ }
-if (DATA.runs.length) load(); else document.getElementById('main').replaceChildren(empty('No runs embedded'));
+if (DATA.runs.length) { load(); labelsInit(); } else document.getElementById('main').replaceChildren(empty('No runs embedded'));
 </script>
 </body>
 </html>

@@ -1,13 +1,19 @@
 # Slack QA taskset
 
 `worldgen-slack` loads related questions against one released Slack world: a SQLite file without the answer key.
-Each task starts a fresh solver session with actor-scoped Slack tools. A native `vf.Judge` call grades the answer the
-response commits to (one that lists alternatives without settling on one is wrong), whether it declined to answer,
-and whether the solver's own observations support the claims that make its answer; other unsupported claims are
-counted (`unsupported_asides`) but cost nothing. The reward is +1 for a right, grounded answer, 0 for a right one the
-observations don't ground or for declining to answer, and -1 for a wrong one: under a 1-or-0 grade a guess always
-beats saying it cannot be told. A `status` task's right answer is the latest value its asker can see, given as not
-settled; a `refusal` is right when nothing is there to find. It does not launch a judge agent.
+Each task starts a fresh solver session with actor-scoped Slack tools. A native `vf.Judge` call (GLM 5.3 by default)
+reads the answer part by part against the gold and reports a few narrow criteria, each with its reason: what the
+answer commits to, whether it gives each answer item, whether it commits to anything the truth rules out (including
+what is out of the asker's sight, which the reader is shown), a hedge, a non-member of a set, holding back, and, for
+a request that can't be answered, declining. Code decides each part: a success gives every item and commits nothing
+false, a fallback holds back honestly, anything else is an error; a request is a success when every part is. The
+prompt is `worldgen_slack/judge_prompt.md`; `--env.taskset.task.judge.prompt` names another file. The reader replies
+in plain JSON, which code reads (not structured output, which Prime bills on GLM 5.3 at about 20 times the cost it
+reports); a reply that doesn't read is asked again. Grounding is code's:
+an answer counts as grounded only when its try was shown a message its gold rests on. False details beside the answer
+are counted (`unsupported_asides`) but cost nothing. The reward is +1 for a right, grounded answer, 0 for a right one
+its observations don't ground or for holding back, and -1 for a wrong one: under a 1-or-0 grade a guess always beats
+saying it cannot be told. It does not launch a judge agent.
 
 ```bash
 uv run eval @ configs/worldgen_slack/eval.toml -n 1 -r 2 --no-push --plain

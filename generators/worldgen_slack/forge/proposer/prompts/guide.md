@@ -71,7 +71,10 @@ The answer
   of the messages its answer rests on (m123 is message 123), which its asker can read.
 - The answer is the shortest complete answer to the label, in the words a careful reader would give: what a part asks
   whether, answer whether (and when, if it asks when: the day, not a clock time it never asks for); what a part asks
-  why, the reason, not a measurement. An answer that demands more than its part asks turns right answers wrong.
+  why, the reason given at or before the decision, not a measurement. An answer that demands more than its part asks
+  turns right answers wrong.
+- Context holds what the answer rests on that the part does not ask for: when it happened, who said it, what it
+  replaced, details posted after a decision. A right answer may give it or leave it out; only the answer is required.
 - text and number: one value. set: every row, two or more: count and list them with world_sql as the asker
   (actor_id), never by eye. status: the latest value the asker can see, which a message out of their sight settles
   (name it in unseen); the right answer gives it as not settled. refusal: no answer; the request cannot be fulfilled

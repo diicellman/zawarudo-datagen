@@ -1,0 +1,76 @@
+# W3 (2026-10-28): W2's world, denser where forge-w2's tasks found the window, in another industry. forge-w2's tasks
+# cite 221 of W2's 252 real facts, so its tasks need a new world. Of its 129 labelled tasks, 34% were in the window; a
+# set part gave 55%, 5 or more ledger facts 48%, a fact beside a decoy 36%, a chain 33% and a status part or an
+# out-of-sight truth about 21% (local-docs/tools-v8/material_yield.py). So W3 asks more facts,
+# collections, decoys and storylines; chains and private truths grow in proportion. A forge (forge-w3.toml) writes its
+# tasks on the finished world. Gates before the run: the tests, ruff, viewer/check.py and a --dry-run.
+sector = "a B2B software company: product releases and incidents, enterprise onboarding and support escalations, security reviews and compliance audits, sales deals and renewals, and hiring"
+seed = 20261048          # day 1 is Monday 2026-03-02: 50 days to 2026-04-20, a quarter's close in them, no holiday
+output = "data/v8-06/w3"
+storylines = 14           # the plot the ledger plans before day 1 (W2: 10)
+max_losses = 3            # lost sessions a day may take (W1 lost 4 in 2.9 hours), each a fresh VM after a pause
+
+# What the ledger holds at least, counted off the plan (world/profile.py). W2 asked 240 facts and held 284.
+[ledger]
+facts = 380               # W2: 240
+chains = 40               # values superseded 3 deep, across 2 or more channels (W2: 30)
+deep_chains = 10          # 4 deep (W2: 8)
+decoys = 50               # each beside a real value of its subject and attribute (W2: 30)
+private_truths = 20       # a value that changed, its current one in a private channel or a DM (W2: 15)
+collections = 24          # 4 or more items of a set, across 3 or more channels, an item's value changed (W2: 12)
+archives = 2
+departures = 3
+
+# One author writes the world in time order.
+[author]
+review_days = [10, 20, 30, 40]  # the judge reviews the world after these days, and at the end
+keepalive = 600           # seconds between pings of the author's VM while the judge works
+day_attempts = 3
+
+# Built by: duckdb < scripts/worldgen_slack/personas.sql
+[personas]
+path = "data/seeds/personas-usa.jsonl"
+typing = "data/seeds/typing-profiles.jsonl"
+gaps = "data/seeds/reply-gaps.json"
+pool = 150                # people at the company (W2: 120)
+
+[calendar]
+days = 50
+
+# The workspace's shape: code places conversations by these targets, and measure.py scores the world against them.
+# W2's, but 7,000 messages over 50 days (140 a day, W2's 125).
+[activity]
+messages = 7000           # people's messages, storylines included; apps post beside them
+channel_skew = 1.3        # Zipf exponent over channels ranked by members: busy channels 3-5 read_channel pages deep
+dms_per_person = 0.4      # direct-message pairs per person (estimate)
+dm_share = 0.25           # share of background messages in DMs (estimate)
+conversation_lines = 6    # mean lines of a background conversation (estimate)
+reply_share = 0.3         # share of messages that are thread replies (vendor survey, low confidence)
+reaction_rate = 0.2       # share of messages with at least one reaction (estimate)
+mention_rate = 0.11       # measured: spencer/software_slacks, deduplicated; checked per day, ± mention_tolerance
+emoji_rate = 0.08         # measured, same corpus; scorecard only
+parts = { early = 0.1, morning = 0.35, afternoon = 0.4, evening = 0.12, night = 0.03 }  # workday rhythm (estimate)
+bot_posts = 3.0           # each app's routine posts per workday (the apps the organization lists)
+promise_rate = 0.03       # promises made per message, at least, each day
+promise_slips = 0.3       # of the promises made so far, at least this share slip, change or are dropped
+
+# Docker containers on the research VM, of the agents' image, as W2 (Prime VMs' sandbox streams dropped 6 times on
+# W2's smoke).
+[env]
+sandbox = "docker"
+docker_image = "sha256:86fe169858e8270c367f687ad9a4e6e52d15f99e8ba3bcf65fb5327c345668e8"
+
+[env.timeout]
+episode = 172800          # the run's wall clock: W2's 40 days took 4.5 hours
+finalize = 300
+
+[env.author]
+model = "anthropic/claude-opus-5.5"
+
+# The cache lives an hour: a review keeps the author waiting longer than the default five minutes.
+[env.author.sampling]
+cache_control = { type = "ephemeral", ttl = "1h" }
+
+# The judge: gpt-6-sol, as it judged W2 (GLM 5.3 lost its sandbox's stream on every review of W2's smoke).
+[env.judge]
+model = "openai/gpt-6-sol"

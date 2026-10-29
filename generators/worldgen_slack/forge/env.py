@@ -14,43 +14,24 @@ from worldgen_slack.release import atomic_json
 from worldgen_slack.world import file_hash
 
 from ..config import pinned
+from ..prices import priced
 from ..session import SETUP_FILES, SessionEnv, require_session
 from ..store import ReviewLimit, Store
 from ..workspace import Workspace, reset_tasks
+from . import tries as try_module
 from .config import ForgeConfig
 from .coverage import coverage
 from .coverage import page as coverage_page
-from .judge import rule
+from .judge import Ruling, rule, said
 from .proposer.task import ProposerTask, adapt_prompt, initial_prompt
 from .release import KEPT
 from .tasks import FAMILIES, Task, answer_text, check, key
-from .tries import Tries, agreeing, by_part, rates, reached
-
-# $ per million fresh input, cached input and output tokens (`prime inference models`, 2026-10-16), for a call its
-# provider leaves unpriced; a model not listed is priced as the dearest.
-PRICES = {
-    "z-ai/glm-5.3": (1.4, 0.26, 4.4),
-    "z-ai/glm-5.3-flash": (0.15, 0.15, 0.5),
-    "deepseek/deepseek-v4.1-flash": (0.3, 0.03, 1.2),
-    "anthropic/claude-opus-5.5": (4.0, 4.0, 20.0),
-}
-DEAREST = (4.0, 4.0, 20.0)
-
-
-def priced(usage: dict, model: str | None) -> float:
-    if usage.get("cost") is not None:
-        return usage["cost"]
-    fresh, cached, out = PRICES.get(model or "", DEAREST)
-    return (
-        (usage.get("prompt_tokens") or 0) * fresh
-        + (usage.get("cached_input_tokens") or 0) * cached
-        + (usage.get("completion_tokens") or 0) * out
-    ) / 1e6
+from .tries import Tries, agreeing, by_part, rates, reached, verified_by
 
 
 def spent(store) -> float:
     """What a forge has spent: each trace's calls (its own and its answer judge's), and the task judge's rulings, at
-    their reported cost or else list prices: an estimate that errs high."""
+    their reported cost or else the prices the bill shows (prices.py)."""
     env, judges = store.settings.get("env", {}), store.settings.get("answer_judge", {}).get("model")
     total = 0.0
     for path in (store.root / "traces").glob("*.json"):
@@ -101,7 +82,9 @@ class ForgeEnv(SessionEnv):
     def __init__(self, settings: ForgeConfig, store: Store):
         super().__init__(settings, store)
         self.tries = Tries(settings, store)
-        self.judging = asyncio.Semaphore(settings.solvers)
+        # The task judge's model is the verifier's and the grader's (GLM, 32 requests at once on this account): it
+        # takes a quarter of the tries' share, so the forge stays under the limit (forge-w2's 429s, 2026-10-19).
+        self.judging = asyncio.Semaphore(max(1, settings.solvers // 4))
 
     @property
     def plan(self) -> dict:
@@ -297,28 +280,32 @@ class ForgeEnv(SessionEnv):
         return out
 
     WHY = {
-        "harder": "The student answered it right {right} of {tries}. Write a harder version: add a part the request "
+        "harder": "The student answered it right {right} of {tries}; its right answers and the messages each part rests "
+        "on are above: the path it took. Write a harder version that path no longer reaches: add a part the request "
         "needs, ask for the answer as of a moment, ask for every item where a reader would stop at one place, or ask "
         "for what is not settled. Its difficulty comes from what the request needs, not from tool tedium.",
         "easier": "The student never answered it ({right} of {tries}), though the verifier did. Write an easier version: "
         "a sub-question, fewer parts, or the part it missed, asked alone.",
         "repaired": "The judge refused it: {reason} Rewrite it so the judge's point is met: a request a colleague would "
-        "make, with one reading, each answer exactly what its part asks, resting on messages that state it.",
+        "make, with one reading, each answer exactly what its part asks, resting on messages that state it, a set's "
+        "answer holding every member (read the messages for each member the judge names before you add it).",
     }
 
     def adapt_page(self, ids: list[str]) -> str:
-        """What each open version is of, how its source went, and what to write."""
+        """What each open version is of, how its source went, and what to write. A harder version also shows how the
+        student got it right, its right answers (grounded first) and the messages each part rests on: a page of rates
+        and wrong answers (a solved task has at most one) left 3 of the smoke's 4 harder versions still solved."""
         state, lines = self.store.state, ["# Versions to write", ""]
         for task_id in ids:
             version = self.plan["planned"][task_id]
             record = state.forged[version["variant_of"]]
             task = Task.model_validate(record["task"])
             measured = record.get("rates") or {}
-            wrong = [
-                (r.get("response") or "")[:300]
-                for r in state.solves.get(task.id, {}).get("results", [])
-                if r and not r.get("crashed") and not r.get("correct")
+            finished = [
+                r for r in state.solves.get(task.id, {}).get("results", []) if r and not r.get("crashed")
             ]
+            wrong = [(r.get("response") or "")[:300] for r in finished if not r.get("correct")]
+            right = sorted((r for r in finished if r.get("correct")), key=lambda r: not r.get("grounded"))
             lines += [
                 f"## {task_id}: {'an' if version['why'] == 'easier' else 'a'} {version['why']} version of {task.id} "
                 f"(variant_of={task.id}, why={version['why']})",
@@ -332,6 +319,16 @@ class ForgeEnv(SessionEnv):
                 ),
             ]
             lines += [f"- a wrong answer: {w!r}" for w in wrong[:2]]
+            if version["why"] == "harder":
+                lines += [f"- a right answer: {(r.get('response') or '')[:600]!r}" for r in right[:2]]
+                lines += [
+                    f"- {p.label} rests on: "
+                    + "; ".join(
+                        f"m{m['id']} {m['from']}, {m['where']}, {m['when']}: {m['text'][:160]!r}"
+                        for m in said(self.world, p.evidence)
+                    )
+                    for p in task.parts
+                ]
             lines.append(
                 "- what to write: "
                 + self.WHY[version["why"]].format(
@@ -346,23 +343,29 @@ class ForgeEnv(SessionEnv):
     # ------------------------------------------------------------------ labelling: verify, measure, judge
 
     async def label(self, agents) -> None:
-        """Every task of the pass labelled side by side, each step kept as it lands. A task whose step fails is marked
-        failed and the others go on; most of them failing is the run's stop."""
+        """Every task due labelled side by side, each step kept as it lands: the pass's, any an earlier labelling left
+        failed, and any whose label rests on tries that crashed (whichever pass labelled it). A few that fail (a provider's burst of refusals) wait and are labelled again, twice; a task that
+        still fails is marked failed and the others go on, and the next labelling (a later pass, or the forge run
+        again) takes it up. Most of them failing is the run's stop, which the CLI resumes."""
         state = self.store.state
-        if reopened := [
-            t
-            for t, r in state.forged.items()
-            if r["pass"] == state.batch and on_crashes(r, state.verifier.get(t, {}))
-        ]:
+        if reopened := [t for t, r in state.forged.items() if on_crashes(r, state.verifier.get(t, {}))]:
             for t in reopened:
                 state.forged[t].pop("label")
             self.store.event("labels_reopened", tasks=reopened, why="their tries crashed")
-        due = [t for t, r in state.forged.items() if r["pass"] == state.batch and "label" not in r]
-        outcomes = await asyncio.gather(*(self.label_one(agents, t) for t in due), return_exceptions=True)
-        failed = {t: o for t, o in zip(due, outcomes) if isinstance(o, BaseException)}
+        due = [
+            t
+            for t, r in state.forged.items()
+            if "label" not in r and (r["pass"] == state.batch or "failed" in r)
+        ]
+        failed = await self.label_all(agents, due)
+        for wait in (try_module.WAITS[-1],) * 2:
+            if not failed or len(failed) * 2 > len(due):
+                break
+            self.store.event("labels_retried", tasks=sorted(failed), wait=wait)
+            if wait:
+                await asyncio.sleep(wait)
+            failed = await self.label_all(agents, sorted(failed))
         for task_id, error in failed.items():
-            if isinstance(error, asyncio.CancelledError):
-                raise error
             state.forged[task_id]["failed"] = f"{type(error).__name__}: {error}"[:500]
             self.store.event("task_failed", task_id=task_id, error=state.forged[task_id]["failed"])
         self.store.save()
@@ -371,31 +374,43 @@ class ForgeEnv(SessionEnv):
                 f"labelling failed for {len(failed)} of {len(due)} tasks: {next(iter(failed.values()))}"
             )
 
+    async def label_all(self, agents, due: list[str]) -> dict[str, BaseException]:
+        """The tasks `due` labelled side by side; those that failed, with why (a stop is raised)."""
+        outcomes = await asyncio.gather(*(self.label_one(agents, t) for t in due), return_exceptions=True)
+        failed = {t: o for t, o in zip(due, outcomes) if isinstance(o, BaseException)}
+        if stop := next((o for o in failed.values() if isinstance(o, asyncio.CancelledError)), None):
+            raise stop
+        return failed
+
     async def label_one(self, agents, task_id: str) -> None:
+        """One task labelled. With a cascade, the student tries it first, and the verifier only when its grounded tries
+        fall short of reaching every part `cascade` times; without one, the verifier first, and the student only on a
+        task it verified. A verified task is judged."""
         record = self.store.state.forged[task_id]
         record.pop("failed", None)
         task, task_key = Task.model_validate(record["task"]), record["key"]
-        verified = await self.tries.verify(agents, task, task_key)
+        cascade = self.settings.cascade
+        measured = await self.measure(agents, task, task_key, record) if cascade else None
+        if measured is not None and min(record["student_reached"]) >= cascade:
+            verified = []  # the student reached it: no verifier runs
+        else:
+            verified = await self.tries.verify(agents, task, task_key)
         record["agree"] = len(agreeing(verified))
         record["reached"] = reached(
             task, verified
-        )  # by part: an answer holds when each part is reached twice
-        record["verified"] = min(record["reached"]) >= 2
+        )  # by part: the verifier's answer holds when each part is reached twice
+        record["verified_by"] = verified_by(task, verified, measured or [], cascade)
+        record["verified"] = record["verified_by"] is not None
         if record["verified"]:
-            measured = await self.tries.measure(agents, task, task_key)
-            record["rates"] = rates(measured)
-            if record["rates"]["right_rate"] is None:
-                raise RuntimeError("every one of the student's tries crashed")
-            record["parts"] = by_part(task, measured)
+            if measured is None:
+                measured = await self.measure(agents, task, task_key, record)
             if "ruling" not in record:
                 async with (
                     self.judging
                 ):  # the judge's model is the verifier's and the grader's: a share of its limit
                     ruling, usage = await rule(self.settings.judge, self.world, task, verified, measured)
                 record["ruling"], record["usage"] = ruling.model_dump(), usage
-            record["approved"] = all(
-                record["ruling"][k] for k in ("realistic", "one_reading", "exact", "supported")
-            )
+            record["approved"] = Ruling.model_validate(record["ruling"]).approved
         record["label"] = label_of(record, self.settings.solved)
         self.store.event(
             "task_labelled",
@@ -403,8 +418,20 @@ class ForgeEnv(SessionEnv):
             label=record["label"],
             agree=record["agree"],
             reached=record["reached"],
+            verified_by=record["verified_by"],
         )
         self.store.save()
+
+    async def measure(self, agents, task: Task, task_key: str, record: dict) -> list[dict]:
+        """The student's tries of a task, kept on its record as its rates, by part, and how often its grounded tries
+        reached each part."""
+        measured = await self.tries.measure(agents, task, task_key)
+        record["rates"] = rates(measured)
+        if crashed := record["rates"]["crashed"]:  # its rate would rest on fewer tries: they run again first
+            raise RuntimeError(f"{crashed} of the student's {len(measured)} tries crashed")
+        record["parts"] = by_part(task, measured)
+        record["student_reached"] = reached(task, measured, grounded=True)
+        return measured
 
     # ------------------------------------------------------------------ the next pass
 
@@ -436,6 +463,23 @@ class ForgeEnv(SessionEnv):
         self.store.save()
 
 
+def reopen(store) -> bool:
+    """A finished forge run again, when an earlier labelling left tasks failed or labelled them on tries that crashed:
+    it labels them, and its release is published anew. Whether it reopened."""
+    state = store.state
+    failed = [t for t, r in state.forged.items() if "label" not in r and "failed" in r]
+    crashed = [t for t, r in state.forged.items() if on_crashes(r, state.verifier.get(t, {}))]
+    if state.phase != "done" or not (failed or crashed):
+        return False
+    state.phase = "label"
+    store.state.plans.setdefault("forge", {})["relabelled"] = True
+    store.event(
+        "forge_reopened", tasks=failed + crashed, why="their labelling failed, or rests on tries that crashed"
+    )
+    store.save()
+    return True
+
+
 def dry_run(config: ForgeConfig) -> dict:
     """What a forge would start from, spending nothing."""
     world = Workspace(config.world / "world.sqlite")
@@ -453,8 +497,10 @@ def dry_run(config: ForgeConfig) -> dict:
         "adapt": config.adapt,
         "tries": config.tries,
         "verify": config.verify,
+        "cascade": config.cascade,
         "proposer": config.env.proposer.model,
         "verifier": config.env.verifier.model,
+        "verifier_effort": config.env.verifier.sampling.reasoning_effort,
         "solver": config.env.solver.model,
         "judge": config.judge.model,
         "spend_limit": config.spend_limit,

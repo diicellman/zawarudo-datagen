@@ -4,6 +4,7 @@ forge's release run through the env as an eval runs it."""
 
 from types import SimpleNamespace
 
+import verifiers.v1 as vf
 from worldgen_slack.taskset import EvaluationConfig, SlackEnv, SlackEnvConfig, SlackTasksetConfig
 from worldgen_slack.toolset import SlackToolset
 
@@ -37,17 +38,15 @@ class Solver:
         for channel, _ in reference.messages[:1]:
             await tools._with_state(tools.read_channel)(channel_id=channel)
         answer = gold_text(reference.reference()) if self.right else "nobody knows"
-        trace = SimpleNamespace(
-            id="solve", info={}, state=stored["state"], last_reply=answer + ".", record_metrics=lambda m: None
-        )
+        trace = vf.Trace.model_construct(id="solve", info={}, state=stored["state"], root_reply=answer + ".")
         await solve.finalize(trace)
         self.scores.append(await solve.semantic_correctness(trace))
 
 
 async def evaluated(release):
     """The release through the env with no model: SlackTaskset loads its tasks, each validates against the release,
-    SlackEnv runs it with the solver seat, and the answer judge (played by code, grounding what the solver read)
-    rewards a right answer +1 and a wrong one -1."""
+    SlackEnv runs it with the solver seat, and the answer judge (its own call, the network faked; grounding is code's,
+    on what the solver read) rewards a right answer +1 and a wrong one -1."""
     env = SlackEnv(
         SlackEnvConfig(
             taskset=SlackTasksetConfig(id="worldgen-slack", task=EvaluationConfig(release_dir=release))
@@ -55,7 +54,7 @@ async def evaluated(release):
     )
     tasks = env.taskset.load()
     assert tasks, "the release holds the forge's tasks"
-    GRADER.update(on=True, loose=False, blind=False, grounded=True)
+    GRADER["on"] = True
     try:
         for right, score in ((True, 1.0), (False, -1.0)):
             solver = Solver(right)
@@ -64,4 +63,4 @@ async def evaluated(release):
                 await env.run(task, SimpleNamespace(solver=solver))
             assert solver.scores == [score] * len(tasks), solver.scores
     finally:
-        GRADER.update(on=False, grounded=False)
+        GRADER["on"] = False

@@ -1,6 +1,7 @@
 """Export a worldgen run as a standalone, offline HTML page: lineage, world, tasks, cast and agent traces."""
 
 import argparse
+import hashlib
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -167,7 +168,13 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
                 ),
                 "gold_sql": "rests on "
                 + ", ".join(f"m{m}" for m in evidence)
-                + (f"; the verifier agreed {record['agree']} times" if "agree" in record else ""),
+                + (
+                    "; verified by the student's tries"
+                    if record.get("verified_by") == "student"
+                    else f"; the verifier agreed {record['agree']} times"
+                    if "agree" in record
+                    else ""
+                ),
                 "category": task["family"],
                 "level": record.get("pass", 0),
                 "answer": {"canonical_answer": "; ".join(claims), "required_claims": claims},
@@ -312,6 +319,103 @@ def ledger(path: Path, state: dict) -> tuple[dict, dict, list, dict, dict]:
     return catalog, bindings, scenes, owner, marks
 
 
+# The other values of a message's fact groups: an earlier value, a later one, or a decoy beside it.
+NEAR = """SELECT DISTINCT o.id AS fact, o.is_decoy, o.day, f.day AS own_day FROM evidence e
+JOIN facts f ON f.id = e.fact_id
+JOIN facts o ON lower(trim(o.subject)) = lower(trim(f.subject)) AND lower(trim(o.attribute)) = lower(trim(f.attribute))
+WHERE e.message_id = ? AND o.id <> f.id"""
+TRIED = (
+    "correct", "grounded", "abstained", "crashed", "unanswered", "calls", "evidence_coverage", "response", "reason",
+    "solver_trace_id",
+)  # fmt: skip
+
+
+def forged(run: Path, state: dict) -> dict:
+    """A forge's tasks as a reviewer labels them: each one's label, set, dealt skill, rates (by part), verification
+    and the task judge's ruling; the messages beside its answer that state another value of the same facts (earlier,
+    later, or a decoy); every try of the student and the verifier, with its grade by part; whether its release holds
+    it; when the run has a qc.json, the QC reading of it; and when it has a calibration.json, each calibrated try's
+    reference grade beside the recorded one. Empty for a run that is not a forge."""
+    records = {t: r for t, r in (state.get("forged") or {}).items() if "task" in r}
+    if not records:
+        return {}
+    released = read_json(run / "release" / "tasks.json") or []
+    qc = {v["task_id"]: v for v in read_json(run / "qc.json") or []}
+    calibration = {}  # task -> try -> its reference grade, the recorded one, and whether a person should rule on it
+    for row in read_json(run / "calibration.json") or []:
+        calibration.setdefault(row["task_id"], {})[row["try"]] = row
+    db = connect(run / "world.sqlite")
+    out = {}
+    for task_id, record in records.items():
+        task = record["task"]
+        evidence = {m for p in task["parts"] for m in p.get("evidence", [])}
+        unseen = {m for p in task["parts"] for m in p.get("unseen") or []}
+        near = {}
+        for message in sorted(evidence):
+            for row in db.execute(NEAR, (message,)):
+                role = (
+                    "decoy"
+                    if row["is_decoy"]
+                    else "earlier value"
+                    if row["day"] < row["own_day"]
+                    else "later value"
+                )
+                for (other,) in db.execute(
+                    "SELECT message_id FROM evidence WHERE fact_id = ?", (row["fact"],)
+                ):
+                    if other not in evidence and other not in unseen:
+                        near.setdefault(str(other), role)
+        source = records.get(task.get("variant_of") or "")
+
+        def tries(book: str) -> list[dict]:
+            return [
+                {k: r.get(k) for k in TRIED}
+                | {
+                    "parts": [
+                        {k: p.get(k) for k in ("label", "correct", "missing", "extra")}
+                        for p in r.get("parts") or []
+                    ]
+                }
+                for r in (state.get(book) or {}).get(task_id, {}).get("results", [])
+                if r
+            ]
+
+        out[task_id] = {
+            "label": record.get("label"),
+            "failed": record.get("failed"),
+            "set": record.get("set", "initial"),
+            "skill": record.get("skill"),
+            "family": task["family"],
+            "why": task.get("why"),
+            "variant_of": task.get("variant_of"),
+            "source_question": source["task"]["question"] if source else None,
+            "source_right": (source.get("rates") or {}).get("right_rate") if source else None,
+            "rates": record.get("rates"),
+            "part_rates": record.get("parts"),
+            "verified": record.get("verified"),
+            "agree": record.get("agree"),
+            "reached": record.get("reached"),
+            "ruling": record.get("ruling"),
+            "parts": [
+                {
+                    "label": p["label"],
+                    "answer_type": p["answer_type"],
+                    "answer": p.get("answer") or [],
+                    "evidence": [str(m) for m in p.get("evidence", [])],
+                    "unseen": [str(m) for m in p.get("unseen") or []],
+                }
+                for p in task["parts"]
+            ],
+            "near_misses": near,
+            "tries": {"student": tries("solves"), "verifier": tries("verifier")},
+            "released": any(r["task_id"] == task_id for r in released),
+            "qc": qc.get(task_id),
+            "calibration": calibration.get(task_id) or {},
+        }
+    db.close()
+    return out
+
+
 def chapter_of(db, state: dict, board: dict) -> dict | None:
     """A chapter's world: its version, its first day and when it starts (the days before are an earlier chapter's,
     frozen), the world it continues, and its brief, each entry with its needs and the facts the board plants for it.
@@ -362,7 +466,7 @@ def load_run(path, full=False):
         board.setdefault(slot, []).append(fact)
     chapter = chapter_of(db, state, board)
     db.close()
-    snapshots, attempts = {}, []
+    snapshots, attempts, seen = {}, [], {}  # seen: a snapshot's content -> the first attempt that holds it
     folders = sorted(
         (p for p in (run / "attempts").iterdir() if p.is_dir()),
         key=lambda p: (order.get(p.name, -1 if p.name in ("premise", "organization") else 1e9), p.name),
@@ -371,8 +475,11 @@ def load_run(path, full=False):
         files = {p.stem: read_json(p) for p in folder.glob("*.json")}
         key = None
         if (folder / "world.sqlite").exists():
-            key = folder.name
-            snapshots[key] = snapshot(folder / "world.sqlite")
+            # A world kept unchanged by later attempts (a forge's every turn, on its frozen world) is drawn once.
+            shot = snapshot(folder / "world.sqlite")
+            content = hashlib.sha256(json.dumps(shot, sort_keys=True).encode()).hexdigest()
+            key = seen.setdefault(content, folder.name)
+            snapshots.setdefault(key, shot)
         validation = files.get("validation") or {}
         labels = sorted(name.removeprefix("verdict-") for name in files if name.startswith("verdict-"))
         attempts.append(
@@ -412,6 +519,8 @@ def load_run(path, full=False):
         "snapshots": snapshots,
         "events": events,
         "traces": sorted(traces, key=lambda t: t["start"] or 0),
+        "forge": forged(run, state),
+        "label_set": run.name,  # labels are kept as <label_set>/<task id>
     }
 
 

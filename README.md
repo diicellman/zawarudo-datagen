@@ -119,7 +119,9 @@ depth and people, for whoever writes its next chapter.
 - **Resume:** rerunning the same command resumes from `state.json`; it is refused if the config differs from the
   run's `run.json`. Change `output` (and a world's `seed`) for each new run.
 - **Spend:** reported per role in `summary.json` and by `measure.py`; nothing caps it.
-- **GLM limit:** the account allows 8 concurrent GLM requests, so run one GLM run at a time.
+- **GLM limit:** the account allows 32 concurrent GLM requests (a 429 past it), so run one GLM run at a time; a
+  forge runs `solvers` verifier tries at once (GLM), the grades of its tries, and its task judge at a quarter of
+  `solvers`.
 - **Follow a run:** `tail -F runs/world.log | grep -E '"event": "(day_closed|review_started|candidate_finished|session_lost|world_resumed|workspace_frozen)"|"status"'`.
   For a forge: `grep -E '"event": "(tasks_taken|task_labelled|pass_labelled|ids_dropped|session_lost|forge_resumed)"|"status"'`.
 - **Stop a run** with Ctrl-C or `kill <pid>`: it unwinds, deletes its VM and keeps its checkpoint; rerun to resume.

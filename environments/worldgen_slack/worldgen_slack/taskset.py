@@ -10,9 +10,9 @@ from pydantic import Field
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 
 from .config import role
-from .judge import AnswerJudge, empty_grade, reward
+from .judge import READINGS, AnswerJudge, Misread, empty_grade, fenced, gold, graded, reward
 from .release import PrivateAnswer, PublicTask, load_release
-from .slack import compact, people_shown, shown
+from .slack import people_shown, shown
 from .toolset import CallState, SlackToolset, WorldToolsConfig, stage_world
 from .world import World
 
@@ -38,10 +38,48 @@ def system_prompt(world) -> str:
     return f"You are using Slack as the user with user_id {world.actor['id']}." + when
 
 
+def out_of_sight(path: str, actor_id: str, reference: PrivateAnswer) -> list[list[dict]]:
+    """Each part's messages out of its asker's sight, as the grader reads them: who wrote what, where and when (on the
+    asker's clock). They show how things really stand, against which a flat claim is judged."""
+    world = World(path)
+    try:
+        zone = ZoneInfo(world.db.execute("SELECT tz FROM users WHERE id = ?", (actor_id,)).fetchone()[0])
+        hidden = []
+        for answer in reference.answers():
+            said = []
+            for channel, ts in answer.unseen:
+                row = world.db.execute(
+                    """SELECT m.ts_us, m.text, m.parent_id, c.name, c.type, u.real_name FROM messages m
+                    JOIN channels c ON c.id = m.channel_id JOIN users u ON u.id = m.user_id
+                    WHERE m.channel_id = ? AND m.ts = ?""",
+                    (channel, ts),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"a message out of sight, {channel} {ts}, is not in the world")
+                where = (
+                    f"#{row['name']}" if row["name"] else ("a DM" if row["type"] == "im" else "a group DM")
+                )
+                when = datetime.fromtimestamp(row["ts_us"] / 1e6, zone)
+                said.append(
+                    {
+                        "from": row["real_name"],
+                        "where": where + (" (thread reply)" if row["parent_id"] else ""),
+                        "when": f"{when:%a %b} {when.day}, {when:%H:%M}",
+                        "text": row["text"],
+                    }
+                )
+            hidden.append(said)
+        return hidden
+    finally:
+        world.close()
+
+
 class SolverConfig(vf.TaskConfig):
     tools: WorldToolsConfig
     reference: PrivateAnswer = Field(exclude=True, repr=False)
-    judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
+    judge: vf.JudgeConfig = vf.JudgeConfig(
+        model="z-ai/glm-5.3", sampling=vf.SamplingConfig(reasoning_effort="high")
+    )
 
 
 class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
@@ -51,7 +89,12 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
 
     @classmethod
     def create(
-        cls, task: PublicTask, world: Path, reference: PrivateAnswer, judge=None, network_policy=True
+        cls,
+        task: PublicTask,
+        world: Path,
+        reference: PrivateAnswer,
+        judge=None,
+        network_policy=True,
     ) -> Self:
         """`world` is a solver copy (no answer key); `network_policy` blocks egress where the runtime enforces it."""
         config = SolverConfig(tools=WorldToolsConfig(actor_id=task.actor_id), reference=reference)
@@ -74,29 +117,29 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
     def outcome(trace: vf.Trace) -> dict:
         """A solve's graded result. One that crashed before its grade (its harness, its model stream or its grading
         failed) scores zero and is marked crashed: its try tells nothing about the task. One that finished without an
-        answer is marked unanswered."""
-        result = trace.info.get("evaluation")
-        crashed = result is None or not trace.ok
+        answer is marked unanswered and is wrong: an empty last message, or a framework limit that cut it off (the turn
+        cap mid-search, a token cap, a reply cut at its length), whose last message is no answer, graded or not."""
+        cut = trace.ok and trace.is_truncated
+        result = None if cut else trace.info.get("evaluation")
+        crashed = not trace.ok or (result is None and not cut)
         if result is None:
             failed = "grading failed: " if trace.info.get("grading_started") else ""
             result = {
                 "task_id": trace.task.data.task_id,
-                "execution_ok": False,
+                "execution_ok": cut,
                 "semantic_correctness": 0.0,
                 "correct": False,
                 "grounded": False,
                 "calls": len(trace.info.get("observations", [])),
                 "solver_trace_id": trace.id,
-                "reason": failed + "; ".join(e.message for e in trace.errors),
+                "reason": f"cut off: {trace.stop_condition or 'its reply at its length'}"
+                if cut
+                else failed + "; ".join(e.message for e in trace.errors),
                 "response": trace.last_reply,
             }
         if not trace.ok:
             result.update(execution_ok=False, semantic_correctness=0.0)
-        # A finished try that never answers (an empty last message, or the turn cap mid-search) is wrong, and counted.
-        silent = (
-            not (result.get("response") or "").strip()
-            or getattr(trace, "stop_condition", None) == "max_turns"
-        )
+        silent = cut or not (result.get("response") or "").strip()
         return result | {"crashed": crashed, "unanswered": not crashed and silent}
 
     async def finalize(self, trace):
@@ -107,20 +150,29 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
         trace.info["grading_started"] = True
         observations = trace.info.get("observations", [])
         reference = self.config.reference
-        expected = reference.reference()
-        if (trace.last_reply or "").strip():
-            result = await AnswerJudge(self.config.judge).evaluate(
-                trace=trace,
-                question=self.data.prompt,
-                reference=expected,
-                response=trace.last_reply,
-                observations=compact(observations),
-            )
-            grade = result.parsed
+        outcome, reading = "error", {}
+        if not (trace.last_reply or "").strip():
+            grade = empty_grade(reference)
         else:
-            grade = empty_grade(expected)
-        if grade.grounded and not observations:
-            raise ValueError("judge claimed grounding without observations")
+            # The model reads what the answer commits to, criterion by criterion; code grades it. A reading that
+            # misreads the gold's parts or items, or a reply that does not parse, is asked again (each call recorded on
+            # the trace once it parses): a grade costs a reading, where its try's crash would cost the whole try again.
+            hidden = out_of_sight(self.config.tools.db_path, self.config.tools.actor_id, reference)
+            for n in range(1, READINGS + 1):
+                try:
+                    result = await AnswerJudge(self.config.judge).evaluate(
+                        trace=trace,
+                        request=self.data.prompt,
+                        reference=gold(reference, hidden),
+                        response=fenced(trace.last_reply),
+                    )
+                    grade, outcome = graded(result.parsed, reference, bool(observations))
+                except Misread:
+                    if n == READINGS:
+                        raise
+                else:
+                    reading = {"reading": result.parsed.model_dump(mode="json"), "readings": n}
+                    break
         seen = set().union(*map(shown, observations))
         users = set().union(*map(people_shown, observations))
 
@@ -142,6 +194,8 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
             "execution_ok": True,
             "semantic_correctness": score,
             **grade.model_dump(mode="json"),
+            "outcome": outcome,
+            **reading,
             "response": trace.last_reply,
             "evidence_coverage": coverage,
             **({"part_coverage": [covered(p) for p in reference.parts]} if reference.parts else {}),
@@ -162,7 +216,9 @@ class SolverTask(vf.Task[WorldTaskData, CallState, SolverConfig]):
 
 class EvaluationConfig(vf.TaskConfig):
     release_dir: Path | None = None  # the release to evaluate: a generated world's release/ directory
-    judge: vf.JudgeConfig = vf.JudgeConfig(model="openai/gpt-6-sol")
+    judge: vf.JudgeConfig = vf.JudgeConfig(
+        model="z-ai/glm-5.3", sampling=vf.SamplingConfig(reasoning_effort="high")
+    )
 
 
 def release(config: EvaluationConfig):
